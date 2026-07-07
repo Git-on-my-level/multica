@@ -59,8 +59,8 @@ export function runtimeListOptions(wsId: string, owner?: "me") {
 const GITHUB_RELEASES_URL = () =>
   githubConfigFromStore().releasesLatestApiUrl;
 
-export function latestCliVersionOptions() {
-  const repo = githubConfigFromStore().repo;
+export function latestCliVersionOptions(repoOverride?: string) {
+  const repo = repoOverride ?? githubConfigFromStore().repo;
   return queryOptions({
     queryKey: [...runtimeKeys.latestVersion(), repo] as const,
     queryFn: async (): Promise<string | null> => {

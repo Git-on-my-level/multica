@@ -38,7 +38,11 @@ export function buildCliInstallCommand(
   repo = DEFAULT_GITHUB_REPO,
   branch = DEFAULT_GITHUB_BRANCH,
 ): string {
-  return `curl -fsSL https://raw.githubusercontent.com/${repo}/${branch}/scripts/install.sh | bash`;
+  const curl = `curl -fsSL https://raw.githubusercontent.com/${repo}/${branch}/scripts/install.sh | bash`;
+  if (repo === DEFAULT_GITHUB_REPO) {
+    return curl;
+  }
+  return `MULTICA_GITHUB_REPO=${repo} ${curl}`;
 }
 
 export function buildCliInstallPs1Command(

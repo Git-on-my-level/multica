@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../auth";
+import { useGithubConfig } from "../github/config";
 import type { AgentRuntime } from "../types";
 import { runtimeListOptions, latestCliVersionOptions } from "./queries";
 
@@ -47,11 +48,12 @@ function runtimeNeedsUpdate(
  */
 export function useMyRuntimesNeedUpdate(wsId: string | undefined): boolean {
   const userId = useAuthStore((s) => s.user?.id);
+  const { repo } = useGithubConfig();
   const { data: runtimes } = useQuery({
     ...runtimeListOptions(wsId ?? ""),
     enabled: !!wsId,
   });
-  const { data: latestVersion } = useQuery(latestCliVersionOptions());
+  const { data: latestVersion } = useQuery(latestCliVersionOptions(repo));
 
   if (!runtimes || !latestVersion || !userId) return false;
 
@@ -64,11 +66,12 @@ export function useMyRuntimesNeedUpdate(wsId: string | undefined): boolean {
  */
 export function useUpdatableRuntimeIds(wsId: string | undefined): Set<string> {
   const userId = useAuthStore((s) => s.user?.id);
+  const { repo } = useGithubConfig();
   const { data: runtimes } = useQuery({
     ...runtimeListOptions(wsId ?? ""),
     enabled: !!wsId,
   });
-  const { data: latestVersion } = useQuery(latestCliVersionOptions());
+  const { data: latestVersion } = useQuery(latestCliVersionOptions(repo));
 
   return useMemo(() => {
     if (!runtimes || !latestVersion || !userId) return new Set<string>();
