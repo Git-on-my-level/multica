@@ -352,6 +352,7 @@ install_cli_to_bin_dir() {
     mkdir -p "$bin_dir" || fail "Failed to create $bin_dir"
     mv "$binary" "$dest" || fail "Failed to install CLI to $dest"
     chmod +x "$dest" || fail "Failed to make CLI executable at $dest"
+    ensure_bin_dir_on_path "$bin_dir"
   elif command_exists sudo; then
     sudo mkdir -p "$bin_dir" || fail "Failed to create $bin_dir (sudo)"
     sudo mv "$binary" "$dest" || fail "Failed to install CLI to $dest (sudo)"
@@ -362,10 +363,7 @@ install_cli_to_bin_dir() {
     mkdir -p "$bin_dir" || fail "Failed to create $bin_dir"
     mv "$binary" "$dest" || fail "Failed to install CLI to $dest"
     chmod +x "$dest" || fail "Failed to make CLI executable at $dest"
-    if ! echo "$PATH" | tr ':' '\n' | grep -q "^$bin_dir$"; then
-      export PATH="$bin_dir:$PATH"
-      add_to_path "$bin_dir"
-    fi
+    ensure_bin_dir_on_path "$bin_dir"
   fi
 
   if [ ! -x "$dest" ]; then
@@ -408,6 +406,14 @@ install_cli_source() {
   install_cli_to_bin_dir "$built"
   rm -rf "$tmp_dir"
   return 0
+}
+
+ensure_bin_dir_on_path() {
+  local bin_dir="$1"
+  if ! echo "$PATH" | tr ':' '\n' | grep -q "^$bin_dir$"; then
+    export PATH="$bin_dir:$PATH"
+    add_to_path "$bin_dir"
+  fi
 }
 
 add_to_path() {

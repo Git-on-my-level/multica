@@ -400,7 +400,42 @@ test_install_creates_missing_bin_dir() {
   fi
 }
 
+test_install_adds_bin_dir_to_path() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  _setup_sandbox "$tmp"
+  local custom_bin="$tmp/custom-bin"
+  rm -rf "$custom_bin"
+
+  local out="$tmp/install.out"
+  local err="$tmp/install.err"
+  if ! PATH="$tmp/stub-bin:/usr/bin:/bin" \
+    MULTICA_BIN_DIR="$custom_bin" \
+    MULTICA_TEST_ARCHIVE="$tmp/multica.tar.gz" \
+    MULTICA_SKIP_BREW=1 \
+    bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
+    echo "install.sh exited non-zero" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if ! grep -q "Multica CLI is ready" "$out"; then
+    echo "expected install to complete after adding bin dir to PATH" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+}
+
 test_install_failure_does_not_claim_success() {
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "skipping test_install_failure_does_not_claim_success: chmod-based write checks are ineffective as root"
+    return 0
+  fi
+
   local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
@@ -455,5 +490,6 @@ test_fork_repo_skips_homebrew
 test_source_build_fallback_when_release_missing
 test_tar_extract_failure_falls_back_to_source_build
 test_install_creates_missing_bin_dir
+test_install_adds_bin_dir_to_path
 test_install_failure_does_not_claim_success
 echo "install.sh tests passed"
