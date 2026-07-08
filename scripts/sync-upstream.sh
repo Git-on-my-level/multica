@@ -63,14 +63,14 @@ if [ "$behind" -eq 0 ] && [ "$ahead" -eq 0 ]; then
 fi
 
 if [ "$behind" -gt 0 ]; then
-  echo "To merge upstream into the current branch:"
-  echo "  git merge $upstream_ref"
-  echo "Or rebase (rewrites history — only on unpublished branches):"
-  echo "  git rebase $upstream_ref"
+  echo "Default sync policy: merge (do not rebase published main)."
+  echo "  git checkout main && git pull origin main"
+  echo "  git merge $upstream_ref -m \"Merge upstream/main into main\""
+  echo "  bash scripts/install-fork.test.sh && bash scripts/selfhost-fork-env.test.sh"
+  echo "  git push origin main"
   echo ""
-  echo "After merge, smoke-check:"
+  echo "After merge, also smoke-check a live deploy if you have one:"
   echo "  curl -fsS \"\$PUBLIC_URL/api/config\" | jq '{github_repo, github_branch}'"
-  echo "  MULTICA_GITHUB_REPO=Git-on-my-level/multica bash -n scripts/install-fork.sh"
 fi
 
 if [ "$ahead" -gt 0 ]; then

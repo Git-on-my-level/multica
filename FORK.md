@@ -157,12 +157,22 @@ Details: [`apps/desktop/MACOS_RELEASE.md`](apps/desktop/MACOS_RELEASE.md).
 
 ## Syncing from upstream
 
+**Default policy: merge `upstream/main` into `main`.** Do not rebase
+published `main` onto upstream (rewrites history / tags / PRs). Do not squash
+the sync commit.
+
 ```bash
 git remote add upstream https://github.com/multica-ai/multica.git   # once
-./scripts/sync-upstream.sh   # fetch + report ahead/behind (no auto-merge)
-git fetch upstream
+./scripts/sync-upstream.sh          # fetch + ahead/behind + both-changed preview
 git checkout main
-git merge upstream/main
+git pull origin main
+git fetch upstream
+git merge upstream/main -m "Merge upstream/main into main"
+# resolve conflicts if any — prefer upstream for product code;
+# keep fork-only overlays (install-fork defaults, FORK.md, release.yml is_upstream)
+bash scripts/install-fork.test.sh
+bash scripts/selfhost-fork-env.test.sh
+git push origin main
 ```
 
 Expect to re-apply or keep:
