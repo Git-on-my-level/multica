@@ -94,56 +94,9 @@ selfhost: ## Create .env if needed, then pull and start self-hosted images
 		fi; \
 		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
 	fi
-	@# When MULTICA_GITHUB_REPO points at a fork (or can be derived from
-	@# git remote origin), default GHCR images to that owner's lowercase
-	@# namespace unless the operator already overrode them.
-	@# Patch .env, re-export into this shell, then pull+up so compose sees the
-	@# fork images (Make's include of .env is parse-time only).
-	@repo="$${MULTICA_GITHUB_REPO:-}"; \
-	if [ -z "$$repo" ] && command -v git >/dev/null 2>&1; then \
-		_url=$$(git remote get-url origin 2>/dev/null || true); \
-		if [ -n "$$_url" ]; then \
-			case "$$_url" in \
-				*github.com[:/]*) \
-					repo=$$(printf '%s' "$$_url" | sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$$#\1/\2#'); \
-					;; \
-			esac; \
-		fi; \
-	fi; \
-	if [ -n "$$repo" ] && [ "$$repo" != "multica-ai/multica" ]; then \
-		owner_lower=$$(printf '%s' "$${repo%%/*}" | tr '[:upper:]' '[:lower:]'); \
-		backend_default="ghcr.io/$${owner_lower}/multica-backend"; \
-		web_default="ghcr.io/$${owner_lower}/multica-web"; \
-		cur_backend="$${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}"; \
-		cur_web="$${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}"; \
-		if [ "$$(uname)" = "Darwin" ]; then \
-			sed -i '' -E "s|^#? ?MULTICA_GITHUB_REPO=.*|MULTICA_GITHUB_REPO=$$repo|" .env; \
-		else \
-			sed -i -E "s|^#? ?MULTICA_GITHUB_REPO=.*|MULTICA_GITHUB_REPO=$$repo|" .env; \
-		fi; \
-		if ! grep -qE '^MULTICA_GITHUB_REPO=' .env; then echo "MULTICA_GITHUB_REPO=$$repo" >> .env; fi; \
-		export MULTICA_GITHUB_REPO="$$repo"; \
-		if [ "$$cur_backend" = "ghcr.io/multica-ai/multica-backend" ]; then \
-			if [ "$$(uname)" = "Darwin" ]; then \
-				sed -i '' -E "s|^#? ?MULTICA_BACKEND_IMAGE=.*|MULTICA_BACKEND_IMAGE=$$backend_default|" .env; \
-			else \
-				sed -i -E "s|^#? ?MULTICA_BACKEND_IMAGE=.*|MULTICA_BACKEND_IMAGE=$$backend_default|" .env; \
-			fi; \
-			if ! grep -qE '^MULTICA_BACKEND_IMAGE=' .env; then echo "MULTICA_BACKEND_IMAGE=$$backend_default" >> .env; fi; \
-			export MULTICA_BACKEND_IMAGE="$$backend_default"; \
-			echo "==> Fork detected ($$repo); using $$backend_default"; \
-		fi; \
-		if [ "$$cur_web" = "ghcr.io/multica-ai/multica-web" ]; then \
-			if [ "$$(uname)" = "Darwin" ]; then \
-				sed -i '' -E "s|^#? ?MULTICA_WEB_IMAGE=.*|MULTICA_WEB_IMAGE=$$web_default|" .env; \
-			else \
-				sed -i -E "s|^#? ?MULTICA_WEB_IMAGE=.*|MULTICA_WEB_IMAGE=$$web_default|" .env; \
-			fi; \
-			if ! grep -qE '^MULTICA_WEB_IMAGE=' .env; then echo "MULTICA_WEB_IMAGE=$$web_default" >> .env; fi; \
-			export MULTICA_WEB_IMAGE="$$web_default"; \
-			echo "==> Fork detected ($$repo); using $$web_default"; \
-		fi; \
-	fi; \
+	@# Fork image / MULTICA_GITHUB_REPO patching lives in scripts/selfhost-fork-env.sh
+	@# so this target stays closer to upstream for merges.
+	@eval "$$(./scripts/selfhost-fork-env.sh)"; \
 	echo "==> Pulling Multica images..."; \
 	if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
@@ -163,8 +116,6 @@ selfhost: ## Create .env if needed, then pull and start self-hosted images
 		sleep 2; \
 	done
 	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
-		repo=$$(grep -E '^MULTICA_GITHUB_REPO=' .env 2>/dev/null | head -1 | cut -d= -f2- || true); \
-		branch=$$(grep -E '^MULTICA_GITHUB_BRANCH=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo main); \
 		backend_image=$$(grep -E '^MULTICA_BACKEND_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-backend); \
 		web_image=$$(grep -E '^MULTICA_WEB_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-web); \
 		image_tag=$$(grep -E '^MULTICA_IMAGE_TAG=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo latest); \
@@ -179,15 +130,7 @@ selfhost: ## Create .env if needed, then pull and start self-hosted images
 		echo "Log in: configure RESEND_API_KEY in .env for email codes,"; \
 		echo "        or read the generated code from backend logs when Resend is unset."; \
 		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		if [ -n "$$repo" ] && [ "$$repo" != "multica-ai/multica" ]; then \
-			echo "  MULTICA_GITHUB_REPO=$$repo curl -fsSL https://raw.githubusercontent.com/$$repo/$$branch/scripts/install-fork.sh | bash"; \
-			echo "  multica setup self-host"; \
-			echo "(see FORK.md)"; \
-		else \
-			echo "  brew install multica-ai/tap/multica"; \
-			echo "  multica setup self-host"; \
-		fi; \
+		./scripts/selfhost-install-hint.sh; \
 	else \
 		echo ""; \
 		echo "Services are still starting. Check logs:"; \
@@ -212,6 +155,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		fi; \
 		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
 	fi
+	@eval "$$(./scripts/selfhost-fork-env.sh)"
 	@echo "==> Building Multica from the current checkout..."
 	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@echo "==> Waiting for backend to be ready..."
@@ -233,25 +177,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		echo "Built images locally via docker-compose.selfhost.build.yml."; \
 		echo "Local tags: multica-backend:dev and multica-web:dev."; \
 		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		repo="$${MULTICA_GITHUB_REPO:-}"; \
-		if [ -z "$$repo" ] && command -v git >/dev/null 2>&1; then \
-			_url=$$(git remote get-url origin 2>/dev/null || true); \
-			case "$$_url" in \
-				*github.com[:/]*) \
-					repo=$$(printf '%s' "$$_url" | sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$$#\1/\2#'); \
-					;; \
-			esac; \
-		fi; \
-		if [ -n "$$repo" ] && [ "$$repo" != "multica-ai/multica" ]; then \
-			branch="$${MULTICA_GITHUB_BRANCH:-main}"; \
-			echo "  MULTICA_GITHUB_REPO=$$repo curl -fsSL https://raw.githubusercontent.com/$$repo/$$branch/scripts/install-fork.sh | bash"; \
-			echo "  multica setup self-host"; \
-			echo "(see FORK.md)"; \
-		else \
-			echo "  brew install multica-ai/tap/multica"; \
-			echo "  multica setup self-host"; \
-		fi; \
+		./scripts/selfhost-install-hint.sh; \
 	else \
 		echo ""; \
 		echo "Services are still starting. Check logs:"; \

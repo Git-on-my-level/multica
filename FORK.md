@@ -26,6 +26,9 @@ These should never be expected upstream. Prefer putting fork defaults here:
 | `FORK.md` | This runbook |
 | `scripts/install-fork.sh` | curl entrypoint; sets `MULTICA_GITHUB_REPO`, skips Homebrew |
 | `scripts/install-fork.ps1` | Windows parity |
+| `scripts/selfhost-fork-env.sh` | `make selfhost` fork `.env` / image patching (keeps Makefile thin) |
+| `scripts/selfhost-install-hint.sh` | Post-selfhost CLI install hint (fork vs brew) |
+| `scripts/sync-upstream.sh` | Fetch upstream + ahead/behind + both-changed file preview |
 | `.goreleaser.fork.yml` | GoReleaser without Homebrew tap publish |
 | `.github/workflows/release.yml` | Single tag pipeline: CLI + Docker + desktop (macOS fork-only job) |
 | `apps/desktop/MACOS_RELEASE.md` | Signing / notarization / Gatekeeper |
@@ -85,6 +88,25 @@ MULTICA_IMAGE_TAG=v0.3.45
 ```
 
 GHCR owner must be **lowercase** (`git-on-my-level`).
+
+### Migrating an existing self-host
+
+If you already run fork GHCR images but UI install/help links still point at
+upstream, set the identity knob and restart the backend:
+
+```bash
+# in .env (or Helm backend.config.githubRepo)
+MULTICA_GITHUB_REPO=Git-on-my-level/multica
+MULTICA_GITHUB_BRANCH=main
+```
+
+```bash
+curl -fsS "$PUBLIC_URL/api/config" | jq '{github_repo, github_branch}'
+# → "Git-on-my-level/multica", "main"
+```
+
+`make selfhost` / `scripts/selfhost-fork-env.sh` will also write this from
+`git remote origin` when unset.
 
 ## Release checklist
 

@@ -94,12 +94,12 @@ describe("ConnectRemoteDialog", () => {
 
   it("uses fork install command from github config", () => {
     const { baseElement } = renderDialog({
-      githubRepo: "Git-on-my-level/multica",
+      githubRepo: "acme/multica",
       githubBranch: "main",
     });
 
     expect(baseElement).toHaveTextContent(
-      "MULTICA_GITHUB_REPO=Git-on-my-level/multica MULTICA_GITHUB_BRANCH=main curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install-fork.sh | bash",
+      "MULTICA_GITHUB_REPO=acme/multica MULTICA_GITHUB_BRANCH=main curl -fsSL https://raw.githubusercontent.com/acme/multica/main/scripts/install-fork.sh | bash",
     );
   });
 

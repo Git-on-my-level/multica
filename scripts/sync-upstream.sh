@@ -36,6 +36,7 @@ behind="$(git rev-list --count "${LOCAL_REF}..${upstream_ref}")"
 ahead="$(git rev-list --count "${upstream_ref}..${LOCAL_REF}")"
 local_sha="$(git rev-parse --short "$LOCAL_REF")"
 upstream_sha="$(git rev-parse --short "$upstream_ref")"
+merge_base="$(git merge-base "$LOCAL_REF" "$upstream_ref")"
 
 echo ""
 echo "Local:    $LOCAL_REF ($local_sha)"
@@ -43,6 +44,18 @@ echo "Upstream: $upstream_ref ($upstream_sha)"
 echo "Behind:   $behind commit(s)"
 echo "Ahead:    $ahead commit(s)"
 echo ""
+
+# Preview files changed on both sides since the merge-base (conflict magnets).
+both_changed="$(
+  comm -12 \
+    <(git diff --name-only "$merge_base" "$LOCAL_REF" | sort -u) \
+    <(git diff --name-only "$merge_base" "$upstream_ref" | sort -u)
+)"
+if [ -n "$both_changed" ]; then
+  echo "Files changed on both sides since merge-base (likely conflict surface):"
+  printf '%s\n' "$both_changed" | sed 's/^/  /'
+  echo ""
+fi
 
 if [ "$behind" -eq 0 ] && [ "$ahead" -eq 0 ]; then
   echo "✓ In sync with $upstream_ref"
@@ -54,6 +67,10 @@ if [ "$behind" -gt 0 ]; then
   echo "  git merge $upstream_ref"
   echo "Or rebase (rewrites history — only on unpublished branches):"
   echo "  git rebase $upstream_ref"
+  echo ""
+  echo "After merge, smoke-check:"
+  echo "  curl -fsS \"\$PUBLIC_URL/api/config\" | jq '{github_repo, github_branch}'"
+  echo "  MULTICA_GITHUB_REPO=Git-on-my-level/multica bash -n scripts/install-fork.sh"
 fi
 
 if [ "$ahead" -gt 0 ]; then
