@@ -343,7 +343,7 @@ function Install-CliToBinDir {
 function Install-CliSource {
     Write-Info "Building Multica CLI from source..."
 
-    $ref = if ($env:MULTICA_CLI_REF) { $env:MULTICA_CLI_REF } else { "main" }
+    $ref = if ($env:MULTICA_CLI_REF) { $env:MULTICA_CLI_REF } else { $DefaultBranch }
     if (-not (Test-CommandExists "git")) {
         Write-Warn "Git is not installed; cannot build from source."
         return $false

@@ -301,7 +301,11 @@ install_cli_binary() {
     return 1
   fi
 
-  tar -xzf "$tmp_dir/multica.tar.gz" -C "$tmp_dir" multica
+  if ! tar -xzf "$tmp_dir/multica.tar.gz" -C "$tmp_dir" multica; then
+    rm -rf "$tmp_dir"
+    warn "Failed to extract CLI binary from archive."
+    return 1
+  fi
   install_cli_to_bin_dir "$tmp_dir/multica"
   rm -rf "$tmp_dir"
   return 0
@@ -330,7 +334,7 @@ install_cli_to_bin_dir() {
 install_cli_source() {
   info "Building Multica CLI from source..."
 
-  local ref="${MULTICA_CLI_REF:-main}"
+  local ref="${MULTICA_CLI_REF:-$DEFAULT_BRANCH}"
   if ! command_exists git; then
     warn "Git is not installed; cannot build from source."
     return 1
