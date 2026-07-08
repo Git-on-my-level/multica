@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # Upstream defaults to ghcr.io/multica-ai/*. Forks should override both
 # repositories to ghcr.io/<lowercase-owner>/multica-{backend,web} and set
-# backend.config.githubRepo (see FORKING.md).
+# backend.config.githubRepo (see FORK.md).
 images:
   backend:
     repository: ghcr.io/multica-ai/multica-backend

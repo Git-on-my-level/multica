@@ -234,8 +234,24 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		echo "Local tags: multica-backend:dev and multica-web:dev."; \
 		echo ""; \
 		echo "Next — install the CLI and connect your machine:"; \
-		echo "  brew install multica-ai/tap/multica"; \
-		echo "  multica setup self-host"; \
+		repo="$${MULTICA_GITHUB_REPO:-}"; \
+		if [ -z "$$repo" ] && command -v git >/dev/null 2>&1; then \
+			_url=$$(git remote get-url origin 2>/dev/null || true); \
+			case "$$_url" in \
+				*github.com[:/]*) \
+					repo=$$(printf '%s' "$$_url" | sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$$#\1/\2#'); \
+					;; \
+			esac; \
+		fi; \
+		if [ -n "$$repo" ] && [ "$$repo" != "multica-ai/multica" ]; then \
+			branch="$${MULTICA_GITHUB_BRANCH:-main}"; \
+			echo "  MULTICA_GITHUB_REPO=$$repo curl -fsSL https://raw.githubusercontent.com/$$repo/$$branch/scripts/install-fork.sh | bash"; \
+			echo "  multica setup self-host"; \
+			echo "(see FORK.md)"; \
+		else \
+			echo "  brew install multica-ai/tap/multica"; \
+			echo "  multica setup self-host"; \
+		fi; \
 	else \
 		echo ""; \
 		echo "Services are still starting. Check logs:"; \

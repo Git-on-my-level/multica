@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Report how far this fork is behind/ahead of upstream/main.
-# Does not merge — operators decide when to sync (see FORKING.md).
+# Does not merge — operators decide when to sync (see FORK.md).
 set -euo pipefail
 
 UPSTREAM_URL="${MULTICA_UPSTREAM_URL:-https://github.com/multica-ai/multica.git}"

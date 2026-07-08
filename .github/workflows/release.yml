@@ -489,6 +489,9 @@ jobs:
           # Enable signing when CSC_LINK is present; otherwise ad-hoc.
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
         shell: bash
+        # Apple Silicon only — publishing both x64 and arm64 with --publish
+        # always overwrites latest-mac.yml on the same release and breaks
+        # electron-updater (no separate latest-arm64.yml channel on macOS).
         run: >-
           node scripts/package.mjs
           --mac --arm64 --publish always
