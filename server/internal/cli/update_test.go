@@ -270,6 +270,80 @@ func TestVerifyAssetSHA256(t *testing.T) {
 	})
 }
 
+func TestResolveGitHubRepo(t *testing.T) {
+	t.Run("defaults to upstream when unset", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_GITHUB_REPO", "")
+		if got := ResolveGitHubRepo(); got != DefaultGitHubRepo {
+			t.Fatalf("ResolveGitHubRepo() = %q, want %q", got, DefaultGitHubRepo)
+		}
+	})
+
+	t.Run("uses valid override", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_GITHUB_REPO", "Git-on-my-level/multica")
+		if got := ResolveGitHubRepo(); got != "Git-on-my-level/multica" {
+			t.Fatalf("ResolveGitHubRepo() = %q", got)
+		}
+	})
+
+	t.Run("reads fork repo from CLI config", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_GITHUB_REPO", "")
+		cfg := CLIConfig{GitHubRepo: "Git-on-my-level/multica"}
+		if err := SaveCLIConfig(cfg); err != nil {
+			t.Fatalf("SaveCLIConfig: %v", err)
+		}
+		if got := ResolveGitHubRepo(); got != "Git-on-my-level/multica" {
+			t.Fatalf("ResolveGitHubRepo() = %q", got)
+		}
+	})
+
+	t.Run("rejects full URL", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_GITHUB_REPO", "https://github.com/multica-ai/multica")
+		if got := ResolveGitHubRepo(); got != DefaultGitHubRepo {
+			t.Fatalf("ResolveGitHubRepo() = %q, want default", got)
+		}
+	})
+}
+
+func TestShouldSkipBrewUpgrade(t *testing.T) {
+	t.Run("skips when env set", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_SKIP_BREW", "1")
+		t.Setenv("MULTICA_GITHUB_REPO", "")
+		if !ShouldSkipBrewUpgrade() {
+			t.Fatal("expected skip brew")
+		}
+	})
+
+	t.Run("skips for fork repo", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_SKIP_BREW", "")
+		t.Setenv("MULTICA_GITHUB_REPO", "Git-on-my-level/multica")
+		if !ShouldSkipBrewUpgrade() {
+			t.Fatal("expected skip brew for fork")
+		}
+	})
+
+	t.Run("allows upstream", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("HOME", dir)
+		t.Setenv("MULTICA_SKIP_BREW", "")
+		t.Setenv("MULTICA_GITHUB_REPO", "")
+		if ShouldSkipBrewUpgrade() {
+			t.Fatal("expected brew for upstream")
+		}
+	})
+}
+
 func TestUpdateDownloadTimeoutOrDefault(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -1,6 +1,11 @@
 export const DEFAULT_GITHUB_REPO = "multica-ai/multica";
 export const DEFAULT_GITHUB_BRANCH = "main";
 
+const INSTALL_SCRIPT = "install.sh";
+const FORK_INSTALL_SCRIPT = "install-fork.sh";
+const INSTALL_PS1_SCRIPT = "install.ps1";
+const FORK_INSTALL_PS1_SCRIPT = "install-fork.ps1";
+
 export function githubWebUrl(repo = DEFAULT_GITHUB_REPO): string {
   return `https://github.com/${repo}`;
 }
@@ -38,12 +43,16 @@ export function buildCliInstallCommand(
   repo = DEFAULT_GITHUB_REPO,
   branch = DEFAULT_GITHUB_BRANCH,
 ): string {
-  return `curl -fsSL https://raw.githubusercontent.com/${repo}/${branch}/scripts/install.sh | bash`;
+  const script =
+    repo === DEFAULT_GITHUB_REPO ? INSTALL_SCRIPT : FORK_INSTALL_SCRIPT;
+  return `curl -fsSL https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script} | bash`;
 }
 
 export function buildCliInstallPs1Command(
   repo = DEFAULT_GITHUB_REPO,
   branch = DEFAULT_GITHUB_BRANCH,
 ): string {
-  return `irm https://raw.githubusercontent.com/${repo}/${branch}/scripts/install.ps1 | iex`;
+  const script =
+    repo === DEFAULT_GITHUB_REPO ? INSTALL_PS1_SCRIPT : FORK_INSTALL_PS1_SCRIPT;
+  return `irm https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script} | iex`;
 }

@@ -99,7 +99,7 @@ describe("ConnectRemoteDialog", () => {
     });
 
     expect(baseElement).toHaveTextContent(
-      "curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install.sh | bash",
+      "curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install-fork.sh | bash",
     );
   });
 

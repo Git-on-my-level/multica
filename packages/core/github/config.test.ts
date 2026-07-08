@@ -24,7 +24,7 @@ describe("resolveGithubConfig", () => {
       branch: "main",
     });
     expect(cfg.cliInstallCommand).toBe(
-      "curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install.sh | bash",
+      "curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install-fork.sh | bash",
     );
     expect(cfg.webUrl).toBe("https://github.com/Git-on-my-level/multica");
     expect(cfg.issuesUrl).toBe(

@@ -13,8 +13,10 @@ $ErrorActionPreference = "Stop"
 # Configuration
 # ---------------------------------------------------------------------------
 $RepoSlug      = if ($env:MULTICA_GITHUB_REPO) { $env:MULTICA_GITHUB_REPO.Trim() } else { "multica-ai/multica" }
+$UpstreamRepo  = "multica-ai/multica"
 $RepoUrl       = "https://github.com/$RepoSlug.git"
 $RepoWebUrl    = "https://github.com/$RepoSlug"
+$DefaultBranch = if ($env:MULTICA_GITHUB_BRANCH) { $env:MULTICA_GITHUB_BRANCH.Trim() } else { "main" }
 $DefaultInstallDir = Join-Path $env:USERPROFILE ".multica\server"
 $InstallDir    = if ($env:MULTICA_INSTALL_DIR) { $env:MULTICA_INSTALL_DIR } else { $DefaultInstallDir }
 
@@ -42,6 +44,18 @@ function New-RandomHex {
         $rng.Dispose()
     }
     return -join ($bytes | ForEach-Object { "{0:x2}" -f $_ })
+}
+
+function Get-InstallScriptName {
+    if ($RepoSlug -eq $UpstreamRepo) {
+        return "install.ps1"
+    }
+    return "install-fork.ps1"
+}
+
+function Get-InstallScriptUrl {
+    $script = Get-InstallScriptName
+    return "https://raw.githubusercontent.com/$RepoSlug/$DefaultBranch/scripts/$script"
 }
 
 function Get-EnvFileValue {
@@ -82,6 +96,80 @@ function Get-SelfHostBackendPort {
 
 function Get-SelfHostFrontendPort {
     return Get-EnvFileValue -Path (Join-Path $InstallDir ".env") -Name "FRONTEND_PORT" -Default "3000"
+}
+
+function Set-EnvFileValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [string]$Value
+    )
+
+    $line = "$Name=$Value"
+    if (-not (Test-Path $Path)) {
+        $line | Add-Content -Path $Path
+        return
+    }
+
+    $content = Get-Content $Path
+    $updated = $false
+    $result = foreach ($row in $content) {
+        if ($row -match "^(#\s*)?$([regex]::Escape($Name))=") {
+            $updated = $true
+            $line
+        } else {
+            $row
+        }
+    }
+    if (-not $updated) {
+        $result += $line
+    }
+    $result | Set-Content -Path $Path
+}
+
+function Persist-ForkGithubRepo {
+    if ($RepoSlug -eq $UpstreamRepo) {
+        return
+    }
+
+    $configDir = Join-Path $env:USERPROFILE ".multica"
+    $configFile = Join-Path $configDir "config.json"
+    if (-not (Test-Path $configDir)) {
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    }
+
+    if (Test-Path $configFile) {
+        try {
+            $json = Get-Content $configFile -Raw | ConvertFrom-Json
+            $json | Add-Member -NotePropertyName github_repo -NotePropertyValue $RepoSlug -Force
+            ($json | ConvertTo-Json -Depth 4) + "`n" | Set-Content -Path $configFile
+            return
+        } catch {
+            Write-Warn "Could not merge github_repo into existing config.json; fix the file manually or install a JSON tool."
+            return
+        }
+    }
+
+    (@{ github_repo = $RepoSlug } | ConvertTo-Json) + "`n" | Set-Content -Path $configFile
+}
+
+function Patch-ForkSelfhostEnv {
+    param([string]$Path = ".env")
+
+    if ($RepoSlug -eq $UpstreamRepo) {
+        return
+    }
+
+    $owner = $RepoSlug.Split("/")[0].ToLowerInvariant()
+    Set-EnvFileValue -Path $Path -Name "MULTICA_GITHUB_REPO" -Value $RepoSlug
+    Set-EnvFileValue -Path $Path -Name "MULTICA_GITHUB_BRANCH" -Value $DefaultBranch
+    Set-EnvFileValue -Path $Path -Name "MULTICA_BACKEND_IMAGE" -Value "ghcr.io/$owner/multica-backend"
+    Set-EnvFileValue -Path $Path -Name "MULTICA_WEB_IMAGE" -Value "ghcr.io/$owner/multica-web"
+
+    $imageTag = Get-LatestVersion
+    if ($imageTag) {
+        Set-EnvFileValue -Path $Path -Name "MULTICA_IMAGE_TAG" -Value $imageTag
+    }
 }
 
 function Get-LatestVersion {
@@ -232,6 +320,76 @@ function Get-InstalledCliVersion {
 # ---------------------------------------------------------------------------
 # CLI Installation
 # ---------------------------------------------------------------------------
+function Test-ShouldSkipBrew {
+    if ($env:MULTICA_SKIP_BREW -eq "1") {
+        return $true
+    }
+    return $RepoSlug -ne $UpstreamRepo
+}
+
+function Install-CliToBinDir {
+    param([string]$ExeSrc)
+
+    $binDir = Join-Path $env:USERPROFILE ".multica\bin"
+    if (-not (Test-Path $binDir)) {
+        New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    }
+
+    Copy-Item $ExeSrc (Join-Path $binDir "multica.exe") -Force
+    Add-ToUserPath $binDir
+    Write-Ok "Multica CLI installed to $binDir\multica.exe"
+}
+
+function Install-CliSource {
+    Write-Info "Building Multica CLI from source..."
+
+    $ref = if ($env:MULTICA_CLI_REF) { $env:MULTICA_CLI_REF } else { "main" }
+    if (-not (Test-CommandExists "git")) {
+        Write-Warn "Git is not installed; cannot build from source."
+        return $false
+    }
+    if (-not (Test-CommandExists "go")) {
+        Write-Warn "Go is not installed; cannot build from source."
+        return $false
+    }
+
+    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "multica-source-build"
+    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $tmpDir | Out-Null
+    $srcDir = Join-Path $tmpDir "repo"
+    $built = Join-Path $tmpDir "multica.exe"
+
+    try {
+        git clone --depth 1 $RepoUrl $srcDir 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Failed to clone $RepoSlug."
+            return $false
+        }
+
+        Push-Location $srcDir
+        if ($ref -ne "main") {
+            git fetch origin $ref --depth 1 2>$null
+            git checkout --force $ref 2>$null
+        }
+        Pop-Location
+
+        Push-Location (Join-Path $srcDir "server")
+        go build -ldflags="-s -w" -o $built ./cmd/multica
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Go build failed."
+            return $false
+        }
+        Pop-Location
+
+        Install-CliToBinDir $built
+        return $true
+    } finally {
+        if (Test-Path $tmpDir) {
+            Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Install-CliBinary {
     Write-Info "Installing Multica CLI from GitHub Releases..."
 
@@ -243,7 +401,8 @@ function Install-CliBinary {
 
     $latest = Get-LatestVersion
     if (-not $latest) {
-        Write-Fail "Could not determine latest release. Check your network connection."
+        Write-Warn "Could not determine latest release."
+        return $false
     }
 
     $version = $latest.TrimStart('v')
@@ -258,7 +417,8 @@ function Install-CliBinary {
         Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmpDir "multica.zip") -UseBasicParsing
     } catch {
         Remove-Item $tmpDir -Recurse -Force
-        Write-Fail "Failed to download CLI binary: $_"
+        Write-Warn "Failed to download CLI binary: $_"
+        return $false
     }
 
     # Verify SHA256 checksum
@@ -284,7 +444,8 @@ function Install-CliBinary {
             $expectedHash = ($expectedLine -split "\s+")[0].ToLower()
             if ($actualHash -ne $expectedHash) {
                 Remove-Item $tmpDir -Recurse -Force
-                Write-Fail "Checksum verification failed. Expected: $expectedHash, Got: $actualHash"
+                Write-Warn "Checksum verification failed. Expected: $expectedHash, Got: $actualHash"
+                return $false
             }
             Write-Ok "Checksum verified"
         } else {
@@ -296,25 +457,19 @@ function Install-CliBinary {
 
     Expand-Archive -Path (Join-Path $tmpDir "multica.zip") -DestinationPath $tmpDir -Force
 
-    $binDir = Join-Path $env:USERPROFILE ".multica\bin"
-    if (-not (Test-Path $binDir)) {
-        New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-    }
-
     $exeSrc = Join-Path $tmpDir "multica.exe"
     if (-not (Test-Path $exeSrc)) {
         $exeSrc = Get-ChildItem -Path $tmpDir -Filter "multica.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
     }
     if (-not $exeSrc -or -not (Test-Path $exeSrc)) {
         Remove-Item $tmpDir -Recurse -Force
-        Write-Fail "multica.exe not found in downloaded archive."
+        Write-Warn "multica.exe not found in downloaded archive."
+        return $false
     }
 
-    Copy-Item $exeSrc (Join-Path $binDir "multica.exe") -Force
+    Install-CliToBinDir $exeSrc
     Remove-Item $tmpDir -Recurse -Force
-
-    Add-ToUserPath $binDir
-    Write-Ok "Multica CLI installed to $binDir\multica.exe"
+    return $true
 }
 
 function Add-ToUserPath {
@@ -351,22 +506,33 @@ function Install-Cli {
 
         if ($isUpToDate) {
             Write-Ok "Multica CLI is up to date ($currentVer)"
+            Persist-ForkGithubRepo
             return
         }
 
         Write-Info "Multica CLI $currentVer installed, latest is $latestVer - upgrading..."
-        Install-CliBinary
+        if (-not (Install-CliBinary)) {
+            if (-not (Install-CliSource)) {
+                Write-Fail "Failed to upgrade Multica CLI."
+            }
+        }
 
         $newVer = Get-InstalledCliVersion
         Write-Ok "Multica CLI upgraded ($currentVer -> $newVer)"
+        Persist-ForkGithubRepo
         return
     }
 
-    Install-CliBinary
+    if (-not (Install-CliBinary)) {
+        if (-not (Install-CliSource)) {
+            Write-Fail "Failed to install Multica CLI."
+        }
+    }
 
     if (-not (Test-CommandExists "multica")) {
         Write-Fail "CLI installed but 'multica' not found on PATH. Restart your terminal and try again."
     }
+    Persist-ForkGithubRepo
 }
 
 # ---------------------------------------------------------------------------
@@ -439,6 +605,8 @@ function Install-Server {
         Write-Ok "Using existing .env"
     }
 
+    Patch-ForkSelfhostEnv -Path ".env"
+
     Write-Info "Pulling official Multica images..."
     Pull-OfficialSelfHostImages
     Write-Info "Starting Multica services (this may take a few minutes on first run)..."
@@ -489,7 +657,7 @@ function Start-DefaultInstall {
     Write-Host "     multica setup self-host      " -NoNewline; Write-Host "# Connect to a self-hosted server" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Self-hosting? Install the server first:"
-    Write-Host '     $env:MULTICA_MODE="with-server"; irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex'
+    Write-Host "     `$env:MULTICA_MODE=`"with-server`"; irm $(Get-InstallScriptUrl) | iex"
     Write-Host ""
 }
 
@@ -525,7 +693,7 @@ function Start-LocalInstall {
     Write-Host "  or read the generated code from backend logs when Resend is unset."
     Write-Host ""
     Write-Host "  To stop all services:"
-    Write-Host '     $env:MULTICA_MODE="stop"; irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex'
+    Write-Host "     `$env:MULTICA_MODE=`"stop`"; irm $(Get-InstallScriptUrl) | iex"
     Write-Host ""
 }
 

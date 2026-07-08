@@ -27,6 +27,8 @@ import (
 // changes one place.
 const ChecksumManifestName = "checksums.txt"
 
+const DefaultGitHubRepo = "multica-ai/multica"
+
 const DefaultUpdateDownloadTimeout = 120 * time.Second
 
 // GitHubRelease is the subset of the GitHub releases API response we need.
@@ -223,7 +225,8 @@ func verifyAssetSHA256(data []byte, expectedHex, assetName string) error {
 
 func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/multica-ai/multica/releases/tags/"+tag, nil)
+	repo := ResolveGitHubRepo()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -246,10 +249,11 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from the multica GitHub repo.
+// FetchLatestRelease fetches the latest release tag from the configured GitHub repo.
 func FetchLatestRelease() (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/multica-ai/multica/releases/latest", nil)
+	repo := ResolveGitHubRepo()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +274,53 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 		return nil, err
 	}
 	return &release, nil
+}
+
+// ResolveGitHubRepo returns the owner/repo slug used for release lookups.
+// MULTICA_GITHUB_REPO overrides the upstream default when it is a valid slug.
+func ResolveGitHubRepo() string {
+	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
+	if repo != "" && validGithubRepoSlug(repo) {
+		return repo
+	}
+	cfg, err := LoadCLIConfig()
+	if err == nil {
+		repo = strings.TrimSpace(cfg.GitHubRepo)
+		if repo != "" && validGithubRepoSlug(repo) {
+			return repo
+		}
+	}
+	return DefaultGitHubRepo
+}
+
+// ShouldSkipBrewUpgrade reports whether brew-based self-update should be skipped.
+func ShouldSkipBrewUpgrade() bool {
+	if strings.TrimSpace(os.Getenv("MULTICA_SKIP_BREW")) == "1" {
+		return true
+	}
+	return ResolveGitHubRepo() != DefaultGitHubRepo
+}
+
+// GitHubReleasesLatestURL returns the web URL for the latest release page.
+func GitHubReleasesLatestURL() string {
+	return fmt.Sprintf("https://github.com/%s/releases/latest", ResolveGitHubRepo())
+}
+
+func validGithubRepoSlug(raw string) bool {
+	if strings.Contains(raw, "://") {
+		return false
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, "/") {
+			return false
+		}
+	}
+	return true
 }
 
 // knownBrewPrefixes lists the install roots Homebrew uses on each platform.
