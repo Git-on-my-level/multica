@@ -28,8 +28,17 @@ multica version
 ## Step 2: Install the Multica CLI
 
 > **Windows users:** Skip to [Option C: Windows (PowerShell)](#option-c-windows-powershell) below.
+>
+> **Fork / self-host operators:** If this machine should track a GitHub fork
+> (not `multica-ai/multica`), skip Homebrew and use the fork installer instead —
+> see [FORK.md](FORK.md). Example:
+>
+> ```bash
+> MULTICA_GITHUB_REPO=owner/repo curl -fsSL \
+>   https://raw.githubusercontent.com/owner/repo/main/scripts/install-fork.sh | bash
+> ```
 
-### Option A: Homebrew (preferred — macOS/Linux)
+### Option A: Homebrew (preferred — macOS/Linux for upstream)
 
 Check if Homebrew is available:
 

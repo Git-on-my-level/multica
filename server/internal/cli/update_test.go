@@ -283,8 +283,8 @@ func TestResolveGitHubRepo(t *testing.T) {
 	t.Run("uses valid override", func(t *testing.T) {
 		dir := t.TempDir()
 		t.Setenv("HOME", dir)
-		t.Setenv("MULTICA_GITHUB_REPO", "Git-on-my-level/multica")
-		if got := ResolveGitHubRepo(); got != "Git-on-my-level/multica" {
+		t.Setenv("MULTICA_GITHUB_REPO", "acme/multica")
+		if got := ResolveGitHubRepo(); got != "acme/multica" {
 			t.Fatalf("ResolveGitHubRepo() = %q", got)
 		}
 	})
@@ -293,11 +293,11 @@ func TestResolveGitHubRepo(t *testing.T) {
 		dir := t.TempDir()
 		t.Setenv("HOME", dir)
 		t.Setenv("MULTICA_GITHUB_REPO", "")
-		cfg := CLIConfig{GitHubRepo: "Git-on-my-level/multica"}
+		cfg := CLIConfig{GitHubRepo: "acme/multica"}
 		if err := SaveCLIConfig(cfg); err != nil {
 			t.Fatalf("SaveCLIConfig: %v", err)
 		}
-		if got := ResolveGitHubRepo(); got != "Git-on-my-level/multica" {
+		if got := ResolveGitHubRepo(); got != "acme/multica" {
 			t.Fatalf("ResolveGitHubRepo() = %q", got)
 		}
 	})
@@ -327,7 +327,7 @@ func TestShouldSkipBrewUpgrade(t *testing.T) {
 		dir := t.TempDir()
 		t.Setenv("HOME", dir)
 		t.Setenv("MULTICA_SKIP_BREW", "")
-		t.Setenv("MULTICA_GITHUB_REPO", "Git-on-my-level/multica")
+		t.Setenv("MULTICA_GITHUB_REPO", "acme/multica")
 		if !ShouldSkipBrewUpgrade() {
 			t.Fatal("expected skip brew for fork")
 		}

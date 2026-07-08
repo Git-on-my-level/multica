@@ -31,6 +31,14 @@ spec:
               value: "0.0.0.0"
             - name: PORT
               value: "3000"
+            {{- if .Values.backend.config.githubRepo }}
+            - name: MULTICA_GITHUB_REPO
+              value: {{ .Values.backend.config.githubRepo | quote }}
+            {{- end }}
+            {{- if .Values.backend.config.githubBranch }}
+            - name: MULTICA_GITHUB_BRANCH
+              value: {{ .Values.backend.config.githubBranch | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.frontend.resources | nindent 12 }}
 ---

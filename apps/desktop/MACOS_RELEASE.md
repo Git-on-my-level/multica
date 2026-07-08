@@ -15,15 +15,20 @@ package time:
 
 `scripts/package.mjs` skips notarization when `APPLE_TEAM_ID` is unset and logs a warning.
 
-## Fork CI (`release-fork.yml`)
+## Fork CI (`release.yml` → `desktop-mac`)
 
 Wire the variables above as GitHub Actions **repository secrets** on the fork
-(`Git-on-my-level/multica`). The macOS job already forwards them to `package.mjs`.
-Without all five, CI produces a Developer ID-signed (or ad-hoc) build that Gatekeeper
-still rejects with **"Apple could not verify Multica"**.
+(`Git-on-my-level/multica`). The fork-only `desktop-mac` job in
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) already
+forwards them to `package.mjs`. Without all five, CI produces a Developer
+ID-signed (or ad-hoc) build that Gatekeeper still rejects with **"Apple could
+not verify Multica"**.
 
-After secrets are configured, tag a new release (e.g. `v0.3.46`) and confirm the mac job
-uploads `multica-desktop-*-mac-arm64.dmg`, `.zip`, and `latest-mac.yml`.
+CI publishes **arm64 only** so a single `latest-mac.yml` is written per tag
+(publishing x64 + arm64 with `--publish always` overwrites that feed and breaks
+auto-update). After secrets are configured, tag a new release (e.g. `v0.3.46`)
+and confirm the mac job uploads `multica-desktop-*-mac-arm64.dmg`, `.zip`, and
+`latest-mac.yml`.
 
 ## Verify a release artifact
 

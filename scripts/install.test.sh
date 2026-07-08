@@ -180,7 +180,7 @@ test_fork_repo_skips_homebrew() {
   cat >"$tmp/stub-bin/curl" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$*" == *"-sI"* ]]; then
-  printf 'HTTP/2 302\r\nlocation: https://github.com/Git-on-my-level/multica/releases/tag/v0.3.2\r\n'
+  printf 'HTTP/2 302\r\nlocation: https://github.com/acme/multica/releases/tag/v0.3.2\r\n'
   exit 0
 fi
 out=""
@@ -201,7 +201,7 @@ exit 99
 STUB
   chmod +x "$tmp/stub-bin/brew"
 
-  _run_installer "$tmp" env MULTICA_GITHUB_REPO=Git-on-my-level/multica
+  _run_installer "$tmp" env MULTICA_GITHUB_REPO=acme/multica
   if grep -q "brew should not be called" "$tmp/install.err"; then
     echo "brew was invoked for fork repo" >&2
     return 1
@@ -224,7 +224,7 @@ GO
   cat >"$stub_bin/curl" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$*" == *"-sI"* ]]; then
-  printf 'HTTP/2 302\r\nlocation: https://github.com/Git-on-my-level/multica/releases/tag/v0.3.2\r\n'
+  printf 'HTTP/2 302\r\nlocation: https://github.com/acme/multica/releases/tag/v0.3.2\r\n'
   exit 0
 fi
 exit 22
@@ -285,7 +285,7 @@ test_source_build_fallback_when_release_missing() {
   if ! PATH="$tmp/stub-bin:$tmp/install-bin:/usr/bin:/bin" \
     MULTICA_BIN_DIR="$tmp/install-bin" \
     MULTICA_SKIP_BREW=1 \
-    MULTICA_GITHUB_REPO="Git-on-my-level/multica" \
+    MULTICA_GITHUB_REPO="acme/multica" \
     MULTICA_CLI_REF="main" \
     bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
     echo "install.sh exited non-zero" >&2
@@ -318,7 +318,7 @@ test_tar_extract_failure_falls_back_to_source_build() {
   cat >"$tmp/stub-bin/curl" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$*" == *"-sI"* ]]; then
-  printf 'HTTP/2 302\r\nlocation: https://github.com/Git-on-my-level/multica/releases/tag/v0.3.2\r\n'
+  printf 'HTTP/2 302\r\nlocation: https://github.com/acme/multica/releases/tag/v0.3.2\r\n'
   exit 0
 fi
 out=""
@@ -337,7 +337,7 @@ STUB
   if ! PATH="$tmp/stub-bin:$tmp/install-bin:/usr/bin:/bin" \
     MULTICA_BIN_DIR="$tmp/install-bin" \
     MULTICA_SKIP_BREW=1 \
-    MULTICA_GITHUB_REPO="Git-on-my-level/multica" \
+    MULTICA_GITHUB_REPO="acme/multica" \
     MULTICA_CLI_REF="main" \
     bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
     echo "install.sh exited non-zero" >&2

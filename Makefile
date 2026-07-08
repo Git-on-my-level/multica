@@ -76,7 +76,7 @@ makehelp: help ## Alias for `make help`
 # ---------- Self-hosting (Docker Compose) ----------
 ##@ Self-hosting
 
-selfhost: ## Create .env if needed, then pull and start the official self-hosted images
+selfhost: ## Create .env if needed, then pull and start self-hosted images
 	$(REQUIRE_COMPOSE)
 	@if [ ! -f .env ]; then \
 		echo "==> Creating .env from .env.example..."; \
@@ -94,15 +94,19 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		fi; \
 		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
 	fi
-	@echo "==> Pulling official Multica images..."
-	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
+	@# Fork image / MULTICA_GITHUB_REPO patching lives in scripts/selfhost-fork-env.sh
+	@# so this target stays closer to upstream for merges.
+	@eval "$$(./scripts/selfhost-fork-env.sh)"; \
+	echo "==> Pulling Multica images..."; \
+	if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
-		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
+		echo "Images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
 		echo "If this is before the first GHCR release, build from the current checkout:"; \
 		echo "  make selfhost-build"; \
+		echo "Fork operators: see FORK.md for release + image setup."; \
 		exit 1; \
-	fi
-	@echo "==> Starting Multica via Docker Compose..."
+	fi; \
+	echo "==> Starting Multica via Docker Compose..."; \
 	$(COMPOSE) -f docker-compose.selfhost.yml up -d
 	@echo "==> Waiting for backend to be ready..."
 	@for i in $$(seq 1 30); do \
@@ -112,20 +116,21 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		sleep 2; \
 	done
 	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
+		backend_image=$$(grep -E '^MULTICA_BACKEND_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-backend); \
+		web_image=$$(grep -E '^MULTICA_WEB_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-web); \
+		image_tag=$$(grep -E '^MULTICA_IMAGE_TAG=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo latest); \
 		echo ""; \
 		echo "✓ Multica is running!"; \
 		echo "  Frontend: http://localhost:$${FRONTEND_PORT:-3000}"; \
 		echo "  Backend:  http://localhost:$${PORT:-8080}"; \
 		echo ""; \
-		echo "Images: $${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:$${MULTICA_IMAGE_TAG:-latest}"; \
-		echo "        $${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:$${MULTICA_IMAGE_TAG:-latest}"; \
+		echo "Images: $$backend_image:$$image_tag"; \
+		echo "        $$web_image:$$image_tag"; \
 		echo ""; \
 		echo "Log in: configure RESEND_API_KEY in .env for email codes,"; \
 		echo "        or read the generated code from backend logs when Resend is unset."; \
 		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		echo "  brew install multica-ai/tap/multica"; \
-		echo "  multica setup self-host"; \
+		./scripts/selfhost-install-hint.sh; \
 	else \
 		echo ""; \
 		echo "Services are still starting. Check logs:"; \
@@ -150,6 +155,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		fi; \
 		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
 	fi
+	@eval "$$(./scripts/selfhost-fork-env.sh)"
 	@echo "==> Building Multica from the current checkout..."
 	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@echo "==> Waiting for backend to be ready..."
@@ -171,9 +177,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		echo "Built images locally via docker-compose.selfhost.build.yml."; \
 		echo "Local tags: multica-backend:dev and multica-web:dev."; \
 		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		echo "  brew install multica-ai/tap/multica"; \
-		echo "  multica setup self-host"; \
+		./scripts/selfhost-install-hint.sh; \
 	else \
 		echo ""; \
 		echo "Services are still starting. Check logs:"; \

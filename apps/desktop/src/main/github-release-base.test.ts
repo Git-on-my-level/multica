@@ -10,8 +10,8 @@ import {
 describe("githubRepoFromAppUpdateYaml", () => {
   it("parses owner and repo from app-update.yml", () => {
     expect(
-      githubRepoFromAppUpdateYaml("owner: Git-on-my-level\nrepo: multica\nprovider: github\n"),
-    ).toBe("Git-on-my-level/multica");
+      githubRepoFromAppUpdateYaml("owner: acme\nrepo: multica\nprovider: github\n"),
+    ).toBe("acme/multica");
   });
 
   it("returns null when owner or repo is missing", () => {
@@ -25,8 +25,8 @@ describe("resolveGithubRepo", () => {
   });
 
   it("prefers MULTICA_GITHUB_REPO when set", () => {
-    process.env.MULTICA_GITHUB_REPO = "Git-on-my-level/multica";
-    expect(resolveGithubRepo()).toBe("Git-on-my-level/multica");
+    process.env.MULTICA_GITHUB_REPO = "acme/multica";
+    expect(resolveGithubRepo()).toBe("acme/multica");
   });
 
   it("falls back to the upstream default when env is unset", () => {
@@ -46,9 +46,9 @@ describe("githubLatestDownloadBase", () => {
   });
 
   it("honors MULTICA_GITHUB_REPO for fork/self-host overrides", () => {
-    process.env.MULTICA_GITHUB_REPO = "Git-on-my-level/multica";
+    process.env.MULTICA_GITHUB_REPO = "acme/multica";
     expect(githubLatestDownloadBase()).toBe(
-      "https://github.com/Git-on-my-level/multica/releases/latest/download",
+      "https://github.com/acme/multica/releases/latest/download",
     );
   });
 });
@@ -59,9 +59,9 @@ describe("githubReleasesLatestPageUrl", () => {
   });
 
   it("points at the latest release page for the resolved repo", () => {
-    process.env.MULTICA_GITHUB_REPO = "Git-on-my-level/multica";
+    process.env.MULTICA_GITHUB_REPO = "acme/multica";
     expect(githubReleasesLatestPageUrl()).toBe(
-      "https://github.com/Git-on-my-level/multica/releases/latest",
+      "https://github.com/acme/multica/releases/latest",
     );
   });
 });
