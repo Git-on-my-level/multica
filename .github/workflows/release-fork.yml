@@ -88,6 +88,11 @@ jobs:
             target: linux
           - os: windows-latest
             target: win
+          # Unsigned macOS desktop for fork auto-update. package.mjs skips
+          # notarization when APPLE_TEAM_ID is unset; CSC_IDENTITY_AUTO_DISCOVERY
+          # below falls back to ad-hoc signing (same as a local release build).
+          - os: macos-latest
+            target: mac
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -123,8 +128,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        shell: bash
         run: >-
           node scripts/package.mjs
           --${{ matrix.target }} --x64 --arm64 --publish always
-          -c.publish.owner=${{ github.repository_owner }}
-          -c.publish.repo=multica
+          --config.publish.owner=${{ github.repository_owner }}
+          --config.publish.repo=multica
