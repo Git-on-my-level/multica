@@ -163,21 +163,24 @@ selfhost: ## Create .env if needed, then pull and start self-hosted images
 		sleep 2; \
 	done
 	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
+		repo=$$(grep -E '^MULTICA_GITHUB_REPO=' .env 2>/dev/null | head -1 | cut -d= -f2- || true); \
+		branch=$$(grep -E '^MULTICA_GITHUB_BRANCH=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo main); \
+		backend_image=$$(grep -E '^MULTICA_BACKEND_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-backend); \
+		web_image=$$(grep -E '^MULTICA_WEB_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo ghcr.io/multica-ai/multica-web); \
+		image_tag=$$(grep -E '^MULTICA_IMAGE_TAG=' .env 2>/dev/null | head -1 | cut -d= -f2- || echo latest); \
 		echo ""; \
 		echo "✓ Multica is running!"; \
 		echo "  Frontend: http://localhost:$${FRONTEND_PORT:-3000}"; \
 		echo "  Backend:  http://localhost:$${PORT:-8080}"; \
 		echo ""; \
-		echo "Images: $${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:$${MULTICA_IMAGE_TAG:-latest}"; \
-		echo "        $${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:$${MULTICA_IMAGE_TAG:-latest}"; \
+		echo "Images: $$backend_image:$$image_tag"; \
+		echo "        $$web_image:$$image_tag"; \
 		echo ""; \
 		echo "Log in: configure RESEND_API_KEY in .env for email codes,"; \
 		echo "        or read the generated code from backend logs when Resend is unset."; \
 		echo ""; \
 		echo "Next — install the CLI and connect your machine:"; \
-		repo="$${MULTICA_GITHUB_REPO:-}"; \
 		if [ -n "$$repo" ] && [ "$$repo" != "multica-ai/multica" ]; then \
-			branch="$${MULTICA_GITHUB_BRANCH:-main}"; \
 			echo "  MULTICA_GITHUB_REPO=$$repo curl -fsSL https://raw.githubusercontent.com/$$repo/$$branch/scripts/install-fork.sh | bash"; \
 			echo "  multica setup self-host"; \
 			echo "(see FORK.md)"; \

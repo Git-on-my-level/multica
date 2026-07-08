@@ -491,6 +491,6 @@ jobs:
         shell: bash
         run: >-
           node scripts/package.mjs
-          --mac --x64 --arm64 --publish always
+          --mac --arm64 --publish always
           --config.publish.owner=${{ github.repository_owner }}
           --config.publish.repo=${{ github.event.repository.name }}

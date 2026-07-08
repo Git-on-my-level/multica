@@ -23,8 +23,8 @@ set -euo pipefail
 FORK_DEFAULT_GITHUB_REPO="Git-on-my-level/multica"
 
 export MULTICA_SKIP_BREW=1
-export MULTICA_CLI_REF="${MULTICA_CLI_REF:-main}"
 export MULTICA_GITHUB_BRANCH="${MULTICA_GITHUB_BRANCH:-main}"
+export MULTICA_CLI_REF="${MULTICA_CLI_REF:-$MULTICA_GITHUB_BRANCH}"
 
 derive_repo_from_git_remote() {
   local dir="${1:-.}"

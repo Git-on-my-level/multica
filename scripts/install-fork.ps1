@@ -20,11 +20,11 @@ $ErrorActionPreference = "Stop"
 $ForkDefaultGithubRepo = "Git-on-my-level/multica"
 
 $env:MULTICA_SKIP_BREW = "1"
-if (-not $env:MULTICA_CLI_REF) {
-    $env:MULTICA_CLI_REF = "main"
-}
 if (-not $env:MULTICA_GITHUB_BRANCH) {
     $env:MULTICA_GITHUB_BRANCH = "main"
+}
+if (-not $env:MULTICA_CLI_REF) {
+    $env:MULTICA_CLI_REF = $env:MULTICA_GITHUB_BRANCH
 }
 
 function Get-RepoFromGitRemote {
