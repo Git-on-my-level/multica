@@ -308,9 +308,62 @@ test_source_build_fallback_when_release_missing() {
   fi
 }
 
+test_tar_extract_failure_falls_back_to_source_build() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  _setup_source_build_sandbox "$tmp"
+
+  cat >"$tmp/stub-bin/curl" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *"-sI"* ]]; then
+  printf 'HTTP/2 302\r\nlocation: https://github.com/Git-on-my-level/multica/releases/tag/v0.3.2\r\n'
+  exit 0
+fi
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "not a valid tarball" > "$out"
+STUB
+  chmod +x "$tmp/stub-bin/curl"
+
+  local out="$tmp/install.out"
+  local err="$tmp/install.err"
+  if ! PATH="$tmp/stub-bin:$tmp/install-bin:/usr/bin:/bin" \
+    MULTICA_BIN_DIR="$tmp/install-bin" \
+    MULTICA_SKIP_BREW=1 \
+    MULTICA_GITHUB_REPO="Git-on-my-level/multica" \
+    MULTICA_CLI_REF="main" \
+    bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
+    echo "install.sh exited non-zero" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if [[ ! -x "$tmp/install-bin/multica" ]]; then
+    echo "expected source-built binary after tar failure" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if ! grep -q "Building Multica CLI from source" "$out"; then
+    echo "expected source build fallback after tar failure" >&2
+    cat "$out" >&2 || true
+    return 1
+  fi
+}
+
 test_brew_install_failure_falls_back_to_release_binary
 test_brew_tap_failure_falls_back_to_release_binary
 test_skip_brew_uses_release_binary
 test_fork_repo_skips_homebrew
 test_source_build_fallback_when_release_missing
+test_tar_extract_failure_falls_back_to_source_build
 echo "install.sh tests passed"

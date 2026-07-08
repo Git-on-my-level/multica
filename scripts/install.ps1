@@ -360,18 +360,11 @@ function Install-CliSource {
     $built = Join-Path $tmpDir "multica.exe"
 
     try {
-        git clone --depth 1 $RepoUrl $srcDir 2>&1 | Out-Null
+        git clone --depth 1 --branch $ref $RepoUrl $srcDir 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn "Failed to clone $RepoSlug."
+            Write-Warn "Failed to clone $RepoSlug at ref $ref."
             return $false
         }
-
-        Push-Location $srcDir
-        if ($ref -ne "main") {
-            git fetch origin $ref --depth 1 2>$null
-            git checkout --force $ref 2>$null
-        }
-        Pop-Location
 
         Push-Location (Join-Path $srcDir "server")
         go build -ldflags="-s -w" -o $built ./cmd/multica

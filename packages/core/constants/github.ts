@@ -45,7 +45,11 @@ export function buildCliInstallCommand(
 ): string {
   const script =
     repo === DEFAULT_GITHUB_REPO ? INSTALL_SCRIPT : FORK_INSTALL_SCRIPT;
-  return `curl -fsSL https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script} | bash`;
+  const url = `https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script}`;
+  if (repo === DEFAULT_GITHUB_REPO) {
+    return `curl -fsSL ${url} | bash`;
+  }
+  return `MULTICA_GITHUB_REPO=${repo} MULTICA_GITHUB_BRANCH=${branch} curl -fsSL ${url} | bash`;
 }
 
 export function buildCliInstallPs1Command(
@@ -54,5 +58,9 @@ export function buildCliInstallPs1Command(
 ): string {
   const script =
     repo === DEFAULT_GITHUB_REPO ? INSTALL_PS1_SCRIPT : FORK_INSTALL_PS1_SCRIPT;
-  return `irm https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script} | iex`;
+  const url = `https://raw.githubusercontent.com/${repo}/${branch}/scripts/${script}`;
+  if (repo === DEFAULT_GITHUB_REPO) {
+    return `irm ${url} | iex`;
+  }
+  return `$env:MULTICA_GITHUB_REPO='${repo}'; $env:MULTICA_GITHUB_BRANCH='${branch}'; irm ${url} | iex`;
 }

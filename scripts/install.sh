@@ -349,15 +349,10 @@ install_cli_source() {
   src_dir="$tmp_dir/repo"
   built="$tmp_dir/multica"
 
-  if ! git clone --depth 1 "$REPO_URL" "$src_dir" >"$tmp_dir/clone.log" 2>&1; then
-    warn "Failed to clone $REPO_SLUG (see $tmp_dir/clone.log)."
+  if ! git clone --depth 1 --branch "$ref" "$REPO_URL" "$src_dir" >"$tmp_dir/clone.log" 2>&1; then
+    warn "Failed to clone $REPO_SLUG at ref $ref (see $tmp_dir/clone.log)."
     rm -rf "$tmp_dir"
     return 1
-  fi
-
-  if [ "$ref" != "main" ]; then
-    (cd "$src_dir" && git fetch origin "$ref" --depth 1 2>/dev/null || true)
-    (cd "$src_dir" && git checkout --force "$ref" 2>/dev/null || true)
   fi
 
   if ! (cd "$src_dir/server" && go build -ldflags="-s -w" -o "$built" ./cmd/multica); then
