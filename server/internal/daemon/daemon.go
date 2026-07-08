@@ -2307,7 +2307,7 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 // the restart — extracted so the server-triggered path (handleUpdate) and the
 // auto-update poller (autoUpdateLoop) share the exact same execution body.
 func (d *Daemon) runUpdate(targetVersion string) (string, error) {
-	if cli.IsBrewInstall() {
+	if cli.IsBrewInstall() && !cli.ShouldSkipBrewUpgrade() {
 		d.logger.Info("updating CLI via Homebrew...")
 		out, err := cli.UpdateViaBrew()
 		if err != nil {

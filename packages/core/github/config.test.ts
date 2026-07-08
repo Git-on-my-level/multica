@@ -24,11 +24,19 @@ describe("resolveGithubConfig", () => {
       branch: "main",
     });
     expect(cfg.cliInstallCommand).toBe(
-      "curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install.sh | bash",
+      "MULTICA_GITHUB_REPO=Git-on-my-level/multica MULTICA_GITHUB_BRANCH=main curl -fsSL https://raw.githubusercontent.com/Git-on-my-level/multica/main/scripts/install-fork.sh | bash",
     );
     expect(cfg.webUrl).toBe("https://github.com/Git-on-my-level/multica");
     expect(cfg.issuesUrl).toBe(
       "https://github.com/Git-on-my-level/multica/issues",
+    );
+  });
+
+  it("passes repo override through fork install command", () => {
+    expect(
+      buildCliInstallCommand("myuser/my-fork", "develop"),
+    ).toBe(
+      "MULTICA_GITHUB_REPO=myuser/my-fork MULTICA_GITHUB_BRANCH=develop curl -fsSL https://raw.githubusercontent.com/myuser/my-fork/develop/scripts/install-fork.sh | bash",
     );
   });
 });

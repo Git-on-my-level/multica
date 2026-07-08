@@ -14,11 +14,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-REPO_SLUG="${MULTICA_GITHUB_REPO:-multica-ai/multica}"
+UPSTREAM_REPO="multica-ai/multica"
+REPO_SLUG="${MULTICA_GITHUB_REPO:-$UPSTREAM_REPO}"
 REPO_URL="https://github.com/${REPO_SLUG}.git"
 REPO_WEB_URL="https://github.com/${REPO_SLUG}"  # without .git, for GitHub web APIs
 INSTALL_DIR="${MULTICA_INSTALL_DIR:-$HOME/.multica/server}"
 BREW_PACKAGE="multica-ai/tap/multica"
+DEFAULT_BRANCH="${MULTICA_GITHUB_BRANCH:-main}"
 
 # Colors (disabled when not a terminal)
 if [ -t 1 ] || [ -t 2 ]; then
@@ -41,6 +43,34 @@ warn()  { printf "${BOLD}${YELLOW}⚠ %s${RESET}\n" "$*" >&2; }
 fail()  { printf "${BOLD}${RED}✗ %s${RESET}\n" "$*" >&2; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+should_skip_brew() {
+  if [ "${MULTICA_SKIP_BREW:-}" = "1" ]; then
+    return 0
+  fi
+  [ "$REPO_SLUG" != "$UPSTREAM_REPO" ]
+}
+
+install_script_name() {
+  if [ "$REPO_SLUG" = "$UPSTREAM_REPO" ]; then
+    printf "install.sh"
+  else
+    printf "install-fork.sh"
+  fi
+}
+
+install_ps_script_name() {
+  if [ "$REPO_SLUG" = "$UPSTREAM_REPO" ]; then
+    printf "install.ps1"
+  else
+    printf "install-fork.ps1"
+  fi
+}
+
+install_script_url() {
+  printf "https://raw.githubusercontent.com/%s/%s/scripts/%s" \
+    "$REPO_SLUG" "$DEFAULT_BRANCH" "$(install_script_name)"
+}
 
 env_file_value() {
   local file="$1"
@@ -82,13 +112,122 @@ selfhost_frontend_port() {
   env_file_value "${1:-.env}" "FRONTEND_PORT" "3000"
 }
 
+persist_fork_github_repo() {
+  if [ "$REPO_SLUG" = "$UPSTREAM_REPO" ]; then
+    return 0
+  fi
+
+  local config_dir="$HOME/.multica"
+  local config_file="$config_dir/config.json"
+  mkdir -p "$config_dir"
+
+  if command_exists python3; then
+    if python3 - "$REPO_SLUG" "$config_file" <<'PY'
+import json, os, sys
+
+repo, path = sys.argv[1], sys.argv[2]
+cfg = {}
+if os.path.exists(path):
+    with open(path) as f:
+        cfg = json.load(f)
+cfg["github_repo"] = repo
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.chmod(path, 0o600)
+PY
+    then
+      return 0
+    fi
+    warn "Could not merge github_repo with python3; trying jq or sed fallback"
+  fi
+
+  if [ ! -f "$config_file" ]; then
+    printf '{\n  "github_repo": "%s"\n}\n' "$REPO_SLUG" >"$config_file"
+    chmod 600 "$config_file"
+    return 0
+  fi
+
+  if command_exists jq; then
+    local tmp_file
+    tmp_file="$(mktemp)"
+    if jq --arg repo "$REPO_SLUG" '.github_repo = $repo' "$config_file" >"$tmp_file"; then
+      mv "$tmp_file" "$config_file"
+      chmod 600 "$config_file"
+      return 0
+    fi
+    rm -f "$tmp_file"
+  fi
+
+  if grep -q '"github_repo"[[:space:]]*:' "$config_file" 2>/dev/null; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+      sed -i '' "s|\"github_repo\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"github_repo\": \"${REPO_SLUG}\"|" "$config_file"
+    else
+      sed -i "s|\"github_repo\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"github_repo\": \"${REPO_SLUG}\"|" "$config_file"
+    fi
+    chmod 600 "$config_file"
+    return 0
+  fi
+
+  warn "Could not persist fork GitHub repo to ~/.multica/config.json (install python3 or jq to merge with existing config)"
+}
+
+set_env_file_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local line="${key}=${value}"
+
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+      sed -i '' "s|^${key}=.*|${line}|" "$file"
+    else
+      sed -i "s|^${key}=.*|${line}|" "$file"
+    fi
+    return 0
+  fi
+
+  if grep -qE "^# ${key}=" "$file" 2>/dev/null; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+      sed -i '' "s|^# ${key}=.*|${line}|" "$file"
+    else
+      sed -i "s|^# ${key}=.*|${line}|" "$file"
+    fi
+    return 0
+  fi
+
+  printf '%s\n' "$line" >>"$file"
+}
+
+patch_fork_selfhost_env() {
+  local env_file="${1:-.env}"
+  if [ "$REPO_SLUG" = "$UPSTREAM_REPO" ]; then
+    return 0
+  fi
+
+  local owner="${REPO_SLUG%%/*}"
+  local owner_lower
+  owner_lower="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"
+
+  set_env_file_value "$env_file" "MULTICA_GITHUB_REPO" "$REPO_SLUG"
+  set_env_file_value "$env_file" "MULTICA_GITHUB_BRANCH" "$DEFAULT_BRANCH"
+  set_env_file_value "$env_file" "MULTICA_BACKEND_IMAGE" "ghcr.io/${owner_lower}/multica-backend"
+  set_env_file_value "$env_file" "MULTICA_WEB_IMAGE" "ghcr.io/${owner_lower}/multica-web"
+
+  local image_tag
+  image_tag=$(get_latest_version)
+  if [ -n "$image_tag" ]; then
+    set_env_file_value "$env_file" "MULTICA_IMAGE_TAG" "$image_tag"
+  fi
+}
+
 detect_os() {
   case "$(uname -s)" in
     Darwin) OS="darwin" ;;
     Linux)  OS="linux" ;;
     MINGW*|MSYS*|CYGWIN*)
             fail "This script does not support Windows. Use the PowerShell installer instead:
-  irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex" ;;
+  irm https://raw.githubusercontent.com/${REPO_SLUG}/${DEFAULT_BRANCH}/scripts/$(install_ps_script_name) | iex" ;;
     *)      fail "Unsupported operating system: $(uname -s). Multica supports macOS, Linux, and Windows." ;;
   esac
 
@@ -146,7 +285,8 @@ install_cli_binary() {
   local latest
   latest=$(curl -sI "$REPO_WEB_URL/releases/latest" 2>/dev/null | grep -i '^location:' | sed 's/.*tag\///' | tr -d '\r\n' || true)
   if [ -z "$latest" ]; then
-    fail "Could not determine latest release. Check your network connection."
+    warn "Could not determine latest release."
+    return 1
   fi
 
   local version="${latest#v}"
@@ -157,32 +297,73 @@ install_cli_binary() {
   info "Downloading $url ..."
   if ! curl -fsSL "$url" -o "$tmp_dir/multica.tar.gz"; then
     rm -rf "$tmp_dir"
-    fail "Failed to download CLI binary."
+    warn "Failed to download CLI binary."
+    return 1
   fi
 
-  tar -xzf "$tmp_dir/multica.tar.gz" -C "$tmp_dir" multica
+  if ! tar -xzf "$tmp_dir/multica.tar.gz" -C "$tmp_dir" multica; then
+    rm -rf "$tmp_dir"
+    warn "Failed to extract CLI binary from archive."
+    return 1
+  fi
+  install_cli_to_bin_dir "$tmp_dir/multica"
+  rm -rf "$tmp_dir"
+  return 0
+}
 
-  # Try /usr/local/bin first, fall back to ~/.local/bin. Tests and scripted
-  # installs can override the first choice with MULTICA_BIN_DIR.
+install_cli_to_bin_dir() {
+  local binary="$1"
   local bin_dir="${MULTICA_BIN_DIR:-/usr/local/bin}"
   if [ -w "$bin_dir" ]; then
-    mv "$tmp_dir/multica" "$bin_dir/multica"
+    mv "$binary" "$bin_dir/multica"
   elif command_exists sudo; then
-    sudo mv "$tmp_dir/multica" "$bin_dir/multica"
+    sudo mv "$binary" "$bin_dir/multica"
   else
     bin_dir="$HOME/.local/bin"
     mkdir -p "$bin_dir"
-    mv "$tmp_dir/multica" "$bin_dir/multica"
+    mv "$binary" "$bin_dir/multica"
     chmod +x "$bin_dir/multica"
-    # Add to PATH if not already there
     if ! echo "$PATH" | tr ':' '\n' | grep -q "^$bin_dir$"; then
       export PATH="$bin_dir:$PATH"
       add_to_path "$bin_dir"
     fi
   fi
-
-  rm -rf "$tmp_dir"
   ok "Multica CLI installed to $bin_dir/multica"
+}
+
+install_cli_source() {
+  info "Building Multica CLI from source..."
+
+  local ref="${MULTICA_CLI_REF:-$DEFAULT_BRANCH}"
+  if ! command_exists git; then
+    warn "Git is not installed; cannot build from source."
+    return 1
+  fi
+  if ! command_exists go; then
+    warn "Go is not installed; cannot build from source."
+    return 1
+  fi
+
+  local tmp_dir built src_dir
+  tmp_dir=$(mktemp -d)
+  src_dir="$tmp_dir/repo"
+  built="$tmp_dir/multica"
+
+  if ! git clone --depth 1 --branch "$ref" "$REPO_URL" "$src_dir" >"$tmp_dir/clone.log" 2>&1; then
+    warn "Failed to clone $REPO_SLUG at ref $ref (see $tmp_dir/clone.log)."
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  if ! (cd "$src_dir/server" && go build -ldflags="-s -w" -o "$built" ./cmd/multica); then
+    warn "Go build failed."
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  install_cli_to_bin_dir "$built"
+  rm -rf "$tmp_dir"
+  return 0
 }
 
 add_to_path() {
@@ -260,6 +441,13 @@ upgrade_cli_brew() {
   fi
 }
 
+warn_homebrew_path_conflict() {
+  if should_skip_brew && command_exists brew && brew list "$BREW_PACKAGE" >/dev/null 2>&1; then
+    warn "Homebrew multica is still installed and may take precedence on PATH."
+    warn "Consider: brew uninstall $BREW_PACKAGE"
+  fi
+}
+
 install_cli() {
   if command_exists multica; then
     local current_ver
@@ -275,32 +463,40 @@ install_cli() {
 
     if [ -z "$latest_ver" ] || [ "$current_cmp" = "$latest_cmp" ]; then
       ok "Multica CLI is up to date ($current_ver)"
+      persist_fork_github_repo
+      warn_homebrew_path_conflict
       return 0
     fi
 
     info "Multica CLI $current_ver installed, latest is $latest_ver — upgrading..."
-    if command_exists brew && brew list "$BREW_PACKAGE" >/dev/null 2>&1; then
+    if ! should_skip_brew && command_exists brew && brew list "$BREW_PACKAGE" >/dev/null 2>&1; then
       upgrade_cli_brew
-    else
-      install_cli_binary
+    elif ! install_cli_binary; then
+      install_cli_source || fail "Failed to upgrade Multica CLI."
     fi
 
     local new_ver
     new_ver=$(multica version 2>/dev/null | awk 'NR==1{print $2}' || echo "unknown")
     ok "Multica CLI upgraded ($current_ver → $new_ver)"
+    persist_fork_github_repo
+    warn_homebrew_path_conflict
     return 0
   fi
 
-  if command_exists brew; then
-    install_cli_brew || install_cli_binary
+  if should_skip_brew; then
+    install_cli_binary || install_cli_source || fail "Failed to install Multica CLI."
+  elif command_exists brew; then
+    install_cli_brew || install_cli_binary || install_cli_source || fail "Failed to install Multica CLI."
   else
-    install_cli_binary
+    install_cli_binary || install_cli_source || fail "Failed to install Multica CLI."
   fi
 
   # Verify
   if ! command_exists multica; then
     fail "CLI installed but 'multica' not found on PATH. You may need to restart your shell."
   fi
+  persist_fork_github_repo
+  warn_homebrew_path_conflict
 }
 
 # ---------------------------------------------------------------------------
@@ -377,6 +573,8 @@ setup_server() {
     ok "Using existing .env"
   fi
 
+  patch_fork_selfhost_env .env
+
   # Start Docker Compose
   info "Pulling official Multica images..."
   pull_official_selfhost_images
@@ -428,7 +626,7 @@ run_default() {
   printf "     ${CYAN}multica setup self-host${RESET}       # Connect to a self-hosted server\n"
   printf "\n"
   printf "  ${BOLD}Self-hosting?${RESET} Install the server first:\n"
-  printf "     curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash -s -- --with-server\n"
+  printf "     curl -fsSL %s | bash -s -- --with-server\n" "$(install_script_url)"
   printf "\n"
 }
 
@@ -466,7 +664,7 @@ run_with_server() {
   printf "  or read the generated code from backend logs when Resend is unset.\n"
   printf "\n"
   printf "  ${BOLD}To stop all services:${RESET}\n"
-  printf "     curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash -s -- --stop\n"
+  printf "     curl -fsSL %s | bash -s -- --stop\n" "$(install_script_url)"
   printf "\n"
 }
 
@@ -515,6 +713,12 @@ main() {
         echo "  --stop          Stop a self-hosted installation"
         echo ""
         echo "Environment variables:"
+        echo "  MULTICA_GITHUB_REPO   GitHub owner/repo slug for releases and source"
+        echo "                        builds (default: multica-ai/multica)"
+        echo "  MULTICA_GITHUB_BRANCH Branch for install-script URLs (default: main)"
+        echo "  MULTICA_SKIP_BREW     Set to 1 to skip Homebrew install/upgrade"
+        echo "  MULTICA_CLI_REF       Git ref to build the CLI from when no release"
+        echo "                        binary is available (default: main)"
         echo "  MULTICA_INSTALL_DIR   Self-host server install directory"
         echo "                        (default: \$HOME/.multica/server)"
         echo "  MULTICA_BIN_DIR       Target directory for the CLI binary when"

@@ -24,6 +24,11 @@ type CLIConfig struct {
 	// defaults" — the historical behavior. See issue #3875.
 	Backends *BackendOverrides `json:"backends,omitempty"`
 
+	// GitHubRepo overrides the owner/repo slug used for CLI release lookups
+	// and self-updates when MULTICA_GITHUB_REPO is unset (e.g. after a fork
+	// install). Empty / absent means upstream multica-ai/multica.
+	GitHubRepo string `json:"github_repo,omitempty"`
+
 	// ProfileCommandOverrides is a per-machine map of custom runtime
 	// profile_id -> absolute executable path (MUL-3284). A workspace custom
 	// runtime profile records the command_name the daemon resolves on PATH,
