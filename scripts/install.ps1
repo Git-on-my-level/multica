@@ -330,14 +330,22 @@ function Test-ShouldSkipBrew {
 function Install-CliToBinDir {
     param([string]$ExeSrc)
 
-    $binDir = Join-Path $env:USERPROFILE ".multica\bin"
+    $binDir = if ($env:MULTICA_BIN_DIR) { $env:MULTICA_BIN_DIR.Trim() } else { Join-Path $env:USERPROFILE ".multica\bin" }
     if (-not (Test-Path $binDir)) {
         New-Item -ItemType Directory -Path $binDir -Force | Out-Null
     }
 
-    Copy-Item $ExeSrc (Join-Path $binDir "multica.exe") -Force
+    $dest = Join-Path $binDir "multica.exe"
+    try {
+        Copy-Item $ExeSrc $dest -Force
+    } catch {
+        Write-Fail "Failed to install CLI to $dest`: $_"
+    }
+    if (-not (Test-Path $dest)) {
+        Write-Fail "CLI binary missing at $dest after install."
+    }
     Add-ToUserPath $binDir
-    Write-Ok "Multica CLI installed to $binDir\multica.exe"
+    Write-Ok "Multica CLI installed to $dest"
 }
 
 function Install-CliSource {

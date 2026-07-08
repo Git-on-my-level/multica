@@ -360,10 +360,100 @@ STUB
   fi
 }
 
+test_install_creates_missing_bin_dir() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  _setup_sandbox "$tmp"
+  rm -rf "$tmp/install-bin"
+
+  local out="$tmp/install.out"
+  local err="$tmp/install.err"
+  if ! PATH="$tmp/stub-bin:$tmp/install-bin:/usr/bin:/bin" \
+    MULTICA_BIN_DIR="$tmp/install-bin" \
+    MULTICA_TEST_ARCHIVE="$tmp/multica.tar.gz" \
+    MULTICA_SKIP_BREW=1 \
+    bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
+    echo "install.sh exited non-zero" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if [[ ! -d "$tmp/install-bin" ]]; then
+    echo "expected installer to create $tmp/install-bin" >&2
+    return 1
+  fi
+
+  if [[ ! -x "$tmp/install-bin/multica" ]]; then
+    echo "expected binary at $tmp/install-bin/multica" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if ! grep -q "Multica CLI installed to $tmp/install-bin/multica" "$out"; then
+    echo "expected install success message" >&2
+    cat "$out" >&2 || true
+    return 1
+  fi
+}
+
+test_install_failure_does_not_claim_success() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  _setup_sandbox "$tmp"
+  local fail_bin="$tmp/readonly-parent/bin"
+  mkdir -p "$tmp/readonly-parent"
+  chmod 555 "$tmp/readonly-parent"
+
+  cat >"$tmp/stub-bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+echo "simulated sudo install failure" >&2
+exit 1
+STUB
+  chmod +x "$tmp/stub-bin/sudo"
+
+  local out="$tmp/install.out"
+  local err="$tmp/install.err"
+  if PATH="$tmp/stub-bin:/usr/bin:/bin" \
+    MULTICA_BIN_DIR="$fail_bin" \
+    MULTICA_TEST_ARCHIVE="$tmp/multica.tar.gz" \
+    MULTICA_SKIP_BREW=1 \
+    bash "$ROOT_DIR/scripts/install.sh" >"$out" 2>"$err"; then
+    echo "expected install.sh to fail when sudo install fails" >&2
+    cat "$out" >&2 || true
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  if grep -q "Multica CLI installed to" "$out"; then
+    echo "installer claimed CLI install success after failure" >&2
+    cat "$out" >&2 || true
+    return 1
+  fi
+
+  if grep -q "Multica CLI is ready" "$out"; then
+    echo "installer claimed final success after failure" >&2
+    cat "$out" >&2 || true
+    return 1
+  fi
+
+  if [[ -x "$fail_bin/multica" ]]; then
+    echo "binary should not exist after failed install" >&2
+    return 1
+  fi
+}
+
 test_brew_install_failure_falls_back_to_release_binary
 test_brew_tap_failure_falls_back_to_release_binary
 test_skip_brew_uses_release_binary
 test_fork_repo_skips_homebrew
 test_source_build_fallback_when_release_missing
 test_tar_extract_failure_falls_back_to_source_build
+test_install_creates_missing_bin_dir
+test_install_failure_does_not_claim_success
 echo "install.sh tests passed"

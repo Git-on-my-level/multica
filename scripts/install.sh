@@ -278,6 +278,37 @@ install_cli_brew() {
   fi
 }
 
+default_cli_bin_dir() {
+  if [ -n "${MULTICA_BIN_DIR:-}" ]; then
+    printf '%s' "$MULTICA_BIN_DIR"
+    return
+  fi
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    case "$(uname -m)" in
+      arm64|aarch64)
+        if [ -d /opt/homebrew/bin ] || [ -x /opt/homebrew/bin/brew ]; then
+          printf '%s' '/opt/homebrew/bin'
+          return
+        fi
+        ;;
+    esac
+    if [ -d /usr/local/bin ]; then
+      printf '%s' '/usr/local/bin'
+      return
+    fi
+    printf '%s' '/usr/local/bin'
+    return
+  fi
+
+  if [ -d /usr/local/bin ]; then
+    printf '%s' '/usr/local/bin'
+    return
+  fi
+
+  printf '%s' "$HOME/.local/bin"
+}
+
 install_cli_binary() {
   info "Installing Multica CLI from GitHub Releases..."
 
@@ -313,22 +344,35 @@ install_cli_binary() {
 
 install_cli_to_bin_dir() {
   local binary="$1"
-  local bin_dir="${MULTICA_BIN_DIR:-/usr/local/bin}"
-  if [ -w "$bin_dir" ]; then
-    mv "$binary" "$bin_dir/multica"
+  local bin_dir dest
+  bin_dir="$(default_cli_bin_dir)"
+  dest="$bin_dir/multica"
+
+  if [ -w "$bin_dir" ] 2>/dev/null || { [ ! -e "$bin_dir" ] && [ -w "$(dirname "$bin_dir")" ] 2>/dev/null; }; then
+    mkdir -p "$bin_dir" || fail "Failed to create $bin_dir"
+    mv "$binary" "$dest" || fail "Failed to install CLI to $dest"
+    chmod +x "$dest" || fail "Failed to make CLI executable at $dest"
   elif command_exists sudo; then
-    sudo mv "$binary" "$bin_dir/multica"
+    sudo mkdir -p "$bin_dir" || fail "Failed to create $bin_dir (sudo)"
+    sudo mv "$binary" "$dest" || fail "Failed to install CLI to $dest (sudo)"
+    sudo chmod +x "$dest" || fail "Failed to make CLI executable at $dest (sudo)"
   else
     bin_dir="$HOME/.local/bin"
-    mkdir -p "$bin_dir"
-    mv "$binary" "$bin_dir/multica"
-    chmod +x "$bin_dir/multica"
+    dest="$bin_dir/multica"
+    mkdir -p "$bin_dir" || fail "Failed to create $bin_dir"
+    mv "$binary" "$dest" || fail "Failed to install CLI to $dest"
+    chmod +x "$dest" || fail "Failed to make CLI executable at $dest"
     if ! echo "$PATH" | tr ':' '\n' | grep -q "^$bin_dir$"; then
       export PATH="$bin_dir:$PATH"
       add_to_path "$bin_dir"
     fi
   fi
-  ok "Multica CLI installed to $bin_dir/multica"
+
+  if [ ! -x "$dest" ]; then
+    fail "CLI binary missing or not executable at $dest"
+  fi
+
+  ok "Multica CLI installed to $dest"
 }
 
 install_cli_source() {
@@ -722,8 +766,9 @@ main() {
         echo "  MULTICA_INSTALL_DIR   Self-host server install directory"
         echo "                        (default: \$HOME/.multica/server)"
         echo "  MULTICA_BIN_DIR       Target directory for the CLI binary when"
-        echo "                        installing from GitHub Releases"
-        echo "                        (default: /usr/local/bin, then \$HOME/.local/bin)"
+        echo "                        installing from GitHub Releases or source"
+        echo "                        (default: /opt/homebrew/bin on Apple Silicon,"
+        echo "                         /usr/local/bin otherwise, then \$HOME/.local/bin)"
         echo "  MULTICA_SELFHOST_REF  Git ref to check out for self-host assets"
         echo "                        (default: latest release tag, falling back to main)"
         echo ""
