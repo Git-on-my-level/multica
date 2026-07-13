@@ -22,7 +22,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/internal/featureflagdispatch"
 	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
@@ -176,13 +175,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		AttachmentDownloadMode:   os.Getenv("ATTACHMENT_DOWNLOAD_MODE"),
 		AttachmentDownloadURLTTL: envDuration("ATTACHMENT_DOWNLOAD_URL_TTL", 30*time.Minute),
 		AttachmentFrameAncestors: origins,
+		LLMAPIKey:                strings.TrimSpace(os.Getenv("MULTICA_LLM_API_KEY")),
+		LLMBaseURL:               strings.TrimSpace(os.Getenv("MULTICA_LLM_BASE_URL")),
+		LLMDefaultModel:          strings.TrimSpace(os.Getenv("MULTICA_LLM_DEFAULT_MODEL")),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
 	h.Metrics = opts.BusinessMetrics
 	h.FeatureFlags = opts.FeatureFlags
-	if opts.FeatureFlags != nil {
-		h.DaemonFeatureFlags = featureflagdispatch.NewEvaluator(opts.FeatureFlags)
-	}
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
 	h.IssueService.Metrics = opts.BusinessMetrics
@@ -781,6 +780,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)
 
+		// Note (MUL-4309): the generic OpenAI-compatible passthrough endpoints
+		// (POST /api/llm/v1/chat/completions[/stream]) were intentionally
+		// removed. Exposing a general LLM proxy backed by the deployment's own
+		// key let any logged-in user run arbitrary completions on our dime.
+		// LLM access is now server-internal only (see pkg/llm); anything the
+		// web/client needs must go through a purpose-built business endpoint
+		// that fixes the prompt/model server-side (e.g. chat title generation).
+
 		// Attachment download — user-scoped (auth-only), NOT
 		// workspace-scoped. The handler self-resolves the workspace
 		// from the attachment row and enforces membership inside, so
@@ -1136,6 +1143,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/skills", h.ListAgentSkills)
 					r.Put("/skills", h.SetAgentSkills)
 					r.Post("/skills/add", h.AddAgentSkills)
+					r.Get("/labels", h.ListLabelsForAgent)
+					r.Post("/labels", h.AttachLabelToAgent)
+					r.Delete("/labels/{labelId}", h.DetachLabelFromAgent)
+					r.Put("/skills/{skillId}/enabled", h.SetAgentSkillEnabled)
+					r.Delete("/skills/{skillId}", h.RemoveAgentSkill)
 					// Dedicated env-management endpoint. Owner/admin only;
 					// agent actors are denied. Every reveal / write is
 					// audited to activity_log. See MUL-2600 and
@@ -1152,6 +1164,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Get("/", h.ListAgentTemplates)
 				r.Get("/{slug}", h.GetAgentTemplate)
 			})
+			r.Post("/api/agent-builder/sessions", h.CreateAgentBuilderSession)
 
 			// Skills
 			r.Route("/api/skills", func(r chi.Router) {
@@ -1163,6 +1176,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/", h.GetSkill)
 					r.Put("/", h.UpdateSkill)
 					r.Delete("/", h.DeleteSkill)
+					r.Get("/labels", h.ListLabelsForSkill)
+					r.Post("/labels", h.AttachLabelToSkill)
+					r.Delete("/labels/{labelId}", h.DetachLabelFromSkill)
 					r.Get("/files", h.ListSkillFiles)
 					r.Put("/files", h.UpsertSkillFile)
 					r.Delete("/files/{fileId}", h.DeleteSkillFile)

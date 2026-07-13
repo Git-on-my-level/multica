@@ -40,7 +40,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// instead of inheriting from the outer Claude Code session.
 	var mcpConfigPath string
 	var mcpFileCleanup func() // non-nil while this function owns the temp file
-	if len(opts.McpConfig) > 0 {
+	if hasManagedMcpConfig(opts.McpConfig) {
 		path, err := writeMcpConfigToTemp(opts.McpConfig)
 		if err != nil {
 			cancel()
@@ -240,13 +240,14 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// stderrBuf.Tail() is safe to sample now. Attach the tail to any
 		// non-empty failure message; callers upstream surface this as the
 		// task's error field, which is the only place users see it.
+		stderrTail := stderrBuf.Tail()
 		if finalError != "" {
-			finalError = withAgentStderr(finalError, "claude", stderrBuf.Tail())
+			finalError = withAgentStderr(finalError, "claude", stderrTail)
 		}
 
 		b.cfg.Logger.Info("claude finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed")
+		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", stderrTail)
 		if reportedSessionID != sessionID {
 			b.cfg.Logger.Info("claude resume did not land; clearing fresh session id for daemon fallback",
 				"requested_resume", opts.ResumeSessionID,
@@ -570,7 +571,6 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
-		"--strict-mcp-config",
 		"--permission-mode", "bypassPermissions",
 		// AskUserQuestion is Claude Code's built-in interactive question tool.
 		// The daemon runs Claude in non-interactive stream-json mode and has
@@ -579,6 +579,12 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		// never sees the question (see GitHub #2588). User-facing
 		// clarification belongs in an issue comment instead.
 		"--disallowedTools", "AskUserQuestion",
+	}
+	if hasManagedMcpConfig(opts.McpConfig) {
+		// A saved agent-level config is authoritative, including an explicitly
+		// empty object. With no managed config, omit strict mode so Claude can
+		// inherit the user's local runtime MCP servers.
+		args = append(args, "--strict-mcp-config")
 	}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
@@ -637,16 +643,27 @@ func buildClaudeInput(prompt string) ([]byte, error) {
 
 // resolveSessionID decides which session id to report on the Result. When the
 // caller requested --resume but claude emitted a fresh, different session id
-// AND the run failed, the resume did not land (claude prints
-// "No conversation found with session ID: ..." to stderr, generates a fresh
-// session, and exits). Returning "" in that case keeps the daemon's
-// retry-with-fresh-session fallback able to trigger, instead of silently
-// persisting a brand-new id as if resume had succeeded.
-func resolveSessionID(requestedResume, emitted string, failed bool) string {
+// AND the run failed, the resume did not land. Claude can also report the
+// requested id while printing "No conversation found with session ID: ..." to
+// stderr. Returning "" in those cases keeps the daemon's retry-with-fresh-
+// session fallback able to trigger instead of persisting the dead resume id.
+func resolveSessionID(requestedResume, emitted string, failed bool, stderrTail ...string) string {
+	if failed && requestedResume != "" && claudeNoConversationFound(stderrTail...) {
+		return ""
+	}
 	if failed && requestedResume != "" && emitted != "" && emitted != requestedResume {
 		return ""
 	}
 	return emitted
+}
+
+func claudeNoConversationFound(stderrTail ...string) bool {
+	for _, tail := range stderrTail {
+		if strings.Contains(strings.ToLower(tail), "no conversation found") {
+			return true
+		}
+	}
+	return false
 }
 
 func buildEnv(extra map[string]string) []string {

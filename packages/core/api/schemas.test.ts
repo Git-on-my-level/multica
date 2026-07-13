@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AppConfigSchema,
+  AgentTaskListSchema,
   DashboardAgentRunTimeListSchema,
   DashboardUsageByAgentListSchema,
   DashboardUsageDailyListSchema,
@@ -8,10 +9,12 @@ import {
   DuplicateIssueErrorBodySchema,
   EMPTY_CREATE_FEEDBACK_RESPONSE,
   EMPTY_INBOX_UNREAD_SUMMARY,
+  EMPTY_SEARCH_PROJECTS_RESPONSE,
   EMPTY_USER,
   InboxUnreadSummarySchema,
   IssueTriggerPreviewSchema,
   ListIssuesResponseSchema,
+  SearchProjectsResponseSchema,
   RuntimeHourlyActivityListSchema,
   RuntimeUsageByAgentListSchema,
   RuntimeUsageByHourListSchema,
@@ -185,6 +188,74 @@ describe("TimelineEntriesSchema", () => {
     ]);
 
     expect(parsed[0]?.source_task_id).toBe("task-1");
+  });
+});
+
+describe("AgentTaskListSchema", () => {
+  const task = {
+    id: "task-1",
+    agent_id: "agent-1",
+    runtime_id: "runtime-1",
+    issue_id: "issue-1",
+    status: "queued",
+    priority: 0,
+    dispatched_at: null,
+    started_at: null,
+    completed_at: null,
+    result: null,
+    error: null,
+    created_at: "2026-07-10T00:00:00Z",
+    trigger_comment_id: "comment-3",
+  };
+
+  it("preserves planned and delivered comment IDs for a task run", () => {
+    const parsed = AgentTaskListSchema.parse([
+      {
+        ...task,
+        coalesced_comment_ids: ["comment-1", "comment-2"],
+        delivered_comment_ids: ["comment-1", "comment-2", "comment-3"],
+      },
+    ]);
+
+    expect(parsed[0]?.trigger_comment_id).toBe("comment-3");
+    expect(parsed[0]?.coalesced_comment_ids).toEqual([
+      "comment-1",
+      "comment-2",
+    ]);
+    expect(parsed[0]?.delivered_comment_ids).toEqual([
+      "comment-1",
+      "comment-2",
+      "comment-3",
+    ]);
+  });
+
+  it("accepts task payloads from older backends without comment coverage", () => {
+    const parsed = AgentTaskListSchema.parse([task]);
+    expect(parsed[0]?.coalesced_comment_ids).toBeUndefined();
+    expect(parsed[0]?.delivered_comment_ids).toBeUndefined();
+  });
+
+  it("degrades malformed optional coverage without dropping task rows", () => {
+    const parsed = AgentTaskListSchema.parse([
+      {
+        ...task,
+        coalesced_comment_ids: ["comment-1", 2],
+        delivered_comment_ids: "not-an-array",
+      },
+      {
+        ...task,
+        id: "task-2",
+        delivered_comment_ids: ["comment-2", "comment-3"],
+      },
+    ]);
+
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]?.coalesced_comment_ids).toBeUndefined();
+    expect(parsed[0]?.delivered_comment_ids).toBeUndefined();
+    expect(parsed[1]?.delivered_comment_ids).toEqual([
+      "comment-2",
+      "comment-3",
+    ]);
   });
 });
 
@@ -507,5 +578,54 @@ describe("InboxUnreadSummarySchema", () => {
         ENDPOINT,
       ),
     ).toBe(EMPTY_INBOX_UNREAD_SUMMARY);
+  });
+});
+
+describe("SearchProjectsResponseSchema date drift", () => {
+  const ENDPOINT = { endpoint: "GET /api/projects/search" };
+
+  const baseProject = {
+    id: "p-1",
+    workspace_id: "ws-1",
+    title: "Launch",
+    description: null,
+    icon: null,
+    status: "in_progress",
+    priority: "high",
+    lead_type: null,
+    lead_id: null,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    issue_count: 0,
+    done_count: 0,
+    resource_count: 0,
+    match_source: "title",
+  };
+
+  it("parses start_date / due_date when the backend returns them", () => {
+    const parsed = parseWithFallback(
+      { projects: [{ ...baseProject, start_date: "2026-03-01", due_date: "2026-03-31" }], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(parsed.projects[0]?.start_date).toBe("2026-03-01");
+    expect(parsed.projects[0]?.due_date).toBe("2026-03-31");
+  });
+
+  // Frontend deploys before backend: an older backend omits the new keys. The
+  // .default(null) must keep the whole batch parseable (→ null), not degrade
+  // it to the empty fallback and blank the search results.
+  it("defaults missing start_date / due_date to null without dropping results", () => {
+    const parsed = parseWithFallback(
+      { projects: [baseProject], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(parsed).not.toBe(EMPTY_SEARCH_PROJECTS_RESPONSE);
+    expect(parsed.projects).toHaveLength(1);
+    expect(parsed.projects[0]?.start_date).toBeNull();
+    expect(parsed.projects[0]?.due_date).toBeNull();
   });
 });

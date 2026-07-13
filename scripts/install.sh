@@ -72,6 +72,25 @@ install_script_url() {
     "$REPO_SLUG" "$DEFAULT_BRANCH" "$(install_script_name)"
 }
 
+running_in_ssh_session() {
+  [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ]
+}
+
+print_remote_server_token_hint() {
+  if ! running_in_ssh_session; then
+    return
+  fi
+
+  printf "  ${BOLD}Looks like a remote/SSH session.${RESET} Browser login may not be able to call back to this machine's localhost.\n"
+  printf "  Token login is usually simpler here:\n"
+  printf "     1. On your local computer, open ${CYAN}https://multica.ai/settings?tab=tokens${RESET}\n"
+  printf "        and create a token under ${BOLD}Settings > API Tokens${RESET}.\n"
+  printf "     2. On this server, run:\n"
+  printf "        ${CYAN}multica login --token <YOUR_TOKEN>${RESET}\n"
+  printf "        ${CYAN}multica daemon start${RESET}\n"
+  printf "\n"
+}
+
 env_file_value() {
   local file="$1"
   local key="$2"
@@ -675,6 +694,7 @@ run_default() {
   printf "     ${CYAN}multica setup${RESET}                # Connect to Multica Cloud (multica.ai)\n"
   printf "     ${CYAN}multica setup self-host${RESET}       # Connect to a self-hosted server\n"
   printf "\n"
+  print_remote_server_token_hint
   printf "  ${BOLD}Self-hosting?${RESET} Install the server first:\n"
   printf "     curl -fsSL %s | bash -s -- --with-server\n" "$(install_script_url)"
   printf "\n"

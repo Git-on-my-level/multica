@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -307,7 +308,7 @@ func TestTrySendDropsWhenFull(t *testing.T) {
 	}
 }
 
-func TestBuildClaudeArgsIncludesStrictMCPConfig(t *testing.T) {
+func TestBuildClaudeArgsInheritsMCPByDefault(t *testing.T) {
 	t.Parallel()
 
 	args := buildClaudeArgs(ExecOptions{}, slog.Default())
@@ -316,7 +317,6 @@ func TestBuildClaudeArgsIncludesStrictMCPConfig(t *testing.T) {
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
-		"--strict-mcp-config",
 		"--permission-mode", "bypassPermissions",
 		"--disallowedTools", "AskUserQuestion",
 	}
@@ -328,6 +328,15 @@ func TestBuildClaudeArgsIncludesStrictMCPConfig(t *testing.T) {
 		if args[i] != want {
 			t.Fatalf("expected args[%d] = %q, got %q", i, want, args[i])
 		}
+	}
+}
+
+func TestBuildClaudeArgsUsesStrictMCPForManagedConfig(t *testing.T) {
+	t.Parallel()
+
+	args := buildClaudeArgs(ExecOptions{McpConfig: json.RawMessage(`{}`)}, slog.Default())
+	if !slices.Contains(args, "--strict-mcp-config") {
+		t.Fatalf("managed MCP config must enable strict mode, got %v", args)
 	}
 }
 
@@ -784,6 +793,7 @@ func TestResolveSessionID(t *testing.T) {
 		requested string
 		emitted   string
 		failed    bool
+		stderr    string
 		want      string
 	}{
 		{
@@ -791,6 +801,7 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "",
 			emitted:   "fresh-abc",
 			failed:    false,
+			stderr:    "",
 			want:      "fresh-abc",
 		},
 		{
@@ -798,6 +809,7 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "sess-old",
 			emitted:   "sess-old",
 			failed:    false,
+			stderr:    "",
 			want:      "sess-old",
 		},
 		{
@@ -805,6 +817,7 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "sess-old",
 			emitted:   "sess-old",
 			failed:    true,
+			stderr:    "",
 			want:      "sess-old",
 		},
 		{
@@ -812,6 +825,15 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "sess-dead",
 			emitted:   "fresh-new",
 			failed:    true,
+			stderr:    "",
+			want:      "",
+		},
+		{
+			name:      "resume not found stderr clears matching id so daemon fallback fires",
+			requested: "sess-dead",
+			emitted:   "sess-dead",
+			failed:    true,
+			stderr:    "No conversation found with session ID: sess-dead",
 			want:      "",
 		},
 		{
@@ -819,6 +841,7 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "sess-dead",
 			emitted:   "fresh-new",
 			failed:    false,
+			stderr:    "No conversation found with session ID: sess-dead",
 			want:      "fresh-new",
 		},
 		{
@@ -826,6 +849,7 @@ func TestResolveSessionID(t *testing.T) {
 			requested: "sess-old",
 			emitted:   "",
 			failed:    true,
+			stderr:    "",
 			want:      "",
 		},
 	}
@@ -834,10 +858,10 @@ func TestResolveSessionID(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := resolveSessionID(tc.requested, tc.emitted, tc.failed)
+			got := resolveSessionID(tc.requested, tc.emitted, tc.failed, tc.stderr)
 			if got != tc.want {
-				t.Fatalf("resolveSessionID(%q, %q, %v) = %q, want %q",
-					tc.requested, tc.emitted, tc.failed, got, tc.want)
+				t.Fatalf("resolveSessionID(%q, %q, %v, %q) = %q, want %q",
+					tc.requested, tc.emitted, tc.failed, tc.stderr, got, tc.want)
 			}
 		})
 	}

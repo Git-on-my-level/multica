@@ -237,6 +237,21 @@ export interface AgentTask {
   /** Set when an issue comment triggered this task (@mention or assignee comment). */
   trigger_comment_id?: string;
   /**
+   * Earlier comment IDs folded into this run before it was claimed. This does
+   * not include `trigger_comment_id`, which remains the run's newest trigger.
+   * Their unique union is the queued coverage plan; claimed-task consumers
+   * should prefer `delivered_comment_ids` when that receipt is present. Omitted
+   * by older backends and for runs that were not merged.
+   */
+  coalesced_comment_ids?: string[];
+  /**
+   * Comment IDs actually embedded in the task's latest claim response. Once a
+   * task has left queued state this is the authoritative coverage receipt.
+   * Omitted by older backends, where consumers may fall back to the planned
+   * trigger/coalesced union; an explicitly empty array is still authoritative.
+   */
+  delivered_comment_ids?: string[];
+  /**
    * Canonical short description of what triggered this task — snapshot
    * taken at creation time. For comment-triggered tasks it's the
    * comment text (truncated to ~200 chars); for autopilot it's the
@@ -367,7 +382,7 @@ export interface Agent {
   /**
    * Runtime-native reasoning/effort token (e.g. Claude's
    * `low|medium|high|xhigh|max`, Codex's
-   * `none|minimal|low|medium|high|xhigh`). Empty string means "no
+   * `none|minimal|low|medium|high|xhigh|max|ultra`). Empty string means "no
    * override": the backend omits the effort flag and the upstream CLI
    * config / built-in default decides at run time. The picker is
    * per-runtime per-model — the API never normalises across providers.
@@ -394,6 +409,8 @@ export interface AgentSkillSummary {
   id: string;
   name: string;
   description: string;
+	/** Older servers omit this field; consumers must treat that as enabled. */
+	enabled?: boolean;
 }
 
 export interface CreateAgentRequest {
@@ -423,6 +440,14 @@ export interface CreateAgentRequest {
   /** Optional template slug used by the onboarding agent picker. Surfaced
    *  as the `template` property on the `agent_created` PostHog event. */
   template?: string;
+  /** Workspace skill IDs attached atomically with the agent row. */
+  skill_ids?: string[];
+}
+
+export interface AgentBuilderSession {
+  session_id: string;
+  builder_agent_id: string;
+  runtime_id: string;
 }
 
 /** Agent template summary — fields needed by the picker grid. Does NOT
@@ -609,6 +634,8 @@ export interface SkillSummary {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+	/** Present only when returned from an agent-scoped assignment endpoint. */
+	enabled?: boolean;
 }
 
 export interface Skill extends SkillSummary {
@@ -859,8 +886,17 @@ export interface RuntimeLocalSkillSummary {
    * discovery omit the field; treat `undefined` as unknown rather than
    * asserting either origin.
    */
-  root?: "provider" | "universal";
+  root?: "provider" | "universal" | "plugin";
+  /** Enabled runtime plugin that contributed this skill, when applicable. */
+  plugin?: string;
   file_count: number;
+}
+
+export interface RuntimeLocalMcpServerSummary {
+	name: string;
+	transport?: "stdio" | "http" | "sse" | "unknown";
+	source?: string;
+	enabled: boolean;
 }
 
 export interface RuntimeLocalSkillListRequest {
@@ -869,6 +905,8 @@ export interface RuntimeLocalSkillListRequest {
   status: RuntimeLocalSkillStatus;
   skills?: RuntimeLocalSkillSummary[];
   supported: boolean;
+	mcp_servers?: RuntimeLocalMcpServerSummary[];
+	mcp_supported?: boolean;
   error?: string;
   created_at: string;
   updated_at: string;
@@ -903,6 +941,8 @@ export interface RuntimeLocalSkillImportRequest {
 export interface RuntimeLocalSkillsResult {
   skills: RuntimeLocalSkillSummary[];
   supported: boolean;
+	mcpServers: RuntimeLocalMcpServerSummary[];
+	mcpSupported: boolean;
 }
 
 export interface RuntimeLocalSkillImportResult {
