@@ -45,6 +45,14 @@ var legacyDuplicateMigrationStems = map[string][]string{
 	"124": {"124_autopilot_run_planned_at", "124_channel_generalization", "124_task_prepare_lease"},
 	"127": {"127_issue_pull_request_reference_only", "127_task_squad_id", "127_user_composio_connection"},
 	"128": {"128_agent_task_queue_runtime_mcp_overlay", "128_autopilot_collaborator", "128_comment_routing_escalation"},
+	// Fork-only collision: 143_runtime_profile_add_omp (Git-on-my-level fork,
+	// adds the OMP ACP family since fork v0.3.41) and upstream's
+	// 143_agent_task_queue_chat_pending_v2 (MUL-4159 index fix) picked the
+	// same prefix independently. Both are already deployed in their respective
+	// lineages and touch unrelated objects (runtime_profile CHECK vs an
+	// agent_task_queue index), so they cannot be renumbered. Runner tracks by
+	// full stem, so both apply in lexical order without conflict.
+	"143": {"143_agent_task_queue_chat_pending_v2", "143_runtime_profile_add_omp"},
 }
 
 var migrationPrefixPattern = regexp.MustCompile(`^(\d+)_`)
