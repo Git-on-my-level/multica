@@ -42,12 +42,21 @@ Fork tag automation continues to publish CLI archives through
 `.goreleaser.fork.yml` and may publish fork GHCR backend/web images. It must
 not publish any macOS, Linux, or Windows Desktop artifact.
 
-Desktop releases are manual arm64-only releases from David's Mac, signed with
-`Developer ID Application: DAZHENG ZHANG (JVMXE5G542)`, notarized, stapled, and
-verified before upload. Use [the macOS release guide](apps/desktop/MACOS_RELEASE.md).
-The expected public Desktop set is the arm64 DMG, arm64 ZIP, and
-`latest-mac.yml`; do not publish x64 artifacts. `CSC_IDENTITY_AUTO_DISCOVERY=false`
-belongs only to non-distributed `--publish never` smoke tests.
+Desktop releases are manual arm64-only releases from David's Mac, signed,
+notarized, stapled, and verified before upload. The public deliverable is the
+arm64 **DMG only**: do not publish or wait for a ZIP, updater metadata, CLI,
+containers, Windows, Linux, or x64 artifacts unless explicitly requested.
+Use [the macOS release guide](apps/desktop/MACOS_RELEASE.md). It defaults to
+the `multica-notary` login-Keychain profile and `--publish never`, then verifies
+the resulting DMG before manually creating the matching GitHub Release. Leave
+`CSC_NAME` unset so electron-builder auto-discovers the signing identity;
+`CSC_IDENTITY_AUTO_DISCOVERY=false` belongs only to non-distributed smoke tests.
+
+Pushing a version tag triggers the generic Release workflow, including unrelated
+CLI/container work. That workflow is not a DMG gate: after local DMG checks,
+push an annotated tag at the reviewed commit, verify the remote tag resolves to
+that exact SHA, then use `gh release create --verify-tag` to upload only the
+DMG. Do not wait for the unrelated jobs.
 
 Never rewrite a failed tag or release. Issue a corrected version after fixing
 the cause.
