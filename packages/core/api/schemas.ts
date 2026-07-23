@@ -704,6 +704,76 @@ export const ChildIssuesResponseSchema = z.object({
   issues: z.array(IssueSchema).default([]),
 }).loose();
 
+// ---------------------------------------------------------------------------
+// GitHub PR mirror. The link/unlink endpoints return a single GitHubPullRequest
+// wrapped as `{ pull_request }`; `GET .../pull-requests` returns `{ pull_requests }`
+// (the existing list path, parsed loosely by the API client). The schema guards
+// only the shape the UI renders — enums stay `z.string()` so a new server-side
+// state/conclusion degrades to a generic fallback rather than crashing, and
+// `.loose()` lets unknown field pass through so a future field addition on
+// either side doesn't fail the parse. `parseWithFallback` returns the EMPTY
+// record below when the contract drifts, keeping the PR list rendering.
+// ---------------------------------------------------------------------------
+export const GitHubPullRequestSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  repo_owner: z.string(),
+  repo_name: z.string(),
+  number: z.number(),
+  title: z.string(),
+  state: z.string(),
+  html_url: z.string(),
+  branch: z.string().nullable().optional(),
+  author_login: z.string().nullable().optional(),
+  author_avatar_url: z.string().nullable().optional(),
+  merged_at: z.string().nullable().optional(),
+  closed_at: z.string().nullable().optional(),
+  pr_created_at: z.string(),
+  pr_updated_at: z.string(),
+  mergeable_state: z.string().nullable().optional(),
+  checks_conclusion: z.string().nullable().optional(),
+  checks_passed: z.number(),
+  checks_failed: z.number(),
+  checks_pending: z.number(),
+  additions: z.number(),
+  deletions: z.number(),
+  changed_files: z.number(),
+}).loose();
+
+export const IssuePullRequestResponseSchema = z
+  .object({ pull_request: GitHubPullRequestSchema })
+  .loose();
+
+export const EMPTY_GITHUB_PULL_REQUEST: GitHubPullRequest = {
+  id: "",
+  workspace_id: "",
+  repo_owner: "",
+  repo_name: "",
+  number: 0,
+  title: "",
+  state: "open",
+  html_url: "",
+  branch: null,
+  author_login: null,
+  author_avatar_url: null,
+  merged_at: null,
+  closed_at: null,
+  pr_created_at: "",
+  pr_updated_at: "",
+  mergeable_state: null,
+  checks_conclusion: null,
+  checks_passed: 0,
+  checks_failed: 0,
+  checks_pending: 0,
+  additions: 0,
+  deletions: 0,
+  changed_files: 0,
+};
+
+export const EMPTY_ISSUE_PULL_REQUEST_RESPONSE: { pull_request: GitHubPullRequest } = {
+  pull_request: EMPTY_GITHUB_PULL_REQUEST,
+};
+
 export const CloudRuntimeNodeSchema = z.object({
   id: z.string(),
   owner_id: z.string(),
