@@ -358,6 +358,14 @@ export function builderArgsForTarget(
   return builderArgs;
 }
 
+// Local development builds deliberately skip notarization when neither supported
+// credential path is present. electron-builder accepts either the legacy
+// Apple-ID environment variables (gated here by APPLE_TEAM_ID) or a Keychain
+// profile selected by APPLE_KEYCHAIN_PROFILE.
+export function shouldDisableMacNotarize(env = process.env) {
+  return !env.APPLE_KEYCHAIN_PROFILE && !env.APPLE_TEAM_ID;
+}
+
 function main() {
   const passthrough = stripLeadingSeparator(process.argv.slice(2));
   const parsed = parsePackageArgs(passthrough);
@@ -418,11 +426,12 @@ function main() {
     );
   }
 
-  const disableMacNotarize = !process.env.APPLE_TEAM_ID;
+  const disableMacNotarize = shouldDisableMacNotarize();
   if (disableMacNotarize) {
     console.warn(
-      "[package] APPLE_TEAM_ID not set — skipping notarization (local dev build). " +
-        "Set APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID for a release build.",
+      "[package] no Apple Keychain profile or legacy Apple-ID credentials configured — " +
+        "skipping notarization (local dev build). Set APPLE_KEYCHAIN_PROFILE, or " +
+        "APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID, for a release build.",
     );
   }
 

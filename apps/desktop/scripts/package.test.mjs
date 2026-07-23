@@ -11,6 +11,7 @@ import {
   normalizeGitVersion,
   parsePackageArgs,
   resolveBuildMatrix,
+  shouldDisableMacNotarize,
   stripLeadingSeparator,
 } from "./package.mjs";
 
@@ -175,6 +176,24 @@ describe("stripLeadingSeparator", () => {
   });
 });
 
+describe("shouldDisableMacNotarize", () => {
+  it("disables notarization with no supported release credentials", () => {
+    expect(shouldDisableMacNotarize({})).toBe(true);
+  });
+
+  it("keeps notarization enabled for a Keychain profile", () => {
+    expect(
+      shouldDisableMacNotarize({ APPLE_KEYCHAIN_PROFILE: "multica-notary" }),
+    ).toBe(false);
+  });
+
+  it("keeps the legacy Apple-ID credential path compatible", () => {
+    expect(shouldDisableMacNotarize({ APPLE_TEAM_ID: "JVMXE5G542" })).toBe(
+      false,
+    );
+  });
+});
+
 describe("fork Desktop release policy", () => {
   it("keeps fork tag workflows from publishing Desktop artifacts", () => {
     const workflow = readFileSync(
@@ -187,7 +206,11 @@ describe("fork Desktop release policy", () => {
     expect(workflow).toMatch(/desktop-mac:[\s\S]*?if: \$\{\{ false \}\}/);
     expect(macGuide).toContain("made manually on\nDavid's arm64 Mac");
     expect(macGuide).toContain("--mac --arm64 --publish never");
-    expect(macGuide).toContain("latest-mac.yml");
+    expect(macGuide).toContain("APPLE_KEYCHAIN_PROFILE=multica-notary");
+    expect(macGuide).toContain("DMG only");
+    expect(macGuide).toContain('--target "$RELEASE_SHA"');
+    expect(macGuide).not.toContain('git push origin "v<version>"');
+    expect(macGuide).toContain("awk -F '\\t'");
   });
 });
 
