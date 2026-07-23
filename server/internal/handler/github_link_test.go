@@ -31,7 +31,8 @@ func TestParseCanonicalGitHubPRURL(t *testing.T) {
 		{"canonical", "https://github.com/acme/widget/pull/42", "acme", "widget", 42, true},
 		{"trailing_slash", "https://github.com/acme/widget/pull/42/", "acme", "widget", 42, true},
 		{"with_query_fragment", "https://github.com/acme/widget/pull/7?diff=unified#discussion", "acme", "widget", 7, true},
-		{"http_accepted", "http://github.com/acme/widget/pull/1", "acme", "widget", 1, true},
+		{"http_rejected", "http://github.com/acme/widget/pull/1", "", "", 0, false},
+		{"credentials_rejected", "https://user@github.com/acme/widget/pull/1", "", "", 0, false},
 		{"whitespace_trimmed", "  https://github.com/acme/widget/pull/9  ", "acme", "widget", 9, true},
 		{"enterprise_host_rejected", "https://github.example.com/acme/widget/pull/1", "", "", 0, false},
 		{"non_pull_path_rejected", "https://github.com/acme/widget/issues/1", "", "", 0, false},
@@ -515,24 +516,23 @@ func TestWebhook_DoesNotClobberManualLink(t *testing.T) {
 	}
 	const instID int64 = 60060060
 	seedManualLinkInstallation(t, testWorkspaceID, instID)
-	// Mirror the PR first (manual link requires a mirrored row), then link it
-	// by hand with close intent. The PR title intentionally references the
-	// issue identifier WITHOUT a closing keyword, so the webhook's own auto-link
-	// would compute closeIntent=false — exactly the clobber we must prevent.
-	seedMirroredPR(t, testWorkspaceID, instID, "acme", "coexist", 71, "open")
-	url := "https://github.com/acme/coexist/pull/71"
-	if w := linkIssuePR(t, issueID, url, true); w.Code != http.StatusOK {
-		t.Fatalf("manual link: %d %s", w.Code, w.Body.String())
-	}
-
-	// A routine push: title carries the identifier, no closing keyword. Build
-	// the identifier from the workspace prefix + issue number (db.Issue has no
-	// Identifier field).
+	// First let the webhook create its normal system-owned link. The manual
+	// action below must promote that existing row to member-owned; otherwise a
+	// later webhook would be allowed to overwrite the member's intent.
 	var prefix string
 	if err := testPool.QueryRow(ctx, `SELECT issue_prefix FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&prefix); err != nil {
 		t.Fatalf("load workspace prefix: %v", err)
 	}
 	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
+	firePullRequestWebhookRaw(t, secret, instID, "acme", "coexist", 71, "opened", "open", false,
+		identifier+" tweak", "", "feature/x")
+
+	url := "https://github.com/acme/coexist/pull/71"
+	if w := linkIssuePR(t, issueID, url, true); w.Code != http.StatusOK {
+		t.Fatalf("manual link: %d %s", w.Code, w.Body.String())
+	}
+
+	// A routine push: title carries the identifier, no closing keyword.
 	firePullRequestWebhookRaw(t, secret, instID, "acme", "coexist", 71, "synchronize", "open", false,
 		identifier+" tweak", "", "feature/x")
 
@@ -552,6 +552,9 @@ func TestWebhook_DoesNotClobberManualLink(t *testing.T) {
 	}
 	if !link.CloseIntent {
 		t.Errorf("webhook clobbered manual close_intent: expected true, got false")
+	}
+	if !link.LinkedByType.Valid || link.LinkedByType.String != "member" {
+		t.Errorf("manual override did not promote link ownership: got %+v", link.LinkedByType)
 	}
 	if link.ReferenceOnly {
 		t.Errorf("webhook flipped reference_only: expected false, got true (PR would vanish from the list)")

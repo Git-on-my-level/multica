@@ -1596,13 +1596,13 @@ func (h *Handler) workspaceHasInstallation(ctx context.Context, workspaceID pgty
 
 // parseCanonicalGitHubPRURL parses a canonical GitHub pull-request URL of the
 // form https://github.com/{owner}/{repo}/pull/{number} and returns its owner,
-// repo, and number. It accepts an optional trailing slash and query/fragment
-// and http(s). Any other shape (non-github.com host, /files or /commits
-// suffixes, non-numeric number) is rejected so manual linking always resolves
-// to exactly one mirrored PR row.
+// repo, and number. It accepts an optional trailing slash and query/fragment.
+// Any other shape (including HTTP, credentials/ports, non-github.com hosts,
+// /files or /commits suffixes, and non-numeric numbers) is rejected so manual
+// linking always resolves to exactly one mirrored PR row.
 func parseCanonicalGitHubPRURL(raw string) (owner, repo string, number int32, ok bool) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Host != "github.com" || (u.Scheme != "https" && u.Scheme != "http") {
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil {
 		return "", "", 0, false
 	}
 	// Path segments, excluding empties: [owner, repo, "pull", number].

@@ -260,7 +260,10 @@ export function PullRequestList({ issueId }: { issueId: string }) {
             <AlertDialogAction
               variant="destructive"
               disabled={unlinkMutation.isPending || !unlinkTarget}
-              onClick={() => {
+              onClick={(event) => {
+                // AlertDialogAction closes by default. Keep the confirmation open
+                // while the mutation runs so a server error remains visible.
+                event.preventDefault();
                 if (unlinkTarget) unlinkMutation.mutate(unlinkTarget.html_url);
               }}
             >

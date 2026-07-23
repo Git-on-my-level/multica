@@ -101,7 +101,6 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     expect(parsed.issues[0]?.stage).toBeNull();
   });
 });
-
 // POST /api/issues/preview-trigger feeds this schema through parseWithFallback
 // in client.previewIssueTrigger with fallback { triggers: [], total_count: 0 }
 // (MUL-3375). The four entry points read it to decide "will this start a run",
@@ -700,4 +699,3 @@ describe("IssuePullRequestResponseSchema", () => {
     ).toBe(EMPTY_GITHUB_PULL_REQUEST);
   });
 });
-

@@ -317,6 +317,18 @@ INSERT INTO issue_pull_request (
     $1, $2, sqlc.narg('linked_by_type'), sqlc.narg('linked_by_id'), $3, sqlc.arg('reference_only')
 )
 ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
+    -- A member's manual link is authoritative even when the webhook had
+    -- already created this row. Without this promotion, the following
+    -- webhook still sees a system-owned row and can undo the member's
+    -- close_intent/reference_only choices.
+    linked_by_type = CASE
+        WHEN EXCLUDED.linked_by_type = 'member' THEN EXCLUDED.linked_by_type
+        ELSE issue_pull_request.linked_by_type
+    END,
+    linked_by_id = CASE
+        WHEN EXCLUDED.linked_by_type = 'member' THEN EXCLUDED.linked_by_id
+        ELSE issue_pull_request.linked_by_id
+    END,
     close_intent = CASE
         WHEN sqlc.arg('preserve_close_intent') THEN issue_pull_request.close_intent
         ELSE EXCLUDED.close_intent
