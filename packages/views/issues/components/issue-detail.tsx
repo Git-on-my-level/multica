@@ -1665,7 +1665,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             {t(($) => $.detail.section_pull_requests)}
             <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${pullRequestsOpen ? "rotate-90" : ""}`} />
           </button>
-          {pullRequestsOpen && <div className="pl-2"><PullRequestList issueId={id} /></div>}
+          {pullRequestsOpen && <div className="pl-2"><PullRequestList issueId={id} wsId={wsId} /></div>}
         </div>
       )}
 

@@ -333,6 +333,14 @@ INSERT INTO issue_pull_request (
     $1, $2, $4, $5, $3, $6
 )
 ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
+    linked_by_type = CASE
+        WHEN EXCLUDED.linked_by_type = 'member' THEN EXCLUDED.linked_by_type
+        ELSE issue_pull_request.linked_by_type
+    END,
+    linked_by_id = CASE
+        WHEN EXCLUDED.linked_by_type = 'member' THEN EXCLUDED.linked_by_id
+        ELSE issue_pull_request.linked_by_id
+    END,
     close_intent = CASE
         WHEN $7 THEN issue_pull_request.close_intent
         ELSE EXCLUDED.close_intent
@@ -634,6 +642,32 @@ func (q *Queries) UnlinkIssueFromPullRequest(ctx context.Context, arg UnlinkIssu
 	_, err := q.db.Exec(ctx, unlinkIssueFromPullRequest, arg.IssueID, arg.PullRequestID)
 	return err
 }
+
+const getIssuePullRequestLink = `-- name: GetIssuePullRequestLink :one
+SELECT issue_id, pull_request_id, linked_by_type, linked_by_id, linked_at, close_intent, reference_only FROM issue_pull_request
+WHERE issue_id = $1 AND pull_request_id = $2
+`
+
+type GetIssuePullRequestLinkParams struct {
+	IssueID       pgtype.UUID `json:"issue_id"`
+	PullRequestID pgtype.UUID `json:"pull_request_id"`
+}
+
+func (q *Queries) GetIssuePullRequestLink(ctx context.Context, arg GetIssuePullRequestLinkParams) (IssuePullRequest, error) {
+	row := q.db.QueryRow(ctx, getIssuePullRequestLink, arg.IssueID, arg.PullRequestID)
+	var i IssuePullRequest
+	err := row.Scan(
+		&i.IssueID,
+		&i.PullRequestID,
+		&i.LinkedByType,
+		&i.LinkedByID,
+		&i.LinkedAt,
+		&i.CloseIntent,
+		&i.ReferenceOnly,
+	)
+	return i, err
+}
+
 
 const updateGitHubInstallationAccountByInstallationID = `-- name: UpdateGitHubInstallationAccountByInstallationID :many
 UPDATE github_installation

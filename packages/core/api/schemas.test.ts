@@ -8,10 +8,14 @@ import {
   CreateFeedbackResponseSchema,
   DuplicateIssueErrorBodySchema,
   EMPTY_CREATE_FEEDBACK_RESPONSE,
+  EMPTY_GITHUB_PULL_REQUEST,
+  EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
   EMPTY_INBOX_UNREAD_SUMMARY,
   EMPTY_SEARCH_PROJECTS_RESPONSE,
   EMPTY_USER,
+  GitHubPullRequestSchema,
   InboxUnreadSummarySchema,
+  IssuePullRequestResponseSchema,
   IssueTriggerPreviewSchema,
   ListIssuesResponseSchema,
   SearchProjectsResponseSchema,
@@ -97,7 +101,6 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     expect(parsed.issues[0]?.stage).toBeNull();
   });
 });
-
 // POST /api/issues/preview-trigger feeds this schema through parseWithFallback
 // in client.previewIssueTrigger with fallback { triggers: [], total_count: 0 }
 // (MUL-3375). The four entry points read it to decide "will this start a run",
@@ -627,5 +630,72 @@ describe("SearchProjectsResponseSchema date drift", () => {
     expect(parsed.projects).toHaveLength(1);
     expect(parsed.projects[0]?.start_date).toBeNull();
     expect(parsed.projects[0]?.due_date).toBeNull();
+  });
+});
+
+// The link PR endpoint returns { pull_request }. A drift (null body, or a
+// number field sent as a string) must fall back to the empty PR so the PR
+// list keeps rendering instead of white-screening.
+describe("IssuePullRequestResponseSchema", () => {
+  const ENDPOINT = { endpoint: "POST /api/issues/:id/pull-requests/link" };
+
+  it("parses a well-formed pull request and preserves extra fields", () => {
+    const parsed = parseWithFallback(
+      {
+        pull_request: {
+          id: "pr-1",
+          workspace_id: "ws-1",
+          repo_owner: "acme",
+          repo_name: "widget",
+          number: 42,
+          title: "Fix bug",
+          state: "open",
+          html_url: "https://github.com/acme/widget/pull/42",
+          pr_created_at: "2026-01-01T00:00:00Z",
+          pr_updated_at: "2026-01-01T00:00:00Z",
+          checks_passed: 0,
+          checks_failed: 0,
+          checks_pending: 0,
+          additions: 0,
+          deletions: 0,
+          changed_files: 0,
+          future_field: true,
+        },
+      },
+      IssuePullRequestResponseSchema,
+      EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
+      ENDPOINT,
+    );
+    expect(parsed.pull_request.number).toBe(42);
+    expect((parsed.pull_request as unknown as Record<string, unknown>).future_field).toBe(true);
+  });
+
+  it("returns the empty fallback for null and for a wrong-typed number", () => {
+    // null body -> wrapper fallback, whose pull_request is the empty PR.
+    expect(
+      parseWithFallback(null, IssuePullRequestResponseSchema, EMPTY_ISSUE_PULL_REQUEST_RESPONSE, ENDPOINT),
+    ).toBe(EMPTY_ISSUE_PULL_REQUEST_RESPONSE);
+    // wrong-typed number on the inner PR -> wrapper fallback.
+    expect(
+      parseWithFallback(
+        { pull_request: { id: "pr-1", number: "not-a-number" } },
+        IssuePullRequestResponseSchema,
+        EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
+        ENDPOINT,
+      ),
+    ).toBe(EMPTY_ISSUE_PULL_REQUEST_RESPONSE);
+    // Inner schema directly: null and a wrong-typed number both yield the
+    // empty PR record.
+    expect(
+      parseWithFallback(null, GitHubPullRequestSchema, EMPTY_GITHUB_PULL_REQUEST, ENDPOINT),
+    ).toBe(EMPTY_GITHUB_PULL_REQUEST);
+    expect(
+      parseWithFallback(
+        { id: "pr-1", number: "not-a-number" },
+        GitHubPullRequestSchema,
+        EMPTY_GITHUB_PULL_REQUEST,
+        ENDPOINT,
+      ),
+    ).toBe(EMPTY_GITHUB_PULL_REQUEST);
   });
 });

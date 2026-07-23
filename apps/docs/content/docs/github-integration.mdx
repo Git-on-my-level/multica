@@ -191,7 +191,7 @@ curl -i -X POST https://<api-host>/api/webhooks/github \
 
 A few rough edges to be aware of today:
 
-- **No manual link UI yet** — the only way to link a PR is to have the identifier in its branch, title, or body.
+- **Manual linking requires a mirrored PR** — you can link a PR to an issue by hand from the issue's PR panel or with `multica issue pull-requests link <issue> --url <github-pr-url> [--close-intent]` (and unlink the same way). The PR must already be mirrored in the workspace — i.e. a connected GitHub App installation has reported it via webhook. Manually fetching an unmirrored PR through the installation is not supported yet; a PR that hasn't appeared in Multica returns an actionable error. A manual link with **close intent** to an already-merged PR moves the issue to `Done` under the same native gate as a `Closes` keyword (no open sibling PRs, issue not already `done`/`cancelled`). Unlinking never reopens a `done`/`cancelled` issue.
 - **No CI / check state** — only the PR itself is mirrored. Build status, review comments, and reviewers are not surfaced in Multica.
 - **No workspace-level config** for the merge → Done rule — it's a fixed default (`merged → done`, unless `cancelled`). Workspace-customizable mappings are a future addition.
 - **Multi-PR-to-one-issue is conservative on merge** — if two PRs both reference `MUL-123` and the first one merges, the issue is moved to `Done` immediately. A follow-up change to wait for all linked PRs to resolve before advancing is in progress.

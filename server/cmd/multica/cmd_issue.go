@@ -188,6 +188,20 @@ var issuePullRequestsCmd = &cobra.Command{
 	RunE:    runIssuePullRequests,
 }
 
+var issuePullRequestsLinkCmd = &cobra.Command{
+	Use:   "link <issue>",
+	Short: "Manually link a GitHub pull request to an issue",
+	Args:  exactArgs(1),
+	RunE:  runIssuePullRequestsLink,
+}
+
+var issuePullRequestsUnlinkCmd = &cobra.Command{
+	Use:   "unlink <issue>",
+	Short: "Unlink a GitHub pull request from an issue",
+	Args:  exactArgs(1),
+	RunE:  runIssuePullRequestsUnlink,
+}
+
 var issueChildrenCmd = &cobra.Command{
 	Use:     "children <id>",
 	Aliases: []string{"subissues"},
@@ -408,6 +422,8 @@ func init() {
 	issueCmd.AddCommand(issueListCmd)
 	issueCmd.AddCommand(issueGetCmd)
 	issueCmd.AddCommand(issuePullRequestsCmd)
+	issuePullRequestsCmd.AddCommand(issuePullRequestsLinkCmd)
+	issuePullRequestsCmd.AddCommand(issuePullRequestsUnlinkCmd)
 	issueCmd.AddCommand(issueChildrenCmd)
 	issueCmd.AddCommand(issueCreateCmd)
 	issueCmd.AddCommand(issueUpdateCmd)
@@ -452,6 +468,15 @@ func init() {
 
 	// issue pull-requests
 	issuePullRequestsCmd.Flags().String("output", "table", "Output format: table or json")
+
+	// issue pull-requests link
+	issuePullRequestsLinkCmd.Flags().String("url", "", "Canonical GitHub pull request URL to link (required)")
+	issuePullRequestsLinkCmd.Flags().Bool("close-intent", false, "Mark the issue done when this PR merges")
+	issuePullRequestsLinkCmd.Flags().String("output", "table", "Output format: table or json")
+
+	// issue pull-requests unlink
+	issuePullRequestsUnlinkCmd.Flags().String("url", "", "Canonical GitHub pull request URL to unlink (required)")
+	issuePullRequestsUnlinkCmd.Flags().String("output", "table", "Output format: table or json")
 
 	issueChildrenCmd.Flags().String("output", "table", "Output format: table or json")
 	issueChildrenCmd.Flags().Bool("full-id", false, "Show full UUIDs in table output")
@@ -752,6 +777,78 @@ func runIssuePullRequests(cmd *cobra.Command, args []string) error {
 
 	prs, _ := result["pull_requests"].([]any)
 	printIssuePullRequestsTable(normalizePullRequestList(prs))
+	return nil
+}
+
+// runIssuePullRequestsLink manually links a GitHub pull request to an issue.
+// The PR must already be mirrored in the issue's workspace (delivered by a
+// connected GitHub App installation); an unmirrored PR returns a 404 from the
+// server, which is surfaced to the user. With --close-intent the server advances
+// the issue to done once the PR merges, under the native close gate.
+func runIssuePullRequestsLink(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueRef, err := resolveIssueRef(ctx, client, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve issue: %w", err)
+	}
+
+	urlVal, _ := cmd.Flags().GetString("url")
+	if urlVal == "" {
+		return fmt.Errorf("--url is required")
+	}
+	closeIntent, _ := cmd.Flags().GetBool("close-intent")
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+url.PathEscape(issueRef.ID)+"/pull-requests/link", map[string]any{"url": urlVal, "close_intent": closeIntent}, &result); err != nil {
+		return fmt.Errorf("link pull request: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, result)
+	}
+	fmt.Printf("Linked %s to %s\n", urlVal, issueRef.Display)
+	return nil
+}
+
+// runIssuePullRequestsUnlink removes a manually linked GitHub pull request from
+// an issue. Unlinking never reopens a done/cancelled issue.
+func runIssuePullRequestsUnlink(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueRef, err := resolveIssueRef(ctx, client, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve issue: %w", err)
+	}
+
+	urlVal, _ := cmd.Flags().GetString("url")
+	if urlVal == "" {
+		return fmt.Errorf("--url is required")
+	}
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+url.PathEscape(issueRef.ID)+"/pull-requests/unlink", map[string]any{"url": urlVal}, &result); err != nil {
+		return fmt.Errorf("unlink pull request: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, result)
+	}
+	fmt.Printf("Unlinked %s from %s\n", urlVal, issueRef.Display)
 	return nil
 }
 

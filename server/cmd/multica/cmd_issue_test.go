@@ -717,6 +717,195 @@ func TestRunIssuePullRequestsTableIncludesCoreFields(t *testing.T) {
 	}
 }
 
+func newIssuePullRequestsLinkTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "link"}
+	cmd.Flags().String("output", "table", "")
+	cmd.Flags().String("url", "", "")
+	cmd.Flags().Bool("close-intent", false, "")
+	return cmd
+}
+
+func newIssuePullRequestsUnlinkTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "unlink"}
+	cmd.Flags().String("output", "table", "")
+	cmd.Flags().String("url", "", "")
+	return cmd
+}
+
+// TestRunIssuePullRequestsLink_PostsUrlAndCloseIntent asserts the link
+// subcommand POSTs {url, close_intent} to the resolved issue's link endpoint,
+// covering the default (close_intent=false) and --close-intent=true paths, and
+// that a missing --url errors before any link request is made.
+func TestRunIssuePullRequestsLink_PostsUrlAndCloseIntent(t *testing.T) {
+	for _, closeIntent := range []bool{false, true} {
+		label := "default_false"
+		if closeIntent {
+			label = "explicit_true"
+		}
+		t.Run(label, func(t *testing.T) {
+			var (
+				gotMethod string
+				gotBody   map[string]any
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/issues/MUL-2818":
+					json.NewEncoder(w).Encode(map[string]any{
+						"id":         "issue-uuid",
+						"identifier": "MUL-2818",
+					})
+				case "/api/issues/issue-uuid/pull-requests/link":
+					gotMethod = r.Method
+					_ = json.NewDecoder(r.Body).Decode(&gotBody)
+					json.NewEncoder(w).Encode(map[string]any{
+						"pull_request": map[string]any{
+							"number":   float64(42),
+							"state":    "open",
+							"html_url": "https://github.com/multica-ai/multica/pull/42",
+						},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			t.Setenv("MULTICA_SERVER_URL", srv.URL)
+			t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+			t.Setenv("MULTICA_TOKEN", "test-token")
+
+			cmd := newIssuePullRequestsLinkTestCmd()
+			_ = cmd.Flags().Set("url", "https://github.com/multica-ai/multica/pull/42")
+			if closeIntent {
+				_ = cmd.Flags().Set("close-intent", "true")
+			}
+
+			old := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+			err := runIssuePullRequestsLink(cmd, []string{"MUL-2818"})
+			_ = w.Close()
+			os.Stdout = old
+			out, _ := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("runIssuePullRequestsLink: %v", err)
+			}
+
+			if gotMethod != "POST" {
+				t.Fatalf("method = %q, want POST", gotMethod)
+			}
+			if gotBody["url"] != "https://github.com/multica-ai/multica/pull/42" {
+				t.Fatalf("body url = %#v, want the PR URL", gotBody["url"])
+			}
+			if gotBody["close_intent"] != closeIntent {
+				t.Fatalf("body close_intent = %#v, want %v", gotBody["close_intent"], closeIntent)
+			}
+			text := string(out)
+			if !strings.Contains(text, "https://github.com/multica-ai/multica/pull/42") || !strings.Contains(text, "MUL-2818") {
+				t.Fatalf("stdout missing url/identifier: %q", text)
+			}
+		})
+	}
+
+	// Missing --url must error before any link POST reaches the server. The
+	// resolve GET still runs (it precedes the --url guard), but the link
+	// endpoint must never be hit.
+	t.Run("missing_url_errors", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/issues/MUL-2818":
+				json.NewEncoder(w).Encode(map[string]any{"id": "issue-uuid", "identifier": "MUL-2818"})
+			case "/api/issues/issue-uuid/pull-requests/link":
+				t.Fatalf("link endpoint must not be hit when --url is missing")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		t.Setenv("MULTICA_SERVER_URL", srv.URL)
+		t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+		t.Setenv("MULTICA_TOKEN", "test-token")
+
+		cmd := newIssuePullRequestsLinkTestCmd()
+		err := runIssuePullRequestsLink(cmd, []string{"MUL-2818"})
+		if err == nil {
+			t.Fatal("expected error for missing --url, got nil")
+		}
+		if !strings.Contains(err.Error(), "--url is required") {
+			t.Fatalf("error = %q, want it to mention --url is required", err.Error())
+		}
+	})
+}
+
+// TestRunIssuePullRequestsUnlink_PostsUrl asserts the unlink subcommand POSTs
+// {url} (no close_intent) to the resolved issue's unlink endpoint, prints a
+// human confirmation, and errors when --url is missing.
+func TestRunIssuePullRequestsUnlink_PostsUrl(t *testing.T) {
+	var (
+		gotMethod string
+		gotBody   map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/MUL-2818":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id":         "issue-uuid",
+				"identifier": "MUL-2818",
+			})
+		case "/api/issues/issue-uuid/pull-requests/unlink":
+			gotMethod = r.Method
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssuePullRequestsUnlinkTestCmd()
+	_ = cmd.Flags().Set("url", "https://github.com/multica-ai/multica/pull/42")
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err := runIssuePullRequestsUnlink(cmd, []string{"MUL-2818"})
+	_ = w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("runIssuePullRequestsUnlink: %v", err)
+	}
+
+	if gotMethod != "POST" {
+		t.Fatalf("method = %q, want POST", gotMethod)
+	}
+	if gotBody["url"] != "https://github.com/multica-ai/multica/pull/42" {
+		t.Fatalf("body url = %#v, want the PR URL", gotBody["url"])
+	}
+	if _, ok := gotBody["close_intent"]; ok {
+		t.Fatalf("unlink body must not carry close_intent, got %#v", gotBody)
+	}
+	text := string(out)
+	if !strings.Contains(text, "https://github.com/multica-ai/multica/pull/42") || !strings.Contains(text, "MUL-2818") {
+		t.Fatalf("stdout missing url/identifier: %q", text)
+	}
+
+	// Missing --url must error before any unlink POST reaches the server.
+	cmd2 := newIssuePullRequestsUnlinkTestCmd()
+	err = runIssuePullRequestsUnlink(cmd2, []string{"MUL-2818"})
+	if err == nil {
+		t.Fatal("expected error for missing --url, got nil")
+	}
+	if !strings.Contains(err.Error(), "--url is required") {
+		t.Fatalf("error = %q, want it to mention --url is required", err.Error())
+	}
+}
+
 func TestTruncateID(t *testing.T) {
 	tests := []struct {
 		name string

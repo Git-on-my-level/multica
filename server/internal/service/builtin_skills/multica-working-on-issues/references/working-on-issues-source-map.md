@@ -21,6 +21,38 @@ The CLI resolves the issue ref, GETs the endpoint, and (for `--output json`)
 prints the raw `{"pull_requests": [...]}` body. Only `--output` is accepted; the
 default `table` shows `NUMBER STATE TITLE URL`.
 
+## Manual link / unlink (first-class, not metadata)
+
+A PR can be linked by hand from the CLI or the web/desktop issue-detail UI, in
+addition to the webhook auto-link path. Linking reuses the SAME
+`issue_pull_request` row + `close_intent`/`reference_only` columns and the SAME
+close aggregate as webhooks — there is no parallel metadata-only link system.
+
+| Behavior | File:line |
+|---|---|
+| CLI `multica issue pull-requests link <issue> --url <github-pr-url> [--close-intent]` | `server/cmd/multica/cmd_issue.go:191` (cmd), `:788` (`runIssuePullRequestsLink`) |
+| CLI `multica issue pull-requests unlink <issue> --url <github-pr-url>` | `server/cmd/multica/cmd_issue.go:198` (cmd), `:823` (`runIssuePullRequestsUnlink`) |
+| `pull-requests` stays a leaf list command with `link`/`unlink` subcommands (`git stash` pattern) | `server/cmd/multica/cmd_issue.go:425-426` (`AddCommand`) |
+| POST routes `/pull-requests/link`, `/pull-requests/unlink` | `server/cmd/server/router.go:1021-1022` |
+| Handler `LinkPullRequestToIssue` | `server/internal/handler/github.go:600` |
+| Handler `UnlinkPullRequestFromIssue` | `server/internal/handler/github.go:680` |
+| Canonical URL parse `parseCanonicalGitHubPRURL` (github.com `/pull/<n>` only) | `server/internal/handler/github.go:1578` |
+| Connected-installation scope gate `workspaceHasInstallation` | `server/internal/handler/github.go:1559` |
+| Shared close-gate re-eval `reevaluateIssueCloseGate` (also used by the webhook mirror path) | `server/internal/handler/github.go:1540` |
+
+The `{id}` segment accepts the issue UUID or `PREFIX-NUMBER` (CLI resolves via
+`resolveIssueRef`). `close_intent` defaults FALSE. The PR must already be
+mirrored in the issue's workspace — `GetGitHubPullRequest` is keyed on
+`(workspace_id, owner, repo, number)`, so a PR mirrored in another workspace
+can never resolve here (cross-workspace denial by construction), and an
+unmirrored PR returns 404 (fail-closed). A link with `close_intent` to an
+already-merged PR re-runs `reevaluateIssueCloseGate`, advancing the issue to
+`done` only when the native conditions hold (issue not `done`/`cancelled`, no
+open/draft sibling, ≥1 merged close-intent PR). Unlinking deletes the link row
+only and never reopens a `done`/`cancelled` issue. Both emit
+`pull_request:linked` / `pull_request:unlinked`; `done` transitions also emit
+`issue:updated`.
+
 ## PR response shape
 
 `GitHubPullRequestResponse` struct: `server/internal/handler/github.go:51`. JSON
@@ -172,4 +204,7 @@ grep -n 'extractIdentifiers(\|extractClosingIdentifiers(\|derivePRState(' intern
 grep -n 'qualifyingIdents\|reference_only\|ReferenceOnly' internal/handler/github.go pkg/db/queries/github.sql
 grep -n 'prevIssue.Status == "backlog"\|func (h \*Handler) shouldEnqueueAgentTask' internal/handler/issue.go
 grep -n 'func notifyParentOfChildDone'       internal/handler/issue_child_done.go
+grep -n 'issuePullRequestsLinkCmd\|issuePullRequestsUnlinkCmd\|runIssuePullRequestsLink\|runIssuePullRequestsUnlink' cmd/multica/cmd_issue.go
+grep -n 'pull-requests/link\|pull-requests/unlink\|LinkPullRequestToIssue\|UnlinkPullRequestFromIssue' cmd/server/router.go internal/handler/github.go
+grep -n 'func parseCanonicalGitHubPRURL\|func (h \*Handler) workspaceHasInstallation\|func (h \*Handler) reevaluateIssueCloseGate' internal/handler/github.go
 ```

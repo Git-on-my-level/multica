@@ -233,6 +233,8 @@ import {
   EMPTY_LABEL,
   EMPTY_LIST_LABELS_RESPONSE,
   EMPTY_RESOURCE_LABELS_RESPONSE,
+  IssuePullRequestResponseSchema,
+  EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
 } from "./schemas";
 
 /** Identifies the calling client to the server.
@@ -2408,6 +2410,43 @@ export class ApiClient {
 
   async listIssuePullRequests(issueId: string): Promise<{ pull_requests: GitHubPullRequest[] }> {
     return this.fetch(`/api/issues/${issueId}/pull-requests`);
+  }
+
+  // Manually link a GitHub PR URL to an issue. The server canonicalises the
+  // URL and requires the PR to already be mirrored in this workspace (a
+  // connected GitHub App installation delivers it via webhook); an unmirrored
+  // PR returns 404 — fail-closed, surfaced to the user by the UI. When
+  // closeIntent is true and the linked PR is merged, the server advances the
+  // issue to done under the native close gate. The response is parsed leniently
+  // so a contract drift degrades to the empty PR rather than crashing the list.
+  async linkIssuePullRequest(
+    issueId: string,
+    url: string,
+    closeIntent: boolean,
+  ): Promise<GitHubPullRequest> {
+    const raw = await this.fetch<unknown>(
+      `/api/issues/${issueId}/pull-requests/link`,
+      {
+        method: "POST",
+        body: JSON.stringify({ url, close_intent: closeIntent }),
+      },
+    );
+    const body = parseWithFallback(
+      raw,
+      IssuePullRequestResponseSchema,
+      EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
+      { endpoint: "POST /api/issues/:id/pull-requests/link" },
+    );
+    return body.pull_request;
+  }
+
+  // Unlink a previously (manually or automatically) linked PR. Never reopens
+  // a done/cancelled issue — the close gate is one-way for those states.
+  async unlinkIssuePullRequest(issueId: string, url: string): Promise<void> {
+    await this.fetch(`/api/issues/${issueId}/pull-requests/unlink`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
   }
 
   // Lark integration
