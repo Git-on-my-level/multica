@@ -322,4 +322,24 @@ describe("PullRequestList link / unlink", () => {
       );
     });
   });
+
+  it("shows the server error in the confirm dialog when unlinking fails", async () => {
+    mockUnlinkIssuePullRequest.mockRejectedValue(
+      new Error("pull request is not linked to this issue"),
+    );
+    mockPRs = [makePR({ html_url: "https://github.com/acme/widget/pull/42" })];
+    renderList();
+    await waitForRender();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Unlink$/i }));
+    fireEvent.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", { name: /^Unlink$/i }),
+    );
+
+    // The error surfaces inside the confirm dialog and the dialog stays open.
+    await waitFor(() => {
+      expect(screen.getByText(/not linked to this issue/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+  });
 });

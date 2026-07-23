@@ -574,7 +574,6 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"pull_requests": out})
 }
 
-
 // ── Manual link / unlink ───────────────────────────────────────────────────
 
 // linkPullRequestRequest is the body for POST /api/issues/{id}/pull-requests/link.
@@ -703,6 +702,16 @@ func (h *Handler) UnlinkPullRequestFromIssue(w http.ResponseWriter, r *http.Requ
 		PrNumber:    number,
 	})
 	if err != nil {
+		writeError(w, http.StatusNotFound, "pull request is not linked to this issue")
+		return
+	}
+	// The PR is mirrored, but may not be linked to THIS issue. Distinguish the
+	// two cases so an idempotent re-unlink reports the missing link rather than
+	// silently 200-ing.
+	if _, err := h.Queries.GetIssuePullRequestLink(r.Context(), db.GetIssuePullRequestLinkParams{
+		IssueID:       issue.ID,
+		PullRequestID: pr.ID,
+	}); err != nil {
 		writeError(w, http.StatusNotFound, "pull request is not linked to this issue")
 		return
 	}
@@ -1089,12 +1098,29 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 			closeIntent := declared && !preserveCloseIntent
 			_, qualifies := qualifyingIdents[id]
 			referenceOnly := !qualifies
+			// A member-authored manual link is authoritative: routine webhook
+			// activity (synchronize/edited) must not regress its close_intent or
+			// hide the PR by flipping reference_only to true. If a manual link
+			// already exists for this (issue, PR), preserve both fields as-stored
+			// so the webhook only manages its own system-authored rows. Without
+			// this, a push to a manually-linked PR with no closing keyword would
+			// wipe the manual "mark done when merged" intent (close_intent) and a
+			// bare body mention would flip reference_only and hide the PR.
+			preserve := preserveCloseIntent
+			refOnly := referenceOnly
+			if existing, err := h.Queries.GetIssuePullRequestLink(ctx, db.GetIssuePullRequestLinkParams{
+				IssueID:       issue.ID,
+				PullRequestID: pr.ID,
+			}); err == nil && existing.LinkedByType.Valid && existing.LinkedByType.String == "member" {
+				preserve = true
+				refOnly = existing.ReferenceOnly
+			}
 			if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
 				IssueID:             issue.ID,
 				PullRequestID:       pr.ID,
 				CloseIntent:         closeIntent,
-				ReferenceOnly:       referenceOnly,
-				PreserveCloseIntent: preserveCloseIntent,
+				ReferenceOnly:       refOnly,
+				PreserveCloseIntent: preserve,
 				LinkedByType:        strToText("system"),
 				LinkedByID:          pgtype.UUID{},
 			}); err != nil {
@@ -1528,7 +1554,6 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		"source":         "github_pr_merged",
 	})
 }
-
 
 // reevaluateIssueCloseGate re-runs the issue auto-advance gate against the
 // persisted PR close aggregate. It advances the issue to done only when the

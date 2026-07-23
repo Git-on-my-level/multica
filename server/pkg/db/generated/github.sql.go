@@ -635,6 +635,32 @@ func (q *Queries) UnlinkIssueFromPullRequest(ctx context.Context, arg UnlinkIssu
 	return err
 }
 
+const getIssuePullRequestLink = `-- name: GetIssuePullRequestLink :one
+SELECT issue_id, pull_request_id, linked_by_type, linked_by_id, linked_at, close_intent, reference_only FROM issue_pull_request
+WHERE issue_id = $1 AND pull_request_id = $2
+`
+
+type GetIssuePullRequestLinkParams struct {
+	IssueID       pgtype.UUID `json:"issue_id"`
+	PullRequestID pgtype.UUID `json:"pull_request_id"`
+}
+
+func (q *Queries) GetIssuePullRequestLink(ctx context.Context, arg GetIssuePullRequestLinkParams) (IssuePullRequest, error) {
+	row := q.db.QueryRow(ctx, getIssuePullRequestLink, arg.IssueID, arg.PullRequestID)
+	var i IssuePullRequest
+	err := row.Scan(
+		&i.IssueID,
+		&i.PullRequestID,
+		&i.LinkedByType,
+		&i.LinkedByID,
+		&i.LinkedAt,
+		&i.CloseIntent,
+		&i.ReferenceOnly,
+	)
+	return i, err
+}
+
+
 const updateGitHubInstallationAccountByInstallationID = `-- name: UpdateGitHubInstallationAccountByInstallationID :many
 UPDATE github_installation
 SET account_login = $2,

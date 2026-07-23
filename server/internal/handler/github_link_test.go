@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -76,20 +81,20 @@ func seedMirroredPR(t *testing.T, wsID string, installationID int64, owner, repo
 	ctx := context.Background()
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	params := db.UpsertGitHubPullRequestParams{
-		WorkspaceID:  parseUUID(wsID),
+		WorkspaceID:    parseUUID(wsID),
 		InstallationID: installationID,
-		RepoOwner:    owner,
-		RepoName:     repo,
-		PrNumber:     number,
-		Title:        "Mirrored PR " + repo + "#" + strconv.Itoa(int(number)),
-		State:        state,
-		HtmlUrl:      "https://github.com/" + owner + "/" + repo + "/pull/" + strconv.Itoa(int(number)),
-		PrCreatedAt:  now,
-		PrUpdatedAt:  now,
-		HeadSha:      "deadbeef",
-		Additions:    1,
-		Deletions:    1,
-		ChangedFiles: 1,
+		RepoOwner:      owner,
+		RepoName:       repo,
+		PrNumber:       number,
+		Title:          "Mirrored PR " + repo + "#" + strconv.Itoa(int(number)),
+		State:          state,
+		HtmlUrl:        "https://github.com/" + owner + "/" + repo + "/pull/" + strconv.Itoa(int(number)),
+		PrCreatedAt:    now,
+		PrUpdatedAt:    now,
+		HeadSha:        "deadbeef",
+		Additions:      1,
+		Deletions:      1,
+		ChangedFiles:   1,
 	}
 	if state == "merged" {
 		params.MergedAt = now
@@ -444,5 +449,114 @@ func TestUnlinkPullRequest_NotMirroredReturns404(t *testing.T) {
 	w := unlinkIssuePR(t, issueID, "https://github.com/acme/never-mirrored/pull/99")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unlink unmirrored: expected 404, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// firePullRequestWebhookRaw delivers a signed pull_request webhook with full
+// control over action/title/body/branch. Unlike the multi-PR suite's
+// firePullRequestWebhook (which titles the PR "Fix <id>", a closing keyword),
+// this one lets a test place the issue identifier in the title WITHOUT a
+// closing keyword — the exact shape that exposes the manual-link clobber. The
+// path is exercised end-to-end through HandleGitHubWebhook (HMAC + installation
+// lookup + mirror + auto-link), not just the handler's internals.
+func firePullRequestWebhookRaw(t *testing.T, secret string, instID int64, owner, repo string, number int32, action, state string, merged bool, title, body, branch string) {
+	t.Helper()
+	payload := map[string]any{
+		"action": action,
+		"pull_request": map[string]any{
+			"number":     number,
+			"html_url":   "https://github.com/" + owner + "/" + repo + "/pull/" + strconv.Itoa(int(number)),
+			"title":      title,
+			"body":       body,
+			"state":      state,
+			"draft":      false,
+			"merged":     merged,
+			"created_at": "2026-07-23T00:00:00Z",
+			"updated_at": "2026-07-23T00:00:00Z",
+			"head":       map[string]any{"ref": branch, "sha": "cafebabe"},
+			"user":       map[string]any{"login": "octocat", "avatar_url": ""},
+		},
+		"repository":   map[string]any{"name": repo, "owner": map[string]any{"login": owner}},
+		"installation": map[string]any{"id": instID},
+	}
+	raw, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(raw)
+	req := httptest.NewRequest("POST", "/api/webhooks/github", bytes.NewReader(raw))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	rec := httptest.NewRecorder()
+	testHandler.HandleGitHubWebhook(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("webhook %s: expected 202, got %d %s", action, rec.Code, rec.Body.String())
+	}
+}
+
+// TestWebhook_DoesNotClobberManualLink is the regression guard for the
+// manual-link / webhook coexistence bug: a manually-linked PR with
+// close_intent=true must survive routine webhook activity (a synchronize push
+// whose title carries the issue identifier but no closing keyword). Without
+// the member-link preservation in mirrorPullRequestForWorkspace, that push
+// would overwrite close_intent true->false and silently kill "mark done when
+// merged"; a bare body mention would additionally flip reference_only and hide
+// the PR from the list.
+func TestWebhook_DoesNotClobberManualLink(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	secret := "manual-coexist-secret"
+	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
+
+	issueID := createManualLinkIssue(t, "in_progress")
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	const instID int64 = 60060060
+	seedManualLinkInstallation(t, testWorkspaceID, instID)
+	// Mirror the PR first (manual link requires a mirrored row), then link it
+	// by hand with close intent. The PR title intentionally references the
+	// issue identifier WITHOUT a closing keyword, so the webhook's own auto-link
+	// would compute closeIntent=false — exactly the clobber we must prevent.
+	seedMirroredPR(t, testWorkspaceID, instID, "acme", "coexist", 71, "open")
+	url := "https://github.com/acme/coexist/pull/71"
+	if w := linkIssuePR(t, issueID, url, true); w.Code != http.StatusOK {
+		t.Fatalf("manual link: %d %s", w.Code, w.Body.String())
+	}
+
+	// A routine push: title carries the identifier, no closing keyword. Build
+	// the identifier from the workspace prefix + issue number (db.Issue has no
+	// Identifier field).
+	var prefix string
+	if err := testPool.QueryRow(ctx, `SELECT issue_prefix FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&prefix); err != nil {
+		t.Fatalf("load workspace prefix: %v", err)
+	}
+	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
+	firePullRequestWebhookRaw(t, secret, instID, "acme", "coexist", 71, "synchronize", "open", false,
+		identifier+" tweak", "", "feature/x")
+
+	// Resolve the link row via the mirrored PR id and assert the webhook did
+	// not regress the member-authored close_intent or flip reference_only.
+	pr, err := testHandler.Queries.GetGitHubPullRequest(ctx, db.GetGitHubPullRequestParams{
+		WorkspaceID: parseUUID(testWorkspaceID), RepoOwner: "acme", RepoName: "coexist", PrNumber: 71,
+	})
+	if err != nil {
+		t.Fatalf("GetGitHubPullRequest: %v", err)
+	}
+	link, err := testHandler.Queries.GetIssuePullRequestLink(ctx, db.GetIssuePullRequestLinkParams{
+		IssueID: parseUUID(issueID), PullRequestID: pr.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetIssuePullRequestLink after webhook: %v", err)
+	}
+	if !link.CloseIntent {
+		t.Errorf("webhook clobbered manual close_intent: expected true, got false")
+	}
+	if link.ReferenceOnly {
+		t.Errorf("webhook flipped reference_only: expected false, got true (PR would vanish from the list)")
+	}
+	if got := countLinks(t, issueID); got != 1 {
+		t.Errorf("expected PR to remain visible (1 link), got %d", got)
 	}
 }

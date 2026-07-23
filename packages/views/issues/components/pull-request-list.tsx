@@ -99,6 +99,7 @@ export function PullRequestList({ issueId }: { issueId: string }) {
   // Unlink confirm dialog state. One dialog at the list level rather than one
   // per row — the target PR is captured here when a row's unlink button fires.
   const [unlinkTarget, setUnlinkTarget] = useState<GitHubPullRequest | null>(null);
+  const [unlinkError, setUnlinkError] = useState<string | null>(null);
 
   const resetLinkDialog = () => {
     setUrl("");
@@ -124,7 +125,9 @@ export function PullRequestList({ issueId }: { issueId: string }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
       setUnlinkTarget(null);
+      setUnlinkError(null);
     },
+    onError: (e: unknown) => setUnlinkError(e instanceof Error ? e.message : String(e)),
   });
 
   const trimmedUrl = url.trim();
@@ -163,7 +166,10 @@ export function PullRequestList({ issueId }: { issueId: string }) {
       ) : (
         <PullRequestRows
           prs={prs}
-          onUnlink={(pr) => setUnlinkTarget(pr)}
+          onUnlink={(pr) => {
+            setUnlinkError(null);
+            setUnlinkTarget(pr);
+          }}
         />
       )}
 
@@ -244,6 +250,9 @@ export function PullRequestList({ issueId }: { issueId: string }) {
               {t(($) => $.detail.pull_request_link_unlink_confirm)}
             </AlertDialogTitle>
           </AlertDialogHeader>
+          {unlinkError ? (
+            <p className="text-xs text-destructive">{unlinkError}</p>
+          ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={unlinkMutation.isPending}>
               {t(($) => $.detail.pull_request_link_cancel)}

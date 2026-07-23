@@ -329,3 +329,12 @@ ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
 -- name: UnlinkIssueFromPullRequest :exec
 DELETE FROM issue_pull_request
 WHERE issue_id = $1 AND pull_request_id = $2;
+
+-- name: GetIssuePullRequestLink :one
+-- Returns the link row for one (issue, PR) pair, or no rows when unlinked.
+-- The webhook mirror path uses this to avoid regressing a member-authored
+-- manual link (a routine synchronize/edited push must not flip reference_only
+-- to true and hide the PR, nor clobber a manual close_intent); the manual
+-- unlink path uses it to distinguish "PR not mirrored" from "not linked".
+SELECT * FROM issue_pull_request
+WHERE issue_id = $1 AND pull_request_id = $2;
