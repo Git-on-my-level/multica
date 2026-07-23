@@ -451,6 +451,9 @@ func TestUnlinkPullRequest_NotMirroredReturns404(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unlink unmirrored: expected 404, got %d %s", w.Code, w.Body.String())
 	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("not mirrored in this workspace")) {
+		t.Errorf("unlink unmirrored: expected actionable mirror error, got %s", w.Body.String())
+	}
 }
 
 // firePullRequestWebhookRaw delivers a signed pull_request webhook with full

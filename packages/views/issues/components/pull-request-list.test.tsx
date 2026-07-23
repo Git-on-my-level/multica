@@ -67,13 +67,16 @@ function makePR(overrides: Partial<GitHubPullRequest> = {}): GitHubPullRequest {
 
 function renderList() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <I18nProvider resources={TEST_RESOURCES} locale="en">
-        <PullRequestList issueId="issue-1" wsId="ws-1" />
-      </I18nProvider>
-    </QueryClientProvider>,
-  );
+  return {
+    qc,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <I18nProvider resources={TEST_RESOURCES} locale="en">
+          <PullRequestList issueId="issue-1" wsId="ws-1" />
+        </I18nProvider>
+      </QueryClientProvider>,
+    ),
+  };
 }
 
 async function waitForRender() {
@@ -255,7 +258,8 @@ describe("PullRequestList link / unlink", () => {
   it("submits with the url + close intent and closes the dialog on success", async () => {
     mockLinkIssuePullRequest.mockResolvedValue(makePR());
     mockPRs = [];
-    renderList();
+    const { qc } = renderList();
+    const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
     await screen.findByText(/No linked pull requests/i);
     fireEvent.click(screen.getByRole("button", { name: /Link PR/i }));
     fireEvent.change(screen.getByLabelText(/Pull request URL/i), {
@@ -276,6 +280,17 @@ describe("PullRequestList link / unlink", () => {
     // On success the dialog closes.
     await waitFor(() => {
       expect(screen.queryByRole("heading", { name: /Link a pull request/i })).not.toBeInTheDocument();
+    });
+    // A merged PR can move the issue to done in this mutation. Refresh the
+    // issue caches directly so the status is correct even without a socket.
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["issues", "ws-1", "detail", "issue-1"],
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["issues", "ws-1", "list"],
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["issues", "ws-1", "my"],
     });
   });
 
