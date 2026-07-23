@@ -1,89 +1,69 @@
-# macOS desktop release signing and notarization
+# macOS Desktop release (fork policy)
 
-Gatekeeper blocks apps that are unsigned, ad-hoc signed, or signed with a Developer ID
-certificate that has not been notarized and stapled. Multica's `electron-builder.yml`
-enables `mac.notarize: true`, but notarization only runs when these env vars are set at
-package time:
+Public Desktop releases for `Git-on-my-level/multica` are made manually on
+David's arm64 Mac. They are always signed with the local Keychain identity
+`Developer ID Application: DAZHENG ZHANG (JVMXE5G542)`, notarized by Apple,
+and stapled before publication. Do not publish ad-hoc, unsigned, x64, Linux,
+or Windows Desktop artifacts unless David explicitly asks.
 
-| Variable | Purpose |
-|---|---|
-| `CSC_LINK` | Base64 `.p12` export of **Developer ID Application** cert (or use a macOS keychain cert via `CSC_NAME`) |
-| `CSC_KEY_PASSWORD` | Password for the `.p12` |
-| `APPLE_ID` | Apple ID email for the developer team |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password from [appleid.apple.com](https://appleid.apple.com) |
-| `APPLE_TEAM_ID` | Team ID (e.g. `JVMXE5G542`) |
+Fork tag automation publishes CLI archives and GHCR images only. It never
+publishes Desktop artifacts. `CSC_IDENTITY_AUTO_DISCOVERY=false` is permitted
+only for clearly non-distributed smoke builds with `--publish never`.
 
-`scripts/package.mjs` skips notarization when `APPLE_TEAM_ID` is unset and logs a warning.
+## Prerequisites
 
-## Fork CI (`release.yml` → `desktop-mac`)
-
-Wire the variables above as GitHub Actions **repository secrets** on the fork
-(`Git-on-my-level/multica`). The fork-only `desktop-mac` job in
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) already
-forwards them to `package.mjs`. Without all five, CI produces a Developer
-ID-signed (or ad-hoc) build that Gatekeeper still rejects with **"Apple could
-not verify Multica"**.
-
-CI publishes **arm64 only** so a single `latest-mac.yml` is written per tag
-(publishing x64 + arm64 with `--publish always` overwrites that feed and breaks
-auto-update). After secrets are configured, tag a new release (e.g. `v0.3.46`)
-and confirm the mac job uploads `multica-desktop-*-mac-arm64.dmg`, `.zip`, and
-`latest-mac.yml`.
-
-## Verify a release artifact
+On David's signing Mac, confirm the Keychain identity and export only the
+notarization credentials required by electron-builder:
 
 ```bash
-# Mount DMG or point APP at an installed copy
-APP="/Volumes/Multica 0.3.45-arm64/Multica.app"
-
-codesign -dv --verbose=4 "$APP"
-spctl -a -vv -t install "$APP"
-stapler validate "$APP"
-xattr -l multica-desktop-0.3.45-mac-arm64.dmg   # browser downloads add com.apple.quarantine
+security find-identity -v -p codesigning | rg 'Developer ID Application: DAZHENG ZHANG \(JVMXE5G542\)'
+export CSC_NAME='Developer ID Application: DAZHENG ZHANG (JVMXE5G542)'
+export APPLE_ID='your-apple-id@example.com'
+export APPLE_APP_SPECIFIC_PASSWORD='app-specific-password'
+export APPLE_TEAM_ID='JVMXE5G542'
 ```
 
-| `spctl` result | Meaning |
-|---|---|
-| `accepted` + `source=Notarized Developer ID` | Gatekeeper-clean |
-| `rejected` + `source=Unnotarized Developer ID` | Signed but not notarized — user must Right-click → Open once, or staple after notarization |
-| `rejected` + no Developer ID in origin | Ad-hoc or unsigned — replace with a Developer ID build |
+Use an app-specific password, never a primary Apple Account password. Do not
+set `CSC_IDENTITY_AUTO_DISCOVERY=false` for this release path.
 
-## Local notarized release (maintainers)
+## Manual arm64 release checklist
 
-On a Mac with the Developer ID cert in Keychain:
+1. Start from the intended, already-pushed fork tag. Never rewrite a failed
+   tag or release; create a corrective version instead.
+2. Build locally without publication. This is the verification candidate:
 
-```bash
-export APPLE_ID="you@example.com"
-export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
-export APPLE_TEAM_ID="JVMXE5G542"
-# Optional if cert is in keychain instead of CSC_LINK:
-# export CSC_NAME="Developer ID Application: YOUR NAME (JVMXE5G542)"
+   ```bash
+   cd apps/desktop
+   node scripts/package.mjs --mac --arm64 --publish never \
+     --config.publish.owner=Git-on-my-level \
+     --config.publish.repo=multica
+   ```
 
-cd apps/desktop
-rm -rf dist out
-node scripts/package.mjs --mac --arm64 --publish always \
-  --config.publish.owner=Git-on-my-level \
-  --config.publish.repo=multica
-```
+3. Verify the locally produced DMG and ZIP. Expected assets are
+   `multica-desktop-<version>-mac-arm64.dmg`,
+   `multica-desktop-<version>-mac-arm64.zip`, and `latest-mac.yml`.
+   There must be no x64 Desktop asset.
+4. Mount the DMG and validate its application bundle:
 
-`electron-builder` submits to Apple's notary service and staples the ticket into the
-DMG/ZIP before upload.
+   ```bash
+   hdiutil attach "dist/multica-desktop-<version>-mac-arm64.dmg"
+   APP='/Volumes/Multica <version>/Multica.app'
+   codesign --verify --deep --strict --verbose=4 "$APP"
+   codesign -dv --verbose=4 "$APP"
+   spctl -a -vv -t install "$APP"
+   xcrun stapler validate "$APP"
+   hdiutil detach "$(dirname "$APP")"
+   ```
 
-## User workaround (unnotarized but Developer ID-signed)
+   `spctl` must report `accepted` and `source=Notarized Developer ID`.
+5. Download the candidate ZIP/DMG through the same release path users will
+   use, then repeat the mounted-DMG and installed-app checks. This catches a
+   bad upload, missing staple, and browser-download differences. Quarantine is
+   diagnostic evidence only; do not make `xattr -cr` or Gatekeeper bypasses a
+   release solution.
+6. Only after these checks pass, publish the same arm64 build using the
+   approved manual release process. Confirm the release contains exactly the
+   DMG, ZIP, and `latest-mac.yml` metadata expected by electron-updater.
 
-Valid for [v0.3.45](https://github.com/Git-on-my-level/multica/releases/tag/v0.3.45) until a
-notarized build is published:
-
-1. **Quit Multica** if it is running.
-2. Remove stale updater copies (optional but recommended):
-   `bash scripts/cleanup-macos-desktop-updater.sh`
-3. Download `multica-desktop-*-mac-arm64.dmg` from GitHub Releases.
-4. Open the DMG, drag **Multica** to **Applications**.
-5. **First launch only:** in Finder, Right-click **Multica** → **Open** → confirm **Open**
-   in the dialog. Double-click works on subsequent launches.
-6. If Gatekeeper still blocks after a browser download, clear quarantine on the installed app:
-   `xattr -cr /Applications/Multica.app`
-
-Replacing an older **ad-hoc** install: delete `/Applications/Multica.app` first, then install
-from the current DMG. Run `bash scripts/cleanup-macos-desktop-updater.sh --inspect` to see
-whether the installed copy is ad-hoc, unnotarized Developer ID, or notarized.
+If signing or notarization is unavailable, stop before upload. A public
+Desktop release must be postponed rather than replaced with an ad-hoc build.

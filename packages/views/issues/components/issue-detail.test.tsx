@@ -1,15 +1,24 @@
-import { forwardRef, useRef, useState, useImperativeHandle } from "react";
+import { forwardRef, useEffect, useRef, useState, useImperativeHandle } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Issue, TimelineEntry } from "@multica/core/types";
+import type { Issue, Label, TimelineEntry } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
+import { useResolvedExpandStore } from "@multica/core/issues/stores/resolved-expand-store";
+import {
+  DEFAULT_SUB_ISSUE_ROW_PROPERTIES,
+  useSubIssueDisplayStore,
+} from "@multica/core/issues/stores/sub-issue-display-store";
 import enCommon from "../../locales/en/common.json";
 import enIssues from "../../locales/en/issues.json";
 
 const TEST_RESOURCES = { en: { common: enCommon, issues: enIssues } };
 
 const mockViewport = vi.hoisted(() => ({ isMobile: false }));
+
+// Counts MockContentEditor mounts. This pins the description to exactly one
+// eager editor per issue and catches stale editor reuse across issue switches.
+const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
 
 vi.mock("@multica/ui/hooks/use-mobile", () => ({
   useIsMobile: () => mockViewport.isMobile,
@@ -110,7 +119,21 @@ vi.mock("../../navigation", () => ({
 }));
 
 // Mock editor components (Tiptap requires real DOM)
-vi.mock("../../editor", () => ({
+vi.mock("../../editor", async () => ({
+  // Real lazy-mount controller (pure React, no Tiptap) so readonly-first
+  // shell → activate → ready flows behave exactly as in production.
+  ...(await vi.importActual<typeof import("../../editor/use-lazy-editor")>(
+    "../../editor/use-lazy-editor",
+  )),
+  // Real submit gate (pure React) — see comment-composers.test.tsx.
+  ...(await vi.importActual<typeof import("../../editor/use-upload-gate")>(
+    "../../editor/use-upload-gate",
+  )),
+  useEditorUpload: () => ({
+    uploadWithToast: vi.fn(),
+    upload: vi.fn(),
+    uploading: false,
+  }),
   useFileDropZone: () => ({ isDragOver: false, dropZoneProps: {} }),
   FileDropOverlay: () => null,
   // No-op so comment-card's AttachmentList can render without hitting the
@@ -129,23 +152,42 @@ vi.mock("../../editor", () => ({
     <div data-testid="readonly-content">{content}</div>
   ),
   ContentEditor: forwardRef(function MockContentEditor(
-    { defaultValue, onUpdate, placeholder, flushPendingOnUnmount }: any,
+    {
+      defaultValue,
+      value: syncedValue,
+      onUpdate,
+      placeholder,
+      flushPendingOnUnmount,
+      onReady,
+    }: any,
     ref: any,
   ) {
-    const valueRef = useRef(defaultValue || "");
-    const [value, setValue] = useState(defaultValue || "");
+    const initialValue = syncedValue ?? defaultValue ?? "";
+    const valueRef = useRef(initialValue);
+    const [editorValue, setEditorValue] = useState(initialValue);
+    useEffect(() => {
+      contentEditorMounts.count += 1;
+      onReady?.();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+    useEffect(() => {
+      if (syncedValue === undefined) return;
+      valueRef.current = syncedValue;
+      setEditorValue(syncedValue);
+    }, [syncedValue]);
     useImperativeHandle(ref, () => ({
       getMarkdown: () => valueRef.current,
-      clearContent: () => { valueRef.current = ""; setValue(""); },
+      clearContent: () => { valueRef.current = ""; setEditorValue(""); },
       focus: () => {},
+      focusAtCoords: () => {},
       uploadFile: () => {},
     }));
     return (
       <textarea
-        value={value}
+        value={editorValue}
         onChange={(e) => {
           valueRef.current = e.target.value;
-          setValue(e.target.value);
+          setEditorValue(e.target.value);
           onUpdate?.(e.target.value);
         }}
         placeholder={placeholder}
@@ -155,14 +197,19 @@ vi.mock("../../editor", () => ({
     );
   }),
   TitleEditor: forwardRef(function MockTitleEditor(
-    { defaultValue, placeholder, onBlur, onChange }: any,
+    { defaultValue, placeholder, onBlur, onChange, onReady }: any,
     ref: any,
   ) {
     const valueRef = useRef(defaultValue || "");
     const [value, setValue] = useState(defaultValue || "");
+    useEffect(() => {
+      onReady?.();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     useImperativeHandle(ref, () => ({
       getText: () => valueRef.current,
       focus: () => {},
+      focusAtCoords: () => {},
     }));
     return (
       <input
@@ -211,6 +258,9 @@ const mockApiObj = vi.hoisted(() => ({
   rerunIssue: vi.fn(),
   listTaskMessages: vi.fn().mockResolvedValue([]),
   listChildIssues: vi.fn().mockResolvedValue({ issues: [] }),
+  getChildIssueProgress: vi.fn().mockResolvedValue({ progress: [] }),
+  getAgentTaskSnapshot: vi.fn().mockResolvedValue([]),
+  listProperties: vi.fn().mockResolvedValue({ properties: [], total: 0 }),
   listIssues: vi.fn().mockResolvedValue({ issues: [], total: 0 }),
   uploadFile: vi.fn(),
   listIssueReactions: vi.fn().mockResolvedValue([]),
@@ -256,7 +306,18 @@ vi.mock("@multica/core/issues/config", () => ({
 
 // Mock recent issues store
 const mockRecordVisit = vi.fn();
-vi.mock("@multica/core/issues/stores", () => ({
+vi.mock("@multica/core/issues/stores", async () => ({
+  // Real store, not a stub: resolved-thread expand/collapse behavior under
+  // test runs through it. Deep import keeps the persisted sibling stores
+  // (which need localStorage) out of this mock.
+  ...(await vi.importActual<
+    typeof import("@multica/core/issues/stores/resolved-expand-store")
+  >("@multica/core/issues/stores/resolved-expand-store")),
+  // Real store: sub-issue display tests drive it with setState, and the
+  // component reads it through the barrel — both must hit the same instance.
+  ...(await vi.importActual<
+    typeof import("@multica/core/issues/stores/sub-issue-display-store")
+  >("@multica/core/issues/stores/sub-issue-display-store")),
   useRecentIssuesStore: Object.assign(
     (selector?: any) => {
       const state = { byWorkspace: {}, recordVisit: mockRecordVisit, pruneWorkspaces: vi.fn() };
@@ -355,6 +416,9 @@ beforeEach(() => {
     writable: true,
     value: scrollIntoViewSpy,
   });
+  // The resolved-expand store is module-global (not per-mount like the old
+  // useState); reset so one test's expansions can't leak into the next.
+  useResolvedExpandStore.setState({ expandedByIssue: {} });
 });
 
 // Mock modals
@@ -417,6 +481,7 @@ const mockIssue: Issue = {
   start_date: null,
   due_date: "2026-06-01T00:00:00Z",
   metadata: {},
+  properties: {},
   created_at: "2026-01-15T00:00:00Z",
   updated_at: "2026-01-20T00:00:00Z",
 };
@@ -522,6 +587,7 @@ function hasHighlightedCommentBackground(root: ParentNode | null): boolean {
 describe("IssueDetail (shared)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    contentEditorMounts.count = 0;
     mockViewport.isMobile = false;
     // Default: issue loads successfully
     mockApiObj.getIssue.mockResolvedValue(mockIssue);
@@ -530,6 +596,9 @@ describe("IssueDetail (shared)", () => {
     mockApiObj.listIssueReactions.mockResolvedValue([]);
     mockApiObj.listIssueSubscribers.mockResolvedValue([]);
     mockApiObj.listChildIssues.mockResolvedValue({ issues: [] });
+    mockApiObj.getChildIssueProgress.mockResolvedValue({ progress: [] });
+    mockApiObj.getAgentTaskSnapshot.mockResolvedValue([]);
+    mockApiObj.listProperties.mockResolvedValue({ properties: [], total: 0 });
     mockApiObj.listIssues.mockResolvedValue({ issues: [], total: 0 });
     mockApiObj.getActiveTasksForIssue.mockResolvedValue({ tasks: [] });
     mockApiObj.listTasksByIssue.mockResolvedValue([]);
@@ -553,14 +622,27 @@ describe("IssueDetail (shared)", () => {
     ).toBe(true);
   });
 
+  it("renders comment bodies without Base UI collapsible panels", async () => {
+    const { container } = renderIssueDetail();
+
+    await screen.findByText("Started working on this");
+
+    expect(
+      container.querySelector('[data-slot="collapsible-content"]'),
+    ).toBeNull();
+  });
+
   it("renders issue title and description after loading", async () => {
     renderIssueDetail();
 
-    await waitFor(() => {
-      expect(screen.getByDisplayValue("Implement authentication")).toBeInTheDocument();
-    });
-
-    expect(screen.getByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
+    // The description is the one eager editor: keeping one renderer avoids the
+    // layout jump caused by swapping a long react-markdown tree for ProseMirror.
+    // Title and comment/reply composers remain readonly-first.
+    expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
+    expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("rich-text-editor")).toHaveLength(1);
+    expect(contentEditorMounts.count).toBe(1);
   });
 
   it("opts the description editor into the unmount flush", async () => {
@@ -574,6 +656,45 @@ describe("IssueDetail (shared)", () => {
 
     const description = await screen.findByDisplayValue("Add JWT auth to the backend");
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
+  });
+
+  it("remounts the eager description on issue switch without carrying stale content", async () => {
+    // The web route reuses IssueDetail across issues. The keyed description
+    // editor must remount atomically for the new issue while the title remains
+    // on its cheap stand-in.
+    const queryClient = createTestQueryClient();
+    const issue2 = {
+      ...mockIssue,
+      id: "issue-2",
+      title: "Second issue",
+      description: "Second description",
+    };
+    // The cache seed marks the data stale, so the query refetches in the
+    // background — getIssue must answer per-id or the refetch would clobber
+    // issue-2 with issue-1's payload.
+    mockApiObj.getIssue.mockImplementation((issueId: string) =>
+      Promise.resolve(issueId === "issue-2" ? issue2 : mockIssue),
+    );
+    // Pre-seed issue-2 so its first render skips the loading skeleton.
+    queryClient.setQueryData(["issues", "ws-1", "detail", "issue-2"], issue2);
+    const ui = (issueId: string) => (
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail issueId={issueId} />
+        </QueryClientProvider>
+      </I18nProvider>
+    );
+    const { rerender } = render(ui("issue-1"));
+
+    await screen.findByDisplayValue("Add JWT auth to the backend");
+    const mountsBeforeSwitch = contentEditorMounts.count;
+
+    rerender(ui("issue-2"));
+
+    expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
+    expect(contentEditorMounts.count).toBe(mountsBeforeSwitch + 1);
   });
 
   it("renders the issue title leaf as a link to the issue detail page", async () => {
@@ -682,7 +803,7 @@ describe("IssueDetail (shared)", () => {
     renderIssueDetail();
 
     await waitFor(() => {
-      expect(screen.getByDisplayValue("Implement authentication")).toBeInTheDocument();
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
     });
 
     expect(screen.queryByTestId("panel-group")).not.toBeInTheDocument();
@@ -1283,11 +1404,7 @@ describe("IssueDetail (shared)", () => {
   it("sends empty description when editor is cleared", async () => {
     renderIssueDetail();
 
-    await waitFor(() => {
-      expect(screen.getByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
-    });
-
-    const editor = screen.getByPlaceholderText("Add description...");
+    const editor = await screen.findByDisplayValue("Add JWT auth to the backend");
     fireEvent.change(editor, { target: { value: "" } });
 
     await waitFor(() => {
@@ -1295,6 +1412,169 @@ describe("IssueDetail (shared)", () => {
         "issue-1",
         expect.objectContaining({ description: "" }),
       );
+    });
+  });
+
+  describe("sub-issues list", () => {
+    beforeEach(() => {
+      useSubIssueDisplayStore.setState({
+        rowProperties: { ...DEFAULT_SUB_ISSUE_ROW_PROPERTIES },
+        rowPropertyIds: [],
+      });
+    });
+
+    const label = (id: string, name: string): Label => ({
+      id,
+      workspace_id: "ws-1",
+      resource_type: "issue",
+      name,
+      color: "#3b82f6",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    });
+
+    const subIssue = (overrides: Partial<Issue>): Issue => ({
+      ...mockIssue,
+      parent_issue_id: "issue-1",
+      assignee_type: null,
+      assignee_id: null,
+      due_date: null,
+      priority: "none",
+      ...overrides,
+    });
+
+    it("renders priority, labels, due date and nested progress on rows", async () => {
+      mockApiObj.listChildIssues.mockResolvedValue({
+        issues: [
+          subIssue({
+            id: "child-1",
+            number: 11,
+            identifier: "TES-11",
+            title: "Fix login flow",
+            priority: "urgent",
+            labels: [label("l1", "backend"), label("l2", "auth")],
+            // Past date-only value → overdue styling on an open issue.
+            due_date: "2020-01-01",
+          }),
+          subIssue({
+            id: "child-2",
+            number: 12,
+            identifier: "TES-12",
+            title: "Ship dashboards",
+          }),
+        ],
+      });
+      mockApiObj.getChildIssueProgress.mockResolvedValue({
+        progress: [{ parent_issue_id: "child-1", done: 1, total: 3 }],
+      });
+
+      renderIssueDetail();
+
+      await screen.findByText("Fix login flow");
+      // Label chips ride inside the row link.
+      expect(screen.getByText("backend")).toBeInTheDocument();
+      expect(screen.getByText("auth")).toBeInTheDocument();
+      // Nested own-children progress for child-1 only (header shows 0/2).
+      expect(await screen.findByText("1/3")).toBeInTheDocument();
+      // Overdue open issue renders its due date in the destructive tone.
+      const due = screen.getByText("Jan 1");
+      expect(due.closest("span")?.className).toContain("text-destructive");
+      // Bare row shows no due date / no progress chip of its own.
+      const bareRow = screen.getByText("Ship dashboards").closest("a");
+      expect(bareRow?.textContent).not.toContain("/");
+    });
+
+    it("hides fields the user toggled off in the display preference", async () => {
+      useSubIssueDisplayStore.setState({
+        rowProperties: {
+          ...DEFAULT_SUB_ISSUE_ROW_PROPERTIES,
+          labels: false,
+          dueDate: false,
+        },
+      });
+      mockApiObj.listChildIssues.mockResolvedValue({
+        issues: [
+          subIssue({
+            id: "child-1",
+            number: 11,
+            identifier: "TES-11",
+            title: "Fix login flow",
+            labels: [label("l1", "backend")],
+            due_date: "2020-01-01",
+          }),
+        ],
+      });
+
+      renderIssueDetail();
+
+      await screen.findByText("Fix login flow");
+      expect(screen.queryByText("backend")).not.toBeInTheDocument();
+      expect(screen.queryByText("Jan 1")).not.toBeInTheDocument();
+    });
+
+    it("renders opted-in custom property chips on rows that carry a value", async () => {
+      const estimate = {
+        id: "prop-1",
+        workspace_id: "ws-1",
+        name: "Estimate",
+        type: "text",
+        config: {},
+        position: 0,
+        archived: false,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      };
+      mockApiObj.listProperties.mockResolvedValue({
+        properties: [estimate],
+        total: 1,
+      });
+      useSubIssueDisplayStore.setState({ rowPropertyIds: ["prop-1"] });
+      mockApiObj.listChildIssues.mockResolvedValue({
+        issues: [
+          subIssue({
+            id: "child-1",
+            number: 11,
+            identifier: "TES-11",
+            title: "Fix login flow",
+            properties: { "prop-1": "Sprint 3" },
+          }),
+          subIssue({
+            id: "child-2",
+            number: 12,
+            identifier: "TES-12",
+            title: "Ship dashboards",
+          }),
+        ],
+      });
+
+      renderIssueDetail();
+
+      await screen.findByText("Fix login flow");
+      // Chip renders only on the row that has a value for the property.
+      expect(await screen.findByText("Sprint 3")).toBeInTheDocument();
+      expect(screen.getAllByText("Sprint 3")).toHaveLength(1);
+    });
+
+    it("mutes the due date on done sub-issues even when past", async () => {
+      mockApiObj.listChildIssues.mockResolvedValue({
+        issues: [
+          subIssue({
+            id: "child-1",
+            number: 11,
+            identifier: "TES-11",
+            title: "Wrapped up",
+            status: "done",
+            due_date: "2020-01-01",
+          }),
+        ],
+      });
+
+      renderIssueDetail();
+
+      await screen.findByText("Wrapped up");
+      const due = screen.getByText("Jan 1");
+      expect(due.closest("span")?.className).not.toContain("text-destructive");
+      expect(due.closest("span")?.className).toContain("text-muted-foreground");
     });
   });
 });

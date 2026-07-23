@@ -36,15 +36,10 @@ type AppConfig struct {
 	// with the operator's own domains instead of Multica Cloud defaults.
 	DaemonServerURL string `json:"daemon_server_url,omitempty"`
 	DaemonAppURL    string `json:"daemon_app_url,omitempty"`
-	// GithubRepo / GithubBranch let self-hosted forks override every
-	// user-facing GitHub link (install commands, releases, feedback).
-	GithubRepo   string `json:"github_repo,omitempty"`
-	GithubBranch string `json:"github_branch,omitempty"`
-	// DocsBaseURL / ChangelogURL override Help-menu and helper-agent doc
-	// links. When empty, the frontend falls back to multica.ai (upstream)
-	// or the configured GitHub repo / releases (forks).
-	DocsBaseURL  string `json:"docs_base_url,omitempty"`
-	ChangelogURL string `json:"changelog_url,omitempty"`
+	GithubRepo      string `json:"github_repo,omitempty"`
+	GithubBranch    string `json:"github_branch,omitempty"`
+	DocsBaseURL     string `json:"docs_base_url,omitempty"`
+	ChangelogURL    string `json:"changelog_url,omitempty"`
 
 	// PostHog public config for the frontend. The key is the same Project
 	// API Key the backend uses; returning it here (instead of baking it
@@ -58,6 +53,13 @@ type AppConfig struct {
 	// FeatureFlags exposes only frontend-safe boolean decisions. Do not dump
 	// raw rules here: /api/config is public and may be called anonymously.
 	FeatureFlags map[string]bool `json:"feature_flags,omitempty"`
+
+	// ServerVersion is the running API build version, so self-hosted
+	// operators can confirm what's deployed and include it in bug reports.
+	// Only emitted on self-hosted deployments — omitted on the managed cloud,
+	// which is continuously deployed so its users can't act on the version —
+	// and empty for dev builds that aren't stamped via -X main.version.
+	ServerVersion string `json:"server_version,omitempty"`
 }
 
 // GetConfig is mounted on the public (unauthenticated) route group because
@@ -79,6 +81,12 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config.DocsBaseURL = normalizePublicURL(os.Getenv("MULTICA_DOCS_BASE_URL"))
 	config.ChangelogURL = normalizePublicURL(os.Getenv("MULTICA_CHANGELOG_URL"))
 	config.FeatureFlags = featureflags.EvaluateFrontendPublicFlags(r.Context(), h.FeatureFlags)
+	// Only surface the build version on self-hosted deployments. The managed
+	// cloud is continuously deployed and its users can't choose the build, so
+	// the Help popover's version row would just be noise there (MUL-4108).
+	if !isOfficialCloudDeployment() {
+		config.ServerVersion = h.cfg.ServerVersion
+	}
 
 	// Re-read from env on every request so operators can rotate keys via
 	// secret refresh without a server restart.
@@ -94,12 +102,25 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, config)
 }
 
+func githubConfigFromEnv() (string, string) {
+	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
+	if !validGithubRepoSlug(repo) {
+		return "", ""
+	}
+	return repo, strings.TrimSpace(os.Getenv("MULTICA_GITHUB_BRANCH"))
+}
+
+func validGithubRepoSlug(raw string) bool {
+	if strings.Contains(raw, "://") {
+		return false
+	}
+	parts := strings.Split(raw, "/")
+	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
+}
+
 func daemonSetupURLsFromEnv() (string, string) {
 	serverURL := normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
-	appURL := normalizePublicURL(os.Getenv("MULTICA_APP_URL"))
-	if appURL == "" {
-		appURL = normalizePublicURL(os.Getenv("FRONTEND_ORIGIN"))
-	}
+	appURL := resolveFrontendAppURL()
 	if appURL == "" {
 		return "", ""
 	}
@@ -113,33 +134,16 @@ func daemonSetupURLsFromEnv() (string, string) {
 	return serverURL, appURL
 }
 
-func githubConfigFromEnv() (string, string) {
-	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
-	if repo == "" || !validGithubRepoSlug(repo) {
-		return "", ""
+// resolveFrontendAppURL returns the operator-configured frontend origin
+// (MULTICA_APP_URL, falling back to FRONTEND_ORIGIN), normalized. Shared by
+// the daemon-setup URLs and the managed-cloud detection so both read the same
+// signal.
+func resolveFrontendAppURL() string {
+	appURL := normalizePublicURL(os.Getenv("MULTICA_APP_URL"))
+	if appURL == "" {
+		appURL = normalizePublicURL(os.Getenv("FRONTEND_ORIGIN"))
 	}
-	branch := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_BRANCH"))
-	if branch == "" {
-		return repo, ""
-	}
-	return repo, branch
-}
-
-func validGithubRepoSlug(raw string) bool {
-	if strings.Contains(raw, "://") {
-		return false
-	}
-	parts := strings.Split(raw, "/")
-	if len(parts) != 2 {
-		return false
-	}
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" || strings.Contains(part, "/") {
-			return false
-		}
-	}
-	return true
+	return appURL
 }
 
 func normalizePublicURL(raw string) string {
@@ -157,6 +161,15 @@ func normalizePublicURL(raw string) string {
 // daemon's backend at the frontend (no /health, no WebSocket proxy).
 func isOfficialCloudDaemonConfig(appURL string) bool {
 	return urlHostEquals(appURL, "multica.ai")
+}
+
+// isOfficialCloudDeployment reports whether this server is the official Multica
+// Cloud, reusing the same frontend-host signal as the daemon setup (multica.ai).
+// Managed-cloud-only behavior — such as suppressing the Help popover's
+// server-version row, which only matters to self-hosted operators — is gated on
+// this.
+func isOfficialCloudDeployment() bool {
+	return isOfficialCloudDaemonConfig(resolveFrontendAppURL())
 }
 
 func urlHostEquals(raw, want string) bool {

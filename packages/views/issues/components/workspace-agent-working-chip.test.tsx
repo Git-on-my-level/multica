@@ -2,14 +2,15 @@
 
 import { cleanup, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentTask } from "@multica/core/types";
+import type { WorkspaceWorkingAgent } from "@multica/core/types";
 import { renderWithI18n } from "../../test/i18n";
 
 const mockState = vi.hoisted(() => ({
-  snapshot: [] as unknown[],
-  // Captures the agent ids handed to the avatar stack so a test can assert
-  // the stack still reflects distinct agents even when the count counts issues.
-  avatarAgentIds: undefined as string[] | undefined,
+  agents: [] as WorkspaceWorkingAgent[],
+  requestedType: undefined as string | undefined,
+  requestedMineRelation: undefined as string | undefined,
+  avatarAgentIds: undefined as readonly string[] | undefined,
+  buttonVariant: undefined as string | undefined,
 }));
 
 vi.mock("@multica/core/hooks", () => ({
@@ -17,22 +18,31 @@ vi.mock("@multica/core/hooks", () => ({
 }));
 
 vi.mock("@multica/core/agents", () => ({
-  agentTaskSnapshotOptions: (wsId: string) => ({
-    queryKey: ["agents", "task-snapshot", wsId],
-  }),
-}));
-
-vi.mock("../../agents/components/agent-avatar-stack", () => ({
-  AgentAvatarStack: ({ agentIds }: { agentIds: string[] }) => {
-    mockState.avatarAgentIds = agentIds;
-    return <div data-testid="agent-avatar-stack">{agentIds.length}</div>;
+  workspaceWorkingAgentsOptions: (
+    wsId: string,
+    type?: string,
+    mineRelation?: string,
+  ) => {
+    mockState.requestedType = type;
+    mockState.requestedMineRelation = mineRelation;
+    return {
+      queryKey: [
+        "workspaces",
+        wsId,
+        "working-agents",
+        "list",
+        type ?? "all",
+        mineRelation ? `mine:${mineRelation}` : "workspace",
+      ],
+    };
   },
 }));
 
-vi.mock("../../agents/components/agent-activity-hover-content", () => ({
-  AgentActivityHoverContent: ({ tasks }: { tasks: AgentTask[] }) => (
-    <div data-testid="activity-hover">{tasks.length}</div>
-  ),
+vi.mock("../../agents/components/agent-avatar-stack", () => ({
+  AgentAvatarStack: ({ agentIds }: { agentIds: readonly string[] }) => {
+    mockState.avatarAgentIds = agentIds;
+    return <div data-testid="agent-avatar-stack">{agentIds.length}</div>;
+  },
 }));
 
 vi.mock("@tanstack/react-query", async () => {
@@ -42,49 +52,58 @@ vi.mock("@tanstack/react-query", async () => {
     );
   return {
     ...actual,
-    useQuery: (opts: { queryKey?: readonly unknown[] }) => {
-      if (opts.queryKey?.[1] === "task-snapshot") {
-        return { data: mockState.snapshot };
-      }
-      return { data: undefined };
+    useQuery: () => ({ data: mockState.agents }),
+  };
+});
+
+vi.mock("@multica/ui/components/ui/button", async () => {
+  const actual =
+    await vi.importActual<typeof import("@multica/ui/components/ui/button")>(
+      "@multica/ui/components/ui/button",
+    );
+  return {
+    ...actual,
+    Button: (props: React.ComponentProps<typeof actual.Button>) => {
+      mockState.buttonVariant = props.variant ?? undefined;
+      return <actual.Button {...props} />;
     },
   };
 });
 
-import { WorkspaceAgentWorkingChip } from "./workspace-agent-working-chip";
+import {
+  WorkspaceAgentWorkingChip,
+  chipAppearance,
+} from "./workspace-agent-working-chip";
 
-function makeTask(overrides: Partial<AgentTask>): AgentTask {
+function makeAgent(
+  id: string,
+  runningTaskCount = 1,
+): WorkspaceWorkingAgent {
   return {
-    id: "task-1",
-    agent_id: "agent-1",
-    runtime_id: "runtime-1",
-    issue_id: "issue-1",
-    status: "running",
-    priority: 0,
-    dispatched_at: null,
-    started_at: "2026-06-08T08:00:00Z",
-    completed_at: null,
-    result: null,
-    error: null,
-    created_at: "2026-06-08T08:00:00Z",
-    ...overrides,
+    id,
+    name: `Agent ${id}`,
+    avatar_url: null,
+    running_task_count: runningTaskCount,
+    issue_ids: [],
   };
 }
 
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
-  mockState.snapshot = [];
+  mockState.agents = [];
+  mockState.requestedType = undefined;
+  mockState.requestedMineRelation = undefined;
   mockState.avatarAgentIds = undefined;
+  mockState.buttonVariant = undefined;
 });
 
 describe("WorkspaceAgentWorkingChip", () => {
-  it("counts distinct active issues, not running agents", () => {
-    // Two agents working the SAME issue: the count is about issues, so it
-    // must read "1", not "2" (the old unique-agent behavior). MUL-3875.
-    mockState.snapshot = [
-      makeTask({ id: "t-1", agent_id: "agent-1", issue_id: "issue-1" }),
-      makeTask({ id: "t-2", agent_id: "agent-2", issue_id: "issue-1" }),
+  it("shows every agent returned by the independent workspace API", () => {
+    mockState.agents = [
+      makeAgent("agent-1"),
+      makeAgent("agent-2", 3),
+      makeAgent("agent-3"),
     ];
 
     renderWithI18n(
@@ -92,58 +111,70 @@ describe("WorkspaceAgentWorkingChip", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: /working/i }),
-    ).toHaveTextContent("1");
-    // The avatar stack still shows both distinct agents behind that work.
-    expect(mockState.avatarAgentIds).toEqual(["agent-1", "agent-2"]);
+      screen.getByRole("button", { name: "3 agents working" }),
+    ).toBeTruthy();
+    expect(mockState.avatarAgentIds).toEqual([
+      "agent-1",
+      "agent-2",
+      "agent-3",
+    ]);
+    expect(mockState.requestedType).toBe("issue");
+    expect(mockState.requestedMineRelation).toBeUndefined();
+    expect(mockState.buttonVariant).toBe("brandSubtle");
   });
 
-  it("counts each distinct issue once when agents span several issues", () => {
-    mockState.snapshot = [
-      makeTask({ id: "t-1", agent_id: "agent-1", issue_id: "issue-1" }),
-      makeTask({ id: "t-2", agent_id: "agent-2", issue_id: "issue-2" }),
-      makeTask({ id: "t-3", agent_id: "agent-1", issue_id: "issue-3" }),
-    ];
-
-    renderWithI18n(
-      <WorkspaceAgentWorkingChip value={false} onToggle={() => {}} />,
-    );
-
-    expect(
-      screen.getByRole("button", { name: /working/i }),
-    ).toHaveTextContent("3");
-  });
-
-  it("ignores non-running tasks and respects scopedIssueIds", () => {
-    mockState.snapshot = [
-      makeTask({ id: "t-1", issue_id: "issue-1", status: "running" }),
-      makeTask({ id: "t-2", issue_id: "issue-2", status: "queued" }),
-      makeTask({ id: "t-3", issue_id: "issue-3", status: "running" }),
-    ];
-
+  it("requests the selected My Issues relation when the header is scoped", () => {
     renderWithI18n(
       <WorkspaceAgentWorkingChip
         value={false}
         onToggle={() => {}}
-        scopedIssueIds={new Set(["issue-1"])}
+        mineRelation="involved"
       />,
     );
 
-    // Only the running task within scope counts → "1".
-    expect(
-      screen.getByRole("button", { name: /working/i }),
-    ).toHaveTextContent("1");
+    expect(mockState.requestedType).toBe("issue");
+    expect(mockState.requestedMineRelation).toBe("involved");
   });
 
-  it("shows 0 when no agents are running", () => {
-    mockState.snapshot = [];
-
+  it("shows a known zero instead of an indeterminate Table value", () => {
     renderWithI18n(
       <WorkspaceAgentWorkingChip value={false} onToggle={() => {}} />,
     );
 
     expect(
-      screen.getByRole("button", { name: /working/i }),
-    ).toHaveTextContent("0");
+      screen.getByRole("button", { name: "0 agents working" }),
+    ).toBeTruthy();
+    expect(screen.queryByTestId("agent-avatar-stack")).toBeNull();
+    expect(mockState.buttonVariant).toBe("outline");
+  });
+
+  it("keeps the active filter visually selected after the final agent stops", () => {
+    renderWithI18n(
+      <WorkspaceAgentWorkingChip value onToggle={() => {}} />,
+    );
+
+    expect(mockState.buttonVariant).toBe("brand");
+  });
+});
+
+describe("chipAppearance", () => {
+  it("wears the filled brand tier while the filter is on", () => {
+    expect(chipAppearance(true, true).variant).toBe("brand");
+  });
+
+  it("wears the tint tier for activity without the filter", () => {
+    expect(chipAppearance(false, true).variant).toBe("brandSubtle");
+  });
+
+  it("wears the plain tier with muted text when nothing is running", () => {
+    const appearance = chipAppearance(false, false);
+    expect(appearance.variant).toBe("outline");
+    expect(appearance.className).toContain("text-muted-foreground");
+  });
+
+  it("does not mute the active zero state", () => {
+    const appearance = chipAppearance(true, false);
+    expect(appearance.variant).toBe("brand");
+    expect(appearance.className).not.toContain("text-muted-foreground");
   });
 });

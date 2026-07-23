@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { ListTodo, Plus } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
@@ -16,7 +16,9 @@ import { GanttView } from "../components/gantt-view";
 import { IssuesHeader } from "../components/issues-header";
 import { ListView } from "../components/list-view";
 import { SwimLaneView } from "../components/swimlane-view";
+import { TableView } from "../components/table-view";
 import { useT } from "../../i18n";
+import { IssueContextMenuProvider } from "../actions";
 import { IssueSurfaceActionsProvider } from "./actions-context";
 import { IssueSurfaceSelectionProvider } from "./selection-context";
 import type { IssueCreateDefaults, IssueSurfaceProps } from "./types";
@@ -28,6 +30,12 @@ import {
 export interface IssueSurfaceRenderContext {
   controller: IssueSurfaceController;
   issues: Issue[];
+  /** The rows the agents-working filter would leave on screen, with this
+   *  surface's `clientFilter` applied — headers feed it to the working chip
+   *  so the chip's count is the post-click row count (MUL-4884). Undefined
+   *  means the set is UNKNOWN (not materialized by the server-backed Table);
+   *  the chip renders an indeterminate state instead of a number. */
+  workingIssues: Issue[] | undefined;
 }
 
 interface IssueSurfaceComponentProps extends IssueSurfaceProps {
@@ -45,6 +53,7 @@ export function IssueSurface({
   modes,
   surfaceKey,
   createDefaults,
+  search,
   renderHeader,
   renderEmpty,
   renderLoading,
@@ -60,6 +69,18 @@ export function IssueSurface({
     [resolvedSurfaceKey],
   );
 
+  // Every change of this key tears down and remounts the ENTIRE surface
+  // (providers, DnD, all columns/cards) — by design for data-window changes,
+  // but expensive enough that unexpected flips are performance bugs. Dev-only
+  // breadcrumb so a Performance trace showing double mounts can be tied to
+  // the exact key transition.
+  const contentKey = `${wsId}:${issueScopeKey(scope)}`;
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(`[issue-surface] mount ${contentKey}`);
+    }
+  }, [contentKey]);
+
   return (
     <ViewStoreProvider store={store}>
       {/* Remount on data-window change: the list queries keep the previous
@@ -74,10 +95,11 @@ export function IssueSurface({
           workspaces share the same scope key (e.g. "workspace:all"). Keyed
           by data identity, not surfaceKey (view-preference identity). */}
       <IssueSurfaceContent
-        key={`${wsId}:${issueScopeKey(scope)}`}
+        key={contentKey}
         scope={scope}
         modes={modes}
         createDefaults={createDefaults}
+        search={search}
         renderHeader={renderHeader}
         renderEmpty={renderEmpty}
         renderLoading={renderLoading}
@@ -94,6 +116,7 @@ function IssueSurfaceContent({
   scope,
   modes,
   createDefaults,
+  search,
   renderHeader,
   renderEmpty,
   renderLoading,
@@ -107,7 +130,20 @@ function IssueSurfaceContent({
     scope,
     modes,
     createDefaults,
+    search,
   });
+  const [tableLoadedIssues, setTableLoadedIssues] = useState<Issue[]>([]);
+  const handleTableLoadedIssuesChange = useCallback((next: Issue[]) => {
+    setTableLoadedIssues((current) =>
+      current.length === next.length &&
+      current.every((issue, index) => issue === next[index])
+        ? current
+        : next,
+    );
+  }, []);
+  useEffect(() => {
+    if (controller.viewMode !== "table") setTableLoadedIssues([]);
+  }, [controller.viewMode]);
   const issues = useMemo(
     () =>
       clientFilter
@@ -122,9 +158,20 @@ function IssueSurfaceContent({
         : controller.swimlaneIssues,
     [clientFilter, controller.swimlaneIssues],
   );
+  // Same clientFilter the rendered rows go through, so the chip's promise
+  // survives on surfaces that narrow the list locally (e.g. a search box).
+  // An UNKNOWN scope (undefined) passes through untouched — there is nothing
+  // to filter and the chip must see it as unknown.
+  const workingIssues = useMemo(
+    () =>
+      clientFilter && controller.workingScopeIssues
+        ? controller.workingScopeIssues.filter((issue) => clientFilter(issue))
+        : controller.workingScopeIssues,
+    [clientFilter, controller.workingScopeIssues],
+  );
   const renderContext = useMemo(
-    () => ({ controller, issues }),
-    [controller, issues],
+    () => ({ controller, issues, workingIssues }),
+    [controller, issues, workingIssues],
   );
   const openCreateIssue = useCallback(
     (defaults?: IssueCreateDefaults) => {
@@ -132,16 +179,32 @@ function IssueSurfaceContent({
     },
     [controller],
   );
+  // Stable reference for BoardView's issues: the inline flatMap allocated a
+  // fresh array every render, defeating BoardView's memo.
+  const boardIssues = useMemo(
+    () =>
+      controller.assigneeGroups
+        ? controller.assigneeGroups.flatMap((group) => group.issues)
+        : issues,
+    [controller.assigneeGroups, issues],
+  );
   const shouldShowClientEmpty =
     !!clientFilter &&
     issues.length === 0 &&
     (showClientEmpty ? showClientEmpty(renderContext) : true);
   const shouldShowBatchToolbar =
     batchToolbar !== "never" &&
-    (batchToolbar === "always" || controller.viewMode === "list");
+    (batchToolbar === "always" ||
+      controller.viewMode === "list" ||
+      controller.viewMode === "table");
 
   return (
     <IssueSurfaceActionsProvider actions={controller.actions}>
+      {/* One shared right-click menu for every card/row this surface renders
+          — see IssueContextMenuProvider. Inside the actions provider so the
+          singleton's useIssueActions routes updates through surface
+          actions. */}
+      <IssueContextMenuProvider>
       <IssueSurfaceSelectionProvider selection={controller.selection}>
         {renderHeader ? (
           renderHeader(renderContext)
@@ -150,6 +213,11 @@ function IssueSurfaceContent({
             scopedIssues={controller.surfaceIssues}
             allowGantt={controller.allowGantt}
             isRefreshing={controller.isRefreshing}
+            facetCountsExact={
+              controller.facetCountsExact
+            }
+            tableFacetCounts={controller.tableFacetCounts}
+            onTableFacetChange={controller.setActiveTableFacet}
           />
         )}
         {controller.isLoading ? (
@@ -181,11 +249,7 @@ function IssueSurfaceContent({
           <div className={cn("flex flex-col flex-1 min-h-0", contentClassName)}>
             {controller.viewMode === "board" && (
               <BoardView
-                issues={
-                  controller.assigneeGroups
-                    ? controller.assigneeGroups.flatMap((group) => group.issues)
-                    : issues
-                }
+                issues={boardIssues}
                 assigneeGroups={controller.assigneeGroups}
                 assigneeGroupQueryKey={controller.assigneeGroupQueryKey}
                 assigneeGroupFilter={controller.assigneeGroupFilter}
@@ -199,6 +263,8 @@ function IssueSurfaceContent({
                 sort={controller.sort}
                 projectId={controller.projectId}
                 onCreateIssue={openCreateIssue}
+                statusPagination={controller.statusPagination}
+                groupBranches={controller.groupBranches}
               />
             )}
             {controller.viewMode === "list" && (
@@ -207,12 +273,22 @@ function IssueSurfaceContent({
                 visibleStatuses={controller.visibleStatuses}
                 childProgressMap={controller.childProgressMap}
                 projectMap={controller.projectMap}
-                myIssuesScope={controller.loadMoreScope}
-                myIssuesFilter={controller.loadMoreFilter}
-                sort={controller.sort}
                 projectId={controller.projectId}
                 onMoveIssue={controller.moveIssue}
                 onCreateIssue={openCreateIssue}
+                statusPagination={controller.statusPagination!}
+              />
+            )}
+            {controller.viewMode === "table" && (
+              <TableView
+                serverQuery={controller.tableQuerySpec}
+                childProgressMap={controller.childProgressMap}
+                search={controller.tableSearch}
+                onSearchChange={controller.setTableSearch}
+                onLoadedIssuesChange={handleTableLoadedIssuesChange}
+                onCreateIssue={openCreateIssue}
+                exportIssues={controller.exportTableIssues}
+                resolveExportLookups={controller.resolveTableExportLookups}
               />
             )}
             {controller.viewMode === "gantt" && (
@@ -232,24 +308,38 @@ function IssueSurfaceContent({
                 myIssuesFilter={controller.loadMoreFilter}
                 sort={controller.sort}
                 projectId={controller.projectId}
-                activityByIssueId={controller.activity.activityByIssueId}
                 onCreateIssue={openCreateIssue}
+                groupBranches={controller.groupBranches}
               />
             )}
           </div>
         )}
-        {shouldShowBatchToolbar && <BatchActionToolbar issues={issues} />}
+        {shouldShowBatchToolbar && (
+          <BatchActionToolbar
+            issues={
+              controller.viewMode === "table" ? tableLoadedIssues : issues
+            }
+          />
+        )}
       </IssueSurfaceSelectionProvider>
+      </IssueContextMenuProvider>
     </IssueSurfaceActionsProvider>
   );
 }
 
 function IssueSurfaceSkeleton({ mode }: { mode: string }) {
-  if (mode === "list") {
+  if (mode === "list" || mode === "table") {
     return (
-      <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-10 w-full rounded-lg" />
+      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2">
+        {mode === "table" && <Skeleton className="mb-1 h-8 w-full" />}
+        {Array.from({ length: mode === "table" ? 8 : 4 }).map((_, i) => (
+          <Skeleton
+            key={i}
+            className={cn(
+              "w-full",
+              mode === "table" ? "h-9 rounded-sm" : "h-10 rounded-lg",
+            )}
+          />
         ))}
       </div>
     );

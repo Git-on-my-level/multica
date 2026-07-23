@@ -241,6 +241,8 @@
     "version_unknown": "不明",
     "managed_by_desktop": "デスクトップで管理",
     "managed_by_desktop_title": "CLI バイナリは Multica Desktop で管理されています。CLI をアップグレードするには Desktop を更新してください。",
+    "read_only": "読み取り専用",
+    "read_only_title": "CLI を更新できるのは、ランタイムの所有者とワークスペース管理者のみです。",
     "latest": "最新",
     "available": "利用可能",
     "action": "更新",
@@ -398,6 +400,8 @@
     "unmapped_notice_other": "管理された価格がないモデルが {{count}} 個あり、そのトークンはコスト合計から除外されています。",
     "custom_pricing": {
       "open_button": "カスタム価格を設定",
+      "edit_button": "カスタム価格を編集",
+      "active_notice": "この期間には、設定したカスタム価格で計算されているモデルがあります。",
       "title": "カスタムモデル価格",
       "description": "管理された単価を提供していないモデルの価格を計算できるよう、100 万トークンあたりの単価を入力してください。このマシンにローカルで保存されます。",
       "empty": "今のところ、カスタム価格が必要なモデルはありません。",

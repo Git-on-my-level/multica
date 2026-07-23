@@ -32,9 +32,11 @@ const RESET_STATE = {
     priority: "none" as const,
     assigneeType: undefined,
     assigneeId: undefined,
+    projectId: undefined,
     startDate: null,
     dueDate: null,
     labelIds: [],
+    propertyValues: {},
     attachments: [],
   },
   lastAssigneeType: undefined,
@@ -101,6 +103,24 @@ describe("issue draft store — last assignee", () => {
     expect(useIssueDraftStore.getState().draft.attachments).toEqual([]);
   });
 
+  it("clearDraft removes persisted custom property values", () => {
+    const { setDraft, clearDraft } = useIssueDraftStore.getState();
+
+    setDraft({ propertyValues: { "property-1": "option-1" } });
+    clearDraft();
+
+    expect(useIssueDraftStore.getState().draft.propertyValues).toEqual({});
+  });
+
+  it("clearDraft removes the persisted project selection", () => {
+    const { setDraft, clearDraft } = useIssueDraftStore.getState();
+
+    setDraft({ projectId: "project-1" });
+    clearDraft();
+
+    expect(useIssueDraftStore.getState().draft.projectId).toBeUndefined();
+  });
+
   it("setLastAssignee(undefined) lets the user opt back out of a default", () => {
     const { setLastAssignee, clearDraft } = useIssueDraftStore.getState();
 
@@ -125,7 +145,7 @@ describe("issue draft store — legacy rehydrate", () => {
     setCurrentWorkspace(null, null);
   });
 
-  it("backfills attachments for drafts persisted before the field existed", async () => {
+  it("backfills attachments and custom properties for legacy drafts", async () => {
     localStorage.setItem(
       "multica_issue_draft:acme",
       JSON.stringify({
@@ -150,6 +170,8 @@ describe("issue draft store — legacy rehydrate", () => {
 
     const { draft } = useIssueDraftStore.getState();
     expect(draft.title).toBe("legacy");
+    expect(draft.projectId).toBeUndefined();
     expect(draft.attachments).toEqual([]);
+    expect(draft.propertyValues).toEqual({});
   });
 });

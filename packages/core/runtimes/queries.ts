@@ -13,7 +13,6 @@ export const runtimeKeys = {
   // by-hour now follows the viewer's tz, like the other reports.
   usageByHour: (rid: string, days: number, tz: string) =>
     ["runtimes", "usage", "by-hour", rid, days, tz] as const,
-  latestVersion: () => ["runtimes", "latestVersion"] as const,
 };
 
 // `tz` is the viewer's IANA name — all reports follow the viewer's tz.
@@ -56,25 +55,22 @@ export function runtimeListOptions(wsId: string, owner?: "me") {
   });
 }
 
-const GITHUB_RELEASES_URL = () =>
-  githubConfigFromStore().releasesLatestApiUrl;
-
 export function latestCliVersionOptions() {
-  const repo = githubConfigFromStore().repo;
+  const config = githubConfigFromStore();
   return queryOptions({
-    queryKey: [...runtimeKeys.latestVersion(), repo] as const,
+    queryKey: ["runtimes", "latest-version", config.repo] as const,
     queryFn: async (): Promise<string | null> => {
       try {
-        const resp = await fetch(GITHUB_RELEASES_URL(), {
+        const response = await fetch(config.releasesLatestApiUrl, {
           headers: { Accept: "application/vnd.github+json" },
         });
-        if (!resp.ok) return null;
-        const data = await resp.json();
-        return (data.tag_name as string) ?? null;
+        if (!response.ok) return null;
+        const data = await response.json() as { tag_name?: unknown };
+        return typeof data.tag_name === "string" ? data.tag_name : null;
       } catch {
         return null;
       }
     },
-    staleTime: 10 * 60 * 1000, // 10 minutes
+    staleTime: 10 * 60 * 1000,
   });
 }

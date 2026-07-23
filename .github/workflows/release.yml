@@ -69,8 +69,11 @@ jobs:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
 
+      - name: Verify Go test wrapper
+        run: bash scripts/test-go.test.sh
+
       - name: Run tests
-        run: cd server && go test -race ./...
+        run: bash scripts/test-go.sh --race
 
   # Publishes CLI archives to the GitHub Release for this repository.
   # Upstream uses .goreleaser.yml (includes Homebrew tap). Forks use
@@ -394,6 +397,9 @@ jobs:
   # need a committed electron-builder.yml owner override.
   desktop:
     needs: [verify, cli-release]
+    # Fork tags release CLI archives and GHCR images only. Desktop releases
+    # are a deliberate local Developer ID + notarization operation on arm64.
+    if: needs.verify.outputs.is_upstream == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -446,11 +452,12 @@ jobs:
           --config.publish.owner=${{ github.repository_owner }}
           --config.publish.repo=${{ github.event.repository.name }}
 
-  # macOS desktop for forks only. Upstream still ships macOS via the manual
-  # release-desktop skill (Developer ID + notarization outside this workflow).
+  # Fork Desktop publication is intentionally disabled. GitHub-hosted runners
+  # cannot use David's local Keychain identity, and an unsigned/ad-hoc macOS
+  # artifact must never be attached to a public fork tag.
   desktop-mac:
     needs: [verify, cli-release]
-    if: needs.verify.outputs.is_upstream != 'true'
+    if: ${{ false }}
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -481,15 +488,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Fork releases are intentionally ad-hoc signed. Do not consume
-          # repository signing/notarization secrets here: they belong to the
-          # upstream's manual Developer ID release path and may not be a
-          # usable certificate in a fork.
+          # This disabled job remains fail-closed as defense in depth.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         shell: bash
-        # Apple Silicon only — publishing both x64 and arm64 with --publish
-        # always overwrites latest-mac.yml on the same release and breaks
-        # electron-updater (no separate latest-arm64.yml channel on macOS).
+        # Never enable this job for a distributed build; use MACOS_RELEASE.md.
         run: >-
           node scripts/package.mjs
           --mac --arm64 --publish always

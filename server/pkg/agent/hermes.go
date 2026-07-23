@@ -25,8 +25,132 @@ import (
 // overridden by user-configured custom_args. `acp` is the protocol
 // subcommand that drives the ACP JSON-RPC transport; overriding it
 // would break the daemon↔Hermes communication contract.
+//
+// `-p`/`--profile` are NOT stripped unconditionally: a skill-less Hermes task
+// has no overlay, so its profile selection must pass through to Hermes
+// unchanged. The daemon strips the selected occurrence via StripHermesProfileArgs
+// only when it actually built the per-task overlay (see the daemon's launch-arg
+// handling), so the flag can't re-point HERMES_HOME past the overlay while
+// leaving no-overlay tasks' behavior untouched.
 var hermesBlockedArgs = map[string]blockedArgMode{
 	"acp": blockedStandalone,
+}
+
+// hermesArgProfileRe mirrors the space-form guard in Hermes'
+// hermes_cli.main._apply_profile_override step 1b: a `-p <value>` whose value
+// doesn't match the profile-id shape is not a profile selection at all (e.g.
+// pytest's `-p no:xdist`), so it is ignored rather than consumed. The inline
+// `--profile=<value>` form is NOT guarded here — Hermes forwards it verbatim to
+// resolve_profile_env, which validates and hard-fails on an invalid value; that
+// validation lives in the daemon-side resolver (execenv.ResolveHermesProfile).
+var hermesArgProfileRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// hermesValueFlags and hermesOptionalValueFlags mirror the value-taking flags
+// Hermes skips while scanning argv for -p/--profile, so a value like the `coder`
+// in `-m coder -p research` is never misread as the profile. Kept in sync with
+// _apply_profile_override.value_flags / optional_value_flags.
+var hermesValueFlags = map[string]struct{}{
+	"-z": {}, "--oneshot": {}, "-m": {}, "--model": {}, "--provider": {},
+	"-t": {}, "--toolsets": {}, "-r": {}, "--resume": {}, "-s": {},
+	"--skills": {}, "--usage-file": {},
+}
+var hermesOptionalValueFlags = map[string]struct{}{"-c": {}, "--continue": {}}
+
+// HermesProfileSelection is the profile selection parsed out of custom_args by
+// ParseHermesProfileArgs. It carries the exact argv occurrence to consume so the
+// daemon-side resolver and the launch-arg stripping act on one authoritative
+// parse instead of each re-approximating Hermes' argv handling.
+type HermesProfileSelection struct {
+	Name    string // the selected value; "" for the empty inline `--profile=` value
+	Found   bool   // a -p/--profile selection with a value was matched
+	Inline  bool   // matched the `--profile=<value>` form (value validated downstream)
+	ArgFrom int    // index of the first token to strip, or -1 when nothing matched
+	ArgLen  int    // tokens to strip: 2 for `-p <value>`, 1 for `--profile=<value>`
+}
+
+// ParseHermesProfileArgs finds the first Hermes profile selection in custom_args,
+// mirroring hermes_cli.main._apply_profile_override step 1/1b: it scans for the
+// first `-p`/`--profile <value>` or `--profile=<value>`, skipping value-taking
+// flags and stopping at a `--` sentinel or an `mcp add --args` command-argv
+// passthrough region. A space-form value that fails the profile-id shape is
+// ignored (matches Hermes discarding it). Args are unquoted with the same helper
+// as filterCustomArgs so quoting is handled consistently.
+func ParseHermesProfileArgs(args []string) HermesProfileSelection {
+	none := HermesProfileSelection{ArgFrom: -1}
+	i := 0
+	for i < len(args) {
+		arg := unshellQuoteArg(args[i])
+		if arg == "--" {
+			break
+		}
+		if arg == "--args" && hermesInsideMcpAdd(args, i) {
+			break
+		}
+		if arg == "-p" || arg == "--profile" {
+			if i+1 < len(args) {
+				val := unshellQuoteArg(args[i+1])
+				if !hermesArgProfileRe.MatchString(val) {
+					return none // step 1b: not a valid profile value, ignore
+				}
+				return HermesProfileSelection{Name: val, Found: true, ArgFrom: i, ArgLen: 2}
+			}
+			return none // trailing flag with no value
+		}
+		if v, ok := strings.CutPrefix(arg, "--profile="); ok {
+			return HermesProfileSelection{Name: v, Found: true, Inline: true, ArgFrom: i, ArgLen: 1}
+		}
+		if _, ok := hermesValueFlags[arg]; ok && i+1 < len(args) {
+			i += 2
+			continue
+		}
+		if _, ok := hermesOptionalValueFlags[arg]; ok && i+1 < len(args) &&
+			!strings.HasPrefix(unshellQuoteArg(args[i+1]), "-") {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return none
+}
+
+// hermesInsideMcpAdd reports whether argv position index sits inside an
+// `mcp add ... --args <child argv>` passthrough region, where flags belong to
+// the child MCP command and must not be read as Hermes' own profile selector.
+func hermesInsideMcpAdd(args []string, index int) bool {
+	mcp := -1
+	for j := 0; j < index; j++ {
+		if unshellQuoteArg(args[j]) == "mcp" {
+			mcp = j
+			break
+		}
+	}
+	if mcp < 0 {
+		return false
+	}
+	for j := mcp + 1; j < index; j++ {
+		if unshellQuoteArg(args[j]) == "add" {
+			return true
+		}
+	}
+	return false
+}
+
+// StripHermesProfileArgs removes exactly the argv occurrence ParseHermesProfileArgs
+// selected. The daemon calls this only when it built the per-task overlay, so
+// Hermes uses the overlay's HERMES_HOME instead of re-resolving the profile —
+// while a skill-less task keeps its flags untouched.
+func StripHermesProfileArgs(args []string, sel HermesProfileSelection) []string {
+	if !sel.Found || sel.ArgFrom < 0 || sel.ArgLen <= 0 {
+		return args
+	}
+	end := sel.ArgFrom + sel.ArgLen
+	if end > len(args) {
+		end = len(args)
+	}
+	out := make([]string, 0, len(args)-(end-sel.ArgFrom))
+	out = append(out, args[:sel.ArgFrom]...)
+	out = append(out, args[end:]...)
+	return out
 }
 
 // hermesBackend implements Backend by spawning `hermes acp` and communicating
@@ -36,6 +160,11 @@ var hermesBlockedArgs = map[string]blockedArgMode{
 type hermesBackend struct {
 	cfg Config
 }
+
+var (
+	hermesReaderDrainGrace      = 2 * time.Second
+	hermesNotificationQuietTime = 250 * time.Millisecond
+)
 
 func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
 	execPath := b.cfg.ExecutablePath
@@ -140,6 +269,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	var streamingCurrentTurn atomic.Bool
 
 	promptDone := make(chan hermesPromptResult, 1)
+	activity := make(chan struct{}, 1)
 
 	c := &hermesClient{
 		cfg:          b.cfg,
@@ -148,6 +278,12 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		pendingTools: make(map[string]*pendingToolCall),
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
+		},
+		onActivity: func() {
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
 		},
 		onMessage: func(msg Message) {
 			if !streamingCurrentTurn.Load() {
@@ -189,11 +325,15 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	// Drive the ACP session lifecycle in a goroutine.
 	go func() {
-		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
 		defer func() {
 			stdin.Close()
+			// Cancellation must be reachable before Wait. A pathological child
+			// can close stdout/stderr (so the pipe drain succeeds) but keep the
+			// process alive; waiting first would then block until the overall
+			// task timeout and make a later deferred cancel ineffective.
+			cancel()
 			_ = cmd.Wait()
 		}()
 
@@ -201,7 +341,16 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		finalStatus := "completed"
 		var finalError string
 		var sessionID string
+		// Set when the ACP runtime refuses the session we asked to
+		// resume. Only that is curable by starting a fresh session, so
+		// handshake/network failures below must leave it false.
+		var resumeRejected bool
 		effectiveModel := strings.TrimSpace(opts.Model)
+		// The model id the runtime reports as current right after
+		// session/new or session/resume. Used to skip a redundant
+		// session/set_model when we would otherwise re-select the model the
+		// session is already on (see the set_model gate below).
+		var sessionCurrentModel string
 
 		// 1. Initialize handshake.
 		initResult, err := c.request(runCtx, "initialize", map[string]any{
@@ -257,8 +406,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					"actual", sessionID,
 				)
 			}
+			sessionCurrentModel = extractACPCurrentModelID(result)
 			if effectiveModel == "" {
-				effectiveModel = extractACPCurrentModelID(result)
+				effectiveModel = sessionCurrentModel
 			}
 		} else {
 			result, err := c.request(runCtx, "session/new", buildHermesSessionParams(cwd, opts.Model, mcpServers))
@@ -275,8 +425,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
+			sessionCurrentModel = extractACPCurrentModelID(result)
 			if effectiveModel == "" {
-				effectiveModel = extractACPCurrentModelID(result)
+				effectiveModel = sessionCurrentModel
 			}
 		}
 
@@ -291,7 +442,22 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// if we silently fell back to hermes' default model the
 		// user would think their pick was honoured while the
 		// task actually ran on something else.
-		if opts.Model != "" {
+		//
+		// Skip the call when the session already reports this exact model as
+		// current. Hermes' set_model re-runs provider auto-detection on the
+		// model id, and for a `provider:model` id whose parsed provider equals
+		// the session's current provider it can mis-route to a different
+		// provider (e.g. custom:deepseek-v4-pro → OpenRouter) and fail with an
+		// auth error. Re-selecting the model the session is already on is pure
+		// downside. An empty sessionCurrentModel (older runtime or unparsable
+		// state) falls through and still sends set_model, preserving prior
+		// behaviour. See MUL-5029 / NousResearch/hermes-agent#59089.
+		if opts.Model != "" && effectiveModel == sessionCurrentModel {
+			b.cfg.Logger.Info("hermes session already on requested model; skipping redundant set_model",
+				"model", opts.Model,
+				"session_id", sessionID,
+			)
+		} else if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
@@ -309,12 +475,14 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
 				}
 				resCh <- Result{
-					Status:     finalStatus,
-					Error:      finalError,
-					DurationMs: time.Since(startTime).Milliseconds(),
-					SessionID:  sessionID,
+					Status:         finalStatus,
+					Error:          finalError,
+					DurationMs:     time.Since(startTime).Milliseconds(),
+					SessionID:      sessionID,
+					ResumeRejected: resumeRejected,
 				}
 				return
 			}
@@ -366,6 +534,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
 				}
 			}
 		} else {
@@ -385,24 +554,37 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				c.usageMu.Unlock()
 			default:
 			}
+			waitForHermesNotificationQuiescence(runCtx, activity, readerDone)
 		}
 
 		duration := time.Since(startTime)
 		b.cfg.Logger.Info("hermes finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		// Close stdin and cancel context to signal hermes acp to exit.
+		// Close stdin first so Hermes can observe EOF and exit cleanly. Keep the
+		// process alive while stdout/stderr drain; cancelling at the prompt
+		// response boundary can truncate final notifications that arrive just
+		// after the response.
 		stdin.Close()
-		cancel()
 
-		// Wait for the reader goroutine to finish so all output is accumulated.
-		<-readerDone
-		// Wait for the stderr copier as well so the provider-error sniffer
+		// Wait for the stdout reader and stderr copier so all output is
+		// accumulated and the provider-error sniffer
 		// has every byte the child wrote before we consult it for failure
 		// promotion. Skipping this leaves a small race where stopReason=
 		// end_turn arrives over stdout while the stderr 429 / usage-limit
 		// lines are still in transit, causing the promoted error message
-		// to fall through to the synthetic agent-text fallback.
-		<-stderrDone
+		// to fall through to the synthetic agent-text fallback. If Hermes does
+		// not honor stdin EOF within the bound, cancel it and join both readers
+		// before accessing their buffers.
+		if !waitForHermesPipeDrain(readerDone, stderrDone, hermesReaderDrainGrace) {
+			b.cfg.Logger.Warn("hermes did not close output pipes after stdin EOF; forcing shutdown",
+				"pid", cmd.Process.Pid,
+				"grace", hermesReaderDrainGrace.String(),
+			)
+			cancel()
+			<-readerDone
+			<-stderrDone
+		}
+		streamingCurrentTurn.Store(false)
 
 		outputMu.Lock()
 		finalOutput := output.String()
@@ -433,16 +615,66 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     finalOutput,
-			Error:      finalError,
-			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
-			Usage:      usageMap,
+			Status:         finalStatus,
+			Output:         finalOutput,
+			Error:          finalError,
+			DurationMs:     duration.Milliseconds(),
+			SessionID:      sessionID,
+			ResumeRejected: resumeRejected,
+			Usage:          usageMap,
 		}
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+// waitForHermesNotificationQuiescence gives the stdout reader a bounded chance
+// to consume session updates emitted just after session/prompt returns. Hermes
+// may deliver the final agent_message_chunk after the response; closing stdin
+// or cancelling immediately at that boundary loses the user-visible answer.
+func waitForHermesNotificationQuiescence(ctx context.Context, activity <-chan struct{}, readerDone <-chan struct{}) {
+	quiet := time.NewTimer(hermesNotificationQuietTime)
+	defer quiet.Stop()
+	hard := time.NewTimer(hermesReaderDrainGrace)
+	defer hard.Stop()
+
+	for {
+		select {
+		case <-activity:
+			if !quiet.Stop() {
+				select {
+				case <-quiet.C:
+				default:
+				}
+			}
+			quiet.Reset(hermesNotificationQuietTime)
+		case <-quiet.C:
+			return
+		case <-readerDone:
+			return
+		case <-hard.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func waitForHermesPipeDrain(readerDone, stderrDone <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for readerDone != nil || stderrDone != nil {
+		select {
+		case <-readerDone:
+			readerDone = nil
+		case <-stderrDone:
+			stderrDone = nil
+		case <-timer.C:
+			return false
+		}
+	}
+	return true
 }
 
 // ── hermesClient: ACP JSON-RPC 2.0 transport ──
@@ -450,6 +682,11 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 type hermesPromptResult struct {
 	stopReason string
 	usage      TokenUsage
+	// modelID is the model the agent actually billed this turn against, as
+	// reported on `result._meta.modelId`. Empty for agents that don't report
+	// it. Backends use it to attribute usage when the session handshake
+	// didn't surface a model id (see grok.go).
+	modelID string
 }
 
 type hermesClient struct {
@@ -462,6 +699,10 @@ type hermesClient struct {
 	sessionID    string
 	onMessage    func(Message)
 	onPromptDone func(hermesPromptResult)
+	// onActivity observes accepted ACP session updates. Hermes and Grok use it
+	// to retain a short post-response drain window; other ACP backends leave it
+	// nil and keep their existing lifecycle behavior.
+	onActivity func()
 	// acceptNotification can drop ACP session updates before dispatching to
 	// handlers that mutate client state such as usage or pending tool calls.
 	acceptNotification func(updateType string) bool
@@ -871,6 +1112,7 @@ func (c *hermesClient) extractPromptResult(data json.RawMessage) {
 	var resp struct {
 		StopReason string          `json:"stopReason"`
 		Usage      json.RawMessage `json:"usage"`
+		Meta       json.RawMessage `json:"_meta"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return
@@ -878,14 +1120,76 @@ func (c *hermesClient) extractPromptResult(data json.RawMessage) {
 
 	pr := hermesPromptResult{
 		stopReason: resp.StopReason,
+		modelID:    parseACPModelIDFromMeta(resp.Meta),
 	}
 	if len(resp.Usage) > 0 && string(resp.Usage) != "null" {
 		pr.usage = parseACPTokenUsage(resp.Usage)
+	}
+	// Prefer the standard top-level ACP `usage` field when present. Some
+	// agents (notably xAI Grok Build) put per-turn metering only under
+	// result._meta — either as `_meta.usage` or as flat token counters on
+	// `_meta` itself. Without this fallback, tasks complete with an empty
+	// usage map and Multica's Usage/cost dashboards stay at zero.
+	if !acpTokenUsagePresent(pr.usage) {
+		if metaUsage := parseACPTokenUsageFromMeta(resp.Meta); acpTokenUsagePresent(metaUsage) {
+			pr.usage = metaUsage
+		}
 	}
 
 	if c.onPromptDone != nil {
 		c.onPromptDone(pr)
 	}
+}
+
+// acpTokenUsagePresent reports whether any token counter is non-zero.
+func acpTokenUsagePresent(u TokenUsage) bool {
+	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CacheReadTokens > 0 || u.CacheWriteTokens > 0
+}
+
+// parseACPTokenUsageFromMeta extracts token usage from an ACP result `_meta`
+// object. Grok Build returns shapes like:
+//
+//	{"inputTokens":…,"outputTokens":…,"cachedReadTokens":…,"usage":{…}}
+//
+// Prefer the nested `usage` object when it carries counters; otherwise parse
+// the flat `_meta` fields with the same alias rules as top-level usage.
+func parseACPTokenUsageFromMeta(meta json.RawMessage) TokenUsage {
+	if len(meta) == 0 || string(meta) == "null" {
+		return TokenUsage{}
+	}
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(meta, &envelope); err == nil {
+		if len(envelope.Usage) > 0 && string(envelope.Usage) != "null" {
+			if u := parseACPTokenUsage(envelope.Usage); acpTokenUsagePresent(u) {
+				return u
+			}
+		}
+	}
+	return parseACPTokenUsage(meta)
+}
+
+// parseACPModelIDFromMeta pulls the model id off an ACP result `_meta`
+// object. Grok Build stamps every turn with `_meta.modelId`, which is the
+// only authoritative statement of what the turn was billed against — the
+// session handshake reports a model id on `session/new` but NOT on
+// `session/load`, so a resumed session has no other source.
+func parseACPModelIDFromMeta(meta json.RawMessage) string {
+	if len(meta) == 0 || string(meta) == "null" {
+		return ""
+	}
+	var r struct {
+		ModelID      string `json:"modelId"`
+		ModelIDSnake string `json:"model_id"`
+	}
+	if err := json.Unmarshal(meta, &r); err != nil {
+		return ""
+	}
+	if id := strings.TrimSpace(r.ModelID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(r.ModelIDSnake)
 }
 
 func (c *hermesClient) handleNotification(raw map[string]json.RawMessage) {
@@ -910,6 +1214,9 @@ func (c *hermesClient) handleNotification(raw map[string]json.RawMessage) {
 	updateType, updateData := normalizeACPUpdate(params.Update)
 	if c.acceptNotification != nil && !c.acceptNotification(updateType) {
 		return
+	}
+	if c.onActivity != nil {
+		c.onActivity()
 	}
 
 	switch updateType {
@@ -1072,8 +1379,8 @@ func (c *hermesClient) handleToolCallUpdate(data json.RawMessage) {
 		RawInput   map[string]any    `json:"rawInput"`
 		Input      map[string]any    `json:"input"`
 		Parameters map[string]any    `json:"parameters"`
-		RawOutput  string            `json:"rawOutput"`
-		Output     string            `json:"output"`
+		RawOutput  json.RawMessage   `json:"rawOutput"`
+		Output     json.RawMessage   `json:"output"`
 		Content    []json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -1109,9 +1416,9 @@ func (c *hermesClient) handleToolCallUpdate(data json.RawMessage) {
 	pending := c.takePendingTool(msg.ToolCallID)
 	c.emitDeferredToolUse(pending, msg.ToolCallID, title, msg.Kind, rawInput)
 
-	output := msg.RawOutput
+	output := acpRawText(msg.RawOutput)
 	if output == "" {
-		output = msg.Output
+		output = acpRawText(msg.Output)
 	}
 	if output == "" {
 		output = extractACPToolCallText(msg.Content)
@@ -1236,6 +1543,27 @@ func parseToolArgsJSON(argsText string) map[string]any {
 //     as a minimal unified-diff header so the UI distinguishes writes
 //     from reads without needing a diff viewer.
 //
+// acpRawText renders an ACP output field (rawOutput / output) that may arrive
+// as either a JSON string or a structured value. Some model adapters — notably
+// Kiro's GPT-5.6 Sol path — send the completed tool_call_update's rawOutput as
+// an object like {"items":[{"Json":{...}}]} rather than a string. Declaring
+// that field as a Go string made json.Unmarshal fail, which made
+// handleToolCallUpdate return early and silently DROP the entire update —
+// including its status:"completed" — so the completion signal was lost and the
+// task was wrongly marked failed (issue #5509 / MUL-4860). Accept both shapes.
+func acpRawText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// Non-string (object / array / number): keep the raw JSON as text so the
+	// output is preserved rather than discarded.
+	return string(raw)
+}
+
 // Terminal blocks ({type:"terminal", terminalId}) reference a remote
 // terminal the client would normally subscribe to via terminal/output;
 // we don't advertise terminal capability so we never receive those in
@@ -1338,6 +1666,9 @@ func (c *hermesClient) handleUsageUpdate(data json.RawMessage) {
 	if usage.CacheWriteTokens > c.usage.CacheWriteTokens {
 		c.usage.CacheWriteTokens = usage.CacheWriteTokens
 	}
+	if usage.CostUSDTicks > c.usage.CostUSDTicks {
+		c.usage.CostUSDTicks = usage.CostUSDTicks
+	}
 	c.usageMu.Unlock()
 }
 
@@ -1349,7 +1680,7 @@ func parseACPTokenUsage(data json.RawMessage) TokenUsage {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return TokenUsage{}
 	}
-	return TokenUsage{
+	usage := TokenUsage{
 		InputTokens:  acpUsageInt64(fields, "inputTokens", "input_tokens"),
 		OutputTokens: acpUsageInt64(fields, "outputTokens", "output_tokens"),
 		CacheReadTokens: acpUsageInt64(fields,
@@ -1365,7 +1696,42 @@ func parseACPTokenUsage(data json.RawMessage) TokenUsage {
 			"cache_write_tokens",
 			"cache_creation_input_tokens",
 		),
+		// The provider's own price for this turn, already inclusive of
+		// request-level pricing rules we cannot reconstruct from token
+		// counts (see TokenUsage.CostUSDTicks).
+		CostUSDTicks: acpUsageInt64(fields, "costUsdTicks", "cost_usd_ticks"),
 	}
+	return excludeACPCachedInput(usage, acpUsageInt64(fields, "totalTokens", "total_tokens"))
+}
+
+// excludeACPCachedInput re-buckets a usage record whose `inputTokens` already
+// contains `cachedReadTokens`, so the persisted buckets stay mutually
+// exclusive and dashboard cost math does not charge the cached prefix twice
+// (same normalization codex.go applies via codexUncachedInputTokens).
+//
+// ACP does not specify whether cached reads are counted inside inputTokens.
+// Grok Build counts them inside: a real `grok 0.2.106` turn reports
+// inputTokens=12929, cachedReadTokens=10880, outputTokens=29,
+// totalTokens=12958 — i.e. total == input + output, so the cached prefix is
+// counted once, within input. The same payload's costUsdTicks=75360000
+// ($0.007536) matches exactly (12929-10880) uncached input + 10880 cached
+// read + 29 output at xAI's published grok-4.5 rates, confirming how xAI
+// bills it. Kept raw, that turn is priced as if 12929 tokens were uncached —
+// ~4x the real spend on a cache-heavy turn.
+//
+// `totalTokens` is the only self-describing signal available, so the
+// re-bucketing only happens when it is present and equals input + output.
+// Agents that report exclusive buckets (total == input + cached + output) or
+// omit totalTokens keep their counters untouched.
+func excludeACPCachedInput(usage TokenUsage, totalTokens int64) TokenUsage {
+	if totalTokens <= 0 || usage.CacheReadTokens <= 0 || usage.CacheReadTokens > usage.InputTokens {
+		return usage
+	}
+	if totalTokens != usage.InputTokens+usage.OutputTokens {
+		return usage
+	}
+	usage.InputTokens -= usage.CacheReadTokens
+	return usage
 }
 
 func acpUsageInt64(fields map[string]json.RawMessage, names ...string) int64 {
@@ -1408,6 +1774,32 @@ func extractACPSessionID(result json.RawMessage) string {
 		return ""
 	}
 	return r.SessionID
+}
+
+// extractACPAuthMethods returns the `authMethods` ids advertised in an ACP
+// `initialize` response, in the order the agent listed them. Agents that
+// require authentication (e.g. xAI's Grok Build) enumerate the accepted
+// methods here; per the ACP flow the client MUST send `authenticate` with one
+// of these ids before `session/new` / `session/load`. Agents that need no
+// explicit auth omit the field, so an empty slice means "skip authenticate".
+// A malformed response degrades to an empty slice (fail open on parsing so we
+// don't wedge agents that never needed the step).
+func extractACPAuthMethods(result json.RawMessage) []string {
+	var r struct {
+		AuthMethods []struct {
+			ID string `json:"id"`
+		} `json:"authMethods"`
+	}
+	if err := json.Unmarshal(result, &r); err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(r.AuthMethods))
+	for _, m := range r.AuthMethods {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // extractACPCurrentModelID pulls the model selected by the ACP runtime out of

@@ -76,6 +76,7 @@ export function AuthInitializer({
           changelogUrl: cfg.changelog_url,
         });
         configStore.getState().setFeatureFlags(cfg.feature_flags);
+        configStore.getState().setServerVersion(cfg.server_version);
         if (cfg.posthog_key) {
           initAnalytics({
             key: cfg.posthog_key,

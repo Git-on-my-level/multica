@@ -6,8 +6,6 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Agent, AgentRuntime } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
-import { configStore } from "@multica/core/config";
-import { AGENT_SKILL_TOGGLES_FLAG } from "@multica/core/feature-flags";
 import enCommon from "../../../locales/en/common.json";
 import enAgents from "../../../locales/en/agents.json";
 
@@ -16,6 +14,7 @@ const TEST_RESOURCES = { en: { common: enCommon, agents: enAgents } };
 const mockListSkills = vi.hoisted(() => vi.fn());
 const mockGetSkill = vi.hoisted(() => vi.fn());
 const mockSetAgentSkillEnabled = vi.hoisted(() => vi.fn());
+const mockSetAgentRuntimeSkillEnabled = vi.hoisted(() => vi.fn());
 const mockRemoveAgentSkill = vi.hoisted(() => vi.fn());
 const mockRuntimeCapabilities = vi.hoisted(() => vi.fn());
 
@@ -45,6 +44,8 @@ vi.mock("@multica/core/api", () => ({
     getSkill: (...args: unknown[]) => mockGetSkill(...args),
     setAgentSkills: vi.fn(),
     setAgentSkillEnabled: (...args: unknown[]) => mockSetAgentSkillEnabled(...args),
+    setAgentRuntimeSkillEnabled: (...args: unknown[]) =>
+      mockSetAgentRuntimeSkillEnabled(...args),
     removeAgentSkill: (...args: unknown[]) => mockRemoveAgentSkill(...args),
   },
   ApiError,
@@ -134,10 +135,10 @@ function renderSkillsTab(
 
 describe("SkillsTab", () => {
   beforeEach(() => {
-	vi.clearAllMocks();
-	configStore.getState().setFeatureFlags({ [AGENT_SKILL_TOGGLES_FLAG]: true });
+    vi.clearAllMocks();
     mockListSkills.mockResolvedValue([]);
     mockSetAgentSkillEnabled.mockResolvedValue(undefined);
+    mockSetAgentRuntimeSkillEnabled.mockResolvedValue(undefined);
     mockRemoveAgentSkill.mockResolvedValue(undefined);
     mockRuntimeCapabilities.mockResolvedValue({
       skills: [],
@@ -202,6 +203,81 @@ describe("SkillsTab", () => {
 
     expect(await screen.findByText("Local review")).toBeInTheDocument();
     expect(screen.getByText("Host-level review workflow")).toBeInTheDocument();
+  });
+
+  it("turns a controllable inherited skill off for this agent", async () => {
+    const user = userEvent.setup();
+    mockRuntimeCapabilities.mockResolvedValue({
+      skills: [
+        {
+          key: "local-review",
+          name: "Local review",
+          source_path: "~/.codex/skills/local-review",
+          provider: "codex",
+          root: "provider",
+          can_disable: true,
+          file_count: 1,
+        },
+      ],
+      supported: true,
+      mcpServers: [],
+      mcpSupported: true,
+    });
+
+    renderSkillsTab({}, onlineRuntime);
+    await user.click(
+      await screen.findByRole("switch", {
+        name: /Toggle inherited Local review/i,
+      }),
+    );
+
+    expect(mockSetAgentRuntimeSkillEnabled).toHaveBeenCalledWith("agent-1", {
+      runtime_id: "runtime-1",
+      root: "provider",
+      key: "local-review",
+      name: "Local review",
+      plugin: undefined,
+      enabled: false,
+    });
+  });
+
+  it("renders a persisted inherited-skill override as off", async () => {
+    mockRuntimeCapabilities.mockResolvedValue({
+      skills: [
+        {
+          key: "local-review",
+          name: "Local review",
+          source_path: "~/.codex/skills/local-review",
+          provider: "codex",
+          root: "provider",
+          can_disable: true,
+          file_count: 1,
+        },
+      ],
+      supported: true,
+      mcpServers: [],
+      mcpSupported: true,
+    });
+
+    renderSkillsTab(
+      {
+        disabled_runtime_skills: [
+          {
+            runtime_id: "runtime-1",
+            provider: "codex",
+            root: "provider",
+            key: "local-review",
+          },
+        ],
+      },
+      onlineRuntime,
+    );
+
+    expect(
+      await screen.findByRole("switch", {
+        name: /Toggle inherited Local review/i,
+      }),
+    ).not.toBeChecked();
   });
 
   it("shows a permission notice when capability discovery is forbidden", async () => {

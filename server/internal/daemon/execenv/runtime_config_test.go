@@ -162,6 +162,45 @@ func TestCommentTriggeredProtocolDoesNotForceInReview(t *testing.T) {
 	if !strings.Contains(out, guardrail) {
 		t.Errorf("expected the comment-triggered workflow guardrail %q to be present", guardrail)
 	}
+
+	// For an ordinary agent the guardrail is absolute — the squad-leader
+	// carve-out below must not leak into this path.
+	if strings.Contains(out, "Own the parent issue status") {
+		t.Errorf("ordinary-agent comment brief must not reference the squad status grant:\n%s", out)
+	}
+}
+
+// A squad leader on a comment-triggered turn gets the same guardrail plus a
+// named exception. Without it the guardrail and the Squad Operating Protocol's
+// "Own the parent issue status" responsibility contradict each other on the
+// @mention-dispatch shape, where the member's delivery comment never asks for
+// a status change and no child-done system comment exists to ask on its
+// behalf — so the parent would sit in in_progress forever.
+func TestCommentTriggeredSquadLeaderDefersToStatusOwnershipGrant(t *testing.T) {
+	t.Parallel()
+	out := buildMetaSkillContent("claude", TaskContextForEnv{
+		IssueID:          "55555555-6666-7777-8888-999999999999",
+		TriggerCommentID: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+		IsSquadLeader:    true,
+	})
+
+	for _, want := range []string{
+		"Do NOT change the issue status unless the comment explicitly asks for it",
+		`Squad Operating Protocol's "Own the parent issue status"`,
+		"only appears when this issue is assigned to your squad",
+		"without waiting to be asked",
+		"When it is absent, the rule above is absolute.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("squad-leader comment brief missing %q\n---\n%s", want, out)
+		}
+	}
+
+	// The unqualified sentence must be gone: its presence alongside the grant
+	// is the contradiction this branch exists to remove.
+	if strings.Contains(out, "explicitly asks for it\n") {
+		t.Errorf("squad-leader comment brief still ends the guardrail unqualified\n---\n%s", out)
+	}
 }
 
 // The CLAUDE.md workflow surface must carry the same issue-wide since-delta
@@ -264,6 +303,32 @@ func TestCommentTriggeredBriefResumedNoDeltaSkipsDefaultThreadRead(t *testing.T)
 	}
 }
 
+// When the daemon could not honor an expected resume, the brief must make the
+// context loss user-visible by instructing the agent to disclose it — not leave
+// it as a silent restart (MUL-4424).
+func TestBriefSurfacesResumeUnavailable(t *testing.T) {
+	t.Parallel()
+	const issueID = "11111111-2222-3333-4444-555555555555"
+	base := TaskContextForEnv{IssueID: issueID, TriggerCommentID: "trigger-1", TriggerThreadID: "thread-1"}
+
+	lost := base
+	lost.PriorSessionResumeUnavailable = true
+	out := buildMetaSkillContent("codex", lost)
+	for _, want := range []string{
+		"## Session Continuity Notice",
+		"could NOT be restored",
+		"tell the user up front",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("resume-unavailable brief missing %q\n---\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(buildMetaSkillContent("codex", base), "Session Continuity Notice") {
+		t.Error("brief must not show the continuity notice when no resume was lost")
+	}
+}
+
 // Assignment-triggered briefs are the high-risk path for role conflicts:
 // non-executor agents still need issue context, but the runtime workflow must
 // not turn status changes, investigation, implementation, or delegation into
@@ -297,6 +362,39 @@ func TestAssignmentTriggeredProtocolHonorsAgentIdentity(t *testing.T) {
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("assignment-triggered brief still contains unconditional legacy workflow text %q\n---\n%s", banned, out)
+		}
+	}
+}
+
+// Squad-leader assignment briefs must open the parent with in_progress, but
+// must not treat the first dispatch turn as completion (no unconditional
+// in_review). Leaders move the parent to in_review only on a later re-trigger
+// once the overall goal is met.
+func TestSquadLeaderAssignmentProtocolKeepsParentInProgress(t *testing.T) {
+	t.Parallel()
+	const issueID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	out := buildMetaSkillContent("claude", TaskContextForEnv{
+		IssueID:       issueID,
+		IsSquadLeader: true,
+	})
+
+	for _, want := range []string{
+		"Run `multica issue status " + issueID + " in_progress` unless your Agent Identity forbids issue status changes; if it does, skip this step.",
+		"After this initial dispatch, leave the parent issue `in_progress`",
+		"do NOT run `multica issue status " + issueID + " in_review` or `done` on this turn",
+		"only then, if the overall goal is met, move the parent to `in_review`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("squad-leader assignment brief missing %q\n---\n%s", want, out)
+		}
+	}
+
+	for _, banned := range []string{
+		"When done, run `multica issue status " + issueID + " in_review`",
+		"8. When done, run `multica issue status " + issueID + " in_review`",
+	} {
+		if strings.Contains(out, banned) {
+			t.Errorf("squad-leader assignment brief must not contain ordinary-agent completion step %q\n---\n%s", banned, out)
 		}
 	}
 }
@@ -776,6 +874,7 @@ func TestInjectRuntimeConfigPreservesUserContent(t *testing.T) {
 		filename string
 	}{
 		{"claude", "CLAUDE.md"},
+		{"codebuddy", "CODEBUDDY.md"},
 		{"codex", "AGENTS.md"},
 		{"copilot", "AGENTS.md"},
 		{"opencode", "AGENTS.md"},
@@ -786,6 +885,7 @@ func TestInjectRuntimeConfigPreservesUserContent(t *testing.T) {
 		{"kimi", "AGENTS.md"},
 		{"kiro", "AGENTS.md"},
 		{"antigravity", "AGENTS.md"},
+		{"qwen", "QWEN.md"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -823,12 +923,36 @@ func TestInjectRuntimeConfigPreservesUserContent(t *testing.T) {
 	}
 }
 
+// CodeBuddy is a Claude Code fork but ships its own native config
+// directory (~/.codebuddy, .codebuddy/) rather than reusing Claude's
+// ~/.claude / CLAUDE.md paths (see
+// https://www.codebuddy.ai/docs/cli/codebuddy-dir). This pins the two
+// providers to different target filenames so a future edit can't
+// silently re-merge them.
+func TestRuntimeConfigPathDistinguishesCodebuddyFromClaude(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	claudePath := runtimeConfigPath(dir, "claude")
+	codebuddyPath := runtimeConfigPath(dir, "codebuddy")
+
+	if claudePath != filepath.Join(dir, "CLAUDE.md") {
+		t.Errorf("claude runtime config path = %q, want CLAUDE.md", claudePath)
+	}
+	if codebuddyPath != filepath.Join(dir, "CODEBUDDY.md") {
+		t.Errorf("codebuddy runtime config path = %q, want CODEBUDDY.md", codebuddyPath)
+	}
+	if claudePath == codebuddyPath {
+		t.Fatal("claude and codebuddy must not share a runtime config path")
+	}
+}
+
 func TestInjectRuntimeConfigUnknownProviderSkipsWrite(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	// Seed all three candidate filenames so we can verify none of them get
+	// Seed all candidate filenames so we can verify none of them get
 	// written when the provider is unknown.
-	for _, name := range []string{"CLAUDE.md", "AGENTS.md"} {
+	for _, name := range []string{"CLAUDE.md", "CODEBUDDY.md", "AGENTS.md"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("untouched\n"), 0o644); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
@@ -839,7 +963,7 @@ func TestInjectRuntimeConfigUnknownProviderSkipsWrite(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InjectRuntimeConfig: %v", err)
 	}
-	for _, name := range []string{"CLAUDE.md", "AGENTS.md"} {
+	for _, name := range []string{"CLAUDE.md", "CODEBUDDY.md", "AGENTS.md"} {
 		got, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -1061,7 +1185,7 @@ func TestCleanupRuntimeConfigNoOpCases(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
 		// Seed every candidate filename to verify none of them get touched.
-		for _, name := range []string{"CLAUDE.md", "AGENTS.md"} {
+		for _, name := range []string{"CLAUDE.md", "CODEBUDDY.md", "AGENTS.md"} {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte("untouched\n"), 0o644); err != nil {
 				t.Fatalf("seed %s: %v", name, err)
 			}
@@ -1069,7 +1193,7 @@ func TestCleanupRuntimeConfigNoOpCases(t *testing.T) {
 		if err := CleanupRuntimeConfig(dir, "totally-unknown-provider"); err != nil {
 			t.Errorf("unknown provider must be no-op, got: %v", err)
 		}
-		for _, name := range []string{"CLAUDE.md", "AGENTS.md"} {
+		for _, name := range []string{"CLAUDE.md", "CODEBUDDY.md", "AGENTS.md"} {
 			got, err := os.ReadFile(filepath.Join(dir, name))
 			if err != nil {
 				t.Fatalf("read %s: %v", name, err)
@@ -1124,6 +1248,7 @@ func TestCleanupRuntimeConfigByProvider(t *testing.T) {
 		filename string
 	}{
 		{"claude", "CLAUDE.md"},
+		{"codebuddy", "CODEBUDDY.md"},
 		{"codex", "AGENTS.md"},
 		{"copilot", "AGENTS.md"},
 		{"opencode", "AGENTS.md"},
@@ -1134,6 +1259,7 @@ func TestCleanupRuntimeConfigByProvider(t *testing.T) {
 		{"kimi", "AGENTS.md"},
 		{"kiro", "AGENTS.md"},
 		{"antigravity", "AGENTS.md"},
+		{"qwen", "QWEN.md"},
 	}
 	for _, tc := range cases {
 		tc := tc

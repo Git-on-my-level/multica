@@ -13,10 +13,12 @@ import {
   FolderKanban,
   FolderMinus,
   List,
+  Rows3,
   SignalHigh,
   SlidersHorizontal,
   X,
   Tag,
+  Table2,
   User,
   UserMinus,
   UserPen,
@@ -56,8 +58,17 @@ import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions, agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
 import { labelListOptions } from "@multica/core/labels/queries";
+import { propertyListOptions } from "@multica/core/properties";
+import { propertyIdFromViewKey } from "@multica/core/issues/stores/view-store";
+import type {
+  Issue,
+  IssueProperty,
+  IssueTableFacetSpec,
+  IssueTableFacetsResponse,
+} from "@multica/core/types";
 import { ProjectIcon } from "../../projects/components/project-icon";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { PropertyIcon } from "../../common/property-icon";
 import { LabelChip } from "../../labels/label-chip";
 import {
   SORT_OPTIONS,
@@ -70,6 +81,7 @@ import {
   type SortField,
   type IssueGrouping,
   type SwimlaneGrouping,
+  type TableGrouping,
   type ViewMode,
 } from "@multica/core/issues/stores/view-store";
 import { useViewStore, useViewStoreApi } from "@multica/core/issues/stores/view-store-context";
@@ -79,11 +91,11 @@ import {
   type IssuesScope,
 } from "@multica/core/issues/stores/issues-scope-store";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
-import type { Issue } from "@multica/core/types";
 import { useT } from "../../i18n";
 import { matchesPinyin } from "../../editor/extensions/pinyin-match";
 import { FILTER_ITEM_CLASS, HoverCheck } from "../../common/hover-check";
 import { WorkspaceAgentWorkingChip } from "./workspace-agent-working-chip";
+import { TableColumnPicker } from "./table-view";
 
 type LocalDateRange = {
   from: Date | undefined;
@@ -103,6 +115,7 @@ function getActiveFilterCount(state: {
   projectFilters: string[];
   includeNoProject: boolean;
   labelFilters: string[];
+  propertyFilters?: Record<string, string[]>;
   dateFilter?: IssueDateFilter | null;
 }) {
   let count = 0;
@@ -112,6 +125,9 @@ function getActiveFilterCount(state: {
   if (state.creatorFilters.length > 0) count++;
   if (state.projectFilters.length > 0 || state.includeNoProject) count++;
   if (state.labelFilters.length > 0) count++;
+  for (const selected of Object.values(state.propertyFilters ?? {})) {
+    if (selected.length > 0) count++;
+  }
   if (state.dateFilter) count++;
   return count;
 }
@@ -129,7 +145,14 @@ const DATE_FIELD_LABEL_KEY: Record<IssueDateField, "date_field_created" | "date_
   updated_at: "date_field_updated",
 };
 
-function useIssueCounts(allIssues: Issue[]) {
+/** Feeding this to useIssueCounts hides every per-option badge (badges only
+ *  render at count > 0) without touching the option lists themselves. */
+const NO_COUNT_ISSUES: Issue[] = [];
+
+function useIssueCounts(
+  allIssues: Issue[],
+  serverFacets?: IssueTableFacetsResponse,
+) {
   return useMemo(() => {
     const status = new Map<string, number>();
     const priority = new Map<string, number>();
@@ -137,8 +160,47 @@ function useIssueCounts(allIssues: Issue[]) {
     const creator = new Map<string, number>();
     const project = new Map<string, number>();
     const label = new Map<string, number>();
+    // property definition id → option key → count. Checkbox values count
+    // under the "true"/"false" pseudo-option keys the filter store uses.
+    const property = new Map<string, Map<string, number>>();
     let noAssignee = 0;
     let noProject = 0;
+
+    if (serverFacets) {
+      for (const facet of serverFacets.facets) {
+        const target =
+          facet.kind === "status"
+            ? status
+            : facet.kind === "priority"
+              ? priority
+              : facet.kind === "assignee"
+                ? assignee
+                : facet.kind === "creator"
+                  ? creator
+                  : facet.kind === "project"
+                    ? project
+                    : facet.kind === "label"
+                      ? label
+                      : null;
+        if (facet.kind === "property" && facet.property_id) {
+          property.set(
+            facet.property_id,
+            new Map(facet.values.map((value) => [value.key, value.count])),
+          );
+          continue;
+        }
+        for (const value of facet.values) {
+          if (facet.kind === "assignee" && value.key === "__none__") {
+            noAssignee = value.count;
+          } else if (facet.kind === "project" && value.key === "__none__") {
+            noProject = value.count;
+          } else {
+            target?.set(value.key, value.count);
+          }
+        }
+      }
+      return { status, priority, assignee, creator, noAssignee, project, noProject, label, property };
+    }
 
     for (const issue of allIssues) {
       status.set(issue.status, (status.get(issue.status) ?? 0) + 1);
@@ -165,10 +227,30 @@ function useIssueCounts(allIssues: Issue[]) {
           label.set(l.id, (label.get(l.id) ?? 0) + 1);
         }
       }
+
+      for (const [propertyId, value] of Object.entries(issue.properties ?? {})) {
+        const optionKeys =
+          typeof value === "string"
+            ? [value]
+            : Array.isArray(value)
+              ? value
+              : typeof value === "boolean"
+                ? [String(value)]
+                : [];
+        if (optionKeys.length === 0) continue;
+        let perOption = property.get(propertyId);
+        if (!perOption) {
+          perOption = new Map<string, number>();
+          property.set(propertyId, perOption);
+        }
+        for (const key of optionKeys) {
+          perOption.set(key, (perOption.get(key) ?? 0) + 1);
+        }
+      }
     }
 
-    return { status, priority, assignee, creator, noAssignee, project, noProject, label };
-  }, [allIssues]);
+    return { status, priority, assignee, creator, noAssignee, project, noProject, label, property };
+  }, [allIssues, serverFacets]);
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +587,67 @@ function LabelSubContent({
   );
 }
 
+/**
+ * Option checkboxes for one custom property inside the Filter dropdown.
+ * Select/multi_select list the definition's options (dot + name); checkbox
+ * definitions expose the "true"/"false" pseudo-options with Yes/No labels.
+ */
+function PropertyFilterOptions({
+  property,
+  counts,
+  selected,
+  onToggle,
+}: {
+  property: IssueProperty;
+  counts: Map<string, number> | undefined;
+  selected: string[];
+  onToggle: (optionId: string) => void;
+}) {
+  const { t } = useT("issues");
+  const options =
+    property.type === "checkbox"
+      ? [
+          { id: "true", name: t(($) => $.pickers.custom_property.true_label), color: undefined },
+          { id: "false", name: t(($) => $.pickers.custom_property.false_label), color: undefined },
+        ]
+      : (property.config.options ?? []).map((option) => ({
+          id: option.id,
+          name: option.name,
+          color: option.color as string | undefined,
+        }));
+
+  return (
+    <>
+      {options.map((option) => {
+        const checked = selected.includes(option.id);
+        const count = counts?.get(option.id) ?? 0;
+        return (
+          <DropdownMenuCheckboxItem
+            key={option.id}
+            checked={checked}
+            onCheckedChange={() => onToggle(option.id)}
+            className={FILTER_ITEM_CLASS}
+          >
+            <HoverCheck checked={checked} />
+            {option.color && (
+              <span
+                className="size-2.5 shrink-0 rounded-full"
+                style={{ backgroundColor: option.color }}
+              />
+            )}
+            <span className="truncate">{option.name}</span>
+            {count > 0 && (
+              <span className="ml-auto text-xs text-muted-foreground">
+                {count}
+              </span>
+            )}
+          </DropdownMenuCheckboxItem>
+        );
+      })}
+    </>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Date sub-menu content
 // ---------------------------------------------------------------------------
@@ -655,12 +798,19 @@ export function IssuesHeader({
   dateFilter = null,
   onDateFilterChange,
   isRefreshing = false,
+  facetCountsExact = true,
+  tableFacetCounts,
+  onTableFacetChange,
 }: {
   scopedIssues: Issue[];
   allowGantt?: boolean;
   dateFilter?: IssueDateFilter | null;
   onDateFilterChange?: (filter: IssueDateFilter | null) => void;
   isRefreshing?: boolean;
+  /** See IssueDisplayControls.facetCountsExact. */
+  facetCountsExact?: boolean;
+  tableFacetCounts?: IssueTableFacetsResponse;
+  onTableFacetChange?: (facet: IssueTableFacetSpec | null) => void;
 }) {
   const { t } = useT("issues");
   const scope = useIssuesScopeStore((s) => s.scope);
@@ -672,14 +822,6 @@ export function IssuesHeader({
   const agentRunningFilter = useViewStore((s) => s.agentRunningFilter);
   const toggleAgentRunningFilter = useViewStore(
     (s) => s.toggleAgentRunningFilter,
-  );
-  // Scope the chip to whatever issues this page is currently showing.
-  // /issues uses the full workspace minus Members/Agents pill filtering;
-  // passing the visible-issue id set lets the chip count match the list
-  // length when the filter is on.
-  const scopedIssueIds = useMemo(
-    () => new Set(scopedIssues.map((i) => i.id)),
-    [scopedIssues],
   );
   const SCOPE_LABEL_KEY: Record<IssuesScope, "all_label" | "members_label" | "agents_label"> = {
     all: "all_label",
@@ -755,13 +897,15 @@ export function IssuesHeader({
           <WorkspaceAgentWorkingChip
             value={agentRunningFilter}
             onToggle={toggleAgentRunningFilter}
-            scopedIssueIds={scopedIssueIds}
           />
           <IssueDisplayControls
             scopedIssues={scopedIssues}
             allowGantt={allowGantt}
             dateFilter={dateFilter}
             onDateFilterChange={onDateFilterChange}
+            facetCountsExact={facetCountsExact}
+            tableFacetCounts={tableFacetCounts}
+            onTableFacetChange={onTableFacetChange}
           />
           <ViewRefreshIndicator active={isRefreshing} />
         </div>
@@ -776,6 +920,9 @@ export function IssueDisplayControls({
   allowGantt = false,
   dateFilter = null,
   onDateFilterChange,
+  facetCountsExact = true,
+  tableFacetCounts,
+  onTableFacetChange,
 }: {
   scopedIssues: Issue[];
   hideViewToggle?: boolean;
@@ -785,8 +932,19 @@ export function IssueDisplayControls({
   // /my-issues, actor panel) ignore viewMode === "gantt" and would silently
   // fall back to List if the option were exposed there. Keep Gantt opt-in.
   allowGantt?: boolean;
+  /**
+   * Whether `scopedIssues` covers the surface's full window. Table does not
+   * use loaded rows for counts; server-paged List, Board, and Swimlane follow
+   * the same rule. They supply `tableFacetCounts` from the backend instead,
+   * so badges remain exact without downloading all issues.
+   */
+  facetCountsExact?: boolean;
+  tableFacetCounts?: IssueTableFacetsResponse;
+  onTableFacetChange?: (facet: IssueTableFacetSpec | null) => void;
 }) {
   const { t } = useT("issues");
+  const [tableGroupMenuOpen, setTableGroupMenuOpen] = useState(false);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const viewMode = useViewStore((s) => s.viewMode);
   const statusFilters = useViewStore((s) => s.statusFilters);
   const priorityFilters = useViewStore((s) => s.priorityFilters);
@@ -796,20 +954,68 @@ export function IssueDisplayControls({
   const projectFilters = useViewStore((s) => s.projectFilters);
   const includeNoProject = useViewStore((s) => s.includeNoProject);
   const labelFilters = useViewStore((s) => s.labelFilters);
+  const propertyFilters = useViewStore((s) => s.propertyFilters);
+  const cardPropertyIds = useViewStore((s) => s.cardPropertyIds);
   const sortBy = useViewStore((s) => s.sortBy);
   const sortDirection = useViewStore((s) => s.sortDirection);
   const grouping = useViewStore((s) => s.grouping);
   const swimlaneGrouping = useViewStore((s) => s.swimlaneGrouping);
   const cardProperties = useViewStore((s) => s.cardProperties);
+  const tableGrouping = useViewStore((s) => s.tableGrouping ?? "none");
+  const tableHierarchy = useViewStore((s) => s.tableHierarchy ?? true);
   const showSubIssues = useViewStore((s) => s.showSubIssues);
   const act = useViewStoreApi().getState();
+  const headerWsId = useWorkspaceId();
+  // Active custom-property catalog: drives the filter sections, dynamic
+  // sort/grouping options, and the card-property toggles below.
+  const { data: workspaceProperties = [] } = useQuery(propertyListOptions(headerWsId));
+  const propertyById = useMemo(
+    () => new Map(workspaceProperties.map((p) => [p.id, p])),
+    [workspaceProperties],
+  );
+  const filterableProperties = useMemo(
+    () =>
+      workspaceProperties.filter((p) =>
+        p.type === "select" || p.type === "multi_select" || p.type === "checkbox",
+      ),
+    [workspaceProperties],
+  );
+  const sortableProperties = useMemo(
+    () => workspaceProperties.filter((p) => p.type === "number" || p.type === "date"),
+    [workspaceProperties],
+  );
+  const groupableProperties = useMemo(
+    () => workspaceProperties.filter((p) => p.type === "select"),
+    [workspaceProperties],
+  );
+  const tableGroupableProperties = useMemo(
+    () =>
+      workspaceProperties.filter((p) =>
+        ["select", "checkbox"].includes(p.type),
+      ),
+    [workspaceProperties],
+  );
 
-  const counts = useIssueCounts(scopedIssues);
+  const counts = useIssueCounts(
+    facetCountsExact ? scopedIssues : NO_COUNT_ISSUES,
+    tableFacetCounts,
+  );
   const showDateFilter = !!onDateFilterChange;
+
+  // Only count filters whose definition is still active — a filter pinned to
+  // an archived definition is stripped by the surface controller and must
+  // not light the badge for an effect that no longer exists.
+  const effectivePropertyFilters = useMemo(() => {
+    const activeIds = new Set(filterableProperties.map((p) => p.id));
+    return Object.fromEntries(
+      Object.entries(propertyFilters).filter(([id, selected]) => selected.length > 0 && activeIds.has(id)),
+    );
+  }, [filterableProperties, propertyFilters]);
 
   const activeFilterCount = getActiveFilterCount({
     statusFilters,
     priorityFilters,
+    propertyFilters: effectivePropertyFilters,
     assigneeFilters,
     includeNoAssignee,
     creatorFilters,
@@ -820,12 +1026,14 @@ export function IssueDisplayControls({
   });
   const hasActiveFilters = activeFilterCount > 0;
 
-  const SORT_LABEL_KEY: Record<typeof SORT_OPTIONS[number]["value"], "sort_manual" | "sort_priority" | "sort_start_date" | "sort_due_date" | "sort_created" | "sort_title"> = {
+  const SORT_LABEL_KEY: Record<typeof SORT_OPTIONS[number]["value"], "sort_manual" | "sort_status" | "sort_priority" | "sort_start_date" | "sort_due_date" | "sort_created" | "sort_updated" | "sort_title"> = {
     position: "sort_manual",
+    status: "sort_status",
     priority: "sort_priority",
     start_date: "sort_start_date",
     due_date: "sort_due_date",
     created_at: "sort_created",
+    updated_at: "sort_updated",
     title: "sort_title",
   };
   const GROUPING_LABEL_KEY: Record<typeof GROUPING_OPTIONS[number]["value"], "group_status" | "group_assignee"> = {
@@ -854,15 +1062,41 @@ export function IssueDisplayControls({
           : `${shortDateLabel(dateFilter.from)} - ${shortDateLabel(dateFilter.to)}`
       }`
     : null;
-  const sortLabel = t(($) => $.display[SORT_LABEL_KEY[sortBy]]);
-  const groupingLabel = t(($) => $.display[GROUPING_LABEL_KEY[grouping]]);
+  const sortPropertyId = propertyIdFromViewKey(sortBy);
+  const groupingPropertyId = propertyIdFromViewKey(grouping);
+  const tableGroupingPropertyId = propertyIdFromViewKey(tableGrouping);
+  // Property-backed sort/grouping label straight from the definition name;
+  // a stale persisted id (archived/deleted definition) falls back to the
+  // manual/status default label.
+  const sortLabel = sortPropertyId
+    ? propertyById.get(sortPropertyId)?.name ?? t(($) => $.display.sort_manual)
+    : t(($) => $.display[SORT_LABEL_KEY[sortBy as keyof typeof SORT_LABEL_KEY]]);
+  const groupingLabel = groupingPropertyId
+    ? propertyById.get(groupingPropertyId)?.name ?? t(($) => $.display.group_status)
+    : t(($) => $.display[GROUPING_LABEL_KEY[grouping as keyof typeof GROUPING_LABEL_KEY]]);
   const swimlaneGroupingLabel = t(($) => $.display[SWIMLANE_GROUPING_LABEL_KEY[swimlaneGrouping]]);
+  const effectiveTableGrouping =
+    tableGroupingPropertyId && !propertyById.has(tableGroupingPropertyId)
+      ? "none"
+      : tableGrouping;
+  const tableGroupingLabel = tableGroupingPropertyId
+    ? propertyById.get(tableGroupingPropertyId)?.name ??
+      t(($) => $.table.group_none)
+    : effectiveTableGrouping === "status"
+      ? t(($) => $.table.columns.status)
+      : effectiveTableGrouping === "assignee"
+        ? t(($) => $.table.columns.assignee)
+        : t(($) => $.table.group_none);
   const controlButtonClass = "h-8 w-8 gap-1 px-0 text-muted-foreground md:h-7 md:w-auto md:px-2.5";
 
   return (
     <div className="flex shrink-0 items-center gap-1">
         {/* Filter */}
-        <DropdownMenu>
+        <DropdownMenu
+          onOpenChange={(open) => {
+            if (!open) onTableFacetChange?.(null);
+          }}
+        >
           <Tooltip>
             <DropdownMenuTrigger
               render={
@@ -886,22 +1120,6 @@ export function IssueDisplayControls({
                       {hasActiveFilters && (
                         <span className="tabular-nums md:hidden">{activeFilterCount}</span>
                       )}
-                      {hasActiveFilters && (
-                        <span
-                          role="button"
-                          tabIndex={-1}
-                          className="-mr-1 ml-0.5 hidden rounded-sm p-0.5 hover:bg-white/20 md:inline-flex"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            act.clearFilters();
-                            onDateFilterChange?.(null);
-                          }}
-                          onPointerDown={(e) => e.stopPropagation()}
-                        >
-                          <X className="size-3" />
-                        </span>
-                      )}
                     </Button>
                   }
                 />
@@ -911,7 +1129,11 @@ export function IssueDisplayControls({
           </Tooltip>
           <DropdownMenuContent align="end" className="w-auto">
             {/* Status */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "status" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <CircleDot className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_status)}</span>
@@ -947,7 +1169,11 @@ export function IssueDisplayControls({
             </DropdownMenuSub>
 
             {/* Priority */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "priority" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <SignalHigh className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_priority)}</span>
@@ -1003,7 +1229,11 @@ export function IssueDisplayControls({
             )}
 
             {/* Assignee */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "assignee" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <User className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_assignee)}</span>
@@ -1027,7 +1257,11 @@ export function IssueDisplayControls({
             </DropdownMenuSub>
 
             {/* Creator */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "creator" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <UserPen className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_creator)}</span>
@@ -1048,7 +1282,11 @@ export function IssueDisplayControls({
             </DropdownMenuSub>
 
             {/* Project */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "project" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <FolderKanban className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_project)}</span>
@@ -1071,7 +1309,11 @@ export function IssueDisplayControls({
             </DropdownMenuSub>
 
             {/* Label */}
-            <DropdownMenuSub>
+            <DropdownMenuSub
+              onOpenChange={(open) =>
+                onTableFacetChange?.(open ? { kind: "label" } : null)
+              }
+            >
               <DropdownMenuSubTrigger>
                 <Tag className="size-3.5" />
                 <span className="flex-1">{t(($) => $.filters.section_label)}</span>
@@ -1090,6 +1332,46 @@ export function IssueDisplayControls({
               </DropdownMenuSubContent>
             </DropdownMenuSub>
 
+            {/* Custom properties — one sub per filterable definition */}
+            {filterableProperties.length > 0 && <DropdownMenuSeparator />}
+            {filterableProperties.map((property) => {
+              const selected = propertyFilters[property.id] ?? [];
+              return (
+                <DropdownMenuSub
+                  key={property.id}
+                  onOpenChange={(open) =>
+                    onTableFacetChange?.(
+                      open
+                        ? { kind: "property", property_id: property.id }
+                        : null,
+                    )
+                  }
+                >
+                  <DropdownMenuSubTrigger>
+                    {property.icon ? (
+                      <PropertyIcon property={property} className="size-3.5 text-xs" />
+                    ) : (
+                      <SlidersHorizontal className="size-3.5" />
+                    )}
+                    <span className="flex-1 truncate">{property.name}</span>
+                    {selected.length > 0 && (
+                      <span className="text-xs text-primary font-medium">
+                        {selected.length}
+                      </span>
+                    )}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="w-auto min-w-44 p-1">
+                    <PropertyFilterOptions
+                      property={property}
+                      counts={counts.property.get(property.id)}
+                      selected={selected}
+                      onToggle={(optionId) => act.togglePropertyFilter(property.id, optionId)}
+                    />
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              );
+            })}
+
             {/* Reset */}
             {hasActiveFilters && (
               <>
@@ -1107,6 +1389,108 @@ export function IssueDisplayControls({
           </DropdownMenuContent>
         </DropdownMenu>
 
+        {hasActiveFilters && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t(($) => $.filters.reset)}
+                  onClick={() => {
+                    act.clearFilters();
+                    onDateFilterChange?.(null);
+                  }}
+                  className="hidden text-muted-foreground md:inline-flex"
+                >
+                  <X className="size-3.5" />
+                </Button>
+              }
+            />
+            <TooltipContent side="bottom">
+              {t(($) => $.filters.reset)}
+            </TooltipContent>
+          </Tooltip>
+        )}
+
+        {viewMode === "table" && (
+          <DropdownMenu
+            open={tableGroupMenuOpen}
+            onOpenChange={setTableGroupMenuOpen}
+          >
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={controlButtonClass}
+                >
+                  <Rows3 className="size-3.5" />
+                  <span className="hidden md:inline">
+                    {effectiveTableGrouping === "none"
+                      ? t(($) => $.table.group_label)
+                      : t(($) => $.table.group_active, {
+                          group: tableGroupingLabel,
+                        })}
+                  </span>
+                  <ChevronDown className="size-3 text-muted-foreground" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end" className="w-auto min-w-48">
+              <DropdownMenuRadioGroup
+                value={effectiveTableGrouping}
+                onValueChange={(value) => {
+                  act.setTableGrouping(value as TableGrouping);
+                  setTableGroupMenuOpen(false);
+                }}
+              >
+                <DropdownMenuRadioItem value="none">
+                  {t(($) => $.table.group_none)}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="status">
+                  {t(($) => $.table.columns.status)}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="assignee">
+                  {t(($) => $.table.columns.assignee)}
+                </DropdownMenuRadioItem>
+                {tableGroupableProperties.map((property) => (
+                  <DropdownMenuRadioItem
+                    key={property.id}
+                    value={`property:${property.id}`}
+                  >
+                    <PropertyIcon
+                      property={property}
+                      className="size-3.5 text-xs"
+                    />
+                    <span>{property.name}</span>
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+
+        {viewMode === "table" && (
+          <TableColumnPicker
+            properties={workspaceProperties}
+            trigger={
+              <Button
+                variant="outline"
+                size="sm"
+                className={controlButtonClass}
+              >
+                <Columns3 className="size-3.5" />
+                <span className="hidden md:inline">
+                  {t(($) => $.table.columns.section)}
+                </span>
+                <ChevronDown className="size-3 text-muted-foreground" />
+              </Button>
+            }
+          />
+        )}
+
         {/* Display settings */}
         <Popover>
           <Tooltip>
@@ -1115,14 +1499,8 @@ export function IssueDisplayControls({
                 <TooltipTrigger
                   render={
                     <Button variant="outline" size="sm" className={controlButtonClass}>
-                      {sortBy === "position" ? (
-                        <SlidersHorizontal className="size-3.5" />
-                      ) : sortDirection === "asc" ? (
-                        <ArrowUp className="size-3.5" />
-                      ) : (
-                        <ArrowDown className="size-3.5" />
-                      )}
-                      <span className="hidden md:inline">{sortLabel}</span>
+                      <SlidersHorizontal className="size-3.5" />
+                      <span className="hidden md:inline">{t(($) => $.display.button)}</span>
                     </Button>
                   }
                 />
@@ -1155,6 +1533,12 @@ export function IssueDisplayControls({
                         {GROUPING_OPTIONS.map((opt) => (
                           <DropdownMenuRadioItem key={opt.value} value={opt.value}>
                             {t(($) => $.display[GROUPING_LABEL_KEY[opt.value]])}
+                          </DropdownMenuRadioItem>
+                        ))}
+                        {groupableProperties.map((property) => (
+                          <DropdownMenuRadioItem key={property.id} value={`property:${property.id}`}>
+                            <PropertyIcon property={property} className="size-3.5 text-xs" />
+                            <span>{property.name}</span>
                           </DropdownMenuRadioItem>
                         ))}
                       </DropdownMenuRadioGroup>
@@ -1199,6 +1583,26 @@ export function IssueDisplayControls({
               </div>
             )}
 
+            {viewMode === "table" && (
+              <div className="border-b px-3 py-2.5">
+                <label className="flex cursor-pointer items-center justify-between gap-3">
+                  <span className="min-w-0">
+                    <span className="block text-sm">
+                      {t(($) => $.table.hierarchy)}
+                    </span>
+                    <span className="block text-xs text-muted-foreground">
+                      {t(($) => $.table.hierarchy_description)}
+                    </span>
+                  </span>
+                  <Switch
+                    size="sm"
+                    checked={tableHierarchy}
+                    onCheckedChange={() => act.toggleTableHierarchy()}
+                  />
+                </label>
+              </div>
+            )}
+
             <div className="border-b px-3 py-2.5">
               <span className="text-xs font-medium text-muted-foreground">
                 {t(($) => $.display.ordering_section)}
@@ -1221,7 +1625,13 @@ export function IssueDisplayControls({
                     <DropdownMenuRadioGroup value={sortBy} onValueChange={(v) => act.setSortBy(v as SortField)}>
                       {SORT_OPTIONS.map((opt) => (
                         <DropdownMenuRadioItem key={opt.value} value={opt.value}>
-                          {t(($) => $.display[SORT_LABEL_KEY[opt.value]])}
+                          {t(($) => $.display[SORT_LABEL_KEY[opt.value as keyof typeof SORT_LABEL_KEY]])}
+                        </DropdownMenuRadioItem>
+                      ))}
+                      {sortableProperties.map((property) => (
+                        <DropdownMenuRadioItem key={property.id} value={`property:${property.id}`}>
+                          <PropertyIcon property={property} className="size-3.5 text-xs" />
+                          <span>{property.name}</span>
                         </DropdownMenuRadioItem>
                       ))}
                     </DropdownMenuRadioGroup>
@@ -1255,26 +1665,47 @@ export function IssueDisplayControls({
               />
             </label>
 
-            <div className="px-3 py-2.5">
-              <span className="text-xs font-medium text-muted-foreground">
-                {t(($) => $.display.card_properties_section)}
-              </span>
-              <div className="mt-2 space-y-2">
-                {CARD_PROPERTY_OPTIONS.map((opt) => (
-                  <label
-                    key={opt.key}
-                    className="flex cursor-pointer items-center justify-between"
-                  >
-                    <span className="text-sm">{t(($) => $.display[CARD_PROPERTY_LABEL_KEY[opt.key]])}</span>
-                    <Switch
-                      size="sm"
-                      checked={cardProperties[opt.key]}
-                      onCheckedChange={() => act.toggleCardProperty(opt.key)}
-                    />
-                  </label>
-                ))}
+            {viewMode !== "table" && (
+              <div className="px-3 py-2.5">
+                <span className="text-xs font-medium text-muted-foreground">
+                  {t(($) => $.display.card_properties_section)}
+                </span>
+                <div className="mt-2 space-y-2">
+                  {CARD_PROPERTY_OPTIONS.map((opt) => (
+                    <label
+                      key={opt.key}
+                      className="flex cursor-pointer items-center justify-between"
+                    >
+                      <span className="text-sm">{t(($) => $.display[CARD_PROPERTY_LABEL_KEY[opt.key]])}</span>
+                      <Switch
+                        size="sm"
+                        checked={cardProperties[opt.key]}
+                        onCheckedChange={() => act.toggleCardProperty(opt.key)}
+                      />
+                    </label>
+                  ))}
+                  {workspaceProperties.map((property) => (
+                    <label
+                      key={property.id}
+                      className="flex cursor-pointer items-center justify-between"
+                    >
+                      <span className="flex min-w-0 items-center gap-1.5 truncate text-sm">
+                        <PropertyIcon
+                          property={property}
+                          className="size-3.5 text-xs"
+                        />
+                        <span className="truncate">{property.name}</span>
+                      </span>
+                      <Switch
+                        size="sm"
+                        checked={cardPropertyIds.includes(property.id)}
+                        onCheckedChange={() => act.toggleCardPropertyId(property.id)}
+                      />
+                    </label>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </PopoverContent>
         </Popover>
 
@@ -1282,7 +1713,7 @@ export function IssueDisplayControls({
             this surface doesn't render Gantt, fall back to "list" so the
             trigger icon matches what's actually on screen. */}
         {!hideViewToggle && (
-          <DropdownMenu>
+          <DropdownMenu open={viewMenuOpen} onOpenChange={setViewMenuOpen}>
             <Tooltip>
               <DropdownMenuTrigger
                 render={
@@ -1291,6 +1722,8 @@ export function IssueDisplayControls({
                       <Button variant="outline" size="sm" className={controlButtonClass}>
                         {viewMode === "board" ? (
                           <Columns3 className="size-3.5" />
+                        ) : viewMode === "table" ? (
+                          <Table2 className="size-3.5" />
                         ) : viewMode === "swimlane" ? (
                           <Waves className="size-3.5" />
                         ) : viewMode === "gantt" && allowGantt ? (
@@ -1301,6 +1734,8 @@ export function IssueDisplayControls({
                         <span className="hidden md:inline">
                           {viewMode === "board"
                             ? t(($) => $.view.board)
+                            : viewMode === "table"
+                            ? t(($) => $.view.table)
                             : viewMode === "swimlane"
                             ? t(($) => $.view.swimlane)
                             : viewMode === "gantt" && allowGantt
@@ -1315,6 +1750,8 @@ export function IssueDisplayControls({
               <TooltipContent side="bottom">
                 {viewMode === "board"
                   ? t(($) => $.view.tooltip_board)
+                  : viewMode === "table"
+                  ? t(($) => $.view.tooltip_table)
                   : viewMode === "swimlane"
                   ? t(($) => $.view.tooltip_swimlane)
                   : viewMode === "gantt" && allowGantt
@@ -1326,7 +1763,13 @@ export function IssueDisplayControls({
               <DropdownMenuGroup>
                 <DropdownMenuLabel>{t(($) => $.view.section)}</DropdownMenuLabel>
               </DropdownMenuGroup>
-              <DropdownMenuRadioGroup value={viewMode} onValueChange={(v) => act.setViewMode(v as ViewMode)}>
+              <DropdownMenuRadioGroup
+                value={viewMode}
+                onValueChange={(v) => {
+                  act.setViewMode(v as ViewMode);
+                  setViewMenuOpen(false);
+                }}
+              >
                 <DropdownMenuRadioItem value="board">
                   <Columns3 />
                   {t(($) => $.view.board)}
@@ -1334,6 +1777,10 @@ export function IssueDisplayControls({
                 <DropdownMenuRadioItem value="list">
                   <List />
                   {t(($) => $.view.list)}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="table">
+                  <Table2 />
+                  {t(($) => $.view.table)}
                 </DropdownMenuRadioItem>
                 <DropdownMenuRadioItem value="swimlane">
                   <Waves />

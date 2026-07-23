@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -862,6 +864,131 @@ func TestHermesClientAcceptNotificationGate(t *testing.T) {
 	}
 }
 
+func TestHermesBackendDrainsLateFinalNotificationAfterPromptResponse(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_resumed"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      sleep 0.05
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_resumed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Current answer"}}}}\n'
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt", ExecOptions{
+		ResumeSessionID: "ses_resumed",
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+		if result.Output != "Current answer" {
+			t.Fatalf("expected late current-turn output, got %q", result.Output)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestHermesBackendCancelsBeforeWaitingForLingeringProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_lingering"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exec 1>&-
+      exec 2>&-
+      while :; do :; done
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	select {
+	case _, ok := <-session.Result:
+		if ok {
+			t.Fatal("result channel produced an unexpected second value")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("result channel did not close; cmd.Wait likely ran before cancel")
+	}
+}
+
 func TestHermesClientHandleAgentThought(t *testing.T) {
 	t.Parallel()
 
@@ -992,6 +1119,58 @@ func TestParseACPTokenUsageAliases(t *testing.T) {
 	}
 	if usage.CacheWriteTokens != 3 {
 		t.Errorf("CacheWriteTokens: got %d, want 3", usage.CacheWriteTokens)
+	}
+}
+
+// TestParseACPTokenUsageCachedInputBucketing pins when cached reads are moved
+// out of inputTokens. Persisting overlapping buckets makes the dashboard
+// charge the cached prefix at both the full input rate and the cache-read
+// rate, so the re-bucketing must fire exactly when totalTokens proves the
+// counters overlap — and never otherwise.
+func TestParseACPTokenUsageCachedInputBucketing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want TokenUsage
+	}{
+		{
+			// Grok Build: totalTokens == input + output, so the cached prefix
+			// lives inside inputTokens.
+			name: "inclusive input is reduced by cached reads",
+			raw:  `{"inputTokens":12929,"outputTokens":29,"totalTokens":12958,"cachedReadTokens":10880}`,
+			want: TokenUsage{InputTokens: 2049, OutputTokens: 29, CacheReadTokens: 10880},
+		},
+		{
+			// totalTokens == input + cached + output: the buckets are already
+			// mutually exclusive.
+			name: "exclusive buckets are left alone",
+			raw:  `{"inputTokens":100,"outputTokens":20,"totalTokens":150,"cachedReadTokens":30}`,
+			want: TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30},
+		},
+		{
+			// No totalTokens: nothing in the payload describes the overlap, so
+			// the counters are persisted as reported.
+			name: "missing totalTokens keeps counters as reported",
+			raw:  `{"inputTokens":100,"outputTokens":20,"cachedReadTokens":30}`,
+			want: TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30},
+		},
+		{
+			// Cached reads larger than input cannot be a subset of it.
+			name: "cached larger than input keeps counters as reported",
+			raw:  `{"inputTokens":10,"outputTokens":20,"totalTokens":30,"cachedReadTokens":40}`,
+			want: TokenUsage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 40},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPTokenUsage(json.RawMessage(tt.raw)); got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1341,6 +1520,228 @@ func TestHermesClientExtractPromptResultNoUsage(t *testing.T) {
 	}
 	if got.usage.InputTokens != 0 {
 		t.Errorf("inputTokens: got %d, want 0", got.usage.InputTokens)
+	}
+}
+
+// TestHermesClientExtractPromptResultMetaUsage covers the Grok Build ACP
+// shape: session/prompt returns only stopReason at the top level, with token
+// counters under `_meta.usage` (and mirrored flat fields on `_meta`).
+// Captured from grok 0.2.106 against a live `grok agent stdio` session.
+func TestHermesClientExtractPromptResultMetaUsage(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	// Minimal real-world payload (ids truncated). Nested usage is the
+	// authoritative block; flat _meta counters mirror it.
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"_meta": {
+			"sessionId": "019f8516-4fee-7c23-9766-ec748929e01a",
+			"modelId": "grok-4.5",
+			"inputTokens": 12929,
+			"outputTokens": 29,
+			"cachedReadTokens": 10880,
+			"reasoningTokens": 24,
+			"usage": {
+				"inputTokens": 12929,
+				"outputTokens": 29,
+				"totalTokens": 12958,
+				"cachedReadTokens": 10880,
+				"reasoningTokens": 24,
+				"modelCalls": 1,
+				"costUsdTicks": 75360000
+			}
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.stopReason != "end_turn" {
+		t.Errorf("stopReason: got %q, want %q", got.stopReason, "end_turn")
+	}
+	// Grok counts the cached prefix inside inputTokens (totalTokens 12958 ==
+	// 12929 + 29), so the stored input bucket is the uncached remainder:
+	// 12929 - 10880 = 2049. Priced at xAI's grok-4.5 rates that is
+	// 2049*$2 + 10880*$0.30 + 29*$6 per 1M = $0.007536, which is exactly the
+	// costUsdTicks the same payload reports.
+	if got.usage.InputTokens != 2049 {
+		t.Errorf("inputTokens: got %d, want 2049", got.usage.InputTokens)
+	}
+	if got.usage.OutputTokens != 29 {
+		t.Errorf("outputTokens: got %d, want 29", got.usage.OutputTokens)
+	}
+	if got.usage.CacheReadTokens != 10880 {
+		t.Errorf("cacheReadTokens: got %d, want 10880", got.usage.CacheReadTokens)
+	}
+	// The turn stamps the model it billed against. A resumed session has no
+	// other source for this (session/load reports no model id), so losing it
+	// buckets the whole run under "unknown", which prices at $0.
+	if got.modelID != "grok-4.5" {
+		t.Errorf("modelID: got %q, want %q", got.modelID, "grok-4.5")
+	}
+	// xAI's own price for the turn, in ticks of 1e-10 USD. This is the only
+	// figure that carries request-level pricing rules (the ≥200K prompt
+	// surcharge); dropping it forces a rate-table guess downstream.
+	if got.usage.CostUSDTicks != 75360000 {
+		t.Errorf("costUsdTicks: got %d, want 75360000", got.usage.CostUSDTicks)
+	}
+	if usd := float64(got.usage.CostUSDTicks) / CostUSDTicksPerUSD; math.Abs(usd-0.007536) > 1e-12 {
+		t.Errorf("cost in USD: got %v, want 0.007536", usd)
+	}
+}
+
+// TestParseACPTokenUsageCostIsOptional guards the common case: almost no agent
+// reports a cost, and a zero must stay zero so the reader knows to estimate
+// rather than recording a real $0 spend.
+func TestParseACPTokenUsageCostIsOptional(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{name: "camelCase", raw: `{"inputTokens":10,"costUsdTicks":4200}`, want: 4200},
+		{name: "snake_case", raw: `{"input_tokens":10,"cost_usd_ticks":4200}`, want: 4200},
+		{name: "absent", raw: `{"inputTokens":10,"outputTokens":2}`, want: 0},
+		{name: "null", raw: `{"inputTokens":10,"costUsdTicks":null}`, want: 0},
+		{name: "string number", raw: `{"inputTokens":10,"costUsdTicks":"4200"}`, want: 4200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPTokenUsage(json.RawMessage(tc.raw)).CostUSDTicks; got != tc.want {
+				t.Errorf("CostUSDTicks: got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseACPModelIDFromMeta covers the shapes the `_meta` model id can
+// arrive in, and confirms a missing one degrades to empty rather than
+// inventing an attribution.
+func TestParseACPModelIDFromMeta(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "camelCase", raw: `{"modelId":"grok-4.5"}`, want: "grok-4.5"},
+		{name: "snake_case", raw: `{"model_id":"grok-4.3"}`, want: "grok-4.3"},
+		{name: "camelCase wins over snake_case", raw: `{"modelId":"grok-4.5","model_id":"grok-4.3"}`, want: "grok-4.5"},
+		{name: "whitespace trimmed", raw: `{"modelId":"  grok-4.5  "}`, want: "grok-4.5"},
+		{name: "absent", raw: `{"sessionId":"ses_1"}`, want: ""},
+		{name: "empty string", raw: `{"modelId":""}`, want: ""},
+		{name: "null meta", raw: `null`, want: ""},
+		{name: "malformed", raw: `{"modelId":`, want: ""},
+		{name: "wrong type degrades to empty", raw: `{"modelId":42}`, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPModelIDFromMeta(json.RawMessage(tc.raw)); got != tc.want {
+				t.Errorf("parseACPModelIDFromMeta(%s): got %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHermesClientExtractPromptResultMetaFlatOnly covers agents that put
+// counters on `_meta` without a nested `usage` object.
+func TestHermesClientExtractPromptResultMetaFlatOnly(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"_meta": {
+			"inputTokens": 50,
+			"outputTokens": 10,
+			"cachedReadTokens": 5
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.usage.InputTokens != 50 || got.usage.OutputTokens != 10 || got.usage.CacheReadTokens != 5 {
+		t.Fatalf("unexpected usage from flat _meta: %+v", got.usage)
+	}
+}
+
+// TestHermesClientExtractPromptResultTopLevelBeatsMeta ensures the standard
+// ACP top-level `usage` field still wins when both shapes are present.
+func TestHermesClientExtractPromptResultTopLevelBeatsMeta(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"usage": {"inputTokens": 1, "outputTokens": 2},
+		"_meta": {"usage": {"inputTokens": 999, "outputTokens": 999}}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.usage.InputTokens != 1 || got.usage.OutputTokens != 2 {
+		t.Fatalf("top-level usage should win: %+v", got.usage)
+	}
+}
+
+// TestHermesClientExtractPromptResultTopLevelZeroFallsBackToMeta pins the
+// semantic-empty behavior: an explicit top-level usage object with no
+// effective counters must not hide usable metering supplied by the agent in
+// _meta.
+func TestHermesClientExtractPromptResultTopLevelZeroFallsBackToMeta(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"usage": {
+			"inputTokens": 0,
+			"outputTokens": 0,
+			"cacheReadTokens": 0,
+			"cacheWriteTokens": 0
+		},
+		"_meta": {
+			"usage": {
+				"inputTokens": 100,
+				"outputTokens": 20,
+				"cachedReadTokens": 5,
+				"cachedWriteTokens": 2
+			}
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	want := TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 5, CacheWriteTokens: 2}
+	if got.usage != want {
+		t.Fatalf("zero top-level usage should fall back to _meta: got %+v, want %+v", got.usage, want)
 	}
 }
 
@@ -2149,6 +2550,58 @@ done
 `
 }
 
+// fakeACPRecordingScriptWithCurrentModel is like fakeACPRecordingScript but
+// makes session/new and session/resume advertise a `models.currentModelId`,
+// so tests can drive the "session is already on this model" branch of the
+// set_model gate.
+func fakeACPRecordingScriptWithCurrentModel(recordPath, sessionID, currentModelID string) string {
+	return `#!/bin/sh
+RECORD_PATH=` + recordPath + `
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$RECORD_PATH"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*|*'"method":"session/resume"'*|*'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"` + sessionID + `","models":{"currentModelId":"` + currentModelID + `"}}}\n' "$id"
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// assertNoRecordedFrame fails if any recorded JSON-RPC frame used the given
+// method. The mirror of findRecordedFrame, for asserting a call was skipped.
+func assertNoRecordedFrame(t *testing.T, recordPath, method string) {
+	t.Helper()
+	data, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read record file: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			continue
+		}
+		if frame["method"] == method {
+			t.Fatalf("unexpected recorded frame for method %q in %s", method, string(data))
+		}
+	}
+}
+
 // findRecordedFrame returns the first recorded JSON-RPC frame whose
 // `method` matches the requested one. Used by the resume / capability
 // tests below to inspect what we actually sent on the wire.
@@ -2219,6 +2672,97 @@ func TestHermesSetModelPreservesCustomModelIDWithColon(t *testing.T) {
 	}
 	if params["modelId"] != "custom:lfm2.5:8b" {
 		t.Errorf("session/set_model.modelId must be passed verbatim, got %v", params["modelId"])
+	}
+}
+
+// TestHermesSkipsRedundantSetModelWhenAlreadyCurrent pins the MUL-5029 fix:
+// when session/new already reports the requested model as current, we must
+// NOT replay session/set_model. Hermes' set_model re-runs provider
+// auto-detection and can mis-route a `provider:model` id (e.g.
+// custom:deepseek-v4-pro) to OpenRouter, failing with an auth error on the
+// first turn. Re-selecting the model the session is already on is pure
+// downside, so the call is skipped.
+func TestHermesSkipsRedundantSetModelWhenAlreadyCurrent(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "custom:deepseek-v4-pro")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "custom:deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	assertNoRecordedFrame(t, recordPath, "session/set_model")
+}
+
+// TestHermesSendsSetModelWhenModelDiffersFromCurrent is the counterpart to the
+// skip test: when the requested model differs from the session's current one,
+// the explicit switch must still be sent verbatim.
+func TestHermesSendsSetModelWhenModelDiffersFromCurrent(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "custom:some-default-model")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "custom:deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/set_model")
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/set_model params: got %T, want map", frame["params"])
+	}
+	if params["modelId"] != "custom:deepseek-v4-pro" {
+		t.Errorf("session/set_model.modelId = %v, want custom:deepseek-v4-pro", params["modelId"])
 	}
 }
 
@@ -2373,5 +2917,99 @@ func TestHermesKeepsRemoteMcpWhenCapabilityAdvertised(t *testing.T) {
 	servers := params["mcpServers"].([]any)
 	if len(servers) != 3 {
 		t.Fatalf("session/new.mcpServers: got %d entries, want 3", len(servers))
+	}
+}
+
+// TestParseHermesProfileArgs covers the parser's fidelity to Hermes'
+// _apply_profile_override step 1/1b: first occurrence, both spellings, the inline
+// empty value, the space-form profile-id guard, value-flag skipping, and the
+// `--` / `mcp add --args` boundaries.
+func TestParseHermesProfileArgs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		args     []string
+		wantName string
+		found    bool
+		inline   bool
+		from     int
+		length   int
+	}{
+		{"none", []string{"--yolo"}, "", false, false, -1, 0},
+		{"short flag", []string{"-p", "research"}, "research", true, false, 0, 2},
+		{"long flag", []string{"--profile", "research"}, "research", true, false, 0, 2},
+		{"inline", []string{"--profile=research"}, "research", true, true, 0, 1},
+		{"inline empty value", []string{"--profile="}, "", true, true, 0, 1},
+		{"trailing short flag with no value", []string{"--yolo", "-p"}, "", false, false, -1, 0},
+		{"amid other args", []string{"--yolo", "--profile", "coder", "-x"}, "coder", true, false, 1, 2},
+		{"space-form invalid value ignored", []string{"-p", "no:xdist"}, "", false, false, -1, 0},
+		{"value-flag hides a following -p", []string{"-m", "-p", "research"}, "", false, false, -1, 0},
+		{"double-dash sentinel stops scan", []string{"--", "-p", "research"}, "", false, false, -1, 0},
+		{"mcp add --args passthrough stops scan", []string{"mcp", "add", "srv", "--args", "-p", "research"}, "", false, false, -1, 0},
+		{"only the first occurrence is selected", []string{"-p", "research", "--profile", "coder"}, "research", true, false, 0, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sel := ParseHermesProfileArgs(tc.args)
+			if sel.Name != tc.wantName || sel.Found != tc.found || sel.Inline != tc.inline ||
+				sel.ArgFrom != tc.from || sel.ArgLen != tc.length {
+				t.Errorf("ParseHermesProfileArgs(%v) = %+v, want name=%q found=%v inline=%v from=%d len=%d",
+					tc.args, sel, tc.wantName, tc.found, tc.inline, tc.from, tc.length)
+			}
+		})
+	}
+}
+
+// TestStripHermesProfileArgs asserts only the parsed occurrence is removed (not
+// every -p/--profile spelling), and that the base blocked set does NOT strip the
+// profile flags, so a skill-less task's profile passes through unchanged.
+func TestStripHermesProfileArgs(t *testing.T) {
+	t.Parallel()
+	args := []string{"-p", "research", "--yolo", "--profile", "coder"}
+	sel := ParseHermesProfileArgs(args)
+	got := StripHermesProfileArgs(args, sel)
+	want := []string{"--yolo", "--profile", "coder"}
+	if len(got) != len(want) {
+		t.Fatalf("StripHermesProfileArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("StripHermesProfileArgs = %v, want %v", got, want)
+		}
+	}
+	if none := StripHermesProfileArgs([]string{"--yolo"}, ParseHermesProfileArgs([]string{"--yolo"})); len(none) != 1 || none[0] != "--yolo" {
+		t.Fatalf("no selection should leave args unchanged, got %v", none)
+	}
+	if _, ok := hermesBlockedArgs["-p"]; ok {
+		t.Error("hermesBlockedArgs must not unconditionally strip -p")
+	}
+	if _, ok := hermesBlockedArgs["--profile"]; ok {
+		t.Error("hermesBlockedArgs must not unconditionally strip --profile")
+	}
+}
+
+// TestACPRawText covers the rawOutput/output shape tolerance added for the
+// GPT-5.6 Sol path (#5509): a string is returned verbatim, an object/array is
+// preserved as raw JSON text, and empty input yields "".
+func TestACPRawText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"empty", ``, ""},
+		{"json null", `null`, ""},
+		{"plain string", `"created comment"`, "created comment"},
+		{"object (gpt-5.6-sol shape)", `{"items":[{"Json":{"stdout":"ok\n"}}]}`, `{"items":[{"Json":{"stdout":"ok\n"}}]}`},
+		{"array", `["a","b"]`, `["a","b"]`},
+	}
+	for _, tt := range tests {
+		got := acpRawText(json.RawMessage(tt.raw))
+		if got != tt.want {
+			t.Errorf("%s: acpRawText(%q) = %q, want %q", tt.name, tt.raw, got, tt.want)
+		}
 	}
 }

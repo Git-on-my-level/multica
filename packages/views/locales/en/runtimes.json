@@ -253,6 +253,8 @@
     "version_unknown": "unknown",
     "managed_by_desktop": "Managed by Desktop",
     "managed_by_desktop_title": "The CLI binary is managed by Multica Desktop — update Desktop to upgrade the CLI.",
+    "read_only": "Read-only",
+    "read_only_title": "Only runtime owners and workspace admins can update the CLI.",
     "latest": "Latest",
     "available": "available",
     "action": "Update",
@@ -411,6 +413,8 @@
     "unmapped_notice_other": "{{count}} models have no maintained price — their tokens are excluded from cost totals.",
     "custom_pricing": {
       "open_button": "Set custom prices",
+      "edit_button": "Edit custom prices",
+      "active_notice": "Some models in this period are priced with your custom rates.",
       "title": "Custom model prices",
       "description": "Enter per-million-token rates so we can price models we don't ship a maintained rate for. Stored locally on this machine.",
       "empty": "No models need a custom price right now.",

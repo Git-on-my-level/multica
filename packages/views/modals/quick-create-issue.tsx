@@ -1,36 +1,65 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftRight, Check, ChevronRight, Maximize2, Minimize2, X as XIcon } from "lucide-react";
+import {
+  ArrowLeftRight,
+  CalendarDays,
+  Check,
+  ChevronRight,
+  FolderKanban,
+  Maximize2,
+  Minimize2,
+  MoreHorizontal,
+  Settings2,
+  X as XIcon,
+} from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DialogTitle } from "@multica/ui/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@multica/ui/components/ui/dropdown-menu";
 import { Button } from "@multica/ui/components/ui/button";
 import { Switch } from "@multica/ui/components/ui/switch";
 import { api, ApiError } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { useCurrentWorkspace } from "@multica/core/paths";
+import { useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
+import { useNavigation } from "../navigation";
 import { agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
 import {
   useQuickCreateStore,
   type QuickCreateActorType,
 } from "@multica/core/issues/stores/quick-create-store";
+import {
+  useIssueCreateSettingsStore,
+  type QuickCreateField,
+} from "@multica/core/issues/stores/issue-create-settings-store";
 import { useIssueDraftStore } from "@multica/core/issues/stores/draft-store";
 import { useCreateModeStore } from "@multica/core/issues/stores/create-mode-store";
 import {
   runtimeListOptions,
   checkQuickCreateCliVersion,
+  checkQuickCreateFieldsCliVersion,
   readRuntimeCliVersion,
-  MIN_QUICK_CREATE_CLI_VERSION,
 } from "@multica/core/runtimes";
-import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { useShortcut } from "@multica/core/shortcuts";
 import { ShortcutKeycaps } from "../common/shortcut-keycaps";
-import { contentReferencesAttachment, type Agent, type Attachment, type Squad } from "@multica/core/types";
+import {
+  contentReferencesAttachment,
+  type Agent,
+  type Attachment,
+  type IssuePriority,
+  type Squad,
+} from "@multica/core/types";
 import { ActorAvatar } from "../common/actor-avatar";
 import { PillButton } from "../common/pill-button";
 import { ProjectPicker } from "../projects/components/project-picker";
+import { DueDatePicker, PriorityIcon, PriorityPicker } from "../issues/components";
 import { canAssignAgent } from "../issues/components/pickers/assignee-picker";
 import {
   PropertyPicker,
@@ -45,6 +74,8 @@ import {
   type ContentEditorRef,
   useFileDropZone,
   FileDropOverlay,
+  useUploadGate,
+  useEditorUpload,
 } from "../editor";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import { useT } from "../i18n";
@@ -85,6 +116,8 @@ export function AgentCreatePanel({
   const { t } = useT("modals");
   const sendShortcut = useShortcut("send");
   const workspaceName = useCurrentWorkspace()?.name;
+  const workspacePaths = useWorkspacePaths();
+  const navigation = useNavigation();
   const wsId = useWorkspaceId();
   const userId = useAuthStore((s) => s.user?.id);
   const { data: members = [] } = useQuery(memberListOptions(wsId));
@@ -130,12 +163,15 @@ export function AgentCreatePanel({
   const setLastActor = useQuickCreateStore((s) => s.setLastActor);
   const lastProjectId = useQuickCreateStore((s) => s.lastProjectId);
   const setLastProjectId = useQuickCreateStore((s) => s.setLastProjectId);
+  const visibleFields = useIssueCreateSettingsStore((s) => s.quickCreateFields);
   const promptDraft = useQuickCreateStore((s) => s.prompt);
   const setPrompt = useQuickCreateStore((s) => s.setPrompt);
   const clearPrompt = useQuickCreateStore((s) => s.clearPrompt);
   const keepOpen = useQuickCreateStore((s) => s.keepOpen);
   const setKeepOpen = useQuickCreateStore((s) => s.setKeepOpen);
   const setLastMode = useCreateModeStore((s) => s.setLastMode);
+  const selectionDraft = useIssueDraftStore((s) => s.draft);
+  const setSelectionDraft = useIssueDraftStore((s) => s.setDraft);
 
   // Resolve a candidate actor against the currently-visible agents / squads.
   // Returns null when the candidate doesn't exist in this workspace right
@@ -160,18 +196,35 @@ export function AgentCreatePanel({
 
   const seedActor = useCallback((): ActorSelection | null => {
     // Caller-provided seed wins (e.g. shell pre-seeds with `agent_id` /
-    // `squad_id`), then persisted preference, then first visible agent.
+    // `squad_id`), then the unfinished draft, the last successful pick, and
+    // finally the first visible agent.
     const dataAgent = data?.agent_id as string | undefined;
     const dataSquad = data?.squad_id as string | undefined;
     return (
       resolveActor("agent", dataAgent) ||
       resolveActor("squad", dataSquad) ||
+      resolveActor(
+        selectionDraft.assigneeType === "agent" ||
+          selectionDraft.assigneeType === "squad"
+          ? selectionDraft.assigneeType
+          : null,
+        selectionDraft.assigneeId,
+      ) ||
       resolveActor(lastActorType, lastActorId) ||
       (visibleAgents[0]
         ? ({ type: "agent", id: visibleAgents[0].id } as const)
         : null)
     );
-  }, [resolveActor, data?.agent_id, data?.squad_id, lastActorType, lastActorId, visibleAgents]);
+  }, [
+    resolveActor,
+    data?.agent_id,
+    data?.squad_id,
+    selectionDraft.assigneeType,
+    selectionDraft.assigneeId,
+    lastActorType,
+    lastActorId,
+    visibleAgents,
+  ]);
 
   const [actor, setActor] = useState<ActorSelection | null>(() => seedActor());
 
@@ -194,14 +247,23 @@ export function AgentCreatePanel({
     return visibleSquads.find((s) => s.id === actor.id);
   }, [actor, visibleSquads]);
 
-  // Project selection — defaults to the last project the user picked in this
-  // workspace. `data?.project_id` lets the modal opener seed a one-shot
-  // override (e.g. a future "+ Issue" button on a project page); it does NOT
-  // replace the persisted default.
+  // Unfinished selections live in the shared issue draft. Last-successful
+  // actor/project values remain separate fallbacks, so closing a draft never
+  // overwrites the defaults established by an actual create.
   const [projectId, setProjectId] = useState<string | null>(() => {
-    const seed = (data?.project_id as string | undefined) ?? lastProjectId;
+    const seed =
+      (data?.project_id as string | undefined) ??
+      selectionDraft.projectId ??
+      lastProjectId;
     return seed ?? null;
   });
+  const [priority, setPriority] = useState<IssuePriority>(
+    (data?.priority as IssuePriority | undefined) ?? selectionDraft.priority,
+  );
+  const [dueDate, setDueDate] = useState<string | null>(
+    (data?.due_date as string | undefined) ?? selectionDraft.dueDate,
+  );
+  const [fieldPickerOpen, setFieldPickerOpen] = useState<QuickCreateField | null>(null);
 
   // Parent-issue context — seeded by `openCreateSubIssue` when the modal is
   // opened from the "Add sub issue" entry on an existing issue. We carry it
@@ -216,15 +278,26 @@ export function AgentCreatePanel({
   // Stale-id sweep. Once the project list query has actually resolved
   // (`isSuccess` — distinct from "data is the empty default during loading"),
   // a `projectId` that isn't in the list means the project was deleted in
-  // another session. Clear BOTH local state and the persisted preference;
-  // dropping only local state would leave the deleted UUID in `lastProjectId`,
-  // and the next open would re-seed it and submit the same dead value.
+  // another session. Clear local state, the unfinished draft, and the
+  // last-successful preference; dropping any persisted copy would make the
+  // next open re-seed and submit the same dead value.
   useEffect(() => {
     if (!projectsLoaded || projectId === null) return;
     if (projects.some((p) => p.id === projectId)) return;
     setProjectId(null);
+    if (selectionDraft.projectId === projectId) {
+      setSelectionDraft({ projectId: undefined });
+    }
     if (lastProjectId === projectId) setLastProjectId(null);
-  }, [projectsLoaded, projects, projectId, lastProjectId, setLastProjectId]);
+  }, [
+    projectsLoaded,
+    projects,
+    projectId,
+    selectionDraft.projectId,
+    lastProjectId,
+    setSelectionDraft,
+    setLastProjectId,
+  ]);
 
   // Daemon CLI version gate. The agent-create flow needs the runtime's
   // bundled multica CLI to be ≥ MIN_QUICK_CREATE_CLI_VERSION; older
@@ -243,11 +316,20 @@ export function AgentCreatePanel({
         : undefined,
     [runtimes, selectedAgent?.runtime_id],
   );
-  const versionCheck = useMemo(
-    () => checkQuickCreateCliVersion(readRuntimeCliVersion(selectedRuntime?.metadata)),
-    [selectedRuntime?.metadata],
+  const runtimeCliVersion = readRuntimeCliVersion(selectedRuntime?.metadata);
+  const baseVersionCheck = useMemo(
+    () => checkQuickCreateCliVersion(runtimeCliVersion),
+    [runtimeCliVersion],
   );
-  const versionBlocked = versionCheck.state !== "ok";
+  const fieldVersionCheck = useMemo(
+    () => checkQuickCreateFieldsCliVersion(runtimeCliVersion),
+    [runtimeCliVersion],
+  );
+  const usesExplicitFields = priority !== "none" || dueDate !== null;
+  const versionCheck = usesExplicitFields ? fieldVersionCheck : baseVersionCheck;
+  const versionBlocked =
+    baseVersionCheck.state !== "ok" ||
+    (usesExplicitFields && fieldVersionCheck.state !== "ok");
 
   const initialPrompt = (data?.prompt as string) || promptDraft;
   // The editor is uncontrolled — we read the latest markdown via the ref at
@@ -256,6 +338,9 @@ export function AgentCreatePanel({
   const editorRef = useRef<ContentEditorRef>(null);
   const [hasContent, setHasContent] = useState(initialPrompt.trim().length > 0);
   const [submitting, setSubmitting] = useState(false);
+  // See create-issue's handleSubmit: `submitting` state can't gate two presses
+  // landing in the same tick, and ⌘+Enter makes that trivial to hit.
+  const submittingRef = useRef(false);
   const [justSent, setJustSent] = useState(false);
   const [sentCount, setSentCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -264,7 +349,11 @@ export function AgentCreatePanel({
   // Image paste/drop support: route uploads through the same helper Advanced
   // uses, so users can paste screenshots straight into the prompt and the
   // agent receives them as embedded markdown image URLs in the prompt.
-  const { uploadWithToast, uploading } = useFileUpload(api);
+  const { uploadWithToast } = useEditorUpload();
+  // Was two parallel truths — useFileUpload's request counter for the button
+  // and the editor's node scan for the handler. The editor document is the
+  // queue, so one source drives both now.
+  const uploadGate = useUploadGate(editorRef);
   const handleUploadFile = useCallback(async (file: File) => {
     const result = await uploadWithToast(file);
     if (result) {
@@ -288,18 +377,16 @@ export function AgentCreatePanel({
 
   const submit = async () => {
     const md = editorRef.current?.getMarkdown()?.trim() ?? "";
-    if (!md || !actor || submitting || versionBlocked || uploading) return;
-    // Belt-and-suspenders against the multi-file upload race fixed in
-    // useFileUpload (MUL-3339): `uploading` already tracks an in-flight
-    // counter now, but the editor's per-node `uploading` attr is the most
-    // direct truth — if any image node is still mid-upload, blocking submit
-    // here guarantees `getMarkdown()`'s blob-url strip never erases a
-    // pasted/dropped image whose attachment id hasn't reached
-    // `pendingAttachments` yet.
-    if (editorRef.current?.hasActiveUploads()) return;
+    if (!md || !actor || submittingRef.current || versionBlocked) return;
+    // Submit-time re-read of the queue. Blocking here is what guarantees
+    // `getMarkdown()`'s blob-url strip never erases a pasted/dropped image
+    // whose attachment id hasn't reached `pendingAttachments` yet — the
+    // rendered button state is a frame behind and ⌘+Enter skips it anyway.
+    if (uploadGate.isBlocked()) return;
     const activeAttachmentIds = pendingAttachments
       .filter((a) => contentReferencesAttachment(md, a))
       .map((a) => a.id);
+    submittingRef.current = true;
     setSubmitting(true);
     setError(null);
     try {
@@ -309,11 +396,23 @@ export function AgentCreatePanel({
           : { squad_id: actor.id }),
         prompt: md,
         project_id: projectId ?? undefined,
+        ...(priority !== "none" ? { priority } : {}),
+        ...(dueDate ? { due_date: dueDate } : {}),
         parent_issue_id: parentIssueId,
         ...(activeAttachmentIds.length > 0 ? { attachment_ids: activeAttachmentIds } : {}),
       });
       setLastActor(actor.type, actor.id);
       setLastProjectId(projectId);
+      // A successful create ends this draft. Keep last-successful actor and
+      // project preferences above, but clear the unfinished selections so a
+      // future draft does not inherit priority or due date accidentally.
+      setSelectionDraft({
+        assigneeType: undefined,
+        assigneeId: undefined,
+        projectId: undefined,
+        priority: "none",
+        dueDate: null,
+      });
       clearPrompt();
       setLastMode("agent");
       toast.success(t(($) => $.create_issue.agent.toast_sent), {
@@ -358,7 +457,7 @@ export function AgentCreatePanel({
           setError(
             t(($) => $.create_issue.agent.error_daemon_version, {
               current: cur,
-              min: body.min_version || MIN_QUICK_CREATE_CLI_VERSION,
+              min: body.min_version || versionCheck.min,
             }),
           );
           setSubmitting(false);
@@ -371,6 +470,7 @@ export function AgentCreatePanel({
           : t(($) => $.create_issue.agent.error_unknown),
       );
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -382,6 +482,9 @@ export function AgentCreatePanel({
   // store directly because the manual panel reads its initial values from
   // there. Persist the mode flip so the next `c` lands in manual.
   const switchToManual = () => {
+    // The prompt is serialized into the manual draft here; mid-upload that
+    // body has already lost the pending image (see switchToAgent).
+    if (uploadGate.isBlocked()) return;
     const md = editorRef.current?.getMarkdown() ?? "";
     useIssueDraftStore.getState().setDraft({
       description: md,
@@ -398,9 +501,20 @@ export function AgentCreatePanel({
     // through.
     const carry: Record<string, unknown> = {};
     if (projectId) carry.project_id = projectId;
+    if (priority !== "none") carry.priority = priority;
+    if (dueDate) carry.due_date = dueDate;
     if (parentIssueId) carry.parent_issue_id = parentIssueId;
     if (parentIssueIdentifier) carry.parent_issue_identifier = parentIssueIdentifier;
     onSwitchMode?.(Object.keys(carry).length > 0 ? carry : null);
+  };
+
+  // Field visibility lives in Settings → Issue. Persist the prompt draft
+  // before leaving so what the user typed survives the round-trip, then
+  // close — the dialog would otherwise linger over the settings page.
+  const openFieldSettings = () => {
+    setPrompt(editorRef.current?.getMarkdown() ?? "");
+    onClose();
+    navigation.push(`${workspacePaths.settings()}?tab=issue`);
   };
 
   return (
@@ -453,6 +567,7 @@ export function AgentCreatePanel({
             selectedSquad={selectedSquad}
             onPick={(next) => {
               setActor(next);
+              setSelectionDraft({ assigneeType: next.type, assigneeId: next.id });
               setError(null);
             }}
             t={t}
@@ -490,6 +605,7 @@ export function AgentCreatePanel({
               setPrompt(md);
             }}
             onUploadFile={handleUploadFile}
+            onUploadingChange={uploadGate.onUploadingChange}
             attachments={pendingAttachments}
             onSubmit={submit}
             debounceMs={150}
@@ -501,12 +617,9 @@ export function AgentCreatePanel({
           <div className="px-5 pb-2 text-xs text-destructive">{error}</div>
         )}
 
-        {/* Property toolbar — mirrors the manual panel's pill row so the
-            project pill sits in the same place across both modes. Agent mode
-            owns only the project (status / priority / assignee / due-date are
-            inferred from the prompt), so it's a single pill. The pick is
-            persisted per-workspace via useQuickCreateStore.lastProjectId so
-            users targeting one project skip retyping "in project X".
+        {/* Property toolbar — the project is visible by default; priority and
+            due date live behind the overflow until exposed in settings or
+            given a value. Unfinished picks remain workspace-persistent.
             When the modal was opened from "Add sub issue" on an existing
             issue, a read-only chip on the same row tells the user that the
             new issue will be filed as a sub-issue of that parent — the agent
@@ -515,12 +628,92 @@ export function AgentCreatePanel({
             it non-editable: changing the parent is a `Set parent` action on
             the parent itself, not a knob in the quick-create flow. */}
         <div className="flex items-center gap-1.5 px-4 pb-2 shrink-0 flex-wrap">
-          <ProjectPicker
-            projectId={projectId}
-            onUpdate={(u) => setProjectId(u.project_id ?? null)}
-            triggerRender={<PillButton />}
-            align="start"
-          />
+          {(visibleFields.includes("project") ||
+            projectId !== null ||
+            fieldPickerOpen === "project") && (
+            <ProjectPicker
+              projectId={projectId}
+              onUpdate={(u) => {
+                const next = u.project_id ?? null;
+                setProjectId(next);
+                setSelectionDraft({ projectId: next ?? undefined });
+              }}
+              triggerRender={<PillButton />}
+              align="start"
+              open={fieldPickerOpen === "project" ? true : undefined}
+              onOpenChange={(open) => setFieldPickerOpen(open ? "project" : null)}
+            />
+          )}
+          {(visibleFields.includes("priority") ||
+            priority !== "none" ||
+            fieldPickerOpen === "priority") && (
+            <PriorityPicker
+              priority={priority}
+              onUpdate={(updates) => {
+                if (updates.priority) {
+                  setPriority(updates.priority);
+                  setSelectionDraft({ priority: updates.priority });
+                }
+              }}
+              triggerRender={<PillButton />}
+              align="start"
+              open={fieldPickerOpen === "priority" ? true : undefined}
+              onOpenChange={(open) => setFieldPickerOpen(open ? "priority" : null)}
+            />
+          )}
+          {(visibleFields.includes("due_date") ||
+            dueDate !== null ||
+            fieldPickerOpen === "due_date") && (
+            <DueDatePicker
+              dueDate={dueDate}
+              onUpdate={(updates) => {
+                const next = updates.due_date ?? null;
+                setDueDate(next);
+                setSelectionDraft({ dueDate: next });
+              }}
+              triggerRender={<PillButton />}
+              align="start"
+              open={fieldPickerOpen === "due_date" ? true : undefined}
+              onOpenChange={(open) => setFieldPickerOpen(open ? "due_date" : null)}
+            />
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <PillButton
+                  aria-label={t(($) => $.create_issue.agent.more_fields_aria)}
+                  title={t(($) => $.create_issue.agent.more_fields_aria)}
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </PillButton>
+              }
+            />
+            <DropdownMenuContent align="start" className="w-52">
+              {!visibleFields.includes("project") && projectId === null && (
+                <DropdownMenuItem onClick={() => setFieldPickerOpen("project")}>
+                  <FolderKanban className="size-3.5 text-muted-foreground" />
+                  {t(($) => $.create_issue.agent.set_project)}
+                </DropdownMenuItem>
+              )}
+              {!visibleFields.includes("priority") && priority === "none" && (
+                <DropdownMenuItem onClick={() => setFieldPickerOpen("priority")}>
+                  <PriorityIcon priority="none" className="size-3.5" />
+                  {t(($) => $.create_issue.agent.set_priority)}
+                </DropdownMenuItem>
+              )}
+              {!visibleFields.includes("due_date") && dueDate === null && (
+                <DropdownMenuItem onClick={() => setFieldPickerOpen("due_date")}>
+                  <CalendarDays className="size-3.5 text-muted-foreground" />
+                  {t(($) => $.create_issue.agent.set_due_date)}
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={openFieldSettings}>
+                <Settings2 className="size-3.5 text-muted-foreground" />
+                {t(($) => $.create_issue.agent.customize_fields)}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           {parentIssueId && (
             <span
               data-testid="agent-sub-issue-chip"
@@ -539,10 +732,12 @@ export function AgentCreatePanel({
         {/* Footer */}
         <div className="flex flex-col gap-2 border-t px-4 py-3 shrink-0 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-h-7 items-center gap-2">
+            {/* Deliberately NOT disabled while uploading: each file is its
+                own queue entry, so queueing a second one is safe and waiting
+                for the first to land just to attach the next is busywork. */}
             <FileUploadButton
               size="sm"
               multiple
-              disabled={uploading}
               onSelect={(file) => editorRef.current?.uploadFile(file)}
             />
             {keepOpen && sentCount > 0 && (
@@ -555,8 +750,11 @@ export function AgentCreatePanel({
             <button
               type="button"
               onClick={switchToManual}
+              disabled={uploadGate.uploading}
+              aria-disabled={uploadGate.uploading || undefined}
+              aria-busy={uploadGate.uploading || undefined}
               title={t(($) => $.create_issue.switch_to_manual_tooltip)}
-              className="flex shrink-0 items-center gap-1.5 text-xs px-2 py-1 rounded-sm text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors cursor-pointer"
+              className="flex shrink-0 items-center gap-1.5 text-xs px-2 py-1 rounded-sm text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
             >
               <ArrowLeftRight className="size-3.5" />
               {t(($) => $.create_issue.switch_to_manual)}
@@ -572,7 +770,10 @@ export function AgentCreatePanel({
             <Button
               size="sm"
               onClick={submit}
-              disabled={!hasContent || !actor || submitting || versionBlocked || uploading}
+              disabled={!hasContent || !actor || submitting || versionBlocked || uploadGate.uploading}
+              aria-disabled={uploadGate.uploading || undefined}
+              // Sending is a busy state too, not just uploading.
+              aria-busy={uploadGate.uploading || submitting || undefined}
               title={
                 versionBlocked
                   ? t(($) => $.create_issue.agent.version_blocked_tooltip, { min: versionCheck.min })
@@ -580,7 +781,7 @@ export function AgentCreatePanel({
               }
               className={justSent ? "min-w-28 !bg-emerald-600 !text-white" : "min-w-28"}
             >
-              {submitting ? t(($) => $.create_issue.agent.sending) : uploading ? t(($) => $.create_issue.agent.uploading) : justSent ? (
+              {submitting ? t(($) => $.create_issue.agent.sending) : uploadGate.uploading ? t(($) => $.create_issue.agent.uploading) : justSent ? (
                 <span className="flex items-center gap-1"><Check className="size-3.5" />{t(($) => $.create_issue.agent.sent_label)}</span>
               ) : (
                 <>

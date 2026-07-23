@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserWindow, WebContents } from "electron";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type Handler = (...args: unknown[]) => void;
+type IpcHandler = (...args: unknown[]) => unknown;
 
 const ctx = vi.hoisted(() => ({
   handlers: new Map<string, Handler[]>(),
+  ipcHandlers: new Map<string, IpcHandler>(),
   ipcHandle: vi.fn(),
   checkForUpdates: vi.fn(async () => ({
     updateInfo: { version: "0.3.18" },
@@ -13,20 +18,15 @@ const ctx = vi.hoisted(() => ({
   downloadUpdate: vi.fn(),
   quitAndInstall: vi.fn(),
   getVersion: vi.fn(() => "0.3.17"),
-  autoUpdater: null as {
-    allowPrerelease: boolean;
-  } | null,
-  showMessageBox: vi.fn(async () => ({ response: 1 })),
-  openExternalSafely: vi.fn(),
-  releasesPageUrl: "https://github.com/multica-ai/multica/releases/latest",
+  userDataPath: "",
 }));
 
 vi.mock("electron-updater", () => {
   const autoUpdater = {
     autoDownload: false,
     autoInstallOnAppQuit: false,
-    allowPrerelease: true as boolean,
     channel: undefined as string | undefined,
+    allowDowngrade: false,
     on: vi.fn((event: string, handler: Handler) => {
       const handlers = ctx.handlers.get(event) ?? [];
       handlers.push(handler);
@@ -37,37 +37,64 @@ vi.mock("electron-updater", () => {
     downloadUpdate: ctx.downloadUpdate,
     quitAndInstall: ctx.quitAndInstall,
   };
-  ctx.autoUpdater = autoUpdater;
   return { autoUpdater };
 });
 
 vi.mock("electron", () => ({
   app: {
     getVersion: ctx.getVersion,
+    getPath: vi.fn(() => ctx.userDataPath),
   },
   BrowserWindow: class BrowserWindow {},
-  dialog: {
-    showMessageBox: ctx.showMessageBox,
-  },
   ipcMain: {
     handle: ctx.ipcHandle,
   },
 }));
 
-vi.mock("./external-url", () => ({
-  openExternalSafely: ctx.openExternalSafely,
-}));
+import {
+  configureMacX64UpdateChannel,
+  setupAutoUpdater,
+} from "./updater";
+import { updaterPreferencesPath } from "./updater-preferences";
 
-vi.mock("./github-release-base", () => ({
-  githubReleasesLatestPageUrl: () => ctx.releasesPageUrl,
-}));
+describe("macOS x64 update channel", () => {
+  it("does not touch established architecture paths", () => {
+    for (const [platform, arch] of [
+      ["darwin", "arm64"],
+      ["win32", "x64"],
+      ["win32", "arm64"],
+      ["linux", "arm64"],
+    ] as const) {
+      const updater = { channel: null, allowDowngrade: true };
 
-import { setupAutoUpdater } from "./updater";
+      configureMacX64UpdateChannel(updater, platform, arch);
+
+      expect(updater).toEqual({ channel: null, allowDowngrade: true });
+    }
+  });
+
+  it("does not enable downgrades when selecting an architecture feed", () => {
+    const updater = { channel: null, allowDowngrade: true };
+
+    configureMacX64UpdateChannel(updater, "darwin", "x64");
+
+    expect(updater).toEqual({
+      channel: "latest-x64",
+      allowDowngrade: false,
+    });
+  });
+});
 
 function emitUpdater(event: string, ...args: unknown[]) {
   for (const handler of ctx.handlers.get(event) ?? []) {
     handler(...args);
   }
+}
+
+async function invokeIpc(channel: string, ...args: unknown[]) {
+  const handler = ctx.ipcHandlers.get(channel);
+  if (!handler) throw new Error(`Missing IPC handler: ${channel}`);
+  return handler({}, ...args);
 }
 
 function makeWindow() {
@@ -128,21 +155,82 @@ function makeWindowWithThrowingSend(error: Error) {
 describe("setupAutoUpdater", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    ctx.userDataPath = mkdtempSync(join(tmpdir(), "multica-updater-test-"));
     ctx.handlers.clear();
+    ctx.ipcHandlers.clear();
     ctx.ipcHandle.mockClear();
+    ctx.ipcHandle.mockImplementation((channel: string, handler: IpcHandler) => {
+      ctx.ipcHandlers.set(channel, handler);
+    });
     ctx.checkForUpdates.mockClear();
     ctx.downloadUpdate.mockClear();
     ctx.quitAndInstall.mockClear();
     ctx.getVersion.mockClear();
-    ctx.showMessageBox.mockClear();
-    ctx.openExternalSafely.mockClear();
-    vi.stubGlobal("process", { ...process, platform: "darwin" });
   });
 
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
-    vi.unstubAllGlobals();
+    rmSync(ctx.userDataPath, { recursive: true, force: true });
+  });
+
+  it("enables automatic background updates by default", async () => {
+    setupAutoUpdater(() => null);
+
+    await expect(invokeIpc("updater:get-preferences")).resolves.toEqual({
+      automaticUpdates: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ctx.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips startup and periodic checks when automatic updates are disabled", async () => {
+    writeFileSync(
+      updaterPreferencesPath(ctx.userDataPath),
+      JSON.stringify({ automaticUpdates: false }),
+    );
+    setupAutoUpdater(() => null);
+
+    // Let the async preference load settle before advancing timers; otherwise
+    // the in-flight readFile can resolve after afterEach() removes the temp
+    // dir, default back to enabled=true, and fire a background check into the
+    // next test's freshly-cleared mock (flake on slow CI).
+    await invokeIpc("updater:get-preferences");
+
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000 + 5_000);
+
+    expect(ctx.checkForUpdates).not.toHaveBeenCalled();
+  });
+
+  it("persists the automatic update preference and stops future background checks", async () => {
+    setupAutoUpdater(() => null);
+
+    await expect(
+      invokeIpc("updater:set-automatic-updates", false),
+    ).resolves.toEqual({ automaticUpdates: false });
+    expect(
+      JSON.parse(
+        readFileSync(updaterPreferencesPath(ctx.userDataPath), "utf-8"),
+      ),
+    ).toEqual({ automaticUpdates: false });
+
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000 + 5_000);
+    expect(ctx.checkForUpdates).not.toHaveBeenCalled();
+  });
+
+  it("still allows an explicit manual check when automatic updates are disabled", async () => {
+    writeFileSync(
+      updaterPreferencesPath(ctx.userDataPath),
+      JSON.stringify({ automaticUpdates: false }),
+    );
+    setupAutoUpdater(() => null);
+
+    await expect(invokeIpc("updater:check")).resolves.toMatchObject({
+      ok: true,
+    });
+
+    expect(ctx.checkForUpdates).toHaveBeenCalledTimes(1);
   });
 
   it("forwards update progress to a live renderer", () => {
@@ -189,29 +277,5 @@ describe("setupAutoUpdater", () => {
     expect(() => emitUpdater("download-progress", { percent: 42 })).toThrow(
       "boom",
     );
-  });
-
-  it("disables allowPrerelease so git-describe local builds can check stable releases", () => {
-    setupAutoUpdater(() => makeWindow().win);
-    expect(ctx.autoUpdater?.allowPrerelease).toBe(false);
-  });
-
-  it("notifies the renderer and shows a dialog on macOS code-signature install failures", async () => {
-    const { win, send } = makeWindow();
-    setupAutoUpdater(() => win);
-
-    emitUpdater(
-      "error",
-      new Error(
-        "Code signature at URL file:///tmp/Multica.app/ did not pass validation: code did not meet specified code requirements",
-      ),
-    );
-
-    expect(send).toHaveBeenCalledWith("updater:update-error", {
-      code: "signature_mismatch",
-      message:
-        "Code signature at URL file:///tmp/Multica.app/ did not pass validation: code did not meet specified code requirements",
-    });
-    expect(ctx.showMessageBox).toHaveBeenCalled();
   });
 });
