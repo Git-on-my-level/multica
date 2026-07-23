@@ -295,6 +295,13 @@ const updaterAPI = {
     ipcRenderer.on("updater:update-downloaded", handler);
     return () => ipcRenderer.removeListener("updater:update-downloaded", handler);
   },
+  onUpdateError: (
+    callback: (error: { code: string; message: string }) => void,
+  ) => {
+    const handler = (_: unknown, error: { code: string; message: string }) => callback(error);
+    ipcRenderer.on("updater:update-error", handler);
+    return () => ipcRenderer.removeListener("updater:update-error", handler);
+  },
   downloadUpdate: () => ipcRenderer.invoke("updater:download"),
   installUpdate: () => ipcRenderer.invoke("updater:install"),
   getReleasesPageUrl: (): Promise<string> => ipcRenderer.invoke("updater:releases-page-url"),

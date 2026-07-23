@@ -58,7 +58,18 @@ const PERIODIC_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 type RendererChannel =
   | "updater:update-available"
   | "updater:download-progress"
-  | "updater:update-downloaded";
+  | "updater:update-downloaded"
+  | "updater:update-error";
+
+function isMacCodeSignatureError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const message = err.message;
+  return (
+    message.includes("Code signature") ||
+    message.includes("code requirements") ||
+    message.includes("SQRLCodeSignature")
+  );
+}
 
 function isDestroyedObjectError(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Object has been destroyed");
@@ -194,6 +205,12 @@ export function setupAutoUpdater(getMainWindow: () => BrowserWindow | null): voi
 
   autoUpdater.on("error", (err) => {
     console.error("Auto-updater error:", err);
+    if (process.platform === "darwin" && isMacCodeSignatureError(err)) {
+      sendToLiveRenderer(getMainWindow(), "updater:update-error", {
+        code: "signature_mismatch",
+        message: err.message,
+      });
+    }
   });
 
   // Retained for IPC back-compat with older renderer bundles. With
