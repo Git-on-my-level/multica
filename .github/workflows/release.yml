@@ -481,13 +481,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Enable signing when CSC_LINK is present; otherwise ad-hoc.
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
+          # Fork releases are intentionally ad-hoc signed. Do not consume
+          # repository signing/notarization secrets here: they belong to the
+          # upstream's manual Developer ID release path and may not be a
+          # usable certificate in a fork.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         shell: bash
         # Apple Silicon only — publishing both x64 and arm64 with --publish
         # always overwrites latest-mac.yml on the same release and breaks
