@@ -893,7 +893,7 @@ func TestParseHermesSessionNewModels(t *testing.T) {
         "currentModelId": "nous:anthropic/claude-opus-4.7"
       }
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 2 {
 		t.Fatalf("expected 2 models (duplicate deduped), got %d: %+v", len(models), models)
 	}
@@ -921,7 +921,7 @@ func TestParseHermesSessionNewModelsPreservesCustomModelIDsWithColons(t *testing
         "currentModelId": "custom:lfm2.5:8b"
       }
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 1 {
 		t.Fatalf("expected 1 model, got %d: %+v", len(models), models)
 	}
@@ -947,7 +947,7 @@ func TestParseHermesSessionNewModelsSnakeCaseAndUnknownNames(t *testing.T) {
         "current_model_id": "nous:moonshotai/kimi-k2.6"
       }
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 2 {
 		t.Fatalf("expected 2 models, got %d: %+v", len(models), models)
 	}
@@ -967,13 +967,13 @@ func TestParseHermesSessionNewModelsMissingField(t *testing.T) {
 	// failed _build_model_state — should yield nil so the caller
 	// can distinguish "no catalog" from "empty catalog".
 	raw := []byte(`{"sessionId": "ses_123"}`)
-	if got := parseACPSessionNewModels(raw); got != nil && len(got) != 0 {
+	if got := parseACPSessionNewModels(raw, false); got != nil && len(got) != 0 {
 		t.Errorf("expected nil/empty, got %+v", got)
 	}
 }
 
 func TestParseHermesSessionNewModelsGarbage(t *testing.T) {
-	if got := parseACPSessionNewModels([]byte("not json")); got != nil {
+	if got := parseACPSessionNewModels([]byte("not json"), false); got != nil {
 		t.Errorf("expected nil for non-JSON, got %+v", got)
 	}
 }
@@ -1011,7 +1011,7 @@ func TestParseACPSessionNewModelsFromConfigOptions(t *testing.T) {
         }
       ]
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 3 {
 		t.Fatalf("expected 3 models from configOptions, got %d: %+v", len(models), models)
 	}
@@ -1047,7 +1047,7 @@ func TestParseACPSessionNewModelsPrefersModelsBlockOverConfigOptions(t *testing.
          "options": [{"value": "other/one", "name": "Other"}]}
       ]
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 1 || models[0].ID != "nous:anthropic/claude-opus-4.7" {
 		t.Fatalf("models block must win over configOptions, got %+v", models)
 	}
@@ -1072,7 +1072,7 @@ func TestParseACPSessionNewModelsConfigOptionsSnakeCaseAndCategoryOnly(t *testin
         }
       ]
     }`)
-	models := parseACPSessionNewModels(raw)
+	models := parseACPSessionNewModels(raw, false)
 	if len(models) != 2 {
 		t.Fatalf("expected 2 models (duplicate and blank dropped), got %d: %+v", len(models), models)
 	}
@@ -1094,7 +1094,7 @@ func TestParseACPSessionNewModelsIgnoresNonModelConfigOptions(t *testing.T) {
          "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
       ]
     }`)
-	if got := parseACPSessionNewModels(raw); len(got) != 0 {
+	if got := parseACPSessionNewModels(raw, false); len(got) != 0 {
 		t.Errorf("expected empty catalog, got %+v", got)
 	}
 }

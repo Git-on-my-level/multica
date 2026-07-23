@@ -406,7 +406,8 @@ func discoverOmpModels(ctx context.Context, executablePath string) ([]Model, err
 		defaultBin:   "omp",
 		clientName:   "multica-model-discovery",
 		tmpdirPrefix: "multica-omp-discovery-",
-		acpArgs:      []string{"acp", "--yolo"},
+		acpArgs:           []string{"acp", "--yolo"},
+		slashModelProvider: true,
 	})
 }
 
@@ -945,6 +946,11 @@ type acpDiscoveryProvider struct {
 	// Legacy discovery providers keep their empty-list behavior; Grok enables
 	// this so it can log the actual fallback reason.
 	strictErrors bool
+	// slashModelProvider derives the dropdown group from the `provider/model`
+	// slash form in addition to the ACP-standard `provider:model` colon form.
+	// Only OMP advertises slash-form ids (e.g. "zai/glm-5.2"); other ACP agents
+	// such as kimi ("kimi-code/k3") carry no provider and stay ungrouped.
+	slashModelProvider bool
 }
 
 // discoverACPModels runs the ACP handshake for any agent CLI that
@@ -1102,7 +1108,7 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 	if err != nil {
 		return fail("session/new", err)
 	}
-	models := parseACPSessionNewModels(sessionResult)
+	models := parseACPSessionNewModels(sessionResult, p.slashModelProvider)
 	if len(models) == 0 {
 		// session/new succeeded but carried no catalog we recognise. This
 		// is what upstream schema drift looks like from here (MUL-5239:
@@ -1147,7 +1153,7 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 // Returns nil (not an empty slice) when the payload is missing so
 // the caller can distinguish "parsed with no models" (valid but
 // empty catalog) from "couldn't find the structure at all".
-func parseACPSessionNewModels(raw json.RawMessage) []Model {
+func parseACPSessionNewModels(raw json.RawMessage, slashProvider bool) []Model {
 	type acpModelInfo struct {
 		ModelID      string `json:"modelId"`
 		ModelIDSnake string `json:"model_id"`
@@ -1184,12 +1190,12 @@ func parseACPSessionNewModels(raw json.RawMessage) []Model {
 			continue
 		}
 		seen[modelID] = true
-		models = append(models, acpModelEntry(modelID, m.Name, currentModelID))
+		models = append(models, acpModelEntry(modelID, m.Name, currentModelID, slashProvider))
 	}
 	if len(models) > 0 {
 		return models
 	}
-	if fromConfig := parseACPConfigOptionModels(raw); len(fromConfig) > 0 {
+	if fromConfig := parseACPConfigOptionModels(raw, slashProvider); len(fromConfig) > 0 {
 		return fromConfig
 	}
 	return models
@@ -1222,7 +1228,7 @@ func parseACPSessionNewModels(raw json.RawMessage) []Model {
 //
 // Returns nil when no model option is present, so the caller can keep
 // whatever the `models` block produced.
-func parseACPConfigOptionModels(raw json.RawMessage) []Model {
+func parseACPConfigOptionModels(raw json.RawMessage, slashProvider bool) []Model {
 	type acpConfigChoice struct {
 		Value string `json:"value"`
 		Name  string `json:"name"`
@@ -1262,7 +1268,7 @@ func parseACPConfigOptionModels(raw json.RawMessage) []Model {
 				continue
 			}
 			seen[modelID] = true
-			models = append(models, acpModelEntry(modelID, choice.Name, currentValue))
+			models = append(models, acpModelEntry(modelID, choice.Name, currentValue, slashProvider))
 		}
 		if len(models) > 0 {
 			return models
@@ -1275,19 +1281,22 @@ func parseACPConfigOptionModels(raw json.RawMessage) []Model {
 // the provider tests. OMP and newer upstream ACP clients share the exact
 // configOptions wire shape, so one parser prevents the contracts from drifting.
 func parseACPModelConfigOptions(raw json.RawMessage) []Model {
-	return parseACPConfigOptionModels(raw)
+	return parseACPConfigOptionModels(raw, true)
 }
 
 // acpModelEntry builds one dropdown entry from an ACP-advertised model id
-// and its display name. Provider is derived from the `provider:model` form
-// only — ids like kimi's `kimi-code/k3` carry no colon and stay ungrouped,
-// which matches how the UI renders a flat catalog.
-func acpModelEntry(modelID, name, currentModelID string) Model {
+// and its display name. Provider is derived from the `provider:model` form;
+// when slashProvider is set it is additionally derived from the `provider/model`
+// form, which only OMP uses (e.g. "zai/glm-5.2"). Other agents (kimi's
+// "kimi-code/k3") carry no provider and stay ungrouped, matching the flat catalog.
+func acpModelEntry(modelID, name, currentModelID string, slashProvider bool) Model {
 	provider := ""
 	if idx := strings.Index(modelID, ":"); idx > 0 {
 		provider = modelID[:idx]
-	} else if idx := strings.Index(modelID, "/"); idx > 0 {
-		provider = modelID[:idx]
+	} else if slashProvider {
+		if idx := strings.Index(modelID, "/"); idx > 0 {
+			provider = modelID[:idx]
+		}
 	}
 	return Model{
 		ID:       modelID,
