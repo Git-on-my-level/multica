@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
@@ -13,6 +13,23 @@ import {
   resolveBuildMatrix,
   stripLeadingSeparator,
 } from "./package.mjs";
+
+describe("fork release workflow", () => {
+  it("always uses ad-hoc macOS signing instead of fork secrets", () => {
+    const releaseWorkflow = readFileSync(
+      resolve(process.cwd(), "../../.github/workflows/release.yml"),
+      "utf8",
+    );
+    const desktopMacJob = releaseWorkflow.slice(
+      releaseWorkflow.indexOf("  desktop-mac:"),
+    );
+
+    expect(desktopMacJob).toContain('CSC_IDENTITY_AUTO_DISCOVERY: "false"');
+    expect(desktopMacJob).not.toMatch(
+      /CSC_LINK:|CSC_KEY_PASSWORD:|APPLE_ID:|APPLE_APP_SPECIFIC_PASSWORD:|APPLE_TEAM_ID:/,
+    );
+  });
+});
 
 describe("normalizeGitVersion", () => {
   it("returns null for empty / nullish input", () => {
