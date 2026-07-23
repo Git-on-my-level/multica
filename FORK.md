@@ -53,10 +53,11 @@ the resulting DMG before manually creating the matching GitHub Release. Leave
 `CSC_IDENTITY_AUTO_DISCOVERY=false` belongs only to non-distributed smoke tests.
 
 Pushing a version tag triggers the generic Release workflow, including unrelated
-CLI/container work. That workflow is not a DMG gate: after local DMG checks,
-push an annotated tag at the reviewed commit, verify the remote tag resolves to
-that exact SHA, then use `gh release create --verify-tag` to upload only the
-DMG. Do not wait for the unrelated jobs.
+CLI/container work. That workflow is not a DMG gate. After local DMG checks, use
+`gh release create --target <reviewed-sha>` to create the missing lightweight
+tag and DMG-only release through GitHub's Release API, then verify
+the remote tag resolves to that exact SHA. Do not push the tag separately or
+wait for unrelated jobs.
 
 Never rewrite a failed tag or release. Issue a corrected version after fixing
 the cause.

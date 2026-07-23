@@ -208,6 +208,9 @@ describe("fork Desktop release policy", () => {
     expect(macGuide).toContain("--mac --arm64 --publish never");
     expect(macGuide).toContain("APPLE_KEYCHAIN_PROFILE=multica-notary");
     expect(macGuide).toContain("DMG only");
+    expect(macGuide).toContain('--target "$RELEASE_SHA"');
+    expect(macGuide).not.toContain('git push origin "v<version>"');
+    expect(macGuide).toContain("awk -F '\\t'");
   });
 });
 
