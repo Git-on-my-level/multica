@@ -702,7 +702,7 @@ func (h *Handler) UnlinkPullRequestFromIssue(w http.ResponseWriter, r *http.Requ
 		PrNumber:    number,
 	})
 	if err != nil {
-		writeError(w, http.StatusNotFound, "pull request is not linked to this issue")
+		writeError(w, http.StatusNotFound, "pull request is not mirrored in this workspace; it becomes linkable once a connected GitHub App installation reports it via webhook")
 		return
 	}
 	// The PR is mirrored, but may not be linked to THIS issue. Distinguish the

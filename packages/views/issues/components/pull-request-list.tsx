@@ -15,6 +15,7 @@ import {
   Unlink,
   XCircle,
 } from "lucide-react";
+import { issueKeys } from "@multica/core/issues/queries";
 import {
   issuePullRequestsOptions,
   derivePullRequestStatusKind,
@@ -83,7 +84,7 @@ const CHECKS_ICON: Record<
   pending: { icon: CircleDashed, className: "text-amber-600 dark:text-amber-400" },
 };
 
-export function PullRequestList({ issueId }: { issueId: string }) {
+export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: string }) {
   const { t } = useT("issues");
   const qc = useQueryClient();
   const { data, isLoading } = useQuery(issuePullRequestsOptions(issueId));
@@ -110,10 +111,17 @@ export function PullRequestList({ issueId }: { issueId: string }) {
   const linkMutation = useMutation({
     mutationFn: (vars: { url: string; closeIntent: boolean }) =>
       api.linkIssuePullRequest(issueId, vars.url, vars.closeIntent),
-    onSuccess: () => {
+    onSuccess: (_data, vars) => {
       // Realtime also invalidates this tree on pull_request:linked, but we
       // invalidate directly so the UI converges even without an open socket.
       qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
+      // Close intent on an already-merged PR can advance the issue to done in
+      // the same response; refresh issue caches when the socket is absent.
+      if (vars.closeIntent) {
+        qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, issueId) });
+        qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+        qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+      }
       setLinkOpen(false);
       resetLinkDialog();
     },
