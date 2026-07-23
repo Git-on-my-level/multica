@@ -118,6 +118,26 @@ not observe a routable issue key in the PR title/body/branch — or the only mat
 was a bare body mention, which links as `reference_only` and is hidden from this
 list (see the reference-only rule above).
 
+## Linking or unlinking a PR by hand
+
+If the webhook scanner did not link a PR (e.g. the issue key is not in its
+title/body/branch, or you want close intent without editing the PR body), you
+can link it explicitly. Both reuse the same link row, `close_intent` flag, and
+close aggregate as the webhook path — there is no separate metadata-only link.
+
+```bash
+multica issue pull-requests link   <issue> --url <github-pr-url> [--close-intent]
+multica issue pull-requests unlink <issue> --url <github-pr-url>
+```
+
+The PR must already be mirrored in the issue's workspace (a connected GitHub App
+installation delivered it via webhook); an unmirrored PR returns 404. With
+`--close-intent`, linking an already-merged PR advances the issue to `done`
+under the native gate (no open/draft sibling, issue not already
+`done`/`cancelled`). Unlinking never reopens a `done`/`cancelled` issue.
+`pull-requests <id>` (no subcommand) still lists; `link`/`unlink` are
+subcommands.
+
 ## Metadata: high-signal keys only
 
 Metadata is durable issue state. Reading metadata is safe. Writing a metadata key

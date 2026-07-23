@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
   CircleDashed,
@@ -10,7 +10,9 @@ import {
   GitPullRequestArrow,
   GitPullRequestClosed,
   GitPullRequestDraft,
+  Loader2,
   TriangleAlert,
+  Unlink,
   XCircle,
 } from "lucide-react";
 import {
@@ -21,11 +23,32 @@ import {
   type PullRequestStatusKind,
   type PullRequestProgressSegment,
 } from "@multica/core/github";
+import { api } from "@multica/core/api";
 import type {
   GitHubPullRequest,
   GitHubPullRequestChecksConclusion,
   GitHubPullRequestState,
 } from "@multica/core/types";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@multica/ui/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@multica/ui/components/ui/alert-dialog";
+import { Button } from "@multica/ui/components/ui/button";
+import { Checkbox } from "@multica/ui/components/ui/checkbox";
+import { Input } from "@multica/ui/components/ui/input";
+import { Label } from "@multica/ui/components/ui/label";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../../i18n";
 
@@ -34,6 +57,12 @@ type IssuesT = ReturnType<typeof useT<"issues">>["t"];
 // Keep the existing sidebar density: show the first 3 PR rows inline, then
 // collapse the rest once the section reaches 4 rows.
 const PR_LIMIT_BEFORE_COLLAPSE = 4;
+
+// Canonical GitHub PR URL. The server canonicalises and additionally requires
+// the PR to already be mirrored in this workspace; this is only a client-side
+// shape guard so the submit button stays disabled until the input looks like a
+// real PR link, and a clear inline error replaces a round-trip 400.
+const GITHUB_PR_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+\/?(\?.*)?$/i;
 
 const STATE_ICON: Record<
   GitHubPullRequestState,
@@ -56,20 +85,200 @@ const CHECKS_ICON: Record<
 
 export function PullRequestList({ issueId }: { issueId: string }) {
   const { t } = useT("issues");
-  const [expanded, setExpanded] = useState(false);
+  const qc = useQueryClient();
   const { data, isLoading } = useQuery(issuePullRequestsOptions(issueId));
   const prs = data?.pull_requests ?? [];
 
-  if (isLoading) {
-    return <p className="text-xs text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>;
-  }
-  if (prs.length === 0) {
-    return (
-      <p className="text-xs text-muted-foreground px-2">
-        {t(($) => $.detail.pull_requests_empty)}
-      </p>
-    );
-  }
+  // Link dialog state. The dialog stays open on error so the user can fix the
+  // URL or read the server message (e.g. "PR not mirrored in this workspace").
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [closeIntent, setCloseIntent] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Unlink confirm dialog state. One dialog at the list level rather than one
+  // per row — the target PR is captured here when a row's unlink button fires.
+  const [unlinkTarget, setUnlinkTarget] = useState<GitHubPullRequest | null>(null);
+
+  const resetLinkDialog = () => {
+    setUrl("");
+    setCloseIntent(false);
+    setError(null);
+  };
+
+  const linkMutation = useMutation({
+    mutationFn: (vars: { url: string; closeIntent: boolean }) =>
+      api.linkIssuePullRequest(issueId, vars.url, vars.closeIntent),
+    onSuccess: () => {
+      // Realtime also invalidates this tree on pull_request:linked, but we
+      // invalidate directly so the UI converges even without an open socket.
+      qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
+      setLinkOpen(false);
+      resetLinkDialog();
+    },
+    onError: (e: unknown) => setError(e instanceof Error ? e.message : String(e)),
+  });
+
+  const unlinkMutation = useMutation({
+    mutationFn: (prUrl: string) => api.unlinkIssuePullRequest(issueId, prUrl),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
+      setUnlinkTarget(null);
+    },
+  });
+
+  const trimmedUrl = url.trim();
+  const urlValid = GITHUB_PR_URL_RE.test(trimmedUrl);
+  const showUrlError = trimmedUrl.length > 0 && !urlValid;
+
+  const handleSubmitLink = () => {
+    if (!urlValid || linkMutation.isPending) return;
+    linkMutation.mutate({ url: trimmedUrl, closeIntent });
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-end -mx-2 px-2">
+        <Button
+          type="button"
+          variant="link"
+          size="xs"
+          className="h-5 px-1 text-[11px] text-muted-foreground"
+          onClick={() => {
+            resetLinkDialog();
+            setLinkOpen(true);
+          }}
+        >
+          <GitPullRequestArrow className="h-3 w-3" />
+          {t(($) => $.detail.pull_request_link_action)}
+        </Button>
+      </div>
+
+      {isLoading ? (
+        <p className="text-xs text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>
+      ) : prs.length === 0 ? (
+        <p className="text-xs text-muted-foreground px-2">
+          {t(($) => $.detail.pull_requests_empty)}
+        </p>
+      ) : (
+        <PullRequestRows
+          prs={prs}
+          onUnlink={(pr) => setUnlinkTarget(pr)}
+        />
+      )}
+
+      <Dialog
+        open={linkOpen}
+        onOpenChange={(open) => {
+          setLinkOpen(open);
+          if (!open && !linkMutation.isPending) resetLinkDialog();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t(($) => $.detail.pull_request_link_dialog_title)}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="pr-link-url">{t(($) => $.detail.pull_request_link_url_label)}</Label>
+            <Input
+              id="pr-link-url"
+              value={url}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                setError(null);
+              }}
+              placeholder={t(($) => $.detail.pull_request_link_url_placeholder)}
+              aria-invalid={showUrlError || !!error}
+              autoFocus
+            />
+            {showUrlError ? (
+              <p className="text-xs text-destructive">
+                {t(($) => $.detail.pull_request_link_url_invalid)}
+              </p>
+            ) : null}
+            {error ? <p className="text-xs text-destructive">{error}</p> : null}
+            <Label
+              htmlFor="pr-link-close-intent"
+              className="font-normal text-muted-foreground"
+            >
+              <Checkbox
+                id="pr-link-close-intent"
+                checked={closeIntent}
+                onCheckedChange={(checked) => setCloseIntent(checked === true)}
+              />
+              {t(($) => $.detail.pull_request_link_close_intent)}
+            </Label>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={linkMutation.isPending}
+              onClick={() => setLinkOpen(false)}
+            >
+              {t(($) => $.detail.pull_request_link_cancel)}
+            </Button>
+            <Button
+              type="button"
+              onClick={handleSubmitLink}
+              disabled={!urlValid || linkMutation.isPending}
+            >
+              {linkMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              {t(($) => $.detail.pull_request_link_submit)}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={unlinkTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !unlinkMutation.isPending) setUnlinkTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t(($) => $.detail.pull_request_link_unlink_confirm)}
+            </AlertDialogTitle>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={unlinkMutation.isPending}>
+              {t(($) => $.detail.pull_request_link_cancel)}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={unlinkMutation.isPending || !unlinkTarget}
+              onClick={() => {
+                if (unlinkTarget) unlinkMutation.mutate(unlinkTarget.html_url);
+              }}
+            >
+              {unlinkMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              {t(($) => $.detail.pull_request_link_unlink_confirm_action)}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+// The collapsible PR rows. Split out so the list shell (header button,
+// loading / empty states, dialogs) stays readable; the collapse toggle state
+// lives here next to the rows it controls.
+function PullRequestRows({
+  prs,
+  onUnlink,
+}: {
+  prs: GitHubPullRequest[];
+  onUnlink: (pr: GitHubPullRequest) => void;
+}) {
+  const { t } = useT("issues");
+  const [expanded, setExpanded] = useState(false);
 
   // Render rule:
   //   - <  PR_LIMIT_BEFORE_COLLAPSE: every PR row is visible.
@@ -80,14 +289,16 @@ export function PullRequestList({ issueId }: { issueId: string }) {
   const collapsedTail = useCollapse ? prs.slice(PR_LIMIT_BEFORE_COLLAPSE - 1) : [];
 
   return (
-    <div className="space-y-1">
+    <>
       {expandedHead.map((pr) => (
-        <PullRequestRow key={pr.id} pr={pr} />
+        <PullRequestRow key={pr.id} pr={pr} onUnlink={onUnlink} />
       ))}
       {useCollapse ? (
         <div className="space-y-1">
           {expanded
-            ? collapsedTail.map((pr) => <PullRequestRow key={pr.id} pr={pr} />)
+            ? collapsedTail.map((pr) => (
+                <PullRequestRow key={pr.id} pr={pr} onUnlink={onUnlink} />
+              ))
             : null}
           <button
             type="button"
@@ -100,11 +311,17 @@ export function PullRequestList({ issueId }: { issueId: string }) {
           </button>
         </div>
       ) : null}
-    </div>
+    </>
   );
 }
 
-function PullRequestRow({ pr }: { pr: GitHubPullRequest }) {
+function PullRequestRow({
+  pr,
+  onUnlink,
+}: {
+  pr: GitHubPullRequest;
+  onUnlink: (pr: GitHubPullRequest) => void;
+}) {
   const { t } = useT("issues");
   const cfg = STATE_ICON[pr.state] ?? { icon: GitPullRequest, className: "" };
   const StateIcon = cfg.icon;
@@ -131,38 +348,48 @@ function PullRequestRow({ pr }: { pr: GitHubPullRequest }) {
   const stateLabel = getStateLabel(pr.state, t);
 
   return (
-    <a
-      data-testid="pull-request-row"
-      href={pr.html_url}
-      target="_blank"
-      rel="noreferrer noopener"
-      className={cn(
-        "flex items-start gap-2 rounded-md px-2 py-1.5 -mx-2 hover:bg-accent/50 transition-colors group",
-        draftPrefix ? "opacity-80" : null,
-      )}
-    >
-      <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
-      <div className="min-w-0 flex-1">
-        <p className="text-xs font-medium leading-snug truncate group-hover:text-foreground">
-          {pr.title}
-        </p>
-        <p className="text-[11px] text-muted-foreground truncate">
-          {pr.repo_owner}/{pr.repo_name}#{pr.number} · {stateLabel}
-          {pr.author_login ? ` · @${pr.author_login}` : null}
-        </p>
-        <PullRequestRowDetails
-          pr={pr}
-          segments={segments}
-          showStats={showStats}
-          statusText={
-            draftPrefix
-              ? t(($) => $.detail.pull_request_card_draft_prefix, { status: statusText })
-              : statusText
-          }
-          statusKind={kind}
-        />
-      </div>
-    </a>
+    <div className="group/row relative">
+      <a
+        data-testid="pull-request-row"
+        href={pr.html_url}
+        target="_blank"
+        rel="noreferrer noopener"
+        className={cn(
+          "flex items-start gap-2 rounded-md px-2 py-1.5 pr-7 -mx-2 hover:bg-accent/50 transition-colors group",
+          draftPrefix ? "opacity-80" : null,
+        )}
+      >
+        <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-medium leading-snug truncate group-hover:text-foreground">
+            {pr.title}
+          </p>
+          <p className="text-[11px] text-muted-foreground truncate">
+            {pr.repo_owner}/{pr.repo_name}#{pr.number} · {stateLabel}
+            {pr.author_login ? ` · @${pr.author_login}` : null}
+          </p>
+          <PullRequestRowDetails
+            pr={pr}
+            segments={segments}
+            showStats={showStats}
+            statusText={
+              draftPrefix
+                ? t(($) => $.detail.pull_request_card_draft_prefix, { status: statusText })
+                : statusText
+            }
+            statusKind={kind}
+          />
+        </div>
+      </a>
+      <button
+        type="button"
+        aria-label={t(($) => $.detail.pull_request_link_unlink)}
+        onClick={() => onUnlink(pr)}
+        className="absolute right-0.5 top-1.5 z-10 grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/row:opacity-100"
+      >
+        <Unlink className="h-3 w-3" />
+      </button>
+    </div>
   );
 }
 

@@ -574,6 +574,154 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"pull_requests": out})
 }
 
+
+// ── Manual link / unlink ───────────────────────────────────────────────────
+
+// linkPullRequestRequest is the body for POST /api/issues/{id}/pull-requests/link.
+type linkPullRequestRequest struct {
+	URL         string `json:"url"`
+	CloseIntent bool   `json:"close_intent"`
+}
+
+// unlinkPullRequestRequest is the body for POST /api/issues/{id}/pull-requests/unlink.
+type unlinkPullRequestRequest struct {
+	URL string `json:"url"`
+}
+
+// LinkPullRequestToIssue manually links a canonical GitHub PR URL to an issue.
+// The PR must already be mirrored in the issue's workspace (a connected GitHub
+// App installation delivered a pull_request webhook for it) — manually fetching
+// an unmirrored PR through the installation is intentionally out of scope; we
+// fail closed with an actionable error rather than inventing a PR row from a
+// bare URL. Linking is idempotent (ON CONFLICT upserts the close_intent flag).
+// When close_intent is set and the linked PR is already merged, the existing
+// close aggregate is re-evaluated and the issue advances to done under the same
+// native conditions as webhook-driven closing.
+func (h *Handler) LinkPullRequestToIssue(w http.ResponseWriter, r *http.Request) {
+	issue, ok := h.loadIssueForUser(w, r, chi.URLParam(r, "id"))
+	if !ok {
+		return
+	}
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	var req linkPullRequestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+		writeError(w, http.StatusBadRequest, "url is required")
+		return
+	}
+	owner, repo, number, ok := parseCanonicalGitHubPRURL(req.URL)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid pull request URL; expected https://github.com/{owner}/{repo}/pull/{number}")
+		return
+	}
+	// issue.WorkspaceID is the authoritative workspace scope:
+	// GetGitHubPullRequest is keyed on (workspace_id, owner, repo, number), so a
+	// PR mirrored in another workspace can never resolve here — cross-workspace
+	// linking is impossible by construction, regardless of the X-Workspace-ID
+	// header.
+	pr, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
+		WorkspaceID: issue.WorkspaceID,
+		RepoOwner:   owner,
+		RepoName:    repo,
+		PrNumber:    number,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "pull request is not mirrored in this workspace; it becomes linkable once a connected GitHub App installation reports it via webhook")
+		return
+	}
+	// Enforce the "connected installation/repository" scope: a mirrored PR row
+	// can outlive its installation binding (github_pull_request.installation_id
+	// has no FK to github_installation), so refuse to link against a repo whose
+	// installation is no longer connected to this workspace.
+	if !h.workspaceHasInstallation(r.Context(), issue.WorkspaceID, pr.InstallationID) {
+		writeError(w, http.StatusBadRequest, "the GitHub installation for this repository is not connected to the workspace")
+		return
+	}
+
+	linkedByID, _ := parseStrictUUID(userID)
+	if err := h.Queries.LinkIssueToPullRequest(r.Context(), db.LinkIssueToPullRequestParams{
+		IssueID:             issue.ID,
+		PullRequestID:       pr.ID,
+		CloseIntent:         req.CloseIntent,
+		ReferenceOnly:       false,
+		PreserveCloseIntent: false,
+		LinkedByType:        strToText("member"),
+		LinkedByID:          linkedByID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to link pull request")
+		return
+	}
+
+	workspaceID := uuidToString(issue.WorkspaceID)
+	resp := githubPullRequestToResponse(pr)
+	// A close-intent link to an already-merged PR is the manual analogue of a
+	// "Closes X" merge: re-run the native close gate so the issue advances now
+	// if no open/draft sibling blocks it. advanceIssueToDone emits the
+	// EventIssueUpdated broadcast on the transition.
+	if req.CloseIntent && pr.State == "merged" {
+		h.reevaluateIssueCloseGate(r.Context(), issue, workspaceID)
+	}
+
+	h.publish(protocol.EventPullRequestLinked, workspaceID, "member", userID, map[string]any{
+		"pull_request":     resp,
+		"linked_issue_ids": []string{uuidToString(issue.ID)},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"pull_request": resp})
+}
+
+// UnlinkPullRequestFromIssue removes a manually or automatically created link
+// between a canonical GitHub PR URL and an issue. Unlinking never reopens a
+// done/cancelled issue: it only deletes the link row and broadcasts the change,
+// leaving issue status untouched. The PR must resolve to a mirrored row in this
+// workspace (same scoping as link); a missing row means there is no link to
+// remove, so we report it rather than silently no-op.
+func (h *Handler) UnlinkPullRequestFromIssue(w http.ResponseWriter, r *http.Request) {
+	issue, ok := h.loadIssueForUser(w, r, chi.URLParam(r, "id"))
+	if !ok {
+		return
+	}
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	var req unlinkPullRequestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+		writeError(w, http.StatusBadRequest, "url is required")
+		return
+	}
+	owner, repo, number, ok := parseCanonicalGitHubPRURL(req.URL)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid pull request URL; expected https://github.com/{owner}/{repo}/pull/{number}")
+		return
+	}
+	pr, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
+		WorkspaceID: issue.WorkspaceID,
+		RepoOwner:   owner,
+		RepoName:    repo,
+		PrNumber:    number,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "pull request is not linked to this issue")
+		return
+	}
+	if err := h.Queries.UnlinkIssueFromPullRequest(r.Context(), db.UnlinkIssueFromPullRequestParams{
+		IssueID:       issue.ID,
+		PullRequestID: pr.ID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to unlink pull request")
+		return
+	}
+
+	workspaceID := uuidToString(issue.WorkspaceID)
+	h.publish(protocol.EventPullRequestUnlinked, workspaceID, "member", userID, map[string]any{
+		"pull_request":     githubPullRequestToResponse(pr),
+		"linked_issue_ids": []string{uuidToString(issue.ID)},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // ── Webhook ─────────────────────────────────────────────────────────────────
 
 // identifierRe extracts identifiers like "MUL-1510" from text. Case-insensitive
@@ -973,17 +1121,7 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 		// intent was ever delivered, the user should decide manually.
 		if state == "merged" || state == "closed" {
 			for _, issue := range reevalIssues {
-				if issue.Status == "done" || issue.Status == "cancelled" {
-					continue
-				}
-				counts, err := h.Queries.GetIssuePullRequestCloseAggregate(ctx, issue.ID)
-				if err != nil {
-					slog.Warn("github: count linked pr states failed", "err", err, "issue_id", uuidToString(issue.ID))
-					continue
-				}
-				if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
-					h.advanceIssueToDone(ctx, issue, workspaceID)
-				}
+				h.reevaluateIssueCloseGate(ctx, issue, workspaceID)
 			}
 		}
 	}
@@ -1389,6 +1527,69 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		"creator_id":     uuidToString(issue.CreatorID),
 		"source":         "github_pr_merged",
 	})
+}
+
+
+// reevaluateIssueCloseGate re-runs the issue auto-advance gate against the
+// persisted PR close aggregate. It advances the issue to done only when the
+// native conditions hold: the issue is not already terminal (done/cancelled),
+// no linked non-reference-only PR is still open/draft, and at least one merged
+// linked PR carries close_intent. Returns whether the issue advanced.
+// advanceIssueToDone emits the EventIssueUpdated broadcast on a transition, so
+// callers (webhook mirror, manual link) do not double-publish.
+func (h *Handler) reevaluateIssueCloseGate(ctx context.Context, issue db.Issue, workspaceID string) bool {
+	if issue.Status == "done" || issue.Status == "cancelled" {
+		return false
+	}
+	counts, err := h.Queries.GetIssuePullRequestCloseAggregate(ctx, issue.ID)
+	if err != nil {
+		slog.Warn("github: count linked pr states failed", "err", err, "issue_id", uuidToString(issue.ID))
+		return false
+	}
+	if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
+		h.advanceIssueToDone(ctx, issue, workspaceID)
+		return true
+	}
+	return false
+}
+
+// workspaceHasInstallation reports whether the given numeric GitHub
+// installation_id is currently bound to the workspace. Used to gate manual PR
+// linking on a connected installation.
+func (h *Handler) workspaceHasInstallation(ctx context.Context, workspaceID pgtype.UUID, installationID int64) bool {
+	insts, err := h.Queries.ListGitHubInstallationsByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return false
+	}
+	for _, inst := range insts {
+		if inst.InstallationID == installationID {
+			return true
+		}
+	}
+	return false
+}
+
+// parseCanonicalGitHubPRURL parses a canonical GitHub pull-request URL of the
+// form https://github.com/{owner}/{repo}/pull/{number} and returns its owner,
+// repo, and number. It accepts an optional trailing slash and query/fragment
+// and http(s). Any other shape (non-github.com host, /files or /commits
+// suffixes, non-numeric number) is rejected so manual linking always resolves
+// to exactly one mirrored PR row.
+func parseCanonicalGitHubPRURL(raw string) (owner, repo string, number int32, ok bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host != "github.com" || (u.Scheme != "https" && u.Scheme != "http") {
+		return "", "", 0, false
+	}
+	// Path segments, excluding empties: [owner, repo, "pull", number].
+	segs := strings.FieldsFunc(strings.Trim(u.Path, "/"), func(r rune) bool { return r == '/' })
+	if len(segs) != 4 || !strings.EqualFold(segs[2], "pull") {
+		return "", "", 0, false
+	}
+	n, err := strconv.ParseInt(segs[3], 10, 32)
+	if err != nil || n <= 0 {
+		return "", "", 0, false
+	}
+	return segs[0], segs[1], int32(n), true
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
