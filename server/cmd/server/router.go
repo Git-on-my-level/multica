@@ -92,15 +92,11 @@ func allowedOrigins() []string {
 	return origins
 }
 
-// appURLFromEnv resolves the user-facing web app URL. It prefers
-// MULTICA_APP_URL and falls back to FRONTEND_ORIGIN, matching how the backend
-// resolves the app URL elsewhere (handler.daemonSetupURLsFromEnv) and the CLI
-// login flow (cmd/multica tryResolveAppURL). Empty when neither is set.
+// appURLFromEnv returns the configured user-facing web app URL. Keep the
+// outbound integrations on handler.ResolveFrontendAppURL so notification links
+// and /api/config agree on the configured deployment origin.
 func appURLFromEnv() string {
-	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("MULTICA_APP_URL")), "/"); v != "" {
-		return v
-	}
-	return strings.TrimRight(strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")), "/")
+	return handler.ResolveFrontendAppURL()
 }
 
 // parseTrustedProxies parses a comma-separated list of CIDR prefixes from the
@@ -1048,10 +1044,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/", h.CreateIssue)
 				r.Post("/quick-create", h.QuickCreateIssue)
 				r.Post("/preview-trigger", h.PreviewIssueTrigger)
+				r.Post("/route", h.RouteIssueCoordination)
 				r.Post("/batch-update", h.BatchUpdateIssues)
 				r.Post("/batch-delete", h.BatchDeleteIssues)
 				r.Route("/{id}", func(r chi.Router) {
 					r.Get("/", h.GetIssue)
+					r.Get("/inspect", h.InspectIssueCoordination)
 					r.Put("/", h.UpdateIssue)
 					r.Post("/move", h.MoveIssue)
 					r.Delete("/", h.DeleteIssue)

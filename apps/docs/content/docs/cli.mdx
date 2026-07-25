@@ -53,6 +53,9 @@ For the difference between token types, see [Authentication and tokens](/auth-to
 |---|---|
 | `multica issue list` | List issues (prints copy-paste-ready issue keys) |
 | `multica issue get <id>` | Show a single issue (accepts an issue key or a UUID) |
+| `multica issue url <id>` | Print the configured, workspace-qualified web URL for an issue |
+| `multica issue inspect <id> --output json` | Read an ownership, run, PR-handoff, and safe-action snapshot |
+| `multica issue route --title "..." [--repo <url>] [--project <id>] --output json` | Propose a project, duplicate, owner, and available agent without changing anything |
 | `multica issue create --title "..."` | Create a new issue |
 | `multica issue update <id> ...` | Update an issue (status, priority, assignee, etc.) |
 | `multica issue assign <id> --to <name>` | Assign to a member, agent, or squad (assigning to an agent triggers a run) |
@@ -163,6 +166,7 @@ subscribers for issues created by a `create_issue` autopilot; update accepts
 | Command | Purpose |
 |---|---|
 | `multica repo checkout <url>` | Clone a repo locally for agents to use |
+| `multica context --output json` | Show non-secret live workspace, project, repository, and routing-agent context |
 | `multica config` | View or edit local CLI configuration |
 | `multica version` | Print the CLI version |
 | `multica update` | Upgrade the CLI to the latest release |

@@ -1,0 +1,2 @@
+ALTER TABLE issue_pr_handoff_candidate
+DROP CONSTRAINT IF EXISTS issue_pr_handoff_candidate_pkey;

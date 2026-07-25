@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@multica/core/i18n/react";
-import type { GitHubPullRequest } from "@multica/core/types";
+import type { GitHubPullRequest, IssuePullRequestHandoff } from "@multica/core/types";
 import enCommon from "../../locales/en/common.json";
 import enIssues from "../../locales/en/issues.json";
 
@@ -16,7 +16,7 @@ vi.mock("@multica/core/github/queries", async () => {
     ...actual,
     issuePullRequestsOptions: (issueId: string) => ({
       queryKey: ["github", "pull-requests", issueId],
-      queryFn: async () => ({ pull_requests: mockPRs }),
+      queryFn: async () => ({ pull_requests: mockPRs, handoff: mockHandoff }),
       enabled: !!issueId,
     }),
   };
@@ -32,9 +32,15 @@ vi.mock("@multica/core/api", () => ({
 import { PullRequestList } from "./pull-request-list";
 
 let mockPRs: GitHubPullRequest[] = [];
+let mockHandoff: IssuePullRequestHandoff | undefined;
 
 const mockLinkIssuePullRequest = vi.fn();
 const mockUnlinkIssuePullRequest = vi.fn();
+
+beforeEach(() => {
+  mockPRs = [];
+  mockHandoff = undefined;
+});
 
 function makePR(overrides: Partial<GitHubPullRequest> = {}): GitHubPullRequest {
   return {
@@ -291,6 +297,57 @@ describe("PullRequestList sidebar rows", () => {
     expect(screen.getByText("PR-C")).toBeInTheDocument();
     expect(screen.queryByText("PR-D")).not.toBeInTheDocument();
     expect(screen.getByText("Show 1 more")).toBeInTheDocument();
+  });
+});
+
+describe("PullRequestList PR handoff state", () => {
+  it("shows a missing handoff when no PR was reported", async () => {
+    mockHandoff = { state: "missing", candidates: [] };
+    renderList();
+    const status = await screen.findByTestId("pull-request-handoff");
+    expect(status).toHaveAttribute("data-handoff-state", "missing");
+    expect(status).toHaveTextContent("No agent-reported pull request is available");
+  });
+
+  it("shows an awaiting-mirror candidate with its canonical PR link", async () => {
+    mockHandoff = {
+      state: "awaiting_mirror",
+      candidates: [{
+        url: "https://github.com/acme/widget/pull/42",
+        state: "awaiting_mirror",
+        task_id: "task-1",
+        repo_owner: "acme",
+        repo_name: "widget",
+        number: 42,
+      }],
+    };
+    renderList();
+    const status = await screen.findByTestId("pull-request-handoff");
+    expect(status).toHaveAttribute("data-handoff-state", "awaiting_mirror");
+    expect(status).toHaveTextContent("Waiting for GitHub to mirror the reported pull request");
+    expect(within(status).getByRole("link", { name: "acme/widget#42" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/widget/pull/42",
+    );
+  });
+
+  it("shows a linked handoff once the native PR exists", async () => {
+    mockPRs = [makePR({ number: 42 })];
+    mockHandoff = {
+      state: "linked",
+      candidates: [{
+        url: "https://github.com/acme/widget/pull/42",
+        state: "linked",
+        task_id: "task-1",
+        repo_owner: "acme",
+        repo_name: "widget",
+        number: 42,
+      }],
+    };
+    renderList();
+    const status = await screen.findByTestId("pull-request-handoff");
+    expect(status).toHaveAttribute("data-handoff-state", "linked");
+    expect(status).toHaveTextContent("Reported pull request linked");
   });
 });
 

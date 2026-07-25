@@ -20,6 +20,7 @@ import type {
   CreateBillingPortalSessionResponse,
   CronPreviewResponse,
   GitHubPullRequest,
+  ListIssuePullRequestsResponse,
   GroupedIssuesResponse,
   InboxItem,
   InboxWorkspaceUnread,
@@ -732,17 +733,51 @@ export const GitHubPullRequestSchema = z.object({
   pr_updated_at: z.string(),
   mergeable_state: z.string().nullable().optional(),
   checks_conclusion: z.string().nullable().optional(),
-  checks_passed: z.number(),
-  checks_failed: z.number(),
-  checks_pending: z.number(),
-  additions: z.number(),
-  deletions: z.number(),
-  changed_files: z.number(),
+  checks_passed: z.number().optional().default(0),
+  checks_failed: z.number().optional().default(0),
+  checks_pending: z.number().optional().default(0),
+  additions: z.number().optional().default(0),
+  deletions: z.number().optional().default(0),
+  changed_files: z.number().optional().default(0),
 }).loose();
 
 export const IssuePullRequestResponseSchema = z
   .object({ pull_request: GitHubPullRequestSchema })
   .loose();
+
+export const IssuePullRequestHandoffCandidateSchema = z.object({
+  url: z.string(),
+  state: z.enum([
+    "candidate_detected",
+    "awaiting_mirror",
+    "linked",
+    "invalid_external_pr",
+  ]),
+  task_id: z.string(),
+  repo_owner: z.string(),
+  repo_name: z.string(),
+  number: z.number(),
+}).loose();
+
+export const IssuePullRequestHandoffSchema = z.object({
+  state: z.enum([
+    "missing",
+    "candidate_detected",
+    "awaiting_mirror",
+    "linked",
+    "invalid_external_pr",
+    "multiple_candidates_needs_review",
+  ]),
+  candidates: z.array(IssuePullRequestHandoffCandidateSchema).default([]),
+}).loose();
+
+export const ListIssuePullRequestsResponseSchema = z.object({
+  pull_requests: z.array(GitHubPullRequestSchema).default([]),
+  // A newer handoff enum must not hide an otherwise valid legacy PR list.
+  // Unknown/malformed handoff data degrades to "not evaluated" (undefined),
+  // never to a false `missing` assertion.
+  handoff: IssuePullRequestHandoffSchema.optional().catch(undefined),
+}).loose();
 
 export const EMPTY_GITHUB_PULL_REQUEST: GitHubPullRequest = {
   id: "",
@@ -772,6 +807,10 @@ export const EMPTY_GITHUB_PULL_REQUEST: GitHubPullRequest = {
 
 export const EMPTY_ISSUE_PULL_REQUEST_RESPONSE: { pull_request: GitHubPullRequest } = {
   pull_request: EMPTY_GITHUB_PULL_REQUEST,
+};
+
+export const EMPTY_LIST_ISSUE_PULL_REQUESTS_RESPONSE: ListIssuePullRequestsResponse = {
+  pull_requests: [],
 };
 
 export const CloudRuntimeNodeSchema = z.object({

@@ -3169,11 +3169,32 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 	// Collect all attachment URLs (issue-level + comment-level) before CASCADE delete.
 	attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
 
-	err := h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete issue")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	if _, err := qtx.LockIssueForPRHandoffDelete(r.Context(), db.LockIssueForPRHandoffDeleteParams{
+		ID: issue.ID, WorkspaceID: issue.WorkspaceID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete issue")
+		return
+	}
+	if err := qtx.DeleteIssuePRHandoffCandidates(r.Context(), issue.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete issue")
+		return
+	}
+	err = qtx.DeleteIssue(r.Context(), db.DeleteIssueParams{
 		ID:          issue.ID,
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete issue")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete issue")
 		return
 	}
@@ -3544,11 +3565,34 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		// Collect attachment URLs before CASCADE delete to clean up S3 objects.
 		attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
 
-		if err := h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{
+		tx, err := h.TxStarter.Begin(r.Context())
+		if err != nil {
+			slog.Warn("batch delete issue transaction failed", "issue_id", issueID, "error", err)
+			continue
+		}
+		qtx := h.Queries.WithTx(tx)
+		if _, err := qtx.LockIssueForPRHandoffDelete(r.Context(), db.LockIssueForPRHandoffDeleteParams{
+			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
+		}); err != nil {
+			_ = tx.Rollback(r.Context())
+			slog.Warn("batch delete issue PR handoff lock failed", "issue_id", issueID, "error", err)
+			continue
+		}
+		if err := qtx.DeleteIssuePRHandoffCandidates(r.Context(), issue.ID); err != nil {
+			_ = tx.Rollback(r.Context())
+			slog.Warn("batch delete issue PR handoffs failed", "issue_id", issueID, "error", err)
+			continue
+		}
+		if err := qtx.DeleteIssue(r.Context(), db.DeleteIssueParams{
 			ID:          issue.ID,
 			WorkspaceID: issue.WorkspaceID,
 		}); err != nil {
+			_ = tx.Rollback(r.Context())
 			slog.Warn("batch delete issue failed", "issue_id", issueID, "error", err)
+			continue
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			slog.Warn("batch delete issue commit failed", "issue_id", issueID, "error", err)
 			continue
 		}
 

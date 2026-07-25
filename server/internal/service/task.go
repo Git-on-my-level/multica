@@ -2618,6 +2618,10 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		}
 		task = t
 
+		if err := s.recordTaskPRHandoff(ctx, qtx, t, result); err != nil {
+			return err
+		}
+
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
 			// next claim can apply the runtime-guard. Both fields move together:
@@ -2664,6 +2668,14 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 					"current_status", existing.Status,
 					"agent_id", util.UUIDToString(existing.AgentID),
 				)
+				if existing.Status == "completed" {
+					if reconcileErr := s.reconcileTaskPRHandoff(ctx, existing); reconcileErr != nil {
+						slog.Warn("reconcile replayed task PR handoff failed",
+							"task_id", util.UUIDToString(taskID),
+							"error", reconcileErr,
+						)
+					}
+				}
 				return &existing, nil
 			}
 			slog.Warn("complete task failed",
@@ -2685,6 +2697,13 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCompleted(ctx, task)
+	if err := s.reconcileTaskPRHandoff(ctx, task); err != nil {
+		slog.Warn("reconcile task PR handoff failed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(task.IssueID),
+			"error", err,
+		)
+	}
 
 	// Invariant: every completed issue task must have at least one agent
 	// comment on the issue, so the user always sees something when a run

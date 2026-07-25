@@ -726,6 +726,11 @@ export function useRealtimeSync(
         // shape as the tasks invalidation above — any task lifecycle
         // event shifts the aggregated usage numbers.
         qc.invalidateQueries({ queryKey: ["issues", "usage"] });
+        // Completion can persist a PR handoff candidate before the GitHub
+        // webhook mirrors and links it. Refresh the issue sidebar on every
+        // task lifecycle transition so missing/awaiting/linked never sticks
+        // behind the global infinite stale time.
+        qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
         // Squad members-status reads the same task lifecycle to flip
         // working ↔ idle for each agent member.
         invalidateSquadMemberStatusQueries(qc, wsId);

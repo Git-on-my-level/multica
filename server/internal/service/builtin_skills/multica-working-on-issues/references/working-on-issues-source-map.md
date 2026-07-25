@@ -6,6 +6,17 @@ after the latest `main` merge; the prior skill cited pre-merge lines that have
 since moved (see the "drifted" column). Re-confirm with the verification command
 at the bottom before relying on an exact line.
 
+## Coordination commands and PR handoff
+
+| Behavior | File |
+|---|---|
+| CLI registration and implementations for `context`, `issue url`, `issue inspect`, and advisory `issue route` | `server/cmd/multica/cmd_coordination.go` |
+| Read-only inspect and route API handlers | `server/internal/handler/coordination.go` |
+| Canonical GitHub PR URL extraction and repository normalization | `server/internal/githubpr/githubpr.go` |
+| Completion-time candidate classification/persistence and mirror-later reconciliation | `server/internal/service/pr_handoff.go` |
+| PR list handoff read model and webhook-side awaited-candidate linking | `server/internal/handler/github.go` |
+| Candidate persistence schema and queries | `server/migrations/214_issue_pr_handoff_candidate.up.sql`, `server/pkg/db/queries/pr_handoff.sql` |
+
 ## `multica issue pull-requests` — read PR links from Multica
 
 | Behavior | File:line | Drifted from |

@@ -133,6 +133,7 @@ import type {
   NotificationPreferenceResponse,
   NotificationPreferences,
   GitHubPullRequest,
+  ListIssuePullRequestsResponse,
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
   ListLarkInstallationsResponse,
@@ -281,6 +282,8 @@ import {
   EMPTY_RESOURCE_LABELS_RESPONSE,
   IssuePullRequestResponseSchema,
   EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
+  ListIssuePullRequestsResponseSchema,
+  EMPTY_LIST_ISSUE_PULL_REQUESTS_RESPONSE,
 } from "./schemas";
 
 /** Identifies the calling client to the server.
@@ -2793,8 +2796,14 @@ export class ApiClient {
     });
   }
 
-  async listIssuePullRequests(issueId: string): Promise<{ pull_requests: GitHubPullRequest[] }> {
-    return this.fetch(`/api/issues/${issueId}/pull-requests`);
+  async listIssuePullRequests(issueId: string): Promise<ListIssuePullRequestsResponse> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/pull-requests`);
+    return parseWithFallback(
+      raw,
+      ListIssuePullRequestsResponseSchema,
+      EMPTY_LIST_ISSUE_PULL_REQUESTS_RESPONSE,
+      { endpoint: "GET /api/issues/:id/pull-requests" },
+    );
   }
 
   // Manually link a GitHub PR URL to an issue. The server canonicalises the
