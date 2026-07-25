@@ -3,10 +3,10 @@ package main
 import "testing"
 
 func TestAppURLFromEnvUsesConfiguredDeploymentURL(t *testing.T) {
-	t.Setenv("MULTICA_APP_URL", " https://multica-01.tail76ea03.ts.net/ ")
+	t.Setenv("MULTICA_APP_URL", " https://multica.example.test/ ")
 	t.Setenv("FRONTEND_ORIGIN", "https://fallback.example/")
 
-	if got := appURLFromEnv(); got != "https://multica-01.tail76ea03.ts.net" {
+	if got := appURLFromEnv(); got != "https://multica.example.test" {
 		t.Fatalf("appURLFromEnv() = %q, want configured deployment URL", got)
 	}
 }

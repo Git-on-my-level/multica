@@ -53,6 +53,9 @@ Token 类型的详细区分见 [认证与令牌](/auth-tokens)。
 |---|---|
 | `multica issue list` | 列出 issue（默认显示可复制的 issue key） |
 | `multica issue get <id>` | 查看单条 issue（接受 issue key 或 UUID） |
+| `multica issue url <id>` | 输出基于当前配置、包含工作区的 issue 网页链接 |
+| `multica issue inspect <id> --output json` | 查看负责人、运行、PR 交接与安全操作快照 |
+| `multica issue route --title "..." [--repo <url>] [--project <id>] --output json` | 只读建议项目、重复项、负责人和可用智能体 |
 | `multica issue create --title "..."` | 创建新 issue |
 | `multica issue update <id> ...` | 修改 issue（状态、优先级、分配人等） |
 | `multica issue assign <id> --to <name>` | 分配给成员、智能体或小队（分配给智能体会触发一次运行） |
@@ -155,6 +158,7 @@ multica skill import --url https://skills.sh/acme/repo/review-helper --on-confli
 | 命令 | 用途 |
 |---|---|
 | `multica repo checkout <url>` | 把 repo 拉到本地以供智能体使用 |
+| `multica context --output json` | 查看不含密钥的实时工作区、项目、仓库和路由智能体上下文 |
 | `multica config` | 查看 / 修改 CLI 本地配置 |
 | `multica version` | 显示 CLI 版本 |
 | `multica update` | 升级 CLI 到最新版 |

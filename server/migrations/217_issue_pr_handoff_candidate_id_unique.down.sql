@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS issue_pr_handoff_candidate_id_uidx;

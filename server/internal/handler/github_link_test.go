@@ -199,6 +199,170 @@ func TestLinkPullRequest_RejectsMalformedURL(t *testing.T) {
 	}
 }
 
+func TestPRHandoffCandidateLinksOnlyAfterMirrorAndIsIdempotent(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const (
+		installationID int64 = 990042
+		owner                = "acme"
+		repo                 = "handoff-widget"
+		number         int32 = 42
+	)
+	ctx := context.Background()
+	issueID := createManualLinkIssue(t, "in_progress")
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	taskID := parseUUID("22222222-2222-2222-2222-222222222222")
+	url := "https://github.com/acme/handoff-widget/pull/42"
+	params := db.UpsertIssuePRHandoffCandidateParams{
+		WorkspaceID: issue.WorkspaceID,
+		IssueID:     issue.ID,
+		TaskID:      taskID,
+		Url:         url,
+		RepoOwner:   owner,
+		RepoName:    repo,
+		PrNumber:    number,
+		State:       "awaiting_mirror",
+	}
+	first, err := testHandler.Queries.UpsertIssuePRHandoffCandidate(ctx, params)
+	if err != nil {
+		t.Fatalf("UpsertIssuePRHandoffCandidate: %v", err)
+	}
+	second, err := testHandler.Queries.UpsertIssuePRHandoffCandidate(ctx, params)
+	if err != nil {
+		t.Fatalf("replay UpsertIssuePRHandoffCandidate: %v", err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("completion replay created a second candidate: %v != %v", first.ID, second.ID)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_pr_handoff_candidate WHERE issue_id = $1`, issue.ID)
+	})
+	if got := countLinks(t, issueID); got != 0 {
+		t.Fatalf("links before mirror = %d, want 0", got)
+	}
+
+	seedManualLinkInstallation(t, testWorkspaceID, installationID)
+	prID := seedMirroredPR(t, testWorkspaceID, installationID, owner, repo, number, "open")
+	linked := testHandler.linkAwaitingHandoffsForPR(ctx, issue.WorkspaceID, db.GithubPullRequest{
+		ID:             parseUUID(prID),
+		WorkspaceID:    issue.WorkspaceID,
+		InstallationID: installationID,
+		RepoOwner:      owner,
+		RepoName:       repo,
+		PrNumber:       number,
+	})
+	if len(linked) != 1 || linked[0] != issueID {
+		t.Fatalf("linked issues = %#v, want [%s]", linked, issueID)
+	}
+	if got := countLinks(t, issueID); got != 1 {
+		t.Fatalf("links after mirror = %d, want 1", got)
+	}
+	link, err := testHandler.Queries.GetIssuePullRequestLink(ctx, db.GetIssuePullRequestLinkParams{
+		IssueID: issue.ID, PullRequestID: parseUUID(prID),
+	})
+	if err != nil {
+		t.Fatalf("GetIssuePullRequestLink: %v", err)
+	}
+	if link.CloseIntent {
+		t.Fatal("handoff URL must not infer close intent")
+	}
+	var state string
+	if err := testPool.QueryRow(ctx,
+		`SELECT state FROM issue_pr_handoff_candidate WHERE id = $1`, first.ID,
+	).Scan(&state); err != nil {
+		t.Fatalf("load handoff state: %v", err)
+	}
+	if state != "linked" {
+		t.Fatalf("candidate state = %q, want linked", state)
+	}
+}
+
+func TestPRHandoffIssueDeleteCannotLeaveInsertAfterSweepOrphan(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	issueID := createManualLinkIssue(t, "in_progress")
+	issueUUID := parseUUID(issueID)
+
+	completionTx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin completion tx: %v", err)
+	}
+	defer completionTx.Rollback(ctx)
+	completionQ := db.New(completionTx)
+	issue, err := completionQ.GetIssueForPRHandoff(ctx, issueUUID)
+	if err != nil {
+		t.Fatalf("GetIssueForPRHandoff: %v", err)
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteTx, beginErr := testPool.Begin(ctx)
+		if beginErr != nil {
+			deleteDone <- beginErr
+			return
+		}
+		defer deleteTx.Rollback(ctx)
+		qtx := db.New(deleteTx)
+		if _, lockErr := qtx.LockIssueForPRHandoffDelete(ctx, db.LockIssueForPRHandoffDeleteParams{
+			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
+		}); lockErr != nil {
+			deleteDone <- lockErr
+			return
+		}
+		if sweepErr := qtx.DeleteIssuePRHandoffCandidates(ctx, issue.ID); sweepErr != nil {
+			deleteDone <- sweepErr
+			return
+		}
+		if deleteErr := qtx.DeleteIssue(ctx, db.DeleteIssueParams{
+			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
+		}); deleteErr != nil {
+			deleteDone <- deleteErr
+			return
+		}
+		deleteDone <- deleteTx.Commit(ctx)
+	}()
+
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("delete bypassed completion key-share lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, err := completionQ.UpsertIssuePRHandoffCandidate(ctx, db.UpsertIssuePRHandoffCandidateParams{
+		WorkspaceID: issue.WorkspaceID,
+		IssueID:     issue.ID,
+		TaskID:      parseUUID("33333333-3333-3333-3333-333333333333"),
+		Url:         "https://github.com/acme/widget/pull/77",
+		RepoOwner:   "acme",
+		RepoName:    "widget",
+		PrNumber:    77,
+		State:       "awaiting_mirror",
+	}); err != nil {
+		t.Fatalf("insert candidate: %v", err)
+	}
+	if err := completionTx.Commit(ctx); err != nil {
+		t.Fatalf("commit completion: %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("delete transaction: %v", err)
+	}
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM issue_pr_handoff_candidate WHERE issue_id = $1`, issue.ID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count orphan candidates: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("orphan candidate count = %d, want 0", count)
+	}
+}
+
 func TestLinkPullRequest_RequiresUrl(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

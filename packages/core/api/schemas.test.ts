@@ -20,6 +20,7 @@ import {
   InboxItemListSchema,
   InboxUnreadSummarySchema,
   IssueTriggerPreviewSchema,
+  ListIssuePullRequestsResponseSchema,
   ListIssuesResponseSchema,
   ListPropertiesResponseSchema,
   SearchProjectsResponseSchema,
@@ -57,6 +58,70 @@ const baseIssue = {
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };
+
+const basePullRequest = {
+  id: "pr-1",
+  workspace_id: "ws-1",
+  repo_owner: "acme",
+  repo_name: "widget",
+  number: 42,
+  title: "MUL-1: ship it",
+  state: "open",
+  html_url: "https://github.com/acme/widget/pull/42",
+  branch: "mul-1-ship-it",
+  author_login: "octocat",
+  author_avatar_url: null,
+  merged_at: null,
+  closed_at: null,
+  pr_created_at: "2026-01-01T00:00:00Z",
+  pr_updated_at: "2026-01-01T00:00:00Z",
+};
+
+describe("ListIssuePullRequestsResponseSchema", () => {
+  it("defaults optional legacy check and diff counts without losing the PR", () => {
+    const parsed = ListIssuePullRequestsResponseSchema.parse({
+      pull_requests: [basePullRequest],
+    });
+    expect(parsed.pull_requests[0]).toMatchObject({
+      id: "pr-1",
+      checks_passed: 0,
+      checks_failed: 0,
+      checks_pending: 0,
+      additions: 0,
+      deletions: 0,
+      changed_files: 0,
+    });
+    expect(parsed.handoff).toBeUndefined();
+  });
+
+  it("preserves valid PRs but omits an unknown future handoff state", () => {
+    const parsed = ListIssuePullRequestsResponseSchema.parse({
+      pull_requests: [basePullRequest],
+      handoff: { state: "future_state", candidates: [] },
+    });
+    expect(parsed.pull_requests).toHaveLength(1);
+    expect(parsed.handoff).toBeUndefined();
+  });
+
+  it("accepts the awaiting-mirror handoff and canonical candidate metadata", () => {
+    const parsed = ListIssuePullRequestsResponseSchema.parse({
+      pull_requests: [],
+      handoff: {
+        state: "awaiting_mirror",
+        candidates: [{
+          url: "https://github.com/acme/widget/pull/42",
+          state: "awaiting_mirror",
+          task_id: "task-1",
+          repo_owner: "acme",
+          repo_name: "widget",
+          number: 42,
+        }],
+      },
+    });
+    expect(parsed.handoff?.state).toBe("awaiting_mirror");
+    expect(parsed.handoff?.candidates[0]?.number).toBe(42);
+  });
+});
 
 describe("IssueSchema (via ListIssuesResponseSchema)", () => {
   it("accepts a primitive metadata KV map", () => {

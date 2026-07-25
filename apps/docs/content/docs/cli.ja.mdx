@@ -53,6 +53,9 @@ CI やヘッドレス環境では、ブラウザフローをスキップでき�
 |---|---|
 | `multica issue list` | イシューを一覧（コピー＆ペーストできるイシューキーを出力） |
 | `multica issue get <id>` | 単一のイシューを表示（イシューキーまたは UUID を受け取る） |
+| `multica issue url <id>` | 設定済みアプリ URL を使ったワークスペース付きイシュー URL を表示 |
+| `multica issue inspect <id> --output json` | 所有者、実行、PR 引き継ぎ、安全な操作のスナップショットを表示 |
+| `multica issue route --title "..." [--repo <url>] [--project <id>] --output json` | 変更せずにプロジェクト、重複、所有者、利用可能なエージェントを提案 |
 | `multica issue create --title "..."` | 新しいイシューを作成 |
 | `multica issue update <id> ...` | イシューを更新（ステータス、優先度、担当者など） |
 | `multica issue assign <id> --to <name>` | メンバー、エージェント、またはスクワッドに割り当て（エージェントへの割り当ては実行をトリガー） |
@@ -155,6 +158,7 @@ multica skill import --url https://skills.sh/acme/repo/review-helper --on-confli
 | コマンド | 用途 |
 |---|---|
 | `multica repo checkout <url>` | エージェントが使用できるようにリポジトリをローカルにクローン |
+| `multica context --output json` | 秘密情報を含まないワークスペース、プロジェクト、リポジトリ、ルーティングエージェントのライブ情報を表示 |
 | `multica config` | ローカルの CLI 構成を表示または編集 |
 | `multica version` | CLI のバージョンを出力 |
 | `multica update` | CLI を最新のリリースにアップグレード |

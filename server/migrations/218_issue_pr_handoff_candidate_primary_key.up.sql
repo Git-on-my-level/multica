@@ -1,0 +1,3 @@
+ALTER TABLE issue_pr_handoff_candidate
+ADD CONSTRAINT issue_pr_handoff_candidate_pkey
+PRIMARY KEY USING INDEX issue_pr_handoff_candidate_id_uidx;

@@ -16,6 +16,27 @@ For building mention links, load `multica-mentioning` instead — not this skill
 Every contract below is traced to source in
 `references/working-on-issues-source-map.md`.
 
+## Read the coordination snapshot before mutating
+
+Use the ordinary read-only commands when ownership, duplicate work, or PR
+handoff is uncertain:
+
+```bash
+multica context --output json
+multica issue inspect <issue> --output json
+multica issue route --title "..." [--repo <github-clone-url>] [--project <id>] --output json
+multica issue url <issue>
+```
+
+`context` returns non-secret live workspace/project/resource/repository and
+routing-agent context. `inspect` is the server-owned point-in-time view of the
+issue, assignee, active/latest runs, native PRs, PR handoff, and safe-action
+signals. `route` is advisory only: its decisions (`safe_to_create`,
+`use_existing_issue`, `needs_project_selection`, or
+`blocked_by_active_owner`) never create, assign, or rerun anything. `issue url`
+is the authoritative human-facing web URL; do not assemble a public Multica
+domain by hand.
+
 ## PR linking and close intent are two distinct contracts
 
 The GitHub webhook runs two separate scans over an incoming PR. They are not the
@@ -96,7 +117,12 @@ stale).
 multica issue pull-requests <issue-id> --output json
 ```
 
-Returns `{"pull_requests": [...]}`. Each element exposes:
+Returns `{"pull_requests": [...], "handoff": {...}}`. `handoff.state` is one of
+`missing`, `candidate_detected`, `awaiting_mirror`, `linked`,
+`invalid_external_pr`, or `multiple_candidates_needs_review`. A canonical
+agent-reported URL can remain `awaiting_mirror` until the connected GitHub App
+mirrors it; candidate detection alone never declares close intent or completes
+the issue. Each `pull_requests` element exposes:
 
 - `number`, `html_url`, `title`
 - `state` — the PR lifecycle as a **single enum**, one of `merged`, `closed`,

@@ -60,6 +60,38 @@ export interface GitHubPullRequest {
   changed_files?: number;
 }
 
+export type IssuePullRequestHandoffState =
+  | "missing"
+  | "candidate_detected"
+  | "awaiting_mirror"
+  | "linked"
+  | "invalid_external_pr"
+  | "multiple_candidates_needs_review";
+
+export interface IssuePullRequestHandoffCandidate {
+  url: string;
+  state: Exclude<
+    IssuePullRequestHandoffState,
+    "missing" | "multiple_candidates_needs_review"
+  >;
+  task_id: string;
+  repo_owner: string;
+  repo_name: string;
+  number: number;
+}
+
+export interface IssuePullRequestHandoff {
+  state: IssuePullRequestHandoffState;
+  candidates: IssuePullRequestHandoffCandidate[];
+}
+
+export interface ListIssuePullRequestsResponse {
+  pull_requests: GitHubPullRequest[];
+  /** Omitted by older servers. Absence must not be presented as a confirmed
+   * missing handoff because that server never evaluated the handoff state. */
+  handoff?: IssuePullRequestHandoff;
+}
+
 export interface ListGitHubInstallationsResponse {
   installations: GitHubInstallation[];
   /** Whether the deployment has GitHub App credentials configured. When false, the Connect button is hidden / disabled. */

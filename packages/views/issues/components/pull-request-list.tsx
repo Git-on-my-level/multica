@@ -29,6 +29,7 @@ import type {
   GitHubPullRequest,
   GitHubPullRequestChecksConclusion,
   GitHubPullRequestState,
+  IssuePullRequestHandoff,
 } from "@multica/core/types";
 import {
   Dialog,
@@ -110,6 +111,7 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
   const qc = useQueryClient();
   const { data, isLoading } = useQuery(issuePullRequestsOptions(issueId));
   const prs = data?.pull_requests ?? [];
+  const handoff = data?.handoff;
 
   // Link dialog state. The dialog stays open on error so the user can fix the
   // URL or read the server message (e.g. "PR not mirrored in this workspace").
@@ -185,6 +187,8 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
           {t(($) => $.detail.pull_request_link_action)}
         </Button>
       </div>
+
+      {handoff ? <PullRequestHandoffStatus handoff={handoff} /> : null}
 
       {isLoading ? (
         <p className="text-xs text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>
@@ -304,6 +308,65 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+function PullRequestHandoffStatus({ handoff }: { handoff: IssuePullRequestHandoff }) {
+  const { t } = useT("issues");
+  const candidate = handoff.candidates[0];
+  const state = handoff.state;
+  const Icon =
+    state === "linked"
+      ? CheckCircle2
+      : state === "awaiting_mirror" || state === "candidate_detected"
+        ? CircleDashed
+        : state === "missing"
+          ? GitPullRequest
+          : TriangleAlert;
+  const text =
+    state === "missing"
+      ? t(($) => $.detail.pull_request_handoff_missing)
+      : state === "awaiting_mirror"
+        ? t(($) => $.detail.pull_request_handoff_awaiting_mirror)
+        : state === "linked"
+          ? t(($) => $.detail.pull_request_handoff_linked)
+          : state === "invalid_external_pr"
+            ? t(($) => $.detail.pull_request_handoff_invalid_external)
+            : state === "multiple_candidates_needs_review"
+              ? t(($) => $.detail.pull_request_handoff_multiple)
+              : t(($) => $.detail.pull_request_handoff_candidate_detected);
+
+  return (
+    <div
+      data-testid="pull-request-handoff"
+      data-handoff-state={state}
+      className={cn(
+        "flex items-start gap-1.5 rounded-md px-2 py-1.5 text-[11px]",
+        state === "linked"
+          ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+          : state === "invalid_external_pr" || state === "multiple_candidates_needs_review"
+            ? "bg-amber-500/10 text-amber-800 dark:text-amber-300"
+            : "bg-muted/60 text-muted-foreground",
+      )}
+    >
+      <Icon className="mt-0.5 h-3 w-3 shrink-0" />
+      <span className="min-w-0">
+        {text}
+        {candidate && state !== "missing" ? (
+          <>
+            {" "}
+            <a
+              href={candidate.url}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="font-medium underline underline-offset-2"
+            >
+              {candidate.repo_owner}/{candidate.repo_name}#{candidate.number}
+            </a>
+          </>
+        ) : null}
+      </span>
     </div>
   );
 }

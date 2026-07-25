@@ -131,6 +131,10 @@ export type {
   GitHubPullRequest,
   GitHubPullRequestChecksConclusion,
   GitHubPullRequestState,
+  IssuePullRequestHandoff,
+  IssuePullRequestHandoffCandidate,
+  IssuePullRequestHandoffState,
+  ListIssuePullRequestsResponse,
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
 } from "./github";
