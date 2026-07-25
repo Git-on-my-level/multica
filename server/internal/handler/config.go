@@ -120,7 +120,7 @@ func validGithubRepoSlug(raw string) bool {
 
 func daemonSetupURLsFromEnv() (string, string) {
 	serverURL := normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
-	appURL := resolveFrontendAppURL()
+	appURL := ResolveFrontendAppURL()
 	if appURL == "" {
 		return "", ""
 	}
@@ -134,11 +134,11 @@ func daemonSetupURLsFromEnv() (string, string) {
 	return serverURL, appURL
 }
 
-// resolveFrontendAppURL returns the operator-configured frontend origin
+// ResolveFrontendAppURL returns the operator-configured frontend origin
 // (MULTICA_APP_URL, falling back to FRONTEND_ORIGIN), normalized. Shared by
-// the daemon-setup URLs and the managed-cloud detection so both read the same
-// signal.
-func resolveFrontendAppURL() string {
+// daemon setup, managed-cloud detection, and outbound web links so all
+// user-facing links read the same deployment setting.
+func ResolveFrontendAppURL() string {
 	appURL := normalizePublicURL(os.Getenv("MULTICA_APP_URL"))
 	if appURL == "" {
 		appURL = normalizePublicURL(os.Getenv("FRONTEND_ORIGIN"))
@@ -169,7 +169,7 @@ func isOfficialCloudDaemonConfig(appURL string) bool {
 // server-version row, which only matters to self-hosted operators — is gated on
 // this.
 func isOfficialCloudDeployment() bool {
-	return isOfficialCloudDaemonConfig(resolveFrontendAppURL())
+	return isOfficialCloudDaemonConfig(ResolveFrontendAppURL())
 }
 
 func urlHostEquals(raw, want string) bool {
