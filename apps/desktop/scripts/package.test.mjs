@@ -17,7 +17,11 @@ import {
 } from "./package.mjs";
 import {
   assertUpdaterPayload,
+  forkReleasePublisher,
+  forkReleaseRepository,
+  packageArgsForVerifiedMacArm64Build,
   parseLatestMacManifest,
+  releaseAssetPlan,
   releaseTagAtHead,
   updaterAssetNames,
 } from "./release-macos-arm64.mjs";
@@ -57,6 +61,22 @@ describe("macOS arm64 release payload contract", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("uses the fork for the embedded feed and only selects missing verified Desktop assets", () => {
+    const names = updaterAssetNames("1.2.3");
+    expect(forkReleasePublisher).toEqual({
+      provider: "github",
+      owner: "Git-on-my-level",
+      repo: "multica",
+    });
+    expect(forkReleaseRepository).toBe("Git-on-my-level/multica");
+    expect(packageArgsForVerifiedMacArm64Build()).toContain(`--config.publish.owner=${forkReleasePublisher.owner}`);
+    expect(packageArgsForVerifiedMacArm64Build()).toContain(`--config.publish.repo=${forkReleasePublisher.repo}`);
+    expect(releaseAssetPlan(names, [names.zip, "multica-cli-1.2.3-darwin-arm64.tar.gz"])).toEqual({
+      alreadyPublished: [names.zip],
+      upload: [names.dmg, names.manifest, names.blockmap],
+    });
   });
 });
 

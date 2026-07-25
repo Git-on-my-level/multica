@@ -20,8 +20,14 @@ The command fails closed before building unless it finds an arm64 Mac, Go 1.26+,
 the Developer ID identity, and a directly usable `multica-notary` Keychain
 profile. It then builds unpublished first and requires a signed, notarized,
 stapled, Gatekeeper-accepted arm64 app/DMG plus an internally consistent
-`latest-mac.yml`, referenced ZIP, and ZIP blockmap. Only then does it call the
-normal electron-builder publisher with `--publish always`.
+`latest-mac.yml`, referenced ZIP, and ZIP blockmap. The single build is
+fork-configured with `--publish never`, embedding the fork's updater feed before
+validation. It then uses the existing GitHub Release as an
+idempotent publisher for those exact verified DMG, manifest, ZIP, and blockmap
+files. It never asks electron-builder to rebuild with `--publish always`, so a
+second, unvalidated artifact set cannot become public. Existing Desktop assets
+are never replaced: a retry accepts one only when its downloaded bytes match
+the already verified local file, otherwise it fails.
 
 Finally it downloads the public DMG, manifest, ZIP, and blockmap fresh from the
 existing GitHub Release, verifies the manifest path/version/SHA-512 and ZIP,

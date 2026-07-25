@@ -16,6 +16,12 @@ const repoRoot = resolve(desktopRoot, "..", "..");
 const keychainProfile = "multica-notary";
 const teamID = "JVMXE5G542";
 const exactTag = /^v(\d+)\.(\d+)\.(\d+)$/;
+export const forkReleasePublisher = Object.freeze({
+  provider: "github",
+  owner: "Git-on-my-level",
+  repo: "multica",
+});
+export const forkReleaseRepository = `${forkReleasePublisher.owner}/${forkReleasePublisher.repo}`;
 
 export const hermeticReleaseEnv = (env = process.env) => {
   const next = { ...env };
@@ -45,6 +51,31 @@ export function updaterAssetNames(version) {
     manifest: "latest-mac.yml",
     zip: stem,
     blockmap: `${stem}.blockmap`,
+  };
+}
+
+export function packageArgsForVerifiedMacArm64Build() {
+  // These overrides are embedded into app-update.yml while building, so the
+  // updater feed and release destination stay on the fork even though the
+  // repository-wide electron-builder default points to upstream.
+  return [
+    "scripts/package.mjs",
+    "--mac",
+    "--arm64",
+    "--publish",
+    "never",
+    `--config.publish.provider=${forkReleasePublisher.provider}`,
+    `--config.publish.owner=${forkReleasePublisher.owner}`,
+    `--config.publish.repo=${forkReleasePublisher.repo}`,
+  ];
+}
+
+export function releaseAssetPlan(names, existingNames = []) {
+  const requiredNames = Object.values(names);
+  const existing = new Set(existingNames);
+  return {
+    alreadyPublished: requiredNames.filter((name) => existing.has(name)),
+    upload: requiredNames.filter((name) => !existing.has(name)),
   };
 }
 
@@ -140,10 +171,40 @@ function localArtifacts(version) {
   return { dist, names };
 }
 
+function releaseAssetNames(tag) {
+  const release = JSON.parse(command("gh", ["release", "view", tag, "--repo", forkReleaseRepository, "--json", "assets"], { capture: true }));
+  return release.assets.map((asset) => asset.name);
+}
+
+function downloadedAssetMatches(tag, name, localPath) {
+  const downloadDir = mkdtempSync(resolve(tmpdir(), "multica-macos-existing-asset-"));
+  try {
+    command("gh", ["release", "download", tag, "--repo", forkReleaseRepository, "--pattern", name, "--dir", downloadDir]);
+    const downloaded = resolve(downloadDir, name);
+    required(existsSync(downloaded), `could not download existing release asset: ${name}`);
+    required(sha256(downloaded) === sha256(localPath), `existing release asset differs from the locally verified payload: ${name}`);
+  } finally {
+    rmSync(downloadDir, { recursive: true, force: true });
+  }
+}
+
+function publishVerifiedAssets(tag, { dist, names }) {
+  // `gh release upload` never uses --clobber: retries may reuse assets only
+  // when their bytes exactly match this locally verified build. That makes a
+  // partially completed upload safe to resume without replacing public files.
+  const plan = releaseAssetPlan(names, releaseAssetNames(tag));
+  for (const name of plan.alreadyPublished) {
+    downloadedAssetMatches(tag, name, resolve(dist, name));
+  }
+  for (const name of plan.upload) {
+    command("gh", ["release", "upload", tag, resolve(dist, name), "--repo", forkReleaseRepository]);
+  }
+}
+
 function publicArtifacts(tag, version, names, localDmgSha256) {
   const downloadDir = mkdtempSync(resolve(tmpdir(), "multica-macos-release-"));
   try {
-    for (const name of Object.values(names)) command("gh", ["release", "download", tag, "--repo", "Git-on-my-level/multica", "--pattern", name, "--dir", downloadDir]);
+    for (const name of Object.values(names)) command("gh", ["release", "download", tag, "--repo", forkReleaseRepository, "--pattern", name, "--dir", downloadDir]);
     const availableNames = Object.values(names).filter((name) => existsSync(resolve(downloadDir, name)));
     const manifest = readFileSync(resolve(downloadDir, names.manifest), "utf-8");
     assertUpdaterPayload({ version, manifest, availableNames, zipPath: resolve(downloadDir, names.zip) });
@@ -157,13 +218,10 @@ function publicArtifacts(tag, version, names, localDmgSha256) {
 
 function main() {
   const { tag, version } = preflight();
-  command("node", ["scripts/package.mjs", "--mac", "--arm64", "--publish", "never"], { cwd: desktopRoot });
-  localArtifacts(version);
-  // The normal electron-builder publisher is intentionally invoked only after
-  // the signed, notarized, Gatekeeper-validated payload passed all local gates.
-  command("node", ["scripts/package.mjs", "--mac", "--arm64", "--publish", "always"], { cwd: desktopRoot });
-  const publishedLocal = localArtifacts(version);
-  publicArtifacts(tag, version, publishedLocal.names, sha256(resolve(publishedLocal.dist, publishedLocal.names.dmg)));
+  command("node", packageArgsForVerifiedMacArm64Build(), { cwd: desktopRoot });
+  const verifiedLocal = localArtifacts(version);
+  publishVerifiedAssets(tag, verifiedLocal);
+  publicArtifacts(tag, version, verifiedLocal.names, sha256(resolve(verifiedLocal.dist, verifiedLocal.names.dmg)));
   console.log(`[release-macos-arm64] verified public Desktop updater payload for ${tag}`);
 }
 
