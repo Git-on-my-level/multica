@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 27061)
-Total output lines: 2951
-
 import type {
   Issue,
   IssuePriority,
@@ -1116,7 +1113,770 @@ export class ApiClient {
 
   async getAgentTemplate(slug: string): Promise<AgentTemplate> {
     const raw = await this.fetch<unknown>(
-     …7061 tokens truncated…",
+      `/api/agent-templates/${encodeURIComponent(slug)}`,
+    );
+    // Round-trip the requested slug into the fallback so a malformed
+    // detail response still produces a navigable record matching the URL
+    // the user clicked.
+    return parseWithFallback(
+      raw,
+      AgentTemplateSchema,
+      { ...EMPTY_AGENT_TEMPLATE_DETAIL, slug },
+      { endpoint: "GET /api/agent-templates/:slug" },
+    );
+  }
+
+  /** Creates an agent from a curated template. The server fetches every
+   *  referenced skill URL in parallel, materializes them into the workspace
+   *  (find-or-create by name), and writes the agent + skill bindings in a
+   *  single transaction. On any upstream fetch failure, the entire write is
+   *  rolled back and the API returns 422 with `failed_urls`. */
+  async createAgentFromTemplate(
+    data: CreateAgentFromTemplateRequest,
+  ): Promise<CreateAgentFromTemplateResponse> {
+    const raw = await this.fetch<unknown>("/api/agents/from-template", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    return parseWithFallback(
+      raw,
+      CreateAgentFromTemplateResponseSchema,
+      EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
+      { endpoint: "POST /api/agents/from-template" },
+    );
+  }
+
+  async updateAgent(id: string, data: UpdateAgentRequest): Promise<Agent> {
+    return this.fetch(`/api/agents/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async archiveAgent(id: string): Promise<Agent> {
+    return this.fetch(`/api/agents/${id}/archive`, { method: "POST" });
+  }
+
+  /**
+   * Returns the plaintext `custom_env` map for an agent. Owner/admin
+   * only; calls from agent-actor sessions get a 403. Every successful
+   * call writes an `agent_env_revealed` activity_log row server-side.
+   * MUL-2600.
+   */
+  async getAgentEnv(id: string): Promise<AgentEnvResponse> {
+    return this.fetch(`/api/agents/${id}/env`);
+  }
+
+  /**
+   * Replaces an agent's `custom_env` wholesale. Values equal to
+   * `"****"` are preserved server-side (the **** guard) so a partial
+   * UI edit doesn't overwrite real secrets with the masked
+   * placeholder. Owner/admin only; agent actors get a 403. Every
+   * successful call writes an `agent_env_updated` activity_log row.
+   * MUL-2600.
+   */
+  async updateAgentEnv(id: string, data: UpdateAgentEnvRequest): Promise<AgentEnvResponse> {
+    return this.fetch(`/api/agents/${id}/env`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async restoreAgent(id: string): Promise<Agent> {
+    return this.fetch(`/api/agents/${id}/restore`, { method: "POST" });
+  }
+
+  // Bulk-cancel every active task (queued/dispatched/running) for the agent.
+  // Permission: agent owner or workspace admin/owner. Server returns the
+  // count of cancelled rows; broadcasts task:cancelled for each so other
+  // surfaces can clear their live cards.
+  async cancelAgentTasks(id: string): Promise<{ cancelled: number }> {
+    return this.fetch(`/api/agents/${id}/cancel-tasks`, { method: "POST" });
+  }
+
+  async listRuntimes(params?: { workspace_id?: string; owner?: "me" }): Promise<AgentRuntime[]> {
+    const search = new URLSearchParams();
+    if (params?.workspace_id) search.set("workspace_id", params.workspace_id);
+    if (params?.owner) search.set("owner", params.owner);
+    return this.fetch(`/api/runtimes?${search}`);
+  }
+
+  async listCloudRuntimeNodes(
+    params?: ListCloudRuntimeNodesParams,
+  ): Promise<CloudRuntimeNode[]> {
+    const search = new URLSearchParams();
+    if (params?.limit !== undefined) search.set("limit", String(params.limit));
+    if (params?.offset !== undefined) search.set("offset", String(params.offset));
+    const query = search.toString();
+    const raw = await this.fetch<unknown>(
+      `/api/cloud-runtime/nodes${query ? `?${query}` : ""}`,
+    );
+    return parseWithFallback(
+      raw,
+      CloudRuntimeNodeListSchema,
+      EMPTY_CLOUD_RUNTIME_NODE_LIST,
+      { endpoint: "GET /api/cloud-runtime/nodes" },
+    );
+  }
+
+  async createCloudRuntimeNode(
+    data: CreateCloudRuntimeNodeRequest,
+  ): Promise<CloudRuntimeNode> {
+    const res = await this.fetchRaw("/api/cloud-runtime/nodes", {
+      method: "POST",
+      body: JSON.stringify(data),
+      extraHeaders: { "Content-Type": "application/json" },
+    });
+    const raw = await res.json() as unknown;
+    return parseWithFallback(
+      raw,
+      CloudRuntimeNodeSchema,
+      EMPTY_CLOUD_RUNTIME_NODE,
+      { endpoint: "POST /api/cloud-runtime/nodes" },
+    );
+  }
+
+  async deleteCloudRuntimeNode(instanceId: string): Promise<void> {
+    await this.fetchRaw("/api/cloud-runtime/nodes", {
+      method: "DELETE",
+      body: JSON.stringify({ instance_id: instanceId }),
+      extraHeaders: { "Content-Type": "application/json" },
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Cloud Billing — proxies to multica-cloud /api/v1/billing/*. The
+  // multica-api server stamps X-User-ID and forwards bytes; everything
+  // here is upstream-shaped. See packages/core/types/billing.ts for the
+  // response field documentation.
+  // ---------------------------------------------------------------------
+
+  async getCloudBillingBalance(): Promise<BillingBalance> {
+    const raw = await this.fetch<unknown>("/api/cloud-billing/balance");
+    return parseWithFallback(raw, BillingBalanceSchema, EMPTY_BILLING_BALANCE, {
+      endpoint: "GET /api/cloud-billing/balance",
+    });
+  }
+
+  async listCloudBillingTransactions(
+    params?: { page?: number; page_size?: number },
+  ): Promise<BillingTransactionsPage> {
+    const search = new URLSearchParams();
+    if (params?.page !== undefined) search.set("page", String(params.page));
+    if (params?.page_size !== undefined) search.set("page_size", String(params.page_size));
+    const query = search.toString();
+    const raw = await this.fetch<unknown>(
+      `/api/cloud-billing/transactions${query ? `?${query}` : ""}`,
+    );
+    return parseWithFallback(
+      raw,
+      BillingTransactionsPageSchema,
+      EMPTY_BILLING_TRANSACTIONS_PAGE,
+      { endpoint: "GET /api/cloud-billing/transactions" },
+    );
+  }
+
+  async listCloudBillingBatches(
+    params?: { page?: number; page_size?: number },
+  ): Promise<BillingBatchesPage> {
+    const search = new URLSearchParams();
+    if (params?.page !== undefined) search.set("page", String(params.page));
+    if (params?.page_size !== undefined) search.set("page_size", String(params.page_size));
+    const query = search.toString();
+    const raw = await this.fetch<unknown>(
+      `/api/cloud-billing/batches${query ? `?${query}` : ""}`,
+    );
+    return parseWithFallback(
+      raw,
+      BillingBatchesPageSchema,
+      EMPTY_BILLING_BATCHES_PAGE,
+      { endpoint: "GET /api/cloud-billing/batches" },
+    );
+  }
+
+  async listCloudBillingTopups(
+    params?: { page?: number; page_size?: number },
+  ): Promise<BillingTopupsPage> {
+    const search = new URLSearchParams();
+    if (params?.page !== undefined) search.set("page", String(params.page));
+    if (params?.page_size !== undefined) search.set("page_size", String(params.page_size));
+    const query = search.toString();
+    const raw = await this.fetch<unknown>(
+      `/api/cloud-billing/topups${query ? `?${query}` : ""}`,
+    );
+    return parseWithFallback(
+      raw,
+      BillingTopupsPageSchema,
+      EMPTY_BILLING_TOPUPS_PAGE,
+      { endpoint: "GET /api/cloud-billing/topups" },
+    );
+  }
+
+  async listCloudBillingPriceTiers(): Promise<BillingPriceTier[]> {
+    const raw = await this.fetch<unknown>("/api/cloud-billing/price-tiers");
+    return parseWithFallback(
+      raw,
+      BillingPriceTierListSchema,
+      EMPTY_BILLING_PRICE_TIER_LIST,
+      { endpoint: "GET /api/cloud-billing/price-tiers" },
+    );
+  }
+
+  async createCloudBillingCheckoutSession(
+    data: CreateBillingCheckoutSessionRequest,
+  ): Promise<CreateBillingCheckoutSessionResponse> {
+    const res = await this.fetchRaw("/api/cloud-billing/checkout-sessions", {
+      method: "POST",
+      body: JSON.stringify(data),
+      extraHeaders: { "Content-Type": "application/json" },
+    });
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback(
+      raw,
+      CreateBillingCheckoutSessionResponseSchema,
+      EMPTY_CREATE_BILLING_CHECKOUT_SESSION_RESPONSE,
+      { endpoint: "POST /api/cloud-billing/checkout-sessions" },
+    );
+  }
+
+  async getCloudBillingCheckoutSession(
+    sessionId: string,
+  ): Promise<BillingCheckoutSessionStatus> {
+    // Stripe session ids are `cs_<base62>` so they're URL-safe by
+    // construction; encodeURIComponent is paranoia for the case where a
+    // future Stripe format change adds a non-alphanumeric character. The
+    // server has its own allow-list rejection for unsafe ids.
+    const raw = await this.fetch<unknown>(
+      `/api/cloud-billing/checkout-sessions/${encodeURIComponent(sessionId)}`,
+    );
+    return parseWithFallback(
+      raw,
+      BillingCheckoutSessionStatusSchema,
+      EMPTY_BILLING_CHECKOUT_SESSION_STATUS,
+      { endpoint: "GET /api/cloud-billing/checkout-sessions/{sessionId}" },
+    );
+  }
+
+  async createCloudBillingPortalSession(): Promise<CreateBillingPortalSessionResponse> {
+    const res = await this.fetchRaw("/api/cloud-billing/portal-sessions", {
+      method: "POST",
+      // Body is intentionally absent — the upstream endpoint requires no
+      // payload today. fetchRaw with no body skips the Content-Type
+      // default; that's fine because there's nothing to declare.
+    });
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback(
+      raw,
+      CreateBillingPortalSessionResponseSchema,
+      EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE,
+      { endpoint: "POST /api/cloud-billing/portal-sessions" },
+    );
+  }
+
+  async deleteRuntime(runtimeId: string): Promise<void> {
+    await this.fetch(`/api/runtimes/${runtimeId}`, { method: "DELETE" });
+  }
+
+  // Cascade variant of deleteRuntime. The strict DELETE refuses with
+  // structured 409 (`code: "runtime_has_active_agents"`, body carries the
+  // blocking agents) when active agents are bound; the front-end then opens
+  // the cascade-mode confirmation dialog and submits the user-confirmed
+  // active agent set here. Server compares the snapshot to the live set
+  // inside the transaction and refuses with `code: "runtime_delete_plan_changed"`
+  // (same shape, fresh `active_agents`) if they don't match — caller should
+  // re-render the agent list and force the user to re-confirm.
+  async archiveAgentsAndDeleteRuntime(
+    runtimeId: string,
+    expectedActiveAgentIds: string[],
+  ): Promise<{ status: string; agents_archived: number; tasks_cancelled: number }> {
+    return this.fetch(`/api/runtimes/${runtimeId}/archive-agents-and-delete`, {
+      method: "POST",
+      body: JSON.stringify({ expected_active_agent_ids: expectedActiveAgentIds }),
+    });
+  }
+
+  async updateRuntime(
+    runtimeId: string,
+    patch: {
+      visibility?: "private" | "public";
+      /**
+       * Custom display name. Pass an empty string to clear it (the server
+       * reverts to the default name). Omit to leave it unchanged — a JSON
+       * `null` is treated as "unchanged", not "clear". See MUL-4217.
+       */
+      custom_name?: string;
+      /** Apply custom_name to every runtime on the same machine. */
+      apply_to_machine?: boolean;
+    },
+  ): Promise<AgentRuntime> {
+    return this.fetch(`/api/runtimes/${runtimeId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Custom runtime profiles (MUL-3284). All workspace-scoped: the caller
+  // passes the workspace id the same way the runtimes list resolves it.
+  // ---------------------------------------------------------------------
+
+  async listRuntimeProfiles(workspaceId: string): Promise<RuntimeProfile[]> {
+    const res = await this.fetch<{ runtime_profiles?: RuntimeProfile[] }>(
+      `/api/workspaces/${workspaceId}/runtime-profiles`,
+    );
+    return res.runtime_profiles ?? [];
+  }
+
+  async getRuntimeProfile(
+    workspaceId: string,
+    profileId: string,
+  ): Promise<RuntimeProfile> {
+    return this.fetch(
+      `/api/workspaces/${workspaceId}/runtime-profiles/${profileId}`,
+    );
+  }
+
+  async createRuntimeProfile(
+    workspaceId: string,
+    body: CreateRuntimeProfileRequest,
+  ): Promise<RuntimeProfile> {
+    return this.fetch(`/api/workspaces/${workspaceId}/runtime-profiles`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  async updateRuntimeProfile(
+    workspaceId: string,
+    profileId: string,
+    patch: UpdateRuntimeProfileRequest,
+  ): Promise<RuntimeProfile> {
+    return this.fetch(
+      `/api/workspaces/${workspaceId}/runtime-profiles/${profileId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      },
+    );
+  }
+
+  async deleteRuntimeProfile(
+    workspaceId: string,
+    profileId: string,
+  ): Promise<void> {
+    await this.fetch(
+      `/api/workspaces/${workspaceId}/runtime-profiles/${profileId}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async getRuntimeUsage(
+    runtimeId: string,
+    params?: { days?: number; tz?: string },
+  ): Promise<RuntimeUsage[]> {
+    const search = new URLSearchParams();
+    if (params?.days) search.set("days", String(params.days));
+    // `tz` drives the calendar-day boundary for the trend chart (Viewing
+    // layer). Caller-supplied; the backend falls back to user.timezone /
+    // UTC if omitted.
+    if (params?.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/usage?${search}`,
+    );
+    return parseWithFallback<RuntimeUsage[]>(raw, RuntimeUsageListSchema, [], {
+      endpoint: "GET /api/runtimes/:id/usage",
+    });
+  }
+
+  async getRuntimeTaskActivity(
+    runtimeId: string,
+    params?: { tz?: string },
+  ): Promise<RuntimeHourlyActivity[]> {
+    // Hour-of-day heatmap follows the viewer's tz, like the other reports on
+    // this page. Pass the viewer's IANA zone so the server buckets correctly.
+    const search = new URLSearchParams();
+    if (params?.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/activity?${search}`,
+    );
+    return parseWithFallback<RuntimeHourlyActivity[]>(
+      raw,
+      RuntimeHourlyActivityListSchema,
+      [],
+      { endpoint: "GET /api/runtimes/:id/activity" },
+    );
+  }
+
+  async getRuntimeUsageByAgent(
+    runtimeId: string,
+    params?: { days?: number; tz?: string },
+  ): Promise<RuntimeUsageByAgent[]> {
+    const search = new URLSearchParams();
+    if (params?.days) search.set("days", String(params.days));
+    if (params?.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/usage/by-agent?${search}`,
+    );
+    return parseWithFallback<RuntimeUsageByAgent[]>(
+      raw,
+      RuntimeUsageByAgentListSchema,
+      [],
+      { endpoint: "GET /api/runtimes/:id/usage/by-agent" },
+    );
+  }
+
+  async getRuntimeUsageByHour(
+    runtimeId: string,
+    params?: { days?: number; tz?: string },
+  ): Promise<RuntimeUsageByHour[]> {
+    const search = new URLSearchParams();
+    if (params?.days) search.set("days", String(params.days));
+    if (params?.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/usage/by-hour?${search}`,
+    );
+    return parseWithFallback<RuntimeUsageByHour[]>(
+      raw,
+      RuntimeUsageByHourListSchema,
+      [],
+      { endpoint: "GET /api/runtimes/:id/usage/by-hour" },
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Workspace dashboard — three independent rollups for `/{slug}/dashboard`.
+  // Each accepts an optional `project_id` to narrow the scope to one project.
+  // Cost is computed client-side from the model pricing table (same contract
+  // as the per-runtime endpoints above).
+  // ---------------------------------------------------------------------------
+
+  async getDashboardUsageDaily(
+    params: { days?: number; project_id?: string | null; tz?: string },
+  ): Promise<DashboardUsageDaily[]> {
+    const search = new URLSearchParams();
+    if (params.days) search.set("days", String(params.days));
+    if (params.project_id) search.set("project_id", params.project_id);
+    if (params.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(`/api/dashboard/usage/daily?${search}`);
+    return parseWithFallback<DashboardUsageDaily[]>(
+      raw,
+      DashboardUsageDailyListSchema,
+      [],
+      { endpoint: "GET /api/dashboard/usage/daily" },
+    );
+  }
+
+  async getDashboardUsageByAgent(
+    params: { days?: number; project_id?: string | null; tz?: string },
+  ): Promise<DashboardUsageByAgent[]> {
+    const search = new URLSearchParams();
+    if (params.days) search.set("days", String(params.days));
+    if (params.project_id) search.set("project_id", params.project_id);
+    if (params.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(`/api/dashboard/usage/by-agent?${search}`);
+    return parseWithFallback<DashboardUsageByAgent[]>(
+      raw,
+      DashboardUsageByAgentListSchema,
+      [],
+      { endpoint: "GET /api/dashboard/usage/by-agent" },
+    );
+  }
+
+  async getDashboardAgentRunTime(
+    params: { days?: number; project_id?: string | null; tz?: string },
+  ): Promise<DashboardAgentRunTime[]> {
+    const search = new URLSearchParams();
+    if (params.days) search.set("days", String(params.days));
+    if (params.project_id) search.set("project_id", params.project_id);
+    // `tz` aligns the "last N days" cutoff with the viewer's calendar,
+    // matching the per-agent token card.
+    if (params.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(`/api/dashboard/agent-runtime?${search}`);
+    return parseWithFallback<DashboardAgentRunTime[]>(
+      raw,
+      DashboardAgentRunTimeListSchema,
+      [],
+      { endpoint: "GET /api/dashboard/agent-runtime" },
+    );
+  }
+
+  async getDashboardRunTimeDaily(
+    params: { days?: number; project_id?: string | null; tz?: string },
+  ): Promise<DashboardRunTimeDaily[]> {
+    const search = new URLSearchParams();
+    if (params.days) search.set("days", String(params.days));
+    if (params.project_id) search.set("project_id", params.project_id);
+    // `tz` cuts the day buckets in the viewer's calendar so Time / Tasks
+    // align with the Cost / Tokens charts.
+    if (params.tz) search.set("tz", params.tz);
+    const raw = await this.fetch<unknown>(`/api/dashboard/runtime/daily?${search}`);
+    return parseWithFallback<DashboardRunTimeDaily[]>(
+      raw,
+      DashboardRunTimeDailyListSchema,
+      [],
+      { endpoint: "GET /api/dashboard/runtime/daily" },
+    );
+  }
+
+  async initiateUpdate(
+    runtimeId: string,
+    targetVersion: string,
+  ): Promise<RuntimeUpdate> {
+    return this.fetch(`/api/runtimes/${runtimeId}/update`, {
+      method: "POST",
+      body: JSON.stringify({ target_version: targetVersion }),
+    });
+  }
+
+  async getUpdateResult(
+    runtimeId: string,
+    updateId: string,
+  ): Promise<RuntimeUpdate> {
+    return this.fetch(`/api/runtimes/${runtimeId}/update/${updateId}`);
+  }
+
+  async initiateListModels(runtimeId: string): Promise<RuntimeModelListRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/models`, { method: "POST" });
+  }
+
+  async getListModelsResult(
+    runtimeId: string,
+    requestId: string,
+  ): Promise<RuntimeModelListRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/models/${requestId}`);
+  }
+
+  async initiateListLocalSkills(
+    runtimeId: string,
+  ): Promise<RuntimeLocalSkillListRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/local-skills`, {
+      method: "POST",
+    });
+  }
+
+  async getListLocalSkillsResult(
+    runtimeId: string,
+    requestId: string,
+  ): Promise<RuntimeLocalSkillListRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/local-skills/${requestId}`);
+  }
+
+  async initiateImportLocalSkill(
+    runtimeId: string,
+    data: CreateRuntimeLocalSkillImportRequest,
+  ): Promise<RuntimeLocalSkillImportRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/local-skills/import`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getImportLocalSkillResult(
+    runtimeId: string,
+    requestId: string,
+  ): Promise<RuntimeLocalSkillImportRequest> {
+    return this.fetch(`/api/runtimes/${runtimeId}/local-skills/import/${requestId}`);
+  }
+
+  async listAgentTasks(agentId: string): Promise<AgentTask[]> {
+    return this.fetch(`/api/agents/${agentId}/tasks`);
+  }
+
+  // Workspace-scoped agent task snapshot: every active task
+  // (queued/dispatched/running) plus each agent's most recent terminal task.
+  // Powers the front-end's "active wins, else latest terminal" presence
+  // derivation; one fetch backs every per-agent presence read in the app.
+  // Workspace is resolved server-side from the X-Workspace-Slug header.
+  async getAgentTaskSnapshot(): Promise<AgentTask[]> {
+    return this.fetch(`/api/agent-task-snapshot`);
+  }
+
+  // Independent workspace-level projection. Unlike the task snapshot, this
+  // already deduplicates running agents and returns only the display fields
+  // consumers need. Callers may narrow the projection by task source and, for
+  // issue work, the authenticated member's My Issues relation.
+  async getWorkspaceWorkingAgents(
+    type?: WorkspaceWorkingAgentType,
+    mineRelation?: WorkspaceWorkingAgentMineRelation,
+  ): Promise<WorkspaceWorkingAgent[]> {
+    const search = new URLSearchParams();
+    if (type) search.set("type", type);
+    if (mineRelation) {
+      search.set("scope", "mine");
+      search.set("relation", mineRelation);
+    }
+    const query = search.toString();
+    return this.fetch(`/api/working-agents${query ? `?${query}` : ""}`);
+  }
+
+  // Per-agent daily activity for the last 30 days, anchored on
+  // completed_at. One workspace-wide fetch backs both the Agents-list
+  // sparkline (uses trailing 7 buckets) and the agent detail "Last 30
+  // days" panel (uses all 30).
+  async getWorkspaceAgentActivity30d(): Promise<AgentActivityBucket[]> {
+    return this.fetch(`/api/agent-activity-30d`);
+  }
+
+  // Per-agent 30-day total run count for the Agents-list RUNS column.
+  async getWorkspaceAgentRunCounts(): Promise<AgentRunCount[]> {
+    return this.fetch(`/api/agent-run-counts`);
+  }
+
+  async getActiveTasksForIssue(issueId: string): Promise<{ tasks: AgentTask[] }> {
+    return this.fetch(`/api/issues/${issueId}/active-task`);
+  }
+
+  async listTaskMessages(taskId: string): Promise<TaskMessagePayload[]> {
+    return this.fetch(`/api/tasks/${taskId}/messages`);
+  }
+
+  async listTasksByIssue(issueId: string): Promise<AgentTask[]> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/task-runs`);
+    return parseWithFallback<AgentTask[]>(raw, AgentTaskListSchema, [], {
+      endpoint: "GET /api/issues/:id/task-runs",
+    });
+  }
+
+  async getIssueUsage(issueId: string): Promise<IssueUsageSummary> {
+    return this.fetch(`/api/issues/${issueId}/usage`);
+  }
+
+  async cancelTask(issueId: string, taskId: string): Promise<AgentTask> {
+    return this.fetch(`/api/issues/${issueId}/tasks/${taskId}/cancel`, {
+      method: "POST",
+    });
+  }
+
+  async rerunIssue(issueId: string, taskId?: string): Promise<AgentTask> {
+    return this.fetch(`/api/issues/${issueId}/rerun`, {
+      method: "POST",
+      body: JSON.stringify(taskId ? { task_id: taskId } : {}),
+    });
+  }
+
+  // Inbox
+  async listInbox(): Promise<InboxItem[]> {
+    return this.fetch("/api/inbox");
+  }
+
+  async markInboxRead(id: string): Promise<InboxItem> {
+    return this.fetch(`/api/inbox/${id}/read`, { method: "POST" });
+  }
+
+  async archiveInbox(id: string): Promise<InboxItem> {
+    return this.fetch(`/api/inbox/${id}/archive`, { method: "POST" });
+  }
+
+  // Archived notifications, backing the inbox's "Archived" sub-view. Capped
+  // server-side (no pagination in v1). Schema-guarded so a contract drift
+  // renders an empty archive instead of taking the inbox down with it.
+  async listArchivedInbox(): Promise<InboxItem[]> {
+    const raw = await this.fetch<unknown>("/api/inbox/archived");
+    return parseWithFallback(raw, InboxItemListSchema, EMPTY_INBOX_ITEMS, {
+      endpoint: "GET /api/inbox/archived",
+    });
+  }
+
+  async unarchiveInbox(id: string): Promise<InboxItem> {
+    return this.fetch(`/api/inbox/${id}/unarchive`, { method: "POST" });
+  }
+
+  async getUnreadInboxCount(): Promise<{ count: number }> {
+    return this.fetch("/api/inbox/unread-count");
+  }
+
+  // Cross-workspace unread summary: one entry per workspace the user belongs
+  // to that has unread inbox items. Backs the workspace-switcher dot for
+  // OTHER workspaces. Schema-guarded so a contract drift hides the dot rather
+  // than crashing the sidebar.
+  async getInboxUnreadSummary(): Promise<InboxWorkspaceUnread[]> {
+    const raw = await this.fetch<unknown>("/api/inbox/unread-summary");
+    return parseWithFallback(raw, InboxUnreadSummarySchema, EMPTY_INBOX_UNREAD_SUMMARY, {
+      endpoint: "GET /api/inbox/unread-summary",
+    });
+  }
+
+  async markAllInboxRead(): Promise<{ count: number }> {
+    return this.fetch("/api/inbox/mark-all-read", { method: "POST" });
+  }
+
+  async archiveAllInbox(): Promise<{ count: number }> {
+    return this.fetch("/api/inbox/archive-all", { method: "POST" });
+  }
+
+  async archiveAllReadInbox(): Promise<{ count: number }> {
+    return this.fetch("/api/inbox/archive-all-read", { method: "POST" });
+  }
+
+  async archiveCompletedInbox(): Promise<{ count: number }> {
+    return this.fetch("/api/inbox/archive-completed", { method: "POST" });
+  }
+
+  // Notification preferences
+  //
+  // `workspaceSlug` overrides the default `X-Workspace-Slug` header (which
+  // follows the active workspace) so a caller can read a SPECIFIC workspace's
+  // preferences — e.g. honoring the mute setting of the workspace an inbox
+  // notification came from while the user is viewing a different one (#3766).
+  async getNotificationPreferences(workspaceSlug?: string): Promise<NotificationPreferenceResponse> {
+    const raw = await this.fetch<unknown>(
+      "/api/notification-preferences",
+      workspaceSlug ? { headers: { "X-Workspace-Slug": workspaceSlug } } : undefined,
+    );
+    return parseWithFallback(
+      raw,
+      NotificationPreferenceResponseSchema,
+      EMPTY_NOTIFICATION_PREFERENCE_RESPONSE,
+      { endpoint: "GET /api/notification-preferences" },
+    );
+  }
+
+  async updateNotificationPreferences(
+    preferences: NotificationPreferences,
+    workspaceSlug?: string,
+  ): Promise<NotificationPreferenceResponse> {
+    const raw = await this.fetch<unknown>("/api/notification-preferences", {
+      method: "PATCH",
+      headers: workspaceSlug
+        ? { "X-Workspace-Slug": workspaceSlug }
+        : undefined,
+      body: JSON.stringify({ preferences }),
+    });
+    return parseWithFallback(
+      raw,
+      NotificationPreferenceResponseSchema,
+      EMPTY_NOTIFICATION_PREFERENCE_RESPONSE,
+      { endpoint: "PATCH /api/notification-preferences" },
+    );
+  }
+
+  // App Config
+  async getConfig(): Promise<AppConfigResponse> {
+    const raw = await this.fetch<unknown>("/api/config");
+    return parseWithFallback<AppConfigResponse>(raw, AppConfigSchema, EMPTY_APP_CONFIG, {
+      endpoint: "GET /api/config",
+    });
+  }
+
+  // Workspaces
+  async listWorkspaces(): Promise<Workspace[]> {
+    return this.fetch("/api/workspaces");
+  }
+
+  async getWorkspace(id: string): Promise<Workspace> {
+    return this.fetch(`/api/workspaces/${id}`);
+  }
+
+  async createWorkspace(data: { name: string; slug: string; description?: string; context?: string }): Promise<Workspace> {
+    return this.fetch("/api/workspaces", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateWorkspace(id: string, data: { name?: string; description?: string; context?: string; settings?: Record<string, unknown>; repos?: WorkspaceRepo[]; issue_prefix?: string; avatar_url?: string }): Promise<Workspace> {
+    return this.fetch(`/api/workspaces/${id}`, {
+      method: "PATCH",
       body: JSON.stringify(data),
     });
   }
