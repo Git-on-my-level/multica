@@ -281,6 +281,75 @@ func TestPRHandoffCandidateLinksOnlyAfterMirrorAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestPRHandoffSurvivesLaterCompletedTaskWithoutCandidate(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	issueID := createManualLinkIssue(t, "in_progress")
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID); err != nil {
+		t.Fatalf("load test agent: %v", err)
+	}
+
+	var taskA, taskB string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, created_at, completed_at
+		)
+		VALUES ($1, $2, $3, 'completed', 0, now() - interval '2 minutes', now() - interval '90 seconds')
+		RETURNING id
+	`, agentID, testRuntimeID, issue.ID).Scan(&taskA); err != nil {
+		t.Fatalf("insert task A: %v", err)
+	}
+	if _, err := testHandler.Queries.UpsertIssuePRHandoffCandidate(ctx, db.UpsertIssuePRHandoffCandidateParams{
+		WorkspaceID: issue.WorkspaceID,
+		IssueID:     issue.ID,
+		TaskID:      parseUUID(taskA),
+		Url:         "https://github.com/acme/durable-handoff/pull/17",
+		RepoOwner:   "acme",
+		RepoName:    "durable-handoff",
+		PrNumber:    17,
+		State:       "awaiting_mirror",
+	}); err != nil {
+		t.Fatalf("insert task A candidate: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, created_at, completed_at
+		)
+		VALUES ($1, $2, $3, 'completed', 0, now() - interval '1 minute', now())
+		RETURNING id
+	`, agentID, testRuntimeID, issue.ID).Scan(&taskB); err != nil {
+		t.Fatalf("insert no-PR task B: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_pr_handoff_candidate WHERE issue_id = $1`, issue.ID)
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1 OR id = $2`, taskA, taskB)
+	})
+
+	handoff, err := testHandler.loadIssuePRHandoff(ctx, issue.ID, false)
+	if err != nil {
+		t.Fatalf("loadIssuePRHandoff: %v", err)
+	}
+	if handoff.State != "awaiting_mirror" || len(handoff.Candidates) != 1 {
+		t.Fatalf("handoff = %#v, want one awaiting_mirror candidate", handoff)
+	}
+	if handoff.Candidates[0].TaskID != taskA {
+		t.Fatalf("candidate task = %q, want source task A %q", handoff.Candidates[0].TaskID, taskA)
+	}
+	if handoff.Candidates[0].URL != "https://github.com/acme/durable-handoff/pull/17" {
+		t.Fatalf("candidate URL = %q", handoff.Candidates[0].URL)
+	}
+}
+
 func TestPRHandoffIssueDeleteCannotLeaveInsertAfterSweepOrphan(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

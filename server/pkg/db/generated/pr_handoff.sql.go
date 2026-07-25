@@ -127,16 +127,26 @@ func (q *Queries) ListAwaitingPRHandoffCandidates(ctx context.Context, arg ListA
 }
 
 const listLatestIssuePRHandoffCandidates = `-- name: ListLatestIssuePRHandoffCandidates :many
-WITH latest_completed_task AS (
-    SELECT id
-    FROM agent_task_queue
-    WHERE agent_task_queue.issue_id = $1 AND agent_task_queue.status = 'completed'
-    ORDER BY agent_task_queue.completed_at DESC NULLS LAST, agent_task_queue.created_at DESC
+-- A later completed follow-up with no candidate must not erase the last
+-- reported handoff. A later task that does report candidates supersedes the
+-- prior task as one source-bound candidate group.
+WITH latest_candidate_task AS (
+    SELECT t.id AS task_id
+    FROM agent_task_queue t
+    WHERE t.issue_id = $1
+      AND t.status = 'completed'
+      AND EXISTS (
+          SELECT 1
+          FROM issue_pr_handoff_candidate c
+          WHERE c.task_id = t.id AND c.issue_id = $1
+      )
+    ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
     LIMIT 1
 )
 SELECT c.id, c.workspace_id, c.issue_id, c.task_id, c.url, c.repo_owner, c.repo_name, c.pr_number, c.state, c.created_at, c.updated_at
 FROM issue_pr_handoff_candidate c
-JOIN latest_completed_task t ON t.id = c.task_id
+JOIN latest_candidate_task t ON t.task_id = c.task_id
+WHERE c.issue_id = $1
 ORDER BY c.created_at ASC, c.url ASC
 `
 
