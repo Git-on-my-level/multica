@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
@@ -14,6 +15,70 @@ import {
   shouldDisableMacNotarize,
   stripLeadingSeparator,
 } from "./package.mjs";
+import {
+  assertUpdaterPayload,
+  forkReleasePublisher,
+  forkReleaseRepository,
+  packageArgsForVerifiedMacArm64Build,
+  parseLatestMacManifest,
+  releaseAssetPlan,
+  releaseTagAtHead,
+  updaterAssetNames,
+} from "./release-macos-arm64.mjs";
+
+describe("macOS arm64 release payload contract", () => {
+  it("accepts one exact stable tag at HEAD", () => {
+    expect(releaseTagAtHead(["v1.2.3"])).toBe("v1.2.3");
+    expect(() => releaseTagAtHead(["v1.2.3", "v1.2.4"])).toThrow(/exactly one/);
+    expect(() => releaseTagAtHead(["v1.2.3-rc.1"])).toThrow(/exactly one/);
+  });
+
+  it("requires the manifest, referenced ZIP, and ZIP blockmap with a matching hash", () => {
+    const version = "1.2.3";
+    const names = updaterAssetNames(version);
+    const dir = mkdtempSync(join(tmpdir(), "multica-updater-payload-"));
+    const zipPath = join(dir, names.zip);
+    const body = Buffer.from("generated updater zip");
+    writeFileSync(zipPath, body);
+    const sha512 = createHash("sha512").update(body).digest("base64");
+    const manifest = `version: ${version}\npath: ${names.zip}\nsha512: ${sha512}\n`;
+    try {
+      expect(
+        assertUpdaterPayload({
+          version,
+          manifest,
+          availableNames: [names.manifest, names.zip, names.blockmap],
+          zipPath,
+        }),
+      ).toEqual(names);
+      expect(() => assertUpdaterPayload({
+        version,
+        manifest,
+        availableNames: [names.manifest, names.zip],
+        zipPath,
+      })).toThrow(names.blockmap);
+      expect(() => parseLatestMacManifest("version: 1.2.3\npath: update.zip\n")).toThrow(/sha512/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the fork for the embedded feed and only selects missing verified Desktop assets", () => {
+    const names = updaterAssetNames("1.2.3");
+    expect(forkReleasePublisher).toEqual({
+      provider: "github",
+      owner: "Git-on-my-level",
+      repo: "multica",
+    });
+    expect(forkReleaseRepository).toBe("Git-on-my-level/multica");
+    expect(packageArgsForVerifiedMacArm64Build()).toContain(`--config.publish.owner=${forkReleasePublisher.owner}`);
+    expect(packageArgsForVerifiedMacArm64Build()).toContain(`--config.publish.repo=${forkReleasePublisher.repo}`);
+    expect(releaseAssetPlan(names, [names.zip, "multica-cli-1.2.3-darwin-arm64.tar.gz"])).toEqual({
+      alreadyPublished: [names.zip],
+      upload: [names.dmg, names.manifest, names.blockmap],
+    });
+  });
+});
 
 describe("normalizeGitVersion", () => {
   it("returns null for empty / nullish input", () => {
@@ -196,21 +261,24 @@ describe("shouldDisableMacNotarize", () => {
 
 describe("fork Desktop release policy", () => {
   it("keeps fork tag workflows from publishing Desktop artifacts", () => {
+    const repoRoot = [process.cwd(), resolve(process.cwd(), "..", "..")].find(
+      (candidate) => existsSync(resolve(candidate, ".github", "workflows", "release.yml")),
+    );
+    expect(repoRoot, "repository root not found").toBeTruthy();
     const workflow = readFileSync(
-      resolve(process.cwd(), "..", "..", ".github", "workflows", "release.yml"),
+      resolve(repoRoot, ".github", "workflows", "release.yml"),
       "utf-8",
     );
-    const macGuide = readFileSync(resolve(process.cwd(), "MACOS_RELEASE.md"), "utf-8");
+    const macGuide = readFileSync(resolve(repoRoot, "apps", "desktop", "MACOS_RELEASE.md"), "utf-8");
 
     expect(workflow).toMatch(/desktop:\n\s+needs: \[verify, cli-release\]\n[\s\S]*?if: needs\.verify\.outputs\.is_upstream == 'true'/);
     expect(workflow).toMatch(/desktop-mac:[\s\S]*?if: \$\{\{ false \}\}/);
-    expect(macGuide).toContain("made manually on\nDavid's arm64 Mac");
-    expect(macGuide).toContain("--mac --arm64 --publish never");
-    expect(macGuide).toContain("APPLE_KEYCHAIN_PROFILE=multica-notary");
-    expect(macGuide).toContain("DMG only");
-    expect(macGuide).toContain('--target "$RELEASE_SHA"');
-    expect(macGuide).not.toContain('git push origin "v<version>"');
-    expect(macGuide).toContain("awk -F '\\t'");
+    expect(macGuide).toContain("human-gated on the designated arm64 Mac");
+    expect(macGuide).toContain("release:macos-arm64");
+    expect(macGuide).toContain('APPLE_KEYCHAIN_PROFILE="multica-notary"');
+    expect(macGuide).toContain("ZIP, and ZIP blockmap");
+    expect(macGuide).toContain("--publish always");
+    expect(macGuide).toContain("never runs from\nGitHub Actions");
   });
 });
 
