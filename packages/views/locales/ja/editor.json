@@ -34,7 +34,14 @@
     "copy_link": "リンクをコピー",
     "delete": "削除",
     "link_copied": "リンクをコピーしました",
-    "copy_link_failed": "リンクをコピーできませんでした"
+    "copy_link_failed": "リンクをコピーできませんでした",
+    "canvas_label": "画像キャンバス。ドラッグで移動、スクロールで拡大縮小、ダブルクリックで実際のサイズに切り替えできます。"
+  },
+  "canvas": {
+    "zoom_in": "拡大",
+    "zoom_out": "縮小",
+    "zoom_fit": "画面に合わせる",
+    "zoom_actual": "実際のサイズ"
   },
   "attachment": {
     "download_failed": "ダウンロードリンクを取得できませんでした。しばらくしてからもう一度お試しください。",
@@ -72,12 +79,31 @@
   "file_card": {
     "uploading": "{{filename}} をアップロード中"
   },
+  "upload": {
+    "failed": "{{filename}} をアップロードできませんでした: {{reason}}",
+    "in_progress": "アップロード中…",
+    "interrupted": "アップロードが中断されました—ファイルは保存されていません。もう一度添付してください。",
+    "remove": "削除",
+    "uploading_label": "{{filename}} をアップロード中…",
+    "failed_label": "{{filename}} をアップロードできませんでした"
+  },
   "title_editor": {
     "title_aria_label": "タイトル"
   },
   "mermaid": {
     "render_error": "Mermaid ダイアグラムを描画できません。",
-    "rendering": "ダイアグラムを描画中…"
+    "rendering": "ダイアグラムを描画中…",
+    "viewer_title": "ダイアグラム",
+    "canvas_label": "ダイアグラムキャンバス。ドラッグで移動、スクロールで拡大縮小できます。",
+    "open_viewer": "ダイアグラムビューアを開く",
+    "close_viewer": "閉じる",
+    "copy_source": "ダイアグラムのソースをコピー",
+    "show_source": "ソースを表示",
+    "show_diagram": "ダイアグラムを表示",
+    "export": "エクスポート",
+    "export_png": "PNG をダウンロード",
+    "export_svg": "SVG をダウンロード",
+    "export_source": ".mmd をダウンロード"
   },
   "slash_command": {
     "no_skills_configured": "設定済みスキルなし",

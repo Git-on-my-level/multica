@@ -23,17 +23,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
-import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@multica/ui/components/ui/collapsible";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { ReactionBar } from "@multica/ui/components/common/reaction-bar";
 import { cn } from "@multica/ui/lib/utils";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { useTimeAgo } from "../../i18n";
-import { ContentEditor, type ContentEditorRef, ReadonlyContent, useFileDropZone, FileDropOverlay, Attachment as AttachmentRenderer, AttachmentDownloadProvider } from "../../editor";
+import { ContentEditor, type ContentEditorRef, ReadonlyContent, useFileDropZone, FileDropOverlay, Attachment as AttachmentRenderer, AttachmentDownloadProvider, useUploadGate, useComposerSubmit } from "../../editor";
+import { useCommentUploads } from "./use-comment-uploads";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
-import { useFileUpload } from "@multica/core/hooks/use-file-upload";
-import { api } from "@multica/core/api";
+import { api, dispatchReasonCode } from "@multica/core/api";
 import { ReplyInput } from "./reply-input";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
@@ -278,7 +277,15 @@ function TaskCommentRetryButton({
     try {
       await api.rerunIssue(issueId, taskId);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : t(($) => $.execution_log.retry_failed));
+      // Rerun re-checks the operator's invoke permission (MUL-4525); a
+      // structured 403 is a permission block, not a transient failure.
+      toast.error(
+        dispatchReasonCode(e) === "invocation_not_allowed"
+          ? t(($) => $.execution_log.retry_blocked)
+          : e instanceof Error
+            ? e.message
+            : t(($) => $.execution_log.retry_failed),
+      );
     } finally {
       setRetrying(false);
     }
@@ -315,15 +322,24 @@ function useEditAttachmentState(
   onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[]) => Promise<void>,
 ) {
   const { t } = useT("issues");
-  const { uploadWithToast } = useFileUpload(api);
+  const { t: tEditor } = useT("editor");
   const [editing, setEditing] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [initialValue, setInitialValue] = useState(entry.content ?? "");
   const editorRef = useRef<ContentEditorRef>(null);
+  // Saving mid-upload would persist the edit without the file the user just
+  // pasted in — same failure as posting a new comment.
+  const uploadGate = useUploadGate(editorRef);
   const cancelledRef = useRef(false);
-  const savingRef = useRef(false);
   const [content, setContent] = useState(entry.content ?? "");
   const [suppressedAgentIds, setSuppressedAgentIds] = useState<Set<string>>(() => new Set());
-  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  // Uploads for this edit session (MUL-5181) — coordinator-owned, persisted in
+  // the draft store keyed by the edit draft so scroll-out/close no longer drops
+  // an in-flight upload.
+  const draftKey = `edit:${issueId}:${entry.id}` as const;
+  // `gate` widens the editor gate with coordinator-owned placeholders — see
+  // CommentInput.
+  const { uploads, attachments: pendingAttachments, handleUpload, removeUpload, gate } =
+    useCommentUploads(draftKey, { issueId }, uploadGate, editorRef);
   const [retainedStandaloneIds, setRetainedStandaloneIds] = useState<Set<string> | null>(null);
   const triggerPreview = useCommentTriggerPreview({
     issueId,
@@ -336,12 +352,6 @@ function useEditAttachmentState(
     ? [...(entry.attachments ?? []), ...pendingAttachments]
     : entry.attachments;
 
-  const handleUpload = useCallback(async (file: File) => {
-    const result = await uploadWithToast(file, { issueId });
-    if (result) setPendingAttachments((prev) => [...prev, result]);
-    return result;
-  }, [uploadWithToast, issueId]);
-
   useEffect(() => {
     setSuppressedAgentIds(new Set());
   }, [issueId, entry.id, entry.parent_id]);
@@ -351,14 +361,9 @@ function useEditAttachmentState(
     enabled: editing,
   });
 
-  const draftKey = `edit:${issueId}:${entry.id}` as const;
   const getDraft = useCommentDraftStore.getState().getDraft;
   const setDraft = useCommentDraftStore((s) => s.setDraft);
   const clearDraft = useCommentDraftStore((s) => s.clearDraft);
-
-  const initialValue = editing
-    ? (getDraft(draftKey) ?? entry.content ?? "")
-    : (entry.content ?? "");
 
   useEffect(() => {
     const visible = new Set(triggerPreview.agents.map((agent) => agent.id));
@@ -385,14 +390,16 @@ function useEditAttachmentState(
     setEditing(false);
     setContent(entry.content ?? "");
     setSuppressedAgentIds(new Set());
-    setPendingAttachments([]);
     setRetainedStandaloneIds(null);
+    // clearDraft drops both the edit text and its pending attachments.
     clearDraft(draftKey);
   };
 
   const startEdit = () => {
     cancelledRef.current = false;
-    setContent(getDraft(draftKey) ?? entry.content ?? "");
+    const draft = getDraft(draftKey) ?? entry.content ?? "";
+    setInitialValue(draft);
+    setContent(draft);
     setRetainedStandaloneIds(initialStandaloneAttachmentIds(entry));
     setEditing(true);
   };
@@ -402,57 +409,97 @@ function useEditAttachmentState(
     resetState();
   };
 
-  const saveEdit = async () => {
-    if (cancelledRef.current || savingRef.current) return;
-    const trimmed = editorRef.current
-      ?.getMarkdown()
-      ?.replace(/(\n\s*)+$/, "")
-      .trim();
-    if (!trimmed) return;
-    const activeIds = collectActiveAttachmentIds(
-      trimmed,
-      [...(entry.attachments ?? []), ...pendingAttachments],
-      retainedStandaloneIds,
-    );
-    const attachmentsChanged = !sameIdSet(activeIds, (entry.attachments ?? []).map((a) => a.id));
-    if (trimmed === (entry.content ?? "").trim() && !attachmentsChanged) {
-      resetState();
-      return;
-    }
-    const suppressAgentIds = triggerPreview.agents
-      .filter((agent) => suppressedAgentIds.has(agent.id))
-      .map((agent) => agent.id);
-    savingRef.current = true;
-    setSaving(true);
-    try {
-      await onEdit(
-        entry.id,
+  // Await-then-render save (MUL-5181): shared submit contract, with the edit-
+  // only concerns folded into onSubmit — the cancel-race guard, the no-op
+  // short-circuit, and the failure toast. The hook owns the empty guard,
+  // upload re-check, single-flight, and lock/spin via `submitting`.
+  // Stale-submit guard (MUL-5181 P0) — see CommentInput. The edit hook lives
+  // in CommentRow, so "unmounted" here means the issue detail closed.
+  const editMountedRef = useRef(true);
+  useEffect(() => {
+    editMountedRef.current = true;
+    return () => {
+      editMountedRef.current = false;
+    };
+  }, []);
+  const submittedEntryRef = useRef<unknown>(null);
+
+  const { submitting: saving, submit: saveEdit } = useComposerSubmit({
+    editorRef,
+    uploadGate: gate,
+    onSubmit: async (trimmed) => {
+      // A save racing a just-pressed Cancel must never reach the server.
+      if (cancelledRef.current) return false;
+      // Flush pending debounce before snapshotting — see CommentInput.
+      const pendingMd = editorRef.current?.flushPendingUpdate?.();
+      if (pendingMd != null) setDraft(draftKey, pendingMd);
+      submittedEntryRef.current = useCommentDraftStore.getState().drafts[draftKey];
+      const activeIds = collectActiveAttachmentIds(
         trimmed,
-        activeIds,
-        suppressAgentIds.length > 0 ? suppressAgentIds : undefined,
+        [...(entry.attachments ?? []), ...pendingAttachments],
+        // Body-referenced + retained-standalone only (MUL-5181): an upload the
+        // user removed from the body is really unbound. Close-surviving
+        // uploads are written back into the body by the settle handler.
+        retainedStandaloneIds,
       );
+      const attachmentsChanged = !sameIdSet(activeIds, (entry.attachments ?? []).map((a) => a.id));
+      // Nothing changed — close the editor without a write. Accepted, so
+      // onAccepted resets the edit state.
+      if (trimmed === (entry.content ?? "").trim() && !attachmentsChanged) {
+        return true;
+      }
+      const suppressAgentIds = triggerPreview.agents
+        .filter((agent) => suppressedAgentIds.has(agent.id))
+        .map((agent) => agent.id);
+      try {
+        await onEdit(
+          entry.id,
+          trimmed,
+          activeIds,
+          suppressAgentIds.length > 0 ? suppressAgentIds : undefined,
+        );
+        return true;
+      } catch (err) {
+        toast.error(
+          err instanceof Error && err.message
+            ? err.message
+            : t(($) => $.comment.update_failed),
+        );
+        return false;
+      }
+    },
+    onAccepted: () => {
+      // Success may only consume the entry it submitted: edits made during the
+      // save survive, and the editor then STAYS in edit mode on them.
+      const lateMd = editorRef.current?.flushPendingUpdate?.();
+      if (lateMd != null) setDraft(draftKey, lateMd);
+      const store = useCommentDraftStore.getState();
+      const live = store.drafts[draftKey];
+      const untouched = live === undefined || live === submittedEntryRef.current;
+      if (!editMountedRef.current) {
+        if (untouched) store.clearDraft(draftKey);
+        return;
+      }
+      if (!untouched) return;
       resetState();
-    } catch (err) {
-      toast.error(
-        err instanceof Error && err.message
-          ? err.message
-          : t(($) => $.comment.update_failed),
-      );
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
-  };
+    },
+  });
 
   return {
     editing,
     saving,
+    uploading: gate.uploading,
+    onUploadingChange: gate.onUploadingChange,
+    uploadingLabel: tEditor(($) => $.upload.in_progress),
     editorRef,
     editorAttachments,
     handleUpload,
+    uploads,
+    removeUpload,
     isDragOver,
     dropZoneProps,
     triggerPreview,
+    content,
     suppressedAgentIds,
     toggleSuppressedAgent,
     draftKey,
@@ -522,7 +569,7 @@ function CommentRow({
         highlighted={isHighlighted}
         className="flex items-center gap-2.5 px-4 pt-1 pb-1.5"
       >
-        <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size={24} enableHoverCard showStatusDot />
+        <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size="md" enableHoverCard showStatusDot />
         <span className="cursor-pointer text-sm font-medium">
           {getActorName(entry.actor_type, entry.actor_id)}
         </span>
@@ -625,6 +672,7 @@ function CommentRow({
               }}
               onSubmit={edit.saveEdit}
               onUploadFile={edit.handleUpload}
+              onUploadingChange={edit.onUploadingChange}
               debounceMs={100}
               currentIssueId={issueId}
               attachments={edit.editorAttachments}
@@ -647,6 +695,8 @@ function CommentRow({
             <div className="min-w-0 flex-1">
               <CommentTriggerChips
                 agents={edit.triggerPreview.agents}
+                blocked={edit.triggerPreview.blocked}
+                draftContent={edit.content}
                 suppressedAgentIds={edit.suppressedAgentIds}
                 onToggle={edit.toggleSuppressedAgent}
               />
@@ -658,9 +708,16 @@ function CommentRow({
                 onSelect={(file) => edit.editorRef.current?.uploadFile(file)}
               />
               <Button size="sm" variant="ghost" onClick={edit.cancelEdit} disabled={edit.saving}>{t(($) => $.comment.cancel_edit)}</Button>
-              <Button size="sm" variant="outline" onClick={edit.saveEdit} disabled={edit.saving}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={edit.saveEdit}
+                disabled={edit.saving || edit.uploading}
+                aria-disabled={edit.uploading || undefined}
+                aria-busy={edit.uploading || undefined}
+              >
                 {edit.saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                {t(($) => $.comment.save_action)}
+                {edit.uploading ? edit.uploadingLabel : t(($) => $.comment.save_action)}
               </Button>
             </div>
           </div>
@@ -718,7 +775,10 @@ function CommentCardImpl({
   const isCollapsed = useCommentCollapseStore((s) => s.isCollapsed(issueId, entry.id));
   const toggleCollapse = useCommentCollapseStore((s) => s.toggle);
   const open = !isCollapsed;
-  const handleOpenChange = useCallback((_open: boolean) => toggleCollapse(issueId, entry.id), [toggleCollapse, issueId, entry.id]);
+  const handleToggle = useCallback(
+    () => toggleCollapse(issueId, entry.id),
+    [toggleCollapse, issueId, entry.id],
+  );
 
   const edit = useEditAttachmentState(issueId, entry, onEdit);
 
@@ -779,8 +839,7 @@ function CommentCardImpl({
           {t(($) => $.comment.resolve.collapse)}
         </button>
       )}
-      <Collapsible open={open} onOpenChange={handleOpenChange}>
-        {/* root-section — the sticky header's containing block. It wraps ONLY
+      {/* root-section — the sticky header's containing block. It wraps ONLY
             the header + root body, so the header releases the moment you scroll
             past the body into the replies (which render OUTSIDE this wrapper).
             That is what keeps exactly one header pinned at a time: without this
@@ -794,10 +853,16 @@ function CommentCardImpl({
             className="px-4 py-3"
           >
             <div className="flex items-center gap-2.5">
-              <CollapsibleTrigger className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors">
+              <button
+                type="button"
+                aria-expanded={open}
+                aria-controls={`comment-body-${entry.id}`}
+                onClick={handleToggle}
+                className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+              >
                 <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-90")} />
-              </CollapsibleTrigger>
-              <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size={24} enableHoverCard showStatusDot />
+              </button>
+              <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size="md" enableHoverCard showStatusDot />
               <span className="shrink-0 cursor-pointer text-sm font-medium">
                 {getActorName(entry.actor_type, entry.actor_id)}
               </span>
@@ -893,10 +958,11 @@ function CommentCardImpl({
             </div>
           </StickyHeaderShell>
 
-        {/* Collapsible body */}
-        <CollapsibleContent>
-          {/* Parent comment body */}
-          <div className="px-4 pt-1 pb-3">
+        {/* Root comment body. Avoid Base UI's Panel here: every mounted panel
+            probes computed styles to detect animations, forcing a style
+            recalculation across long issue-detail documents. */}
+        {open && (
+          <div id={`comment-body-${entry.id}`} className="px-4 pt-1 pb-3">
             {edit.editing ? (
               <div
                 {...edit.dropZoneProps}
@@ -915,6 +981,7 @@ function CommentCardImpl({
                     }}
                     onSubmit={edit.saveEdit}
                     onUploadFile={edit.handleUpload}
+                    onUploadingChange={edit.onUploadingChange}
                     debounceMs={100}
                     currentIssueId={issueId}
                     attachments={edit.editorAttachments}
@@ -937,6 +1004,8 @@ function CommentCardImpl({
                       )}
                     <CommentTriggerChips
                       agents={edit.triggerPreview.agents}
+                      blocked={edit.triggerPreview.blocked}
+                      draftContent={edit.content}
                       suppressedAgentIds={edit.suppressedAgentIds}
                       onToggle={edit.toggleSuppressedAgent}
                     />
@@ -948,9 +1017,16 @@ function CommentCardImpl({
                   </div>
                   <div className="flex items-center gap-2">
                     <Button size="sm" variant="ghost" onClick={edit.cancelEdit} disabled={edit.saving}>{t(($) => $.comment.cancel_edit)}</Button>
-                    <Button size="sm" variant="outline" onClick={edit.saveEdit} disabled={edit.saving}>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={edit.saveEdit}
+                      disabled={edit.saving || edit.uploading}
+                      aria-disabled={edit.uploading || undefined}
+                      aria-busy={edit.uploading || undefined}
+                    >
                       {edit.saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      {t(($) => $.comment.save_action)}
+                      {edit.uploading ? edit.uploadingLabel : t(($) => $.comment.save_action)}
                     </Button>
                   </div>
                 </div>
@@ -979,7 +1055,7 @@ function CommentCardImpl({
               </>
             )}
           </div>
-        </CollapsibleContent>
+        )}
         </div>
 
         {/* Replies + reply input — rendered OUTSIDE root-section so the root
@@ -1077,7 +1153,6 @@ function CommentCardImpl({
           )}
           </>
         )}
-      </Collapsible>
     </Card>
   );
 }

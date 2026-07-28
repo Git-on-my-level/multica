@@ -1,22 +1,36 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 
 import { setApiInstance } from "../api";
 import type { ApiClient } from "../api/client";
-import type { Issue, ListIssuesParams, ListIssuesResponse } from "../types";
+import type {
+  Issue,
+  IssueTableRowsRequest,
+  IssueTableRowsResponse,
+  ListIssuesParams,
+  ListIssuesResponse,
+  SearchIssuesResponse,
+} from "../types";
 import {
   CHILDREN_BY_PARENTS_CHUNK_SIZE,
+  ISSUE_FLAT_PAGE_SIZE,
   PROJECT_GANTT_MAX_ISSUES,
   PROJECT_GANTT_PAGE_LIMIT,
   childrenByParentsOptions,
+  childIssuesOptions,
+  compareIssuesForSort,
+  issueFlatExportOptions,
+  issueFlatListOptions,
+  issueIdentifierOptions,
   issueKeys,
+  issueTableRowPageOptions,
   projectGanttIssuesOptions,
 } from "./queries";
 
 const WS_ID = "ws-1";
 const PROJECT_ID = "project-1";
 
-function makeIssue(idx: number): Issue {
+function makeIssue(idx: number, overrides: Partial<Issue> = {}): Issue {
   return {
     id: `issue-${idx}`,
     workspace_id: WS_ID,
@@ -38,8 +52,10 @@ function makeIssue(idx: number): Issue {
     due_date: null,
     labels: [],
     metadata: {},
+  properties: {},
     created_at: "2025-01-01T00:00:00Z",
     updated_at: "2025-01-01T00:00:00Z",
+    ...overrides,
   };
 }
 
@@ -53,6 +69,244 @@ function installFakeChildrenApi(
 ) {
   setApiInstance({ listChildrenByParents } as unknown as ApiClient);
 }
+
+function installFakeChildApi(
+  listChildIssues: (parentId: string) => Promise<{ issues: Issue[] }>,
+) {
+  setApiInstance({ listChildIssues } as unknown as ApiClient);
+}
+
+function installFakeSearchApi(
+  searchIssues: (params: { q: string }) => Promise<SearchIssuesResponse>,
+) {
+  setApiInstance({ searchIssues } as unknown as ApiClient);
+}
+
+function makeSearchResult(idx: number, identifier: string) {
+  return { ...makeIssue(idx), identifier, match_source: "title" as const };
+}
+
+describe("childIssuesOptions", () => {
+  it("refetches a cached snapshot when the parent issue is opened again", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const parentId = "parent-1";
+    const oldChild = makeIssue(1, { parent_issue_id: parentId });
+    const newChild = makeIssue(2, { parent_issue_id: parentId });
+    const listChildIssues = vi.fn().mockResolvedValue({
+      issues: [oldChild, newChild],
+    });
+    installFakeChildApi(listChildIssues);
+    qc.setQueryData(issueKeys.children(WS_ID, parentId), [oldChild]);
+
+    const observer = new QueryObserver(
+      qc,
+      childIssuesOptions(WS_ID, parentId),
+    );
+    const unsubscribe = observer.subscribe(() => {});
+
+    await vi.waitFor(() => {
+      expect(listChildIssues).toHaveBeenCalledWith(parentId);
+      expect(observer.getCurrentResult().data).toEqual([oldChild, newChild]);
+    });
+
+    unsubscribe();
+    qc.clear();
+  });
+});
+
+describe("issueTableRowPageOptions", () => {
+  // Reproduces the "count correct, issue missing until page refresh" bug: a row
+  // page gets invalidated while its dynamic useQueries observer is detached, then
+  // the observer reattaches. Under the global `staleTime: Infinity` default the
+  // page is stale only because it is invalidated, so the reattaching observer
+  // MUST refetch it. `refetchOnMount: false` used to suppress that refetch and
+  // strand the row stale; `retryOnMount: false` does not.
+  const request: IssueTableRowsRequest = {
+    query: {
+      scope: { kind: "workspace" },
+      filters: {},
+      sort: { field: "position", direction: "asc" },
+    },
+    group: { kind: "status" },
+    group_key: "todo",
+    hierarchy: { enabled: false },
+    parent_id: null,
+    page: { limit: 50, cursor: null },
+  };
+
+  function makeRowsResponse(issues: Issue[]): IssueTableRowsResponse {
+    return {
+      query_fingerprint: "fp",
+      group_key: "todo",
+      parent_id: null,
+      total: issues.length,
+      rows: issues.map((issue) => ({ issue, direct_child_count: 0 })),
+      branch_total: issues.length,
+      next_cursor: null,
+    };
+  }
+
+  function rowIssueIds(response: IssueTableRowsResponse | undefined): string[] {
+    return response?.rows.map((row) => row.issue.id) ?? [];
+  }
+
+  function installFakeTableRowsApi(
+    listIssueTableRows: (
+      params: IssueTableRowsRequest,
+    ) => Promise<IssueTableRowsResponse>,
+  ) {
+    setApiInstance({ listIssueTableRows } as unknown as ApiClient);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("refetches an invalidated page when its observer reattaches", async () => {
+    // Global default: server state stays fresh until explicitly invalidated.
+    const qc = new QueryClient({
+      defaultOptions: { queries: { staleTime: Infinity } },
+    });
+    const listIssueTableRows = vi
+      .fn<
+        (params: IssueTableRowsRequest) => Promise<IssueTableRowsResponse>
+      >()
+      // Head snapshot, then the post-move snapshot that includes the new issue.
+      .mockResolvedValueOnce(makeRowsResponse([makeIssue(1)]))
+      .mockResolvedValueOnce(makeRowsResponse([makeIssue(1), makeIssue(2)]));
+    installFakeTableRowsApi(listIssueTableRows);
+
+    const options = issueTableRowPageOptions(WS_ID, request);
+
+    const observer1 = new QueryObserver(qc, options);
+    const unsubscribe1 = observer1.subscribe(() => {});
+    await vi.waitFor(() => {
+      expect(listIssueTableRows).toHaveBeenCalledTimes(1);
+      expect(rowIssueIds(observer1.getCurrentResult().data)).toEqual([
+        "issue-1",
+      ]);
+    });
+
+    // Observer detaches (sibling branch left the viewport), then the row page is
+    // invalidated while no observer is active — it only gets marked stale.
+    unsubscribe1();
+    await qc.invalidateQueries({ queryKey: options.queryKey });
+    const cached = qc.getQueryState(options.queryKey);
+    expect(cached?.isInvalidated).toBe(true);
+    expect(cached?.fetchStatus).toBe("idle");
+
+    // Observer reattaches: the invalidated page must refetch and pick up issue-2.
+    const observer2 = new QueryObserver(qc, options);
+    const unsubscribe2 = observer2.subscribe(() => {});
+    await vi.waitFor(() => {
+      expect(listIssueTableRows).toHaveBeenCalledTimes(2);
+      expect(rowIssueIds(observer2.getCurrentResult().data)).toEqual([
+        "issue-1",
+        "issue-2",
+      ]);
+    });
+
+    unsubscribe2();
+    qc.clear();
+  });
+
+  it("keeps an errored page errored on reattach (no auto-retry)", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { staleTime: Infinity } },
+    });
+    const listIssueTableRows = vi
+      .fn<
+        (params: IssueTableRowsRequest) => Promise<IssueTableRowsResponse>
+      >()
+      .mockRejectedValue(new Error("boom"));
+    installFakeTableRowsApi(listIssueTableRows);
+
+    const options = issueTableRowPageOptions(WS_ID, request);
+
+    const observer1 = new QueryObserver(qc, options);
+    const unsubscribe1 = observer1.subscribe(() => {});
+    await vi.waitFor(() => {
+      expect(observer1.getCurrentResult().status).toBe("error");
+    });
+    expect(listIssueTableRows).toHaveBeenCalledTimes(1);
+    unsubscribe1();
+
+    // Reattaching an errored page stays idle — `retryOnMount: false` blocks the
+    // automatic retry; only an explicit Retry re-runs it. The fetch decision is
+    // synchronous, so the observer never enters `fetching`.
+    const observer2 = new QueryObserver(qc, options);
+    const unsubscribe2 = observer2.subscribe(() => {});
+    expect(observer2.getCurrentResult().status).toBe("error");
+    expect(observer2.getCurrentResult().fetchStatus).toBe("idle");
+    expect(listIssueTableRows).toHaveBeenCalledTimes(1);
+
+    unsubscribe2();
+    qc.clear();
+  });
+
+  it("does not auto-retry a background-refetch error on a page that still has data", async () => {
+    // The tricky case: a page loads OK, then an invalidation-triggered background
+    // refetch fails. TanStack flags such a page `isInvalidated: true` (see its
+    // "error" reducer), so it is stale AND errored while keeping the old data. A
+    // plain `refetchOnMount: true` would re-fire the failing request on every
+    // observer reattach; `retryOnMount: false` alone does NOT cover this path
+    // because it only guards no-data first-load errors. The `refetchOnMount`
+    // status guard is what keeps the errored page stable until an explicit Retry.
+    const qc = new QueryClient({
+      defaultOptions: { queries: { staleTime: Infinity } },
+    });
+    const listIssueTableRows = vi
+      .fn<
+        (params: IssueTableRowsRequest) => Promise<IssueTableRowsResponse>
+      >()
+      .mockResolvedValueOnce(makeRowsResponse([makeIssue(1)])) // initial load
+      .mockRejectedValueOnce(new Error("refetch failed")) // background refetch
+      .mockResolvedValueOnce(makeRowsResponse([makeIssue(1), makeIssue(2)])); // explicit Retry
+    installFakeTableRowsApi(listIssueTableRows);
+
+    const options = issueTableRowPageOptions(WS_ID, request);
+
+    const observer1 = new QueryObserver(qc, options);
+    const unsubscribe1 = observer1.subscribe(() => {});
+    await vi.waitFor(() => {
+      expect(observer1.getCurrentResult().status).toBe("success");
+      expect(rowIssueIds(observer1.getCurrentResult().data)).toEqual([
+        "issue-1",
+      ]);
+    });
+
+    // Invalidate while the observer is active: the background refetch fires and
+    // fails, leaving the page errored-with-data and flagged invalidated.
+    void qc.invalidateQueries({ queryKey: options.queryKey }).catch(() => {});
+    await vi.waitFor(() => {
+      expect(observer1.getCurrentResult().status).toBe("error");
+    });
+    expect(listIssueTableRows).toHaveBeenCalledTimes(2);
+    expect(rowIssueIds(observer1.getCurrentResult().data)).toEqual(["issue-1"]);
+    expect(qc.getQueryState(options.queryKey)?.isInvalidated).toBe(true);
+
+    // Detach + reattach must NOT re-fire the failing request.
+    unsubscribe1();
+    const observer2 = new QueryObserver(qc, options);
+    const unsubscribe2 = observer2.subscribe(() => {});
+    expect(observer2.getCurrentResult().status).toBe("error");
+    expect(observer2.getCurrentResult().fetchStatus).toBe("idle");
+    expect(listIssueTableRows).toHaveBeenCalledTimes(2);
+
+    // Only an explicit Retry re-runs it — and then the fresh page renders.
+    await observer2.refetch();
+    expect(listIssueTableRows).toHaveBeenCalledTimes(3);
+    expect(rowIssueIds(observer2.getCurrentResult().data)).toEqual([
+      "issue-1",
+      "issue-2",
+    ]);
+
+    unsubscribe2();
+    qc.clear();
+  });
+});
 
 describe("projectGanttIssuesOptions", () => {
   let qc: QueryClient;
@@ -140,6 +394,237 @@ describe("projectGanttIssuesOptions", () => {
   });
 });
 
+describe("flat issue table queries", () => {
+  let qc: QueryClient;
+
+  beforeEach(() => {
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  });
+
+  afterEach(() => {
+    qc.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("loads one offset page for the interactive table window", async () => {
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockResolvedValue({ issues: [makeIssue(1)], total: 1 });
+    installFakeApi(listIssues);
+
+    const data = await qc.fetchInfiniteQuery(
+      issueFlatListOptions(
+        WS_ID,
+        "project:project-1",
+        {
+          project_id: PROJECT_ID,
+          q: "release train",
+          statuses: ["todo", "in_progress"],
+          priorities: ["high"],
+          assignee_filters: [{ type: "member", id: "member-1" }],
+          include_no_assignee: true,
+          creator_filters: [{ type: "agent", id: "agent-1" }],
+          project_ids: ["project-2"],
+          include_no_project: true,
+          label_ids: ["label-1"],
+          top_level_only: true,
+        },
+        undefined,
+        { sort_by: "updated_at", sort_direction: "desc" },
+      ),
+    );
+
+    expect(data.pages).toHaveLength(1);
+    expect(data.pages[0]?.issues.map((issue) => issue.id)).toEqual([
+      "issue-1",
+    ]);
+    expect(listIssues).toHaveBeenCalledWith({
+      project_id: PROJECT_ID,
+      q: "release train",
+      statuses: ["todo", "in_progress"],
+      priorities: ["high"],
+      assignee_filters: [{ type: "member", id: "member-1" }],
+      include_no_assignee: true,
+      creator_filters: [{ type: "agent", id: "agent-1" }],
+      project_ids: ["project-2"],
+      include_no_project: true,
+      label_ids: ["label-1"],
+      top_level_only: true,
+      sort_by: "updated_at",
+      sort_direction: "desc",
+      limit: ISSUE_FLAT_PAGE_SIZE,
+      offset: 0,
+    });
+  });
+
+  it("walks every page only for an explicit full CSV export", async () => {
+    const first = Array.from({ length: ISSUE_FLAT_PAGE_SIZE }, (_, index) =>
+      makeIssue(index + 1),
+    );
+    const second = [makeIssue(101), makeIssue(102), makeIssue(103)];
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockImplementation(async (params) => ({
+        issues: (params?.offset ?? 0) === 0 ? first : second,
+        total: 103,
+      }));
+    installFakeApi(listIssues);
+
+    const issues = await qc.fetchQuery(
+      issueFlatExportOptions(
+        WS_ID,
+        "project:project-1",
+        { project_id: PROJECT_ID },
+        undefined,
+        { sort_by: "status", sort_direction: "asc" },
+      ),
+    );
+
+    expect(issues).toHaveLength(103);
+    expect(listIssues).toHaveBeenCalledTimes(2);
+    expect(listIssues.mock.calls.map(([params]) => params?.offset)).toEqual([
+      0,
+      ISSUE_FLAT_PAGE_SIZE,
+    ]);
+  });
+
+  it("does not silently truncate exports above ten thousand issues", async () => {
+    const total = 10_001;
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockImplementation(async (params) => {
+        const offset = params?.offset ?? 0;
+        const count = Math.min(ISSUE_FLAT_PAGE_SIZE, total - offset);
+        return {
+          issues: Array.from({ length: count }, (_, index) =>
+            makeIssue(offset + index + 1),
+          ),
+          total,
+        };
+      });
+    installFakeApi(listIssues);
+
+    const issues = await qc.fetchQuery(
+      issueFlatExportOptions(WS_ID, "workspace:all", {}, undefined),
+    );
+
+    expect(issues).toHaveLength(total);
+    expect(listIssues).toHaveBeenCalledTimes(101);
+    expect(listIssues.mock.calls.at(-1)?.[0]?.offset).toBe(10_000);
+  });
+
+  it("keeps paging when the server returns fewer rows than requested", async () => {
+    const total = 101;
+    const serverPageSize = 40;
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockImplementation(async (params) => {
+        const offset = params?.offset ?? 0;
+        const count = Math.min(serverPageSize, total - offset);
+        return {
+          issues: Array.from({ length: count }, (_, index) =>
+            makeIssue(offset + index + 1),
+          ),
+          total,
+        };
+      });
+    installFakeApi(listIssues);
+
+    const issues = await qc.fetchQuery(
+      issueFlatExportOptions(WS_ID, "workspace:all", {}, undefined),
+    );
+
+    expect(issues).toHaveLength(total);
+    expect(listIssues.mock.calls.map(([params]) => params?.offset)).toEqual([
+      0, 40, 80,
+    ]);
+  });
+
+  it("fails explicitly if the export endpoint stops advancing offsets", async () => {
+    const page = Array.from({ length: ISSUE_FLAT_PAGE_SIZE }, (_, index) =>
+      makeIssue(index + 1),
+    );
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockResolvedValue({ issues: page, total: ISSUE_FLAT_PAGE_SIZE * 2 });
+    installFakeApi(listIssues);
+
+    await expect(
+      qc.fetchQuery(
+        issueFlatExportOptions(WS_ID, "workspace:all", {}, undefined),
+      ),
+    ).rejects.toThrow("Issue export pagination did not advance");
+    expect(listIssues).toHaveBeenCalledTimes(2);
+  });
+
+  it("deduplicates the three My Issues relations and restores global sort order", async () => {
+    const shared = makeIssue(1, { status: "done" });
+    const backlog = makeIssue(2, { status: "backlog" });
+    const todo = makeIssue(3, { status: "todo" });
+    const listIssues = vi
+      .fn<(params?: ListIssuesParams) => Promise<ListIssuesResponse>>()
+      .mockImplementation(async (params) => {
+        if (params?.assignee_id) {
+          return { issues: [shared], total: 1 };
+        }
+        if (params?.creator_id) {
+          return { issues: [backlog, shared], total: 2 };
+        }
+        return { issues: [todo], total: 1 };
+      });
+    installFakeApi(listIssues);
+
+    const issues = await qc.fetchQuery(
+      issueFlatExportOptions(
+        WS_ID,
+        "all",
+        {},
+        "user-1",
+        { sort_by: "status", sort_direction: "asc" },
+      ),
+    );
+
+    expect(issues.map((issue) => issue.id)).toEqual([
+      backlog.id,
+      todo.id,
+      shared.id,
+    ]);
+    expect(listIssues).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("compareIssuesForSort tie-break", () => {
+  it("orders equal sort values by created_at DESC then id DESC (server ORDER BY parity)", () => {
+    // Same status AND same created_at — only the id disambiguates. Without a
+    // unique final key the relative order would depend on input order, which
+    // is exactly the instability that duplicates/drops rows at page
+    // boundaries server-side.
+    const first = makeIssue(1, { created_at: "2025-01-01T00:00:00Z" });
+    const second = makeIssue(2, { created_at: "2025-01-01T00:00:00Z" });
+    const sort = { sort_by: "status", sort_direction: "asc" } as const;
+
+    expect(
+      [first, second].sort((a, b) => compareIssuesForSort(a, b, sort)).map((i) => i.id),
+    ).toEqual(["issue-2", "issue-1"]);
+    expect(
+      [second, first].sort((a, b) => compareIssuesForSort(a, b, sort)).map((i) => i.id),
+    ).toEqual(["issue-2", "issue-1"]);
+  });
+
+  it("applies the id tie-break to created_at sorts as well", () => {
+    const first = makeIssue(1, { created_at: "2025-01-01T00:00:00Z" });
+    const second = makeIssue(2, { created_at: "2025-01-01T00:00:00Z" });
+    const sort = { sort_by: "created_at", sort_direction: "desc" } as const;
+
+    expect(
+      [first, second].sort((a, b) => compareIssuesForSort(a, b, sort)).map((i) => i.id),
+    ).toEqual(["issue-2", "issue-1"]);
+    expect(
+      [second, first].sort((a, b) => compareIssuesForSort(a, b, sort)).map((i) => i.id),
+    ).toEqual(["issue-2", "issue-1"]);
+  });
+});
+
 describe("childrenByParentsOptions chunking", () => {
   let qc: QueryClient;
 
@@ -212,5 +697,70 @@ describe("childrenByParentsOptions chunking", () => {
 
     expect(grouped.get("p-0")).toHaveLength(1);
     expect(grouped.get(lastId)).toHaveLength(1);
+  });
+});
+
+describe("issueIdentifierOptions", () => {
+  let qc: QueryClient;
+
+  beforeEach(() => {
+    qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  });
+
+  afterEach(() => {
+    qc.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("returns the issue whose identifier exactly matches the query", async () => {
+    const searchIssues = vi
+      .fn<(params: { q: string }) => Promise<SearchIssuesResponse>>()
+      .mockResolvedValue({
+        issues: [makeSearchResult(7, "MUL-7")],
+        total: 1,
+      });
+    installFakeSearchApi(searchIssues);
+
+    const data = await qc.fetchQuery(issueIdentifierOptions(WS_ID, "MUL-7"));
+
+    expect(data?.id).toBe("issue-7");
+    expect(searchIssues).toHaveBeenCalledWith(
+      expect.objectContaining({ q: "MUL-7" }),
+    );
+  });
+
+  it("returns null when no result's identifier matches (wrong prefix / number-only hit)", async () => {
+    // Backend number-match returns MUL-7 for a TES-7 query; exact filter rejects it.
+    const searchIssues = vi
+      .fn<(params: { q: string }) => Promise<SearchIssuesResponse>>()
+      .mockResolvedValue({
+        issues: [makeSearchResult(7, "MUL-7")],
+        total: 1,
+      });
+    installFakeSearchApi(searchIssues);
+
+    const data = await qc.fetchQuery(issueIdentifierOptions(WS_ID, "TES-7"));
+
+    expect(data).toBeNull();
+  });
+
+  it("returns null on an empty (or malformed→empty) search response", async () => {
+    const searchIssues = vi
+      .fn<(params: { q: string }) => Promise<SearchIssuesResponse>>()
+      .mockResolvedValue({ issues: [], total: 0 });
+    installFakeSearchApi(searchIssues);
+
+    const data = await qc.fetchQuery(issueIdentifierOptions(WS_ID, "MUL-999"));
+
+    expect(data).toBeNull();
+  });
+
+  it("keys the query by workspace and identifier", () => {
+    expect(issueKeys.identifier(WS_ID, "MUL-7")).toEqual([
+      "issues",
+      WS_ID,
+      "identifier",
+      "MUL-7",
+    ]);
   });
 });

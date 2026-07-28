@@ -16,6 +16,25 @@ import (
 // startup rather than per-call matters.
 var providerHTTP5xxRe = regexp.MustCompile(`(^|[^0-9])5[0-9][0-9]([^0-9]|$)`)
 
+// httpAuthCodeRe / httpQuotaCodeRe / httpCapacityCodeRe match specific 3-digit
+// HTTP status codes only when they are NOT embedded in a longer number, using
+// the same digit-boundary guard as providerHTTP5xxRe. Without this guard the
+// bare substrings "401"/"402"/"403"/"429"/"529" fire on unrelated numbers —
+// e.g. "402913 tokens", "15290ms", "exit status 4030" — misclassifying process
+// or unknown failures as provider billing / rate-limit errors. That pollutes
+// failure observability: a genuine process crash gets filed under a provider
+// bucket, masking the real cause on failure dashboards. (A misfire here still
+// can't cause a spurious retry: the auth / quota / capacity buckets these
+// regexes guard are all non-retryable. The only agent_error.* reason on
+// internal/service/task.go's retryableReasons allowlist is provider_network
+// — MUL-4910 — and these regexes never route into it.) The 5xx bucket was
+// already anchored for exactly this reason (MUL-1949); these codes were not.
+var (
+	httpAuthCodeRe     = regexp.MustCompile(`(^|[^0-9])(401|403)([^0-9]|$)`)
+	httpQuotaCodeRe    = regexp.MustCompile(`(^|[^0-9])402([^0-9]|$)`)
+	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9])(429|529)([^0-9]|$)`)
+)
+
 // Classify maps a free-form error string from the agent runtime / CLI
 // to one of the 14 agent_error.* sub-reasons. Always returns a valid
 // Reason; falls back to ReasonAgentUnknown when no rule matches and for
@@ -44,7 +63,7 @@ func Classify(rawError string) Reason {
 	trimmed := strings.TrimSpace(rawError)
 	if trimmed == "" {
 		// SQL maps NULL/empty to a separate bucket ("empty_error"),
-		// but that bucket is not part of the canonical 21. In-flight
+		// but that bucket is not part of the canonical 22. In-flight
 		// callers should never hand us empty input — if they do, the
 		// safest landing is the catchall.
 		return ReasonAgentUnknown
@@ -82,50 +101,49 @@ func Classify(rawError string) Reason {
 		return ReasonAgentMissingConfig
 
 	// 3. Auth / access. 401 / 403 / "Not logged in" / invalid token
-	//    / lacks access to the model.
-	case containsAny(lower,
-		"401",
-		"403",
-		"unauthorized",
-		"login required",
-		"not logged in",
-		"please login again",
-		"refresh token",
-		"invalid api key",
-		"access token",
-		"subscription access",
-		"does not have access",
-		"you may not have access",
-	):
+	//    / lacks access to the model. Status codes use a digit boundary
+	//    so "4030" / "1401ms" don't spuriously land here.
+	case httpAuthCodeRe.MatchString(lower),
+		containsAny(lower,
+			"unauthorized",
+			"login required",
+			"not logged in",
+			"please login again",
+			"refresh token",
+			"invalid api key",
+			"access token",
+			"subscription access",
+			"does not have access",
+			"you may not have access",
+		):
 		return ReasonAgentProviderAuthOrAccess
 
 	// 4. Quota / billing. 402 / insufficient balance / monthly usage
 	//    limit / credits exhausted.
-	case containsAny(lower,
-		"402",
-		"insufficient_balance",
-		"balance is too low",
-		"monthly usage limit",
-		"usage limit",
-		"you've hit your limit",
-		// Curly apostrophe variant: providers and copy-pasted error
-		// strings sometimes use U+2019 instead of ASCII '. SQL ILIKE
-		// would not match the curly form either, so this is a small
-		// in-flight improvement on top of the SQL classifier.
-		"you\u2019ve hit your limit",
-		"credits",
-		"quota",
-	):
+	case httpQuotaCodeRe.MatchString(lower),
+		containsAny(lower,
+			"insufficient_balance",
+			"balance is too low",
+			"monthly usage limit",
+			"usage limit",
+			"you've hit your limit",
+			// Curly apostrophe variant: providers and copy-pasted error
+			// strings sometimes use U+2019 instead of ASCII '. SQL ILIKE
+			// would not match the curly form either, so this is a small
+			// in-flight improvement on top of the SQL classifier.
+			"you\u2019ve hit your limit",
+			"credits",
+			"quota",
+		):
 		return ReasonAgentProviderQuotaLimit
 
 	// 5. Capacity / rate limit. 429 / 529 / overloaded / rate limit.
-	case containsAny(lower,
-		"429",
-		"rate limit",
-		"overloaded",
-		"529",
-		"no capacity available",
-	):
+	case httpCapacityCodeRe.MatchString(lower),
+		containsAny(lower,
+			"rate limit",
+			"overloaded",
+			"no capacity available",
+		):
 		return ReasonAgentProviderCapacityOrRateLimit
 
 	// 6. Provider 5xx / server error. The 5xx regex is checked here
@@ -142,9 +160,28 @@ func Classify(rawError string) Reason {
 		return ReasonAgentProviderServerError
 
 	// 7. Provider network. Stream cut, dial failures, DNS / I/O
-	//    timeout below the HTTP layer.
+	//    timeout below the HTTP layer. "connection closed" / "mid-response"
+	//    catch the Claude Code CLI's mid-stream disconnect
+	//    ("API Error: Connection closed mid-response. ...") so a transient cut
+	//    lands in the retryable provider_network bucket (with session resume)
+	//    instead of falling through to agent_error.unknown / process_failure
+	//    and terminating the task (MUL-4910). Checked before rule 13 so the
+	//    "... exited with error: exit status N ..." variant still routes here.
+	//
+	//    "deadline exceeded" covers every Go-side context deadline that
+	//    reaches the classifier as text — `context deadline exceeded` from a
+	//    cancelled request, and net/http's `Client.Timeout exceeded while
+	//    awaiting headers` variant. Before MUL-5370 these all landed in
+	//    agent_error.unknown, which is not on the retry allowlist, so a
+	//    transient stall became a terminal failure with no usable label.
+	//    Note this only catches deadlines that arrive as a bare string;
+	//    callers holding the error value should classify structurally
+	//    instead (see taskRunFailureReason in daemon/daemon.go).
+	//    Mirror these substrings into the MUL-1949 offline backfill SQL.
 	case containsAny(lower,
 		"stream disconnected",
+		"connection closed",
+		"mid-response",
 		"error sending request",
 		"unable to connect",
 		"dial tcp",
@@ -152,6 +189,8 @@ func Classify(rawError string) Reason {
 		"connectionrefused",
 		"dns",
 		"i/o timeout",
+		"deadline exceeded",
+		"timeout exceeded while awaiting",
 	):
 		return ReasonAgentProviderNetwork
 
@@ -213,6 +252,47 @@ func Classify(rawError string) Reason {
 	}
 
 	return ReasonAgentUnknown
+}
+
+// legacySkillBundlePrefix is the exact wrapper a pre-MUL-5370 daemon put on a
+// failed skill-bundle download. It is an unambiguous witness: no other code
+// path ever produced it, and a current daemon writes "skill bundle
+// unavailable: ..." instead.
+const legacySkillBundlePrefix = "resolve skill bundles:"
+
+// legacySkillBundleReasons are the buckets an older daemon's own classifier
+// could land that failure in. All three mean "we only knew it was some
+// transport fault": agent_error.unknown from a daemon predating the deadline
+// rule, agent_error.provider_network from one that has it, and the
+// pre-MUL-1949 coarse agent_error. None of them carries information that
+// upgrading would discard.
+var legacySkillBundleReasons = map[string]bool{
+	string(ReasonAgentUnknown):         true,
+	string(ReasonAgentProviderNetwork): true,
+	"agent_error":                      true,
+}
+
+// NormalizeDaemonReason upgrades a failure_reason reported by an older daemon
+// onto the taxonomy this server understands, using the raw error text as the
+// witness. It returns the reason unchanged when nothing applies.
+//
+// Why this exists (MUL-5370): installed daemons upgrade on their own cadence,
+// so a fix that only labels a failure correctly on the daemon side reaches
+// nobody until every host updates. The daemon reports a non-empty reason, so
+// FailTask's "classify when empty" guard does not fire, and the server would
+// persist the stale label — no auto-retry, and the chat bubble falls back to
+// generic copy. Recognising the wire shape an old daemon produces closes that
+// gap the moment the server deploys.
+//
+// This is a boundary compatibility shim, not internal fallback logic: it can
+// be deleted once no daemon old enough to emit legacySkillBundlePrefix is
+// still reporting.
+func NormalizeDaemonReason(reason, rawError string) Reason {
+	if legacySkillBundleReasons[reason] &&
+		strings.HasPrefix(strings.TrimSpace(rawError), legacySkillBundlePrefix) {
+		return ReasonSkillBundleUnavailable
+	}
+	return Reason(reason)
 }
 
 // containsAny reports whether s contains any of the supplied substrings.

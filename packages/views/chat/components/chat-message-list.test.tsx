@@ -1,10 +1,45 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@multica/core/i18n/react";
 import { chatKeys } from "@multica/core/chat/queries";
 import type { TaskMessagePayload } from "@multica/core/types";
+import type { ReactElement } from "react";
 import enChat from "../../locales/en/chat.json";
+
+// The live timeline is a real list row rather than Virtuoso chrome (MUL-4922),
+// so it shares one identity with the persisted assistant row and keeps its
+// Mermaid/HTML blocks mounted across task completion. Real react-virtuoso
+// renders its Footer but NO data rows under jsdom's zero-height viewport, so
+// these tests must stub it to see rows at all. computeItemKey is still applied
+// here — it is what expresses the live -> persisted identity.
+vi.mock("react-virtuoso", () => ({
+  Virtuoso: ({
+    data,
+    itemContent,
+    computeItemKey,
+    components,
+    context,
+  }: {
+    data: unknown[];
+    itemContent: (i: number, item: unknown) => ReactElement;
+    computeItemKey: (i: number, item: unknown) => string;
+    components?: { Footer?: (p: { context?: unknown }) => ReactElement | null };
+    context?: unknown;
+  }) => {
+    const Footer = components?.Footer;
+    return (
+      <div>
+        {data.map((item, i) => (
+          <div key={computeItemKey(i, item)} data-row-key={computeItemKey(i, item)}>
+            {itemContent(i, item)}
+          </div>
+        ))}
+        {Footer ? <Footer context={context} /> : null}
+      </div>
+    );
+  },
+}));
 
 import { ChatMessageList } from "./chat-message-list";
 
@@ -97,5 +132,104 @@ describe("ChatMessageList live timeline (MUL-3960 regression)", () => {
     // the fold sprang back open on every streamed message.
     await screen.findByText("3 steps");
     expect(screen.queryByText("Bash")).not.toBeInTheDocument();
+  });
+
+  it("applies an embedded surface content transform to streamed text", async () => {
+    const qc = new QueryClient();
+    qc.setQueryData(chatKeys.taskMessages(TASK_ID), [
+      taskMsg(0, "text", {
+        content:
+          "Draft ready.\n<agent_draft>{\"name\":\"Hidden protocol\"}</agent_draft>",
+      }),
+    ]);
+
+    render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={qc}>
+          <ChatMessageList
+            messages={[]}
+            pendingTask={{ task_id: TASK_ID, status: "running" }}
+            availability="online"
+            transformContent={(content) =>
+              content.replace(
+                /<agent_draft>[\s\S]*?<\/agent_draft>/g,
+                "",
+              )
+            }
+          />
+        </QueryClientProvider>
+      </I18nProvider>,
+    );
+
+    expect(await screen.findByText("Draft ready.")).toBeInTheDocument();
+    expect(screen.queryByText(/Hidden protocol/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatMessageList failure copy (MUL-5370 regression)", () => {
+  // The backend moved to the refined taxonomy (agent_error.*) in MUL-2946 but
+  // the copy map stayed on the six coarse values, so an exact-key lookup
+  // missed every refined reason and fell through to the generic fallback.
+  // A user whose skill bundle download stalled was told only "Something went
+  // wrong", and the maintainer debugging it had nothing better to go on.
+  function renderFailure(reason: string) {
+    return render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={new QueryClient()}>
+          <ChatMessageList
+            messages={[
+              {
+                id: "m1",
+                chat_session_id: "s1",
+                role: "assistant",
+                content: "skill bundle unavailable: skill \"x\"",
+                task_id: null,
+                created_at: new Date(0).toISOString(),
+                failure_reason: reason,
+              },
+            ]}
+            pendingTask={undefined}
+            availability="online"
+          />
+        </QueryClientProvider>
+      </I18nProvider>,
+    );
+  }
+
+  const FALLBACK = enChat.message_list.failure.fallback;
+
+  it("renders dedicated copy for a stalled skill bundle download", async () => {
+    renderFailure("skill_bundle_unavailable");
+    expect(
+      await screen.findByText(enChat.message_list.failure.skill_bundle_unavailable),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(FALLBACK)).not.toBeInTheDocument();
+  });
+
+  it("renders dedicated copy for a refined reason the map names", async () => {
+    renderFailure("agent_error.provider_network");
+    expect(
+      await screen.findByText(enChat.message_list.failure.provider_network),
+    ).toBeInTheDocument();
+  });
+
+  it("degrades an unnamed refined reason to its agent_error family", async () => {
+    renderFailure("agent_error.unknown");
+    expect(
+      await screen.findByText(enChat.message_list.failure.agent_error),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(FALLBACK)).not.toBeInTheDocument();
+  });
+
+  it("degrades a reason newer than this build to its agent_error family", async () => {
+    renderFailure("agent_error.some_future_bucket");
+    expect(
+      await screen.findByText(enChat.message_list.failure.agent_error),
+    ).toBeInTheDocument();
+  });
+
+  it("still falls back when neither the reason nor its family is known", async () => {
+    renderFailure("something_entirely_new");
+    expect(await screen.findByText(FALLBACK)).toBeInTheDocument();
   });
 });

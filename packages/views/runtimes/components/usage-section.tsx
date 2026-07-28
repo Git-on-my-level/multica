@@ -5,6 +5,11 @@ import { BarChart3, ChevronRight, AlertCircle } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Button } from "@multica/ui/components/ui/button";
+import { cn } from "@multica/ui/lib/utils";
+import {
+  CompactNumberFlow,
+  CurrencyNumberFlow,
+} from "@multica/ui/components/ui/number-flow";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { agentListOptions } from "@multica/core/workspace/queries";
 import type { RuntimeUsage, AgentRuntime } from "@multica/core/types";
@@ -128,7 +133,7 @@ function fmtMoney(n: number): string {
 // ---------------------------------------------------------------------------
 
 export function UsageSection({ runtime }: { runtime: AgentRuntime }) {
-  const { t } = useT("runtimes");
+  const { t, i18n } = useT("runtimes");
   const runtimeId = runtime.id;
   // Reports render in the viewer's timezone — the backend slices the UTC
   // hourly rollup on the same `tz` we pass here, so every frontend window
@@ -175,6 +180,7 @@ export function UsageSection({ runtime }: { runtime: AgentRuntime }) {
     cacheableTokens > 0 ? Math.round((totals.cacheRead / cacheableTokens) * 100) : 0;
 
   const costDelta = pctChange(totals.cost, prevTotals.cost);
+  const locales = i18n.resolvedLanguage ?? i18n.language;
 
   return (
     <div className="space-y-5">
@@ -214,17 +220,24 @@ export function UsageSection({ runtime }: { runtime: AgentRuntime }) {
         </div>
       </div>
 
-      {/* Pricing-gap banner. Sits above the KPI grid so a *partial* unmapping
+      {/* Pricing bar. Sits above the KPI grid so a *partial* unmapping
           (some priced + some unpriced models in the same window) still has
           a visible entry point into the manual-pricing dialog — otherwise
           the chart would render normally and the unmapped tokens would silently
-          contribute $0 to totals. */}
-      <UnmappedPricingNotice usage={filtered} />
+          contribute $0 to totals. Stays reachable once every model is priced
+          if the user has saved overrides, so those rates remain editable. */}
+      <CustomPricingBar usage={filtered} />
 
       <div className="grid grid-cols-3 divide-x rounded-lg border bg-card">
         <KpiCard
           label={t(($) => $.usage.kpi_cost_label, { days })}
-          value={fmtMoney(totals.cost)}
+          value={
+            <CurrencyNumberFlow
+              value={totals.cost}
+              locales={locales}
+              aria-label={fmtMoney(totals.cost)}
+            />
+          }
           hint={
             costDelta == null ? undefined : (
               <span
@@ -246,7 +259,13 @@ export function UsageSection({ runtime }: { runtime: AgentRuntime }) {
         />
         <KpiCard
           label={t(($) => $.usage.kpi_cache_label, { days })}
-          value={fmtMoney(totals.cacheSavings)}
+          value={
+            <CurrencyNumberFlow
+              value={totals.cacheSavings}
+              locales={locales}
+              aria-label={fmtMoney(totals.cacheSavings)}
+            />
+          }
           accent={totals.cacheSavings > 0 ? "success" : "default"}
           hint={
             <span>
@@ -259,7 +278,13 @@ export function UsageSection({ runtime }: { runtime: AgentRuntime }) {
         />
         <KpiCard
           label={t(($) => $.usage.kpi_tokens_label, { days })}
-          value={formatTokens(tokensTotal)}
+          value={
+            <CompactNumberFlow
+              value={tokensTotal}
+              locales={locales}
+              aria-label={formatTokens(tokensTotal)}
+            />
+          }
           hint={
             <span>
               {t(($) => $.usage.kpi_tokens_hint, {
@@ -516,39 +541,66 @@ function EmptyChartState({ usage }: { usage: RuntimeUsage[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// UnmappedPricingNotice — always-visible banner shown above the KPI grid
-// whenever the selected window contains any model that isn't priced. Covers
-// the partial-unmapping case where the chart still renders (so EmptyChartState
-// never fires) but some tokens are silently contributing $0 to totals.
+// CustomPricingBar — the only entry point into the custom-pricing dialog,
+// rendered above the KPI grid. Two states:
+//
+//   1. The window contains unpriced models → warning banner. Covers the
+//      partial-unmapping case where the chart still renders (so
+//      EmptyChartState never fires) but some tokens silently contribute $0.
+//   2. Everything resolves, but the user has saved overrides → a quiet row
+//      that still offers the dialog. Gating the whole bar on "something is
+//      unmapped" used to hide it the moment the last override was saved:
+//      the override made the model resolve, the banner disappeared, and the
+//      saved rates could no longer be corrected or removed from the UI.
+//
+// Hidden entirely when nothing is unmapped and nothing is overridden.
 // ---------------------------------------------------------------------------
 
-function UnmappedPricingNotice({ usage }: { usage: RuntimeUsage[] }) {
+function CustomPricingBar({ usage }: { usage: RuntimeUsage[] }) {
   const { t } = useT("runtimes");
   const [dialogOpen, setDialogOpen] = useState(false);
+  // Boolean (not the object) so the selector stays referentially stable.
+  const hasOverrides = useCustomPricingStore(
+    (s) => Object.keys(s.pricings).length > 0,
+  );
   const unmapped = collectUnmappedModels(usage);
-  if (unmapped.length === 0) return null;
+  if (unmapped.length === 0 && !hasOverrides) return null;
 
+  const hasGap = unmapped.length > 0;
   return (
     <div
-      role="alert"
-      className="flex flex-wrap items-center gap-3 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs"
+      role={hasGap ? "alert" : undefined}
+      className={cn(
+        "flex flex-wrap items-center gap-3 rounded-lg border px-3 py-2 text-xs",
+        hasGap ? "border-warning/30 bg-warning/10" : "bg-muted/20",
+      )}
     >
-      <AlertCircle className="h-4 w-4 shrink-0 text-warning" />
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <p className="text-foreground">
-          {t(($) => $.usage.unmapped_notice, { count: unmapped.length })}
+      {hasGap ? (
+        <>
+          <AlertCircle className="h-4 w-4 shrink-0 text-warning" />
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <p className="text-foreground">
+              {t(($) => $.usage.unmapped_notice, { count: unmapped.length })}
+            </p>
+            <p className="truncate font-mono text-[11px] text-muted-foreground">
+              {unmapped.join(", ")}
+            </p>
+          </div>
+        </>
+      ) : (
+        <p className="min-w-0 flex-1 text-muted-foreground">
+          {t(($) => $.usage.custom_pricing.active_notice)}
         </p>
-        <p className="truncate font-mono text-[11px] text-muted-foreground">
-          {unmapped.join(", ")}
-        </p>
-      </div>
+      )}
       <Button
         type="button"
         variant="outline"
         size="sm"
         onClick={() => setDialogOpen(true)}
       >
-        {t(($) => $.usage.custom_pricing.open_button)}
+        {hasGap
+          ? t(($) => $.usage.custom_pricing.open_button)
+          : t(($) => $.usage.custom_pricing.edit_button)}
       </Button>
       <CustomPricingDialog
         open={dialogOpen}
@@ -667,7 +719,7 @@ function CostByBlock({
               const agent = agents.find((a) => a.id === key);
               return (
                 <div className="flex min-w-0 items-center gap-2">
-                  <ActorAvatar actorType="agent" actorId={key} size={22} enableHoverCard />
+                  <ActorAvatar actorType="agent" actorId={key} size="md" enableHoverCard />
                   <span className="cursor-pointer truncate text-sm font-medium">
                     {agent?.name ?? key}
                   </span>
@@ -870,4 +922,3 @@ function computeTotals(rows: RuntimeUsage[]): UsageTotals {
     { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheSavings: 0 },
   );
 }
-

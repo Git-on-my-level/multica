@@ -104,13 +104,34 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 
-	var outputMu sync.Mutex
-	var output strings.Builder
+	// Kiro streams interim narration and the final answer as the same
+	// AgentMessageChunk type; the tracker keeps only the post-tool-call block
+	// for Result.Output while retaining the full text for error detection.
+	var deliverable acpDeliverableTracker
 	var streamingCurrentTurn atomic.Bool
-	var sawCompletedGoalComplete atomic.Bool
-	var sawCompletedIssueComment atomic.Bool
+	// Completion-preservation state for the -32603 close-handshake guard.
+	//
+	// Kiro raises `session/prompt -32603 "failed to generate a response"`
+	// when the model fails to produce its closing turn AFTER the task has
+	// already done its work. We keep such a run "completed" only when we
+	// have POSITIVE proof the finishing step succeeded — never from the mere
+	// absence of a result. A mid-command crash or internal session failure
+	// produces the very same "tool use, no result, -32603" shape, and
+	// treating that as success would mark a genuinely-unfinished task
+	// completed (see the review on #5511 / MUL-4860).
+	//
+	// The only positive proof available at this layer is a terminal
+	// ToolResult with status=="completed" for a finishing tool
+	// (goal_complete or `multica issue comment add`). We record the status
+	// of the MOST RECENT such result (ordered, keyed per CallID) so a later
+	// failed delivery correctly overrides an earlier success — e.g.
+	// "progress comment completed → final comment failed → -32603" must stay
+	// failed, while "first attempt failed → retry completed → -32603" is a
+	// real completion.
 	var goalCompleteCallIDs sync.Map
 	var issueCommentCallIDs sync.Map
+	var finishingMu sync.Mutex
+	var lastFinishingResultStatus string // "", "completed", or "failed"
 
 	promptDone := make(chan hermesPromptResult, 1)
 
@@ -131,23 +152,31 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				if msg.Tool == "goal_complete" && msg.CallID != "" {
 					goalCompleteCallIDs.Store(msg.CallID, struct{}{})
 				}
+				// Recognize `multica issue comment add` by its command
+				// payload regardless of how the adapter titled the tool.
+				// GPT-5.6 Sol may label the shell tool something other than
+				// the aliases kiroToolNameFromTitle folds into "terminal"
+				// (e.g. "execute"/"run"), so gating on msg.Tool=="terminal"
+				// here would miss it entirely (issue #5509). We still require
+				// a CallID so the tool use can be correlated to its result.
 				if msg.CallID != "" && isKiroIssueCommentAddTool(msg) {
 					issueCommentCallIDs.Store(msg.CallID, struct{}{})
 				}
 			}
 			if msg.Type == MessageToolResult {
-				if _, ok := goalCompleteCallIDs.LoadAndDelete(msg.CallID); ok {
-					sawCompletedGoalComplete.Store(msg.Status == "completed")
-				}
-				if _, ok := issueCommentCallIDs.LoadAndDelete(msg.CallID); ok {
-					sawCompletedIssueComment.Store(msg.Status == "completed")
+				_, isGoal := goalCompleteCallIDs.LoadAndDelete(msg.CallID)
+				_, isComment := issueCommentCallIDs.LoadAndDelete(msg.CallID)
+				if isGoal || isComment {
+					// Record this finishing tool's terminal outcome. The
+					// most recent result wins, so the guard sees the final
+					// delivery attempt's status and a later failure
+					// overrides an earlier success.
+					finishingMu.Lock()
+					lastFinishingResultStatus = msg.Status
+					finishingMu.Unlock()
 				}
 			}
-			if msg.Type == MessageText {
-				outputMu.Lock()
-				output.WriteString(msg.Content)
-				outputMu.Unlock()
-			}
+			deliverable.observe(msg)
 			trySend(msgCh, msg)
 		},
 		onPromptDone: func(result hermesPromptResult) {
@@ -189,6 +218,10 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		finalStatus := "completed"
 		var finalError string
 		var sessionID string
+		// Set when the ACP runtime refuses the session we asked to
+		// resume. Only that is curable by starting a fresh session, so
+		// handshake/network failures below must leave it false.
+		var resumeRejected bool
 		effectiveModel := strings.TrimSpace(opts.Model)
 
 		initResult, err := c.request(runCtx, "initialize", map[string]any{
@@ -293,12 +326,14 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
 				}
 				resCh <- Result{
-					Status:     finalStatus,
-					Error:      finalError,
-					DurationMs: time.Since(startTime).Milliseconds(),
-					SessionID:  sessionID,
+					Status:         finalStatus,
+					Error:          finalError,
+					DurationMs:     time.Since(startTime).Milliseconds(),
+					SessionID:      sessionID,
+					ResumeRejected: resumeRejected,
 				}
 				return
 			}
@@ -333,8 +368,18 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			} else {
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("kiro session/prompt failed: %v", err)
-				if (sawCompletedGoalComplete.Load() || sawCompletedIssueComment.Load()) && isKiroGoalCompleteCloseError(err) {
-					b.cfg.Logger.Warn("kiro session/prompt failed after completed task result; preserving completed task status", "error", err)
+				// Preserve completion only on POSITIVE proof: the most
+				// recent finishing-tool ToolResult we observed was
+				// status=="completed", paired with the specific -32603 close
+				// handshake. A missing result is NOT proof — a mid-command
+				// crash produces the same result-less shape (Must-fix #1) —
+				// and because we key on the most recent outcome, a later
+				// failed delivery overrides an earlier success (Must-fix #2).
+				finishingMu.Lock()
+				lastFinishing := lastFinishingResultStatus
+				finishingMu.Unlock()
+				if lastFinishing == "completed" && isKiroGoalCompleteCloseError(err) {
+					b.cfg.Logger.Warn("kiro session/prompt failed after a completed finishing-tool result; preserving completed task status", "error", err)
 					finalStatus = "completed"
 					finalError = ""
 				} else if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
@@ -349,6 +394,25 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
+				} else if opts.ResumeSessionID != "" && isKiroOversizedHistoryImage(err) {
+					// A resumed session whose history contains an image
+					// exceeding the provider's max pixel dimensions replays
+					// that image on every session/prompt and is rejected
+					// before the current turn runs (GH #5975). Unlike a
+					// missing session the transcript still exists, so this is
+					// permanent for the resume path: only a fresh session
+					// without the resume id can recover. Signal
+					// ResumeRejected so the daemon retries once from a cold
+					// session; keep the (poisoned) session id on the result
+					// so it stays visible for auditing — the daemon gates the
+					// retry on the boolean, not on an empty id, and a
+					// successful fresh retry overwrites it with the new id.
+					b.cfg.Logger.Warn("resumed session has an oversized historical image the provider rejects; signaling resume rejection so the daemon retries with a fresh session",
+						"backend", "kiro",
+						"session_id", sessionID,
+					)
+					resumeRejected = true
 				}
 			}
 		} else {
@@ -379,17 +443,17 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		// provider-error sniffer; see hermes.go for the failure mode.
 		<-stderrDone
 
-		outputMu.Lock()
-		finalOutput := output.String()
-		outputMu.Unlock()
+		finalOutput, providerErrorOutput := deliverable.result()
 
 		// Promote completed→failed when stderr or the agent text
 		// stream show a terminal upstream-LLM failure (HTTP 4xx /
 		// rate-limit / expired token). See the helper docs for the
 		// full signal set; the key safety property is that transient
 		// per-attempt warnings followed by a successful retry stay
-		// "completed".
-		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, finalOutput, providerErr)
+		// "completed". It reads the full text stream, not the
+		// deliverable, so a give-up turn that lands before a tool call
+		// stays visible.
+		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, providerErrorOutput, providerErr)
 
 		c.usageMu.Lock()
 		u := c.usage
@@ -405,12 +469,13 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     finalOutput,
-			Error:      finalError,
-			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
-			Usage:      usageMap,
+			Status:         finalStatus,
+			Output:         finalOutput,
+			Error:          finalError,
+			DurationMs:     duration.Milliseconds(),
+			SessionID:      sessionID,
+			ResumeRejected: resumeRejected,
+			Usage:          usageMap,
 		}
 	}()
 
@@ -431,10 +496,44 @@ func isKiroGoalCompleteCloseError(err error) bool {
 	return strings.Contains(strings.ToLower(rpcErr.Data), "failed to generate a response")
 }
 
-func isKiroIssueCommentAddTool(msg Message) bool {
-	if msg.Tool != "terminal" {
+// isKiroOversizedHistoryImage reports whether err is Kiro/upstream rejecting a
+// resumed conversation because an image already baked into the session history
+// exceeds the provider's maximum allowed pixel dimensions. Kiro surfaces this
+// at session/prompt time as a -32603 whose `data` names the offending
+// messages[n].content[m].image.source.base64.data block and the dimension
+// limit (GH #5975), e.g.:
+//
+//	session/prompt: Internal error (code=-32603, data=Encountered an error in
+//	the response stream: messages.14.content.0.image.source.base64.data: At
+//	least one of the image dimensions exceed max allowed size: 8000 pixels)
+//
+// Both markers must be present so an unrelated -32603 — a transient "failed to
+// generate a response" close, or a mid-command crash producing the same
+// result-less shape — is never misread as a permanent history incompatibility.
+// This is deliberately distinct from isACPSessionNotFound: the session exists,
+// only its historical multimodal content is unusable, so the recovery is a
+// fresh session started WITHOUT the resume id rather than clearing a dead id.
+func isKiroOversizedHistoryImage(err error) bool {
+	var rpcErr *acpRPCError
+	if !errors.As(err, &rpcErr) {
 		return false
 	}
+	if rpcErr.Method != "session/prompt" || rpcErr.Code != -32603 {
+		return false
+	}
+	data := strings.ToLower(rpcErr.Data)
+	return strings.Contains(data, "image.source.base64.data") &&
+		strings.Contains(data, "image dimensions exceed max allowed size")
+}
+
+// isKiroIssueCommentAddTool reports whether a tool-use message is a
+// `multica issue comment add` invocation. It keys purely off the command
+// payload, not the normalized tool name: GPT-5.6 Sol adapters may title the
+// shell tool with a name that doesn't fold into "terminal" (the earlier
+// msg.Tool=="terminal" gate silently dropped those and left completed tasks
+// marked failed — see #5509). isKiroIssueCommentAddCommand is strict enough
+// that no non-shell tool's input will accidentally match.
+func isKiroIssueCommentAddTool(msg Message) bool {
 	command, _ := msg.Input["command"].(string)
 	return isKiroIssueCommentAddCommand(command)
 }

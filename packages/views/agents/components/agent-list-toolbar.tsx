@@ -8,8 +8,13 @@ import {
   Search,
   X,
 } from "lucide-react";
-import type { AgentAvailability } from "@multica/core/agents";
+import {
+  ALL_ACCESS_SCOPES,
+  effectiveAccessScope,
+  type AgentAvailability,
+} from "@multica/core/agents";
 import type { MemberWithUser } from "@multica/core/types";
+import { runtimeDisplayLabel } from "@multica/core/runtimes";
 import { resolvePublicFileUrl } from "@multica/core/workspace/avatar-url";
 import {
   AGENT_SCOPES,
@@ -52,6 +57,7 @@ import type { AgentListRow } from "./agents-page";
 const COLUMN_KEYS: AgentColumnKey[] = [
   "status",
   "owner",
+  "access",
   "runtime",
   "lastActive",
   "runs",
@@ -80,8 +86,11 @@ export function countActiveFilterDimensions(
   if (filters.runtimes.length > 0) count++;
   if (filters.owners.length > 0) count++;
   if (filters.models.length > 0) count++;
+  if (filters.access.length > 0) count++;
   return count;
 }
+
+const ACCESS_SCOPES = ALL_ACCESS_SCOPES;
 
 export function AgentListToolbar({
   scope,
@@ -134,6 +143,7 @@ export function AgentListToolbar({
   // toggling one dimension doesn't make the others' options vanish.
   const availabilityCounts = new Map<string, number>();
   const runtimeOptions = new Map<string, { name: string; count: number }>();
+  const accessCounts = new Map<string, number>();
   for (const row of allRows) {
     if (row.presence) {
       availabilityCounts.set(
@@ -145,8 +155,10 @@ export function AgentListToolbar({
     if (rt) {
       const entry = runtimeOptions.get(rt.id);
       if (entry) entry.count += 1;
-      else runtimeOptions.set(rt.id, { name: rt.name, count: 1 });
+      else runtimeOptions.set(rt.id, { name: runtimeDisplayLabel(rt), count: 1 });
     }
+    const a = effectiveAccessScope(row.agent.permission_mode, row.agent.invocation_targets);
+    accessCounts.set(a, (accessCounts.get(a) ?? 0) + 1);
   }
 
   // Owner options: members who own at least one agent in the current scope.
@@ -176,6 +188,7 @@ export function AgentListToolbar({
   const COLUMN_LABELS: Record<AgentColumnKey, string> = {
     status: t(($) => $.columns.status),
     owner: t(($) => $.columns.owner),
+    access: t(($) => $.columns.access),
     runtime: t(($) => $.columns.runtime),
     lastActive: t(($) => $.columns.last_active),
     runs: t(($) => $.columns.runs),
@@ -201,6 +214,7 @@ export function AgentListToolbar({
           <Input
             value={search}
             onChange={(e) => onSearchChange(e.target.value)}
+            aria-label={t(($) => $.page.search_placeholder)}
             placeholder={t(($) => $.page.search_placeholder)}
             className="h-8 w-56 pl-8 text-sm"
           />
@@ -356,6 +370,43 @@ export function AgentListToolbar({
               </DropdownMenuSubContent>
             </DropdownMenuSub>
 
+            {/* Access — effective access scope (workspace / specific-people / owner-only).
+                Mirrors Availability's keyboard/ARIA pattern. */}
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <span className="flex-1">
+                  {t(($) => $.toolbar.section_access)}
+                </span>
+                {filters.access.length > 0 && (
+                  <span className="text-xs font-medium text-primary">
+                    {filters.access.length}
+                  </span>
+                )}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-auto min-w-44">
+                {ACCESS_SCOPES.map((value) => (
+                  <DropdownMenuCheckboxItem
+                    key={value}
+                    checked={filters.access.includes(value)}
+                    onCheckedChange={() => onToggleFilter("access", value)}
+                    className={FILTER_ITEM_CLASS}
+                  >
+                    <HoverCheck checked={filters.access.includes(value)} />
+                    <span className="min-w-0 truncate">
+                      {t(($) =>
+                        value === "workspace"
+                          ? $.access.scope_labels.workspace
+                          : value === "specific-people"
+                            ? $.access.scope_labels.specific_people
+                            : $.access.scope_labels.owner_only,
+                      )}
+                    </span>
+                    {countBadge(accessCounts.get(value) ?? 0)}
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+
             {/* Runtime */}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
@@ -413,7 +464,7 @@ export function AgentListToolbar({
                         name={m?.name ?? userId.slice(0, 8)}
                         initials={(m?.name ?? "?").slice(0, 2).toUpperCase()}
                         avatarUrl={resolvePublicFileUrl(m?.avatar_url ?? null)}
-                        size={16}
+                        size="sm"
                       />
                       <span className="min-w-0 truncate">
                         {m?.name ?? userId.slice(0, 8)}

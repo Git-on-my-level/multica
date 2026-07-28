@@ -7,7 +7,7 @@
 -- "Assigned to me"), and the two filters must produce disjoint result sets.
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage, i.properties
 FROM issue i
 WHERE i.workspace_id = $1
   AND (sqlc.narg('status')::text IS NULL OR i.status = sqlc.narg('status'))
@@ -64,6 +64,17 @@ LIMIT $2 OFFSET $3;
 -- name: GetIssue :one
 SELECT * FROM issue
 WHERE id = $1;
+
+-- name: GetIssueGCStatus :one
+SELECT workspace_id, status, updated_at
+FROM issue
+WHERE id = $1;
+
+-- name: ListIssueGCStatuses :many
+SELECT id, status, updated_at
+FROM issue
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND id = ANY(sqlc.arg('issue_ids')::uuid[]);
 
 -- name: GetIssueInWorkspace :one
 SELECT * FROM issue
@@ -159,14 +170,31 @@ LIMIT 1;
 -- (loadIssueForUser / GetIssueInWorkspace) already enforce membership today,
 -- but a future loader bypass or a new caller skipping the loader would be
 -- silently catastrophic without this guard. See incident #1661.
-DELETE FROM issue WHERE id = $1 AND workspace_id = $2;
+--
+-- issue_vcs_pull_request (migration 213) has no FK to issue, so the link rows
+-- are not cascaded away. Sweep them here so they go atomically with the issue.
+-- The mirrored PR rows themselves belong to the connection, not the issue, so
+-- they persist (matching the GitHub link behaviour).
+--
+-- The sweep MUST route through the same workspace-checked target as the issue
+-- delete: deleting links by bare issue_id would drop another tenant's link rows
+-- when a caller passes a foreign issue_id with its own workspace_id (the issue
+-- itself is correctly untouched, but the links are already gone) — the exact
+-- cross-tenant leak the #1661 guard above exists to prevent.
+WITH target AS (
+    SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
+),
+cleared_vcs_pr_links AS (
+    DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
+)
+DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target);
 
 -- name: ListOpenIssues :many
 -- See ListIssues for the semantics of involves_user_id (mirrors the 4-branch
 -- filter; member-direct assignment is intentionally excluded).
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage, i.properties
 FROM issue i
 WHERE i.workspace_id = $1
   AND i.status NOT IN ('done', 'cancelled')
@@ -176,6 +204,23 @@ WHERE i.workspace_id = $1
   AND (sqlc.narg('creator_id')::uuid IS NULL OR i.creator_id = sqlc.narg('creator_id'))
   AND (sqlc.narg('project_id')::uuid IS NULL OR i.project_id = sqlc.narg('project_id'))
   AND (sqlc.narg('metadata_filter')::jsonb IS NULL OR i.metadata @> sqlc.narg('metadata_filter')::jsonb)
+  -- properties_filter is a jsonb array of groups, each group an array of
+  -- containment patterns (built by parsePropertiesFilterParam): the issue
+  -- must match at least one pattern from EVERY group (AND of ORs). The
+  -- correlated form skips the GIN index, which is fine here: open_only is
+  -- an unpaginated workspace scan already narrowed by status.
+  AND (
+    sqlc.narg('properties_filter')::jsonb IS NULL
+    OR NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(sqlc.narg('properties_filter')::jsonb) AS pf(alternatives)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(pf.alternatives) AS alt(pattern)
+        WHERE i.properties @> alt.pattern
+      )
+    )
+  )
   AND (
     sqlc.narg('involves_user_id')::uuid IS NULL
     OR (i.assignee_type = 'agent' AND i.assignee_id IN (

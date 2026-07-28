@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { useQuery } from "@tanstack/react-query";
 import { ApiError } from "@multica/core/api";
 import type { Agent, AgentRuntime, MemberWithUser } from "@multica/core/types";
+import { runtimeDisplayLabel } from "@multica/core/runtimes";
 import {
   useDeleteRuntime,
   useArchiveAgentsAndDeleteRuntime,
@@ -284,7 +285,7 @@ function LightBody({
         </h2>
         <p className="mt-1 text-sm leading-5 text-muted-foreground">
           {t(($) => $.detail.delete_dialog.light.description, {
-            name: runtime.name,
+            name: runtimeDisplayLabel(runtime),
           })}
         </p>
         <DeletePersistenceNotice runtime={runtime} />
@@ -359,7 +360,7 @@ function CascadeBody({
         </h2>
         <p className="mt-1 text-sm leading-5 text-muted-foreground">
           {t(($) => $.detail.delete_dialog.cascade.description, {
-            name: runtime.name,
+            name: runtimeDisplayLabel(runtime),
           })}
         </p>
 
@@ -484,7 +485,7 @@ function AgentPlanTable({
                 <ActorAvatar
                   actorType="agent"
                   actorId={agent.id}
-                  size={20}
+                  size="sm"
                   enableHoverCard
                 />
                 <span className="truncate font-medium text-foreground">
@@ -496,7 +497,7 @@ function AgentPlanTable({
                   <ActorAvatar
                     actorType="member"
                     actorId={ownerMember.user_id}
-                    size={16}
+                    size="sm"
                   />
                 ) : null}
                 <span className="truncate text-muted-foreground">

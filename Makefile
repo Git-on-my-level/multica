@@ -83,16 +83,19 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		cp .env.example .env; \
 		JWT=$$(openssl rand -hex 32); \
 		PGPASS=$$(openssl rand -hex 24); \
+		VCSKEY=$$(openssl rand -base64 32); \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		else \
 			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
-		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
+		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Pulling official Multica images..."
 	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
@@ -139,16 +142,19 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		cp .env.example .env; \
 		JWT=$$(openssl rand -hex 32); \
 		PGPASS=$$(openssl rand -hex 24); \
+		VCSKEY=$$(openssl rand -base64 32); \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		else \
 			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
-		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
+		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Building Multica from the current checkout..."
 	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
@@ -307,9 +313,9 @@ cli: ## Run the multica CLI with ARGS or MULTICA_ARGS from source
 	@$(MAKE) multica MULTICA_ARGS="$(MULTICA_ARGS)"
 
 multica: ## Run the multica CLI entrypoint directly from the Go source tree
-	cd server && go run ./cmd/multica $(MULTICA_ARGS)
+	cd server && go run -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)" ./cmd/multica $(MULTICA_ARGS)
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell git describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
@@ -322,7 +328,7 @@ test: ## Run Go tests after ensuring the target DB exists and migrations are app
 	$(REQUIRE_ENV)
 	@bash scripts/ensure-postgres.sh "$(ENV_FILE)"
 	cd server && go run ./cmd/migrate up
-	cd server && go test -race ./...
+	bash scripts/test-go.sh --race
 
 # Database
 ##@ Database

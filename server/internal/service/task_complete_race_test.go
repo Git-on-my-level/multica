@@ -4,12 +4,14 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // mockRow implements pgx.Row, returning either a scanned task or pgx.ErrNoRows.
@@ -108,7 +110,7 @@ func TestCompleteTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.CompleteTask(context.Background(), taskID, nil, "", "")
+			got, err := svc.CompleteTask(context.Background(), taskID, nil, "", "", false)
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
@@ -150,7 +152,7 @@ func TestFailTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.FailTask(context.Background(), taskID, "agent crashed", "", "", "")
+			got, err := svc.FailTask(context.Background(), taskID, "agent crashed", "", "", "", false)
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
@@ -167,6 +169,80 @@ func TestFailTask_AlreadyFinalized(t *testing.T) {
 	}
 }
 
+// TestProviderNetworkRetrySchedule locks in the three-tier schedule for a
+// transient provider stream cut (MUL-4910): first run + immediate retry + one
+// retry deferred ~5s, and only for provider_network — other retryable reasons
+// keep their generic max_attempts=2 (single, immediate retry).
+func TestProviderNetworkRetrySchedule(t *testing.T) {
+	const provNet = "agent_error.provider_network"
+
+	// Attempt ceiling: provider_network is raised to 3, but only ever WIDENS the
+	// budget and never overrides the max_attempts<=1 "retry disabled" contract.
+	ceilingCases := []struct {
+		reason string
+		max    int32
+		want   int32
+	}{
+		{provNet, 2, providerNetworkMaxAttempts}, // default budget → raised to 3
+		{provNet, 1, 1},                          // disabled → stays disabled, not revived
+		{provNet, 5, 5},                          // higher configured budget → kept (widen-only)
+		{"timeout", 2, 2},                        // unrelated reason → column value untouched
+		{"timeout", 1, 1},                        // unrelated + disabled → untouched
+	}
+	for _, tc := range ceilingCases {
+		if got := retryAttemptCeiling(tc.reason, tc.max); got != tc.want {
+			t.Errorf("ceiling(%q, %d) = %d, want %d", tc.reason, tc.max, got, tc.want)
+		}
+	}
+
+	// Backoff: only provider_network's final attempt (after the 2nd failure) is
+	// deferred; its first retry and every other reason are immediate.
+	delayCases := []struct {
+		reason        string
+		failedAttempt int32
+		want          time.Duration
+	}{
+		{provNet, 1, 0}, // first failure → immediate retry
+		{provNet, 2, providerNetworkFinalRetryWait}, // second failure → 5s-deferred retry
+		{"timeout", 2, 0}, // unrelated reason → never deferred
+	}
+	for _, tc := range delayCases {
+		if got := retryDelayForAttempt(tc.reason, tc.failedAttempt); got != tc.want {
+			t.Errorf("retryDelayForAttempt(%q, %d) = %s, want %s", tc.reason, tc.failedAttempt, got, tc.want)
+		}
+	}
+
+	// Eligibility across the whole chain. mkTask has an issue link and no
+	// autopilot run so only the reason/attempt/ceiling gate is exercised.
+	mkTask := func(attempt, max int32) db.AgentTaskQueue {
+		return db.AgentTaskQueue{
+			Attempt:     attempt,
+			MaxAttempts: max,
+			IssueID:     pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+		}
+	}
+	eligCases := []struct {
+		name    string
+		reason  string
+		attempt int32
+		max     int32
+		want    bool
+	}{
+		{"provider_network first run retries", provNet, 1, 2, true},
+		{"provider_network second run still retries (deferred tier)", provNet, 2, 2, true},
+		{"provider_network third run is the ceiling", provNet, 3, 2, false},
+		{"provider_network with retry disabled (max_attempts=1) never retries", provNet, 1, 1, false},
+		{"timeout keeps single immediate retry", "timeout", 1, 2, true},
+		{"timeout exhausts at attempt 2", "timeout", 2, 2, false},
+		{"non-retryable reason never retries", "agent_error.unknown", 1, 2, false},
+	}
+	for _, tc := range eligCases {
+		if got := retryEligible(tc.reason, mkTask(tc.attempt, tc.max)); got != tc.want {
+			t.Errorf("%s: retryEligible(%q, attempt=%d/max=%d) = %v, want %v", tc.name, tc.reason, tc.attempt, tc.max, got, tc.want)
+		}
+	}
+}
+
 func TestTaskFailureClassifiers(t *testing.T) {
 	cases := []struct {
 		reason       string
@@ -176,10 +252,17 @@ func TestTaskFailureClassifiers(t *testing.T) {
 	}{
 		{reason: "timeout", wantType: "timeout", wantResumeOK: true, wantRetry: true},
 		{reason: "codex_semantic_inactivity", wantType: "timeout", wantResumeOK: false, wantRetry: true},
+		// Transient mid-stream provider disconnect (MUL-4910): retryable, and
+		// resume-safe so the retry continues the truncated conversation.
+		{reason: "agent_error.provider_network", wantType: "agent_error", wantResumeOK: true, wantRetry: true},
 		{reason: "runtime_recovery", wantType: "runtime", wantResumeOK: true, wantRetry: true},
 		{reason: "iteration_limit", wantType: "agent_output", wantResumeOK: false, wantRetry: false},
 		{reason: "api_invalid_request", wantType: "agent_error", wantResumeOK: false, wantRetry: false},
+		{reason: "agent_error.context_overflow", wantType: "agent_error", wantResumeOK: false, wantRetry: false},
 		{reason: "agent_error", wantType: "agent_error", wantResumeOK: true, wantRetry: false},
+		// Missing terminal result errors classify to agent_error.unknown. Keep
+		// that deterministic upstream failure outside the auto-retry allowlist.
+		{reason: "agent_error.unknown", wantType: "agent_error", wantResumeOK: true, wantRetry: false},
 	}
 
 	for _, tc := range cases {
@@ -194,5 +277,50 @@ func TestTaskFailureClassifiers(t *testing.T) {
 				t.Fatalf("retryableReasons[%q] = %v, want %v", tc.reason, got, tc.wantRetry)
 			}
 		})
+	}
+}
+
+// TestSkillBundleFailureFromLegacyDaemonRetries is the mixed-version
+// regression for MUL-5370. It walks the exact chain FailTask runs for a task
+// an un-upgraded daemon just failed, and asserts the user-visible outcome:
+// the run is retried instead of dying.
+//
+// The trap this guards: the daemon-side fix labels the failure structurally,
+// but an old daemon reports a NON-EMPTY catchall, so FailTask's "classify only
+// when the caller gave us nothing" branch leaves it alone. Without
+// NormalizeDaemonReason the reason stays agent_error.unknown, which is not on
+// retryableReasons — meaning the fix would reach only hosts that happened to
+// update, while the un-upgraded hosts most likely to be hitting the bug keep
+// failing terminally.
+func TestSkillBundleFailureFromLegacyDaemonRetries(t *testing.T) {
+	const legacyErr = "resolve skill bundles: context deadline exceeded"
+	task := db.AgentTaskQueue{
+		Attempt:     1,
+		MaxAttempts: 2,
+		IssueID:     pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+	}
+
+	// What an old daemon puts on the wire, and what FailTask does with it.
+	legacyReason := taskfailure.ReasonAgentUnknown.String()
+	if retryEligible(legacyReason, task) {
+		t.Fatal("precondition: the raw catchall must not be retryable, or this test proves nothing")
+	}
+
+	normalized := taskfailure.NormalizeDaemonReason(legacyReason, legacyErr).String()
+	if normalized != taskfailure.ReasonSkillBundleUnavailable.String() {
+		t.Fatalf("normalized reason = %q, want %q", normalized, taskfailure.ReasonSkillBundleUnavailable)
+	}
+	if !retryEligible(normalized, task) {
+		t.Errorf("a skill-bundle failure reported by an old daemon must still be retried; got reason %q", normalized)
+	}
+
+	// A current daemon supplies the reason itself and must reach the same
+	// outcome — the two versions converge rather than diverging by client.
+	current := taskfailure.NormalizeDaemonReason(
+		taskfailure.ReasonSkillBundleUnavailable.String(),
+		`skill bundle unavailable: skill "x" (id=1, 10 bytes) after 30s: context deadline exceeded`,
+	).String()
+	if !retryEligible(current, task) {
+		t.Errorf("a skill-bundle failure reported by a current daemon must be retried; got reason %q", current)
 	}
 }

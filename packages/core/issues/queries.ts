@@ -1,14 +1,24 @@
-import { keepPreviousData, queryOptions, type QueryClient } from "@tanstack/react-query";
+import {
+  infiniteQueryOptions,
+  keepPreviousData,
+  queryOptions,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { api } from "../api";
 import type {
   GroupedIssuesResponse,
   Issue,
   IssueStatus,
+  IssueTableFacetsRequest,
+  IssueTableGroupSpec,
+  IssueTableGroupsRequest,
+  IssueTableQuerySpec,
+  IssueTableRowsRequest,
   ListGroupedIssuesParams,
   ListIssuesParams,
   ListIssuesCache,
 } from "../types";
-import { BOARD_STATUSES } from "./config";
+import { ALL_STATUSES } from "./config";
 
 export interface IssueSortParam {
   sort_by?: ListIssuesParams["sort_by"];
@@ -16,6 +26,10 @@ export interface IssueSortParam {
   date_field?: ListIssuesParams["date_field"];
   date_start?: ListIssuesParams["date_start"];
   date_end?: ListIssuesParams["date_end"];
+  /** Server-side custom-property filter (definition id → accepted values).
+   *  Lives in the sort/window bag so every list surface, query key, and
+   *  load-more page carries it automatically. */
+  properties?: ListIssuesParams["properties"];
 }
 
 export const issueKeys = {
@@ -25,6 +39,44 @@ export const issueKeys = {
   /** FULL KEY for queryOptions — includes sort. */
   listSorted: (wsId: string, sort?: IssueSortParam) =>
     [...issueKeys.list(wsId), sort ?? {}] as const,
+  flatAll: (wsId: string) => [...issueKeys.all(wsId), "flat"] as const,
+  flat: (
+    wsId: string,
+    scope: string,
+    filter: IssueFlatFilter,
+    sort?: IssueSortParam,
+  ) => [...issueKeys.flatAll(wsId), scope, filter, sort ?? {}] as const,
+  flatExport: (
+    wsId: string,
+    scope: string,
+    filter: IssueFlatFilter,
+    sort?: IssueSortParam,
+  ) => [...issueKeys.flatAll(wsId), "export", scope, filter, sort ?? {}] as const,
+  tableAll: (wsId: string) => [...issueKeys.all(wsId), "table-query"] as const,
+  tableGroups: (
+    wsId: string,
+    query: IssueTableQuerySpec,
+    group: IssueTableGroupsRequest["group"],
+  ) => [...issueKeys.tableAll(wsId), "groups", query, group] as const,
+  tableFacets: (
+    wsId: string,
+    request: IssueTableFacetsRequest,
+  ) => [...issueKeys.tableAll(wsId), "facets", request] as const,
+  tableRows: (
+    wsId: string,
+    query: IssueTableQuerySpec,
+    group: IssueTableGroupSpec,
+    groupKey: string | null,
+    hierarchy: boolean,
+    parentId: string | null,
+  ) => [
+    ...issueKeys.tableAll(wsId),
+    "rows",
+    query,
+    group,
+    groupKey,
+    { hierarchy, parentId },
+  ] as const,
   assigneeGroupsAll: (wsId: string) =>
     [...issueKeys.all(wsId), "assignee-groups"] as const,
   assigneeGroups: (wsId: string, filter: AssigneeGroupedIssuesFilter) =>
@@ -57,8 +109,14 @@ export const issueKeys = {
     [...issueKeys.projectGanttAll(wsId), projectId] as const,
   detail: (wsId: string, id: string) =>
     [...issueKeys.all(wsId), "detail", id] as const,
+  /** Resolve a bare issue identifier (e.g. "MUL-123") to an issue. */
+  identifier: (wsId: string, identifier: string) =>
+    [...issueKeys.all(wsId), "identifier", identifier] as const,
+  /** Prefix for every per-parent children query in a workspace. */
+  childrenAll: (wsId: string) =>
+    [...issueKeys.all(wsId), "children"] as const,
   children: (wsId: string, id: string) =>
-    [...issueKeys.all(wsId), "children", id] as const,
+    [...issueKeys.childrenAll(wsId), id] as const,
   /** Prefix for invalidating all batched-children queries in a workspace. */
   childrenByParentsAll: (wsId: string) =>
     [...issueKeys.all(wsId), "children-by-parents"] as const,
@@ -123,6 +181,25 @@ export type MyIssuesFilter = Pick<
   | "involves_user_id"
 >;
 
+/** Server-side contract for the flat table window. These facets must travel
+ * with every offset page (and live in the query key); post-filtering a loaded
+ * page can silently omit matching issues after the current offset. */
+export type IssueFlatFilter = MyIssuesFilter &
+  Pick<
+    ListIssuesParams,
+    | "q"
+    | "statuses"
+    | "priorities"
+    | "assignee_filters"
+    | "include_no_assignee"
+    | "creator_filters"
+    | "project_ids"
+    | "include_no_project"
+    | "label_ids"
+    | "top_level_only"
+    | "ids"
+  >;
+
 export type AssigneeGroupedIssuesFilter = Omit<
   ListGroupedIssuesParams,
   "group_by" | "limit" | "offset" | "group_assignee_type" | "group_assignee_id"
@@ -130,9 +207,16 @@ export type AssigneeGroupedIssuesFilter = Omit<
 
 /** Page size per status column. */
 export const ISSUE_PAGE_SIZE = 50;
+export const ISSUE_FLAT_PAGE_SIZE = 100;
 
-/** Statuses the issues/my-issues pages paginate. Cancelled is intentionally excluded — it has never been surfaced in the list/board views. */
-export const PAGINATED_STATUSES: readonly IssueStatus[] = BOARD_STATUSES;
+/**
+ * Statuses fetched and paginated into the list/board cache — every lifecycle
+ * status, `cancelled` included. `cancelled` is a first-class default status
+ * (MUL-4290), so it lives in the cache and renders like any other column;
+ * there is no separate "visible board" subset. This constant governs
+ * fetch/cache membership.
+ */
+export const PAGINATED_STATUSES: readonly IssueStatus[] = ALL_STATUSES;
 
 /** Flatten a bucketed response to a single Issue[] for consumers that want the whole list. */
 export function flattenIssueBuckets(data: ListIssuesCache) {
@@ -177,6 +261,245 @@ async function fetchFirstPages(filter: MyIssuesFilter = {}, sort?: IssueSortPara
  * total — pagination on the "All" scope is out of scope; the first
  * 50-per-status × 3 widening (deduped) is what the page renders.
  */
+const MERGE_PRIORITY_RANK: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
+const MERGE_STATUS_RANK: Record<string, number> = {
+  backlog: 0,
+  todo: 1,
+  in_progress: 2,
+  in_review: 3,
+  done: 4,
+  blocked: 5,
+  cancelled: 6,
+};
+
+/**
+ * Comparator mirroring the server's ORDER BY semantics (including
+ * `property:<id>` sorts and missing-values-last). The merged "All" scope
+ * concatenates three independently-ordered queries, so without a re-sort the
+ * relation order (assigned → created → involves) would override the sort the
+ * user picked — e.g. assigned=9 rendering before created=1 (review round 3).
+ */
+export function compareIssuesForSort(a: Issue, b: Issue, sort?: IssueSortParam): number {
+  const by = sort?.sort_by ?? "position";
+  const dir = by !== "position" && sort?.sort_direction === "desc" ? -1 : 1;
+  // created_at DESC then id DESC, mirroring the server's unique ORDER BY
+  // suffix — ids disambiguate bulk-created issues that share a timestamp.
+  const tieBreak = () =>
+    new Date(b.created_at).getTime() - new Date(a.created_at).getTime() ||
+    (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
+
+  const missingAware = (av: string | null, bv: string | null): number => {
+    if (!av && !bv) return tieBreak();
+    if (!av) return 1;
+    if (!bv) return -1;
+    return dir * av.localeCompare(bv) || tieBreak();
+  };
+
+  if (by.startsWith("property:")) {
+    const propertyId = by.slice("property:".length);
+    const av = a.properties?.[propertyId];
+    const bv = b.properties?.[propertyId];
+    const aMissing = av === undefined || Array.isArray(av) || typeof av === "boolean";
+    const bMissing = bv === undefined || Array.isArray(bv) || typeof bv === "boolean";
+    if (aMissing && bMissing) return tieBreak();
+    if (aMissing) return 1;
+    if (bMissing) return -1;
+    if (typeof av === "number" && typeof bv === "number") return dir * (av - bv) || tieBreak();
+    return dir * String(av).localeCompare(String(bv)) || tieBreak();
+  }
+  switch (by) {
+    case "status":
+      return dir * ((MERGE_STATUS_RANK[a.status] ?? 9) - (MERGE_STATUS_RANK[b.status] ?? 9)) || tieBreak();
+    case "priority":
+      return dir * ((MERGE_PRIORITY_RANK[a.priority] ?? 9) - (MERGE_PRIORITY_RANK[b.priority] ?? 9)) || tieBreak();
+    case "title":
+      return dir * a.title.localeCompare(b.title) || tieBreak();
+    case "created_at":
+      return dir * (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) || tieBreak();
+    case "updated_at":
+      return dir * (new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime()) || tieBreak();
+    case "start_date":
+      return missingAware(a.start_date, b.start_date);
+    case "due_date":
+      return missingAware(a.due_date, b.due_date);
+    case "position":
+    default:
+      return a.position - b.position || tieBreak();
+  }
+}
+
+async function fetchAllFlatPages(
+  filter: IssueFlatFilter,
+  sort?: IssueSortParam,
+): Promise<Issue[]> {
+  const issues: Issue[] = [];
+  const seenIds = new Set<string>();
+  let offset = 0;
+  while (true) {
+    const response = await api.listIssues({
+      ...filter,
+      ...sort,
+      limit: ISSUE_FLAT_PAGE_SIZE,
+      offset,
+    });
+    let added = 0;
+    for (const issue of response.issues) {
+      if (seenIds.has(issue.id)) continue;
+      seenIds.add(issue.id);
+      issues.push(issue);
+      added += 1;
+    }
+    if (issues.length >= response.total) break;
+    if (response.issues.length === 0 || added === 0) {
+      throw new Error("Issue export pagination did not advance");
+    }
+    // Advance by what the server actually returned. This guarantees progress
+    // even if an older server clamps the requested page size differently.
+    offset += response.issues.length;
+  }
+  return issues;
+}
+
+async function fetchAllMyFlatIssues(
+  userId: string,
+  filter: IssueFlatFilter,
+  sort?: IssueSortParam,
+): Promise<Issue[]> {
+  const relations = await Promise.all([
+    fetchAllFlatPages({ ...filter, assignee_id: userId }, sort),
+    fetchAllFlatPages({ ...filter, creator_id: userId }, sort),
+    fetchAllFlatPages({ ...filter, involves_user_id: userId }, sort),
+  ]);
+  const byId = new Map<string, Issue>();
+  for (const issues of relations) {
+    for (const issue of issues) byId.set(issue.id, issue);
+  }
+  return [...byId.values()].sort((a, b) => compareIssuesForSort(a, b, sort));
+}
+
+export function issueFlatListOptions(
+  wsId: string,
+  scope: string,
+  filter: IssueFlatFilter,
+  userId?: string,
+  sort?: IssueSortParam,
+) {
+  const allMyIssues = scope === "all" && !!userId;
+  return infiniteQueryOptions({
+    queryKey: issueKeys.flat(wsId, scope, filter, sort),
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
+      if (allMyIssues) {
+        const issues = await fetchAllMyFlatIssues(userId, filter, sort);
+        return { issues, total: issues.length };
+      }
+      return api.listIssues({
+        ...filter,
+        ...sort,
+        limit: ISSUE_FLAT_PAGE_SIZE,
+        offset: pageParam,
+      });
+    },
+    getNextPageParam: (lastPage, allPages) => {
+      if (allMyIssues) return undefined;
+      const loaded = allPages.reduce((count, page) => count + page.issues.length, 0);
+      return loaded < lastPage.total ? loaded : undefined;
+    },
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function issueTableGroupsOptions(
+  wsId: string,
+  query: IssueTableQuerySpec,
+  group: IssueTableGroupsRequest["group"],
+) {
+  return infiniteQueryOptions({
+    queryKey: issueKeys.tableGroups(wsId, query, group),
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) =>
+      api.listIssueTableGroups({
+        query,
+        group,
+        page: { limit: 100, cursor: pageParam },
+    }),
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+/** One independently-addressable Table branch page.
+ *
+ * Table keeps every cursor page under its own query key so a refreshed head
+ * can detach stale tail cursors before their responses land. Keep the request,
+ * key shape, transition placeholder, and retry policy together here — the
+ * dynamic branch graph in views should not duplicate this API contract. */
+export function issueTableRowPageOptions(
+  wsId: string,
+  request: IssueTableRowsRequest,
+) {
+  const cursor = request.page?.cursor ?? null;
+  return queryOptions({
+    queryKey: [
+      ...issueKeys.tableRows(
+        wsId,
+        request.query,
+        request.group,
+        request.group_key,
+        request.hierarchy.enabled,
+        request.parent_id,
+      ),
+      "page",
+      cursor,
+    ] as const,
+    queryFn: () => api.listIssueTableRows(request),
+    placeholderData: keepPreviousData,
+    retry: false,
+    // Dynamic useQueries observers detach/reinstall as sibling branches enter
+    // and leave the viewport. Keep an errored page errored until the user hits
+    // Retry — but still let a successful-but-invalidated page refetch on
+    // reattach, so a row page that gets WS-invalidated while its observer is
+    // detached doesn't stay stranded stale under the global `staleTime: Infinity`
+    // default (correct count, missing issue).
+    //
+    // Both guards are needed: `retryOnMount` covers a first-load error (no
+    // data), while the `refetchOnMount` guard covers a background-refetch error
+    // on a page that still holds data — TanStack flags such a page
+    // `isInvalidated`, so a plain `refetchOnMount: true` would re-fire the
+    // failing request on every reattach instead of waiting for explicit Retry.
+    retryOnMount: false,
+    refetchOnMount: (query) => query.state.status !== "error",
+  });
+}
+
+export function issueTableFacetsOptions(
+  wsId: string,
+  request: IssueTableFacetsRequest,
+) {
+  return queryOptions({
+    queryKey: issueKeys.tableFacets(wsId, request),
+    queryFn: () => api.listIssueTableFacets(request),
+  });
+}
+
+export function issueFlatExportOptions(
+  wsId: string,
+  scope: string,
+  filter: IssueFlatFilter,
+  userId?: string,
+  sort?: IssueSortParam,
+) {
+  return queryOptions({
+    queryKey: issueKeys.flatExport(wsId, scope, filter, sort),
+    queryFn: () =>
+      scope === "all" && userId
+        ? fetchAllMyFlatIssues(userId, filter, sort)
+        : fetchAllFlatPages(filter, sort),
+    staleTime: 0,
+  });
+}
+
 async function fetchAllMyFirstPages(userId: string, sort?: IssueSortParam): Promise<ListIssuesCache> {
   const [byAssignee, byCreator, byInvolves] = await Promise.all([
     fetchFirstPages({ assignee_id: userId }, sort),
@@ -196,6 +519,7 @@ async function fetchAllMyFirstPages(userId: string, sort?: IssueSortParam): Prom
         merged.push(issue);
       }
     }
+    merged.sort((a, b) => compareIssuesForSort(a, b, sort));
     byStatus[status] = { issues: merged, total: merged.length };
   }
   return { byStatus };
@@ -253,7 +577,11 @@ async function fetchAllMyAssigneeGroups(
       existing.total = existing.issues.length;
     }
   }
-  return { groups: [...merged.values()] };
+  const groups = [...merged.values()];
+  for (const group of groups) {
+    group.issues.sort((a, b) => compareIssuesForSort(a, b, sort));
+  }
+  return { groups };
 }
 
 /**
@@ -404,6 +732,37 @@ export function issueDetailOptions(wsId: string, id: string) {
   });
 }
 
+/**
+ * Resolve a bare issue identifier ("MUL-123") to its issue, or `null`.
+ *
+ * Backs the Linear-style autolink: the backend `q` search matches an
+ * identifier on issue NUMBER only (prefix-agnostic — `MUL-123` and `TES-123`
+ * both hit number 123), so the exact `identifier === value` filter here is
+ * what enforces the workspace prefix. A non-existent or wrong-prefix
+ * identifier resolves to `null` and renders as plain text.
+ *
+ * Server state → TanStack Query; the key includes `wsId` and the identifier,
+ * so identical identifiers across the app share one request. Caller gates
+ * `enabled` (identifier shape + workspace prefix).
+ */
+export function issueIdentifierOptions(wsId: string, identifier: string) {
+  return queryOptions({
+    queryKey: issueKeys.identifier(wsId, identifier),
+    queryFn: async ({ signal }) => {
+      const res = await api.searchIssues({
+        q: identifier,
+        limit: 10,
+        include_closed: true,
+        signal,
+      });
+      return res.issues.find((i) => i.identifier === identifier) ?? null;
+    },
+    // Identifier→issue mapping is effectively immutable; avoid refetch churn
+    // when the same key renders across many comments/messages.
+    staleTime: 5 * 60_000,
+  });
+}
+
 export function childIssueProgressOptions(wsId: string) {
   return queryOptions({
     queryKey: issueKeys.childProgress(wsId),
@@ -422,6 +781,12 @@ export function childIssuesOptions(wsId: string, id: string) {
   return queryOptions({
     queryKey: issueKeys.children(wsId, id),
     queryFn: () => api.listChildIssues(id).then((r) => r.issues),
+    // Child creation can happen while this workspace is not the active
+    // realtime subscription (for example, an agent creates it while a
+    // desktop tab is showing another workspace). The global Infinity
+    // staleTime would otherwise reuse an incomplete children snapshot when
+    // the parent is opened again, with no later event guaranteed to heal it.
+    refetchOnMount: "always",
   });
 }
 

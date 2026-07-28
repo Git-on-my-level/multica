@@ -47,7 +47,11 @@ type Agent struct {
 	// Composio toolkit slugs this agent is allowed to mount as MCP. NULL or empty array = no MCP overlay. Mounted for any run that passes the agent invocation-permission gate (MUL-3963); the overlay uses the agent OWNER's active Composio connection, so sharing the agent (public_to) shares these apps with whoever may invoke it. No longer gated on originator == owner. Stored as TEXT[] so the dispatch path can intersect against the owner's active connections with a single SQL ANY() filter.
 	ComposioToolkitAllowlist []string `json:"composio_toolkit_allowlist"`
 	// Agent invocation permission mode (MUL-3963). private = owner only; public_to = allow-list in agent_invocation_target. Replaces visibility as the authorization source for triggering runs; visibility is now a derived legacy field. Default private = deny-by-default.
-	PermissionMode string `json:"permission_mode"`
+	PermissionMode        string      `json:"permission_mode"`
+	Kind                  string      `json:"kind"`
+	SystemKey             pgtype.Text `json:"system_key"`
+	DisabledRuntimeSkills []byte      `json:"disabled_runtime_skills"`
+	ServiceTier           pgtype.Text `json:"service_tier"`
 }
 
 // Allow-list of who may invoke a public_to agent (MUL-3963). One row per (agent, target_type, target); targets stack and canInvokeAgent OR-matches. workspace rows store the agent workspace_id in target_id; member rows store the user id; team rows are reserved and inert in V1. Rows only matter when agent.permission_mode = public_to. No DB foreign keys: agent_id / created_by / member target_id relationships are maintained in the application layer (see migration comment).
@@ -77,12 +81,14 @@ type AgentRuntime struct {
 	LegacyDaemonID pgtype.Text        `json:"legacy_daemon_id"`
 	Visibility     string             `json:"visibility"`
 	ProfileID      pgtype.UUID        `json:"profile_id"`
+	CustomName     pgtype.Text        `json:"custom_name"`
 }
 
 type AgentSkill struct {
 	AgentID   pgtype.UUID        `json:"agent_id"`
 	SkillID   pgtype.UUID        `json:"skill_id"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Enabled   bool               `json:"enabled"`
 }
 
 type AgentTaskQueue struct {
@@ -123,7 +129,34 @@ type AgentTaskQueue struct {
 	// Top-of-chain human originator for this run. For human-triggered tasks (comment by a member, chat, quick-create) equals that member. For agent-fanout tasks inherited from the parent task's originator_user_id via comment.source_task_id. NULL when no human is in the chain (autopilot, system-driven). Used by canInvokeAgent to judge A2A by the originator; the Composio overlay now follows invocation permission and uses the agent owner's connection, so this is audit/attribution + A2A gating, NOT a Composio owner==originator gate (MUL-3963).
 	OriginatorUserID pgtype.UUID `json:"originator_user_id"`
 	// Non-secret per-task connected app metadata corresponding to runtime_mcp_overlay, used by the daemon brief to tell agents which app capabilities are mounted. Cleared with runtime_mcp_overlay after task completion.
-	RuntimeConnectedApps []byte `json:"runtime_connected_apps"`
+	RuntimeConnectedApps   []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds    []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds    []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID        pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	// Waterfall level that resolved originator_user_id for this run: direct_human | delegation | comment_source | rule_owner | owner_fallback | backfill | unattributed. Audit/visibility metadata only — never consulted for authorization. TEXT with no CHECK so new trigger paths can add a source without a migration (MUL-4302 §7). NULL on pre-migration rows.
+	OriginatorSource pgtype.Text `json:"originator_source"`
+	// For originator_source=delegation: the parent task whose accountable human was copied onto this run. Value is copied, not chained, so delegation cycles are harmless (MUL-4302 §3.2). No FK; app-layer integrity only.
+	DelegatedFromTaskID pgtype.UUID `json:"delegated_from_task_id"`
+	// System transient-failure retry lineage: the task this run re-attempts. Inherits the parent attribution unchanged. Kept distinct from rerun_of_task_id so retry vs rerun report separately (MUL-4302 §5). No FK.
+	RetryOfTaskID pgtype.UUID `json:"retry_of_task_id"`
+	// Human manual-rerun lineage: the historical task a member re-ran. The rerun itself is a NEW direct_human attribution to the rerunning member; this column preserves the link to the original (MUL-4302 §5). No FK.
+	RerunOfTaskID pgtype.UUID `json:"rerun_of_task_id"`
+	// For originator_source=rule_owner: the published autopilot rule version snapshot whose publisher is the accountable human. No FK; snapshot table wiring lands in a later Phase 1 increment (MUL-4302 §3.4/§7).
+	RuleVersionID pgtype.UUID `json:"rule_version_id"`
+	// Uniform kind tag for the direct cause of this run (comment | issue_assignment | autopilot_run | rule_version | rerun | ...), paired with trigger_evidence_ref_id. Free TEXT so new evidence kinds need no migration (MUL-4302 §2).
+	TriggerEvidenceKind pgtype.Text `json:"trigger_evidence_kind"`
+	// The row id referenced by trigger_evidence_kind (a comment id, autopilot_run id, rule_version id, source task id, ...). No FK; resolvable per-kind in the app layer (MUL-4302 §2).
+	TriggerEvidenceRefID pgtype.UUID `json:"trigger_evidence_ref_id"`
+	// The one human accountable for this run, for audit / visibility / cost only — NEVER consulted for authorization (that is originator_user_id). Invariant: when originator_user_id IS NOT NULL, this equals it; the two diverge only when originator_user_id IS NULL (autopilot rule_owner / degraded owner_fallback name an accountable human while authorization carries none). No FK, no cascade (MUL-4302 §1/§7). NULL means no accountable human was resolved: a pre-migration row, OR a NEW row whose audit source is not-yet-resolved / unattributed (e.g. run_only autopilot until rule_owner lands) — NOT pre-migration only.
+	AccountableUserID     pgtype.UUID `json:"accountable_user_id"`
+	SessionRolloutMissing bool        `json:"session_rollout_missing"`
+}
+
+type AgentToLabel struct {
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	LabelID   pgtype.UUID        `json:"label_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Attachment struct {
@@ -140,6 +173,7 @@ type Attachment struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	ChatSessionID pgtype.UUID        `json:"chat_session_id"`
 	ChatMessageID pgtype.UUID        `json:"chat_message_id"`
+	TaskID        pgtype.UUID        `json:"task_id"`
 }
 
 type Autopilot struct {
@@ -168,22 +202,34 @@ type AutopilotCollaborator struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+// Append-only snapshot of autopilot rule publishes (MUL-4302 §3.4). One row per substantive publish (create / enable / resume / trigger-condition / target / instructions change), recording the publisher + effective-config summary. Dispatch resolves the latest row for an autopilot as the run's rule_owner accountable human. No FK, no cascade.
+type AutopilotRuleVersion struct {
+	ID              pgtype.UUID        `json:"id"`
+	AutopilotID     pgtype.UUID        `json:"autopilot_id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	PublishedByType string             `json:"published_by_type"`
+	PublishedByID   pgtype.UUID        `json:"published_by_id"`
+	ConfigSummary   []byte             `json:"config_summary"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type AutopilotRun struct {
-	ID             pgtype.UUID        `json:"id"`
-	AutopilotID    pgtype.UUID        `json:"autopilot_id"`
-	TriggerID      pgtype.UUID        `json:"trigger_id"`
-	Source         string             `json:"source"`
-	Status         string             `json:"status"`
-	IssueID        pgtype.UUID        `json:"issue_id"`
-	TaskID         pgtype.UUID        `json:"task_id"`
-	TriggeredAt    pgtype.Timestamptz `json:"triggered_at"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	FailureReason  pgtype.Text        `json:"failure_reason"`
-	TriggerPayload []byte             `json:"trigger_payload"`
-	Result         []byte             `json:"result"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	SquadID        pgtype.UUID        `json:"squad_id"`
-	PlannedAt      pgtype.Timestamptz `json:"planned_at"`
+	ID                pgtype.UUID        `json:"id"`
+	AutopilotID       pgtype.UUID        `json:"autopilot_id"`
+	TriggerID         pgtype.UUID        `json:"trigger_id"`
+	Source            string             `json:"source"`
+	Status            string             `json:"status"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	TaskID            pgtype.UUID        `json:"task_id"`
+	TriggeredAt       pgtype.Timestamptz `json:"triggered_at"`
+	CompletedAt       pgtype.Timestamptz `json:"completed_at"`
+	FailureReason     pgtype.Text        `json:"failure_reason"`
+	TriggerPayload    []byte             `json:"trigger_payload"`
+	Result            []byte             `json:"result"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	SquadID           pgtype.UUID        `json:"squad_id"`
+	PlannedAt         pgtype.Timestamptz `json:"planned_at"`
+	WebhookDeliveryID pgtype.UUID        `json:"webhook_delivery_id"`
 }
 
 type AutopilotSubscriber struct {
@@ -209,6 +255,10 @@ type AutopilotTrigger struct {
 	Provider       string             `json:"provider"`
 	SigningSecret  pgtype.Text        `json:"signing_secret"`
 	EventFilters   []byte             `json:"event_filters"`
+	// Actor type of the trigger's current responsible publisher: member | agent. Set to the creator at creation and re-stamped to the editor on any substantive edit governing this trigger. Consumed only for attribution (source=trigger_owner) — never authorization. NULL on pre-migration triggers (MUL-4302).
+	PublishedByType pgtype.Text `json:"published_by_type"`
+	// The member/agent currently responsible for this trigger's effective config (creator, then last substantive editor). For a member this is the accountable human of runs the trigger fires (source=trigger_owner). No FK, app-layer integrity. NULL on pre-migration triggers, which degrade to rule_owner (MUL-4302).
+	PublishedByID pgtype.UUID `json:"published_by_id"`
 }
 
 type ChannelBindingToken struct {
@@ -270,6 +320,22 @@ type ChannelInstallation struct {
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ChannelMediaPendingObject struct {
+	StorageKey     string             `json:"storage_key"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	ChatMessageID  pgtype.UUID        `json:"chat_message_id"`
+	StorageUrl     string             `json:"storage_url"`
+	InstallationID pgtype.UUID        `json:"installation_id"`
+	State          string             `json:"state"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	Attempt        int32              `json:"attempt"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError      pgtype.Text        `json:"last_error"`
+	TombstonePass  int32              `json:"tombstone_pass"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type ChannelOutboundCardMessage struct {
 	ID                   pgtype.UUID        `json:"id"`
 	ChatSessionID        pgtype.UUID        `json:"chat_session_id"`
@@ -293,30 +359,75 @@ type ChannelUserBinding struct {
 	BoundAt        pgtype.Timestamptz `json:"bound_at"`
 }
 
-type ChatMessage struct {
+type ChatDraftRestore struct {
 	ID            pgtype.UUID        `json:"id"`
 	ChatSessionID pgtype.UUID        `json:"chat_session_id"`
-	Role          string             `json:"role"`
-	Content       string             `json:"content"`
 	TaskID        pgtype.UUID        `json:"task_id"`
+	Content       string             `json:"content"`
+	AttachmentIds []pgtype.UUID      `json:"attachment_ids"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	FailureReason pgtype.Text        `json:"failure_reason"`
-	ElapsedMs     pgtype.Int8        `json:"elapsed_ms"`
+}
+
+type ChatMessage struct {
+	ID                       pgtype.UUID        `json:"id"`
+	ChatSessionID            pgtype.UUID        `json:"chat_session_id"`
+	Role                     string             `json:"role"`
+	Content                  string             `json:"content"`
+	TaskID                   pgtype.UUID        `json:"task_id"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	FailureReason            pgtype.Text        `json:"failure_reason"`
+	ElapsedMs                pgtype.Int8        `json:"elapsed_ms"`
+	MessageKind              string             `json:"message_kind"`
+	ChannelMediaPendingUntil pgtype.Timestamptz `json:"channel_media_pending_until"`
+	ChannelIngested          bool               `json:"channel_ingested"`
+}
+
+type ChatPinnedAgent struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	UserID      pgtype.UUID        `json:"user_id"`
+	AgentID     pgtype.UUID        `json:"agent_id"`
+	Position    float64            `json:"position"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type ChatSession struct {
-	ID          pgtype.UUID        `json:"id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	CreatorID   pgtype.UUID        `json:"creator_id"`
-	Title       string             `json:"title"`
-	SessionID   pgtype.Text        `json:"session_id"`
-	WorkDir     pgtype.Text        `json:"work_dir"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	UnreadSince pgtype.Timestamptz `json:"unread_since"`
-	RuntimeID   pgtype.UUID        `json:"runtime_id"`
+	ID           pgtype.UUID        `json:"id"`
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	AgentID      pgtype.UUID        `json:"agent_id"`
+	CreatorID    pgtype.UUID        `json:"creator_id"`
+	Title        string             `json:"title"`
+	SessionID    pgtype.Text        `json:"session_id"`
+	WorkDir      pgtype.Text        `json:"work_dir"`
+	Status       string             `json:"status"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	UnreadSince  pgtype.Timestamptz `json:"unread_since"`
+	RuntimeID    pgtype.UUID        `json:"runtime_id"`
+	LastReadAt   pgtype.Timestamptz `json:"last_read_at"`
+	IsAgentIntro bool               `json:"is_agent_intro"`
+	PinnedAt     pgtype.Timestamptz `json:"pinned_at"`
+	ProjectID    pgtype.UUID        `json:"project_id"`
+}
+
+type ClientUsageDaily struct {
+	UserID          pgtype.UUID        `json:"user_id"`
+	ClientType      string             `json:"client_type"`
+	InstallID       pgtype.UUID        `json:"install_id"`
+	ActivityDate    pgtype.Date        `json:"activity_date"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ClientVersion   string             `json:"client_version"`
+	Os              string             `json:"os"`
+	FirstActiveAt   pgtype.Timestamptz `json:"first_active_at"`
+	LastActiveAt    pgtype.Timestamptz `json:"last_active_at"`
+	RuntimeProbedAt pgtype.Timestamptz `json:"runtime_probed_at"`
+	ProbeResult     pgtype.Text        `json:"probe_result"`
+	RuntimeCount    pgtype.Int4        `json:"runtime_count"`
+	ProviderSummary []byte             `json:"provider_summary"`
+	OnlineCount     pgtype.Int4        `json:"online_count"`
+	OfflineCount    pgtype.Int4        `json:"offline_count"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Comment struct {
@@ -429,29 +540,45 @@ type GithubPendingInstallation struct {
 }
 
 type GithubPullRequest struct {
-	ID              pgtype.UUID        `json:"id"`
-	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	InstallationID  int64              `json:"installation_id"`
-	RepoOwner       string             `json:"repo_owner"`
-	RepoName        string             `json:"repo_name"`
-	PrNumber        int32              `json:"pr_number"`
-	Title           string             `json:"title"`
-	State           string             `json:"state"`
-	HtmlUrl         string             `json:"html_url"`
-	Branch          pgtype.Text        `json:"branch"`
-	AuthorLogin     pgtype.Text        `json:"author_login"`
-	AuthorAvatarUrl pgtype.Text        `json:"author_avatar_url"`
-	MergedAt        pgtype.Timestamptz `json:"merged_at"`
-	ClosedAt        pgtype.Timestamptz `json:"closed_at"`
-	PrCreatedAt     pgtype.Timestamptz `json:"pr_created_at"`
-	PrUpdatedAt     pgtype.Timestamptz `json:"pr_updated_at"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	HeadSha         string             `json:"head_sha"`
-	MergeableState  pgtype.Text        `json:"mergeable_state"`
-	Additions       int32              `json:"additions"`
-	Deletions       int32              `json:"deletions"`
-	ChangedFiles    int32              `json:"changed_files"`
+	ID                  pgtype.UUID        `json:"id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	InstallationID      int64              `json:"installation_id"`
+	RepoOwner           string             `json:"repo_owner"`
+	RepoName            string             `json:"repo_name"`
+	PrNumber            int32              `json:"pr_number"`
+	Title               string             `json:"title"`
+	State               string             `json:"state"`
+	HtmlUrl             string             `json:"html_url"`
+	Branch              pgtype.Text        `json:"branch"`
+	AuthorLogin         pgtype.Text        `json:"author_login"`
+	AuthorAvatarUrl     pgtype.Text        `json:"author_avatar_url"`
+	MergedAt            pgtype.Timestamptz `json:"merged_at"`
+	ClosedAt            pgtype.Timestamptz `json:"closed_at"`
+	PrCreatedAt         pgtype.Timestamptz `json:"pr_created_at"`
+	PrUpdatedAt         pgtype.Timestamptz `json:"pr_updated_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	HeadSha             string             `json:"head_sha"`
+	MergeableState      pgtype.Text        `json:"mergeable_state"`
+	Additions           int32              `json:"additions"`
+	Deletions           int32              `json:"deletions"`
+	ChangedFiles        int32              `json:"changed_files"`
+	ApiMergeable        pgtype.Text        `json:"api_mergeable"`
+	ApiMergeStateStatus pgtype.Text        `json:"api_merge_state_status"`
+	ChecksRollupState   pgtype.Text        `json:"checks_rollup_state"`
+	SnapshotHeadSha     string             `json:"snapshot_head_sha"`
+	SnapshotFetchedAt   pgtype.Timestamptz `json:"snapshot_fetched_at"`
+}
+
+type GithubPullRequestCheckRun struct {
+	PrID            pgtype.UUID `json:"pr_id"`
+	HeadSha         string      `json:"head_sha"`
+	Ordinal         int32       `json:"ordinal"`
+	Name            string      `json:"name"`
+	Status          string      `json:"status"`
+	Conclusion      pgtype.Text `json:"conclusion"`
+	DetailsUrl      pgtype.Text `json:"details_url"`
+	IsStatusContext bool        `json:"is_status_context"`
 }
 
 type GithubPullRequestCheckSuite struct {
@@ -508,6 +635,7 @@ type Issue struct {
 	StartDate          pgtype.Date        `json:"start_date"`
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
+	Properties         []byte             `json:"properties"`
 }
 
 type IssueDependency struct {
@@ -518,12 +646,28 @@ type IssueDependency struct {
 }
 
 type IssueLabel struct {
+	ID           pgtype.UUID        `json:"id"`
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	Name         string             `json:"name"`
+	Color        string             `json:"color"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ResourceType string             `json:"resource_type"`
+	Description  string             `json:"description"`
+}
+
+type IssueProperty struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
 	Name        string             `json:"name"`
-	Color       string             `json:"color"`
+	Type        string             `json:"type"`
+	Description string             `json:"description"`
+	Config      []byte             `json:"config"`
+	Position    float64            `json:"position"`
+	ArchivedAt  pgtype.Timestamptz `json:"archived_at"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	Icon        string             `json:"icon"`
 }
 
 type IssuePullRequest struct {
@@ -557,6 +701,16 @@ type IssueSubscriber struct {
 type IssueToLabel struct {
 	IssueID pgtype.UUID `json:"issue_id"`
 	LabelID pgtype.UUID `json:"label_id"`
+}
+
+type IssueVcsPullRequest struct {
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	PullRequestID pgtype.UUID        `json:"pull_request_id"`
+	CloseIntent   bool               `json:"close_intent"`
+	ReferenceOnly bool               `json:"reference_only"`
+	LinkedByType  pgtype.Text        `json:"linked_by_type"`
+	LinkedByID    pgtype.UUID        `json:"linked_by_id"`
+	LinkedAt      pgtype.Timestamptz `json:"linked_at"`
 }
 
 type LarkBindingToken struct {
@@ -689,6 +843,8 @@ type Project struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	Priority    string             `json:"priority"`
+	StartDate   pgtype.Date        `json:"start_date"`
+	DueDate     pgtype.Date        `json:"due_date"`
 }
 
 type ProjectResource struct {
@@ -737,6 +893,12 @@ type SkillFile struct {
 	Content   string             `json:"content"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type SkillToLabel struct {
+	SkillID   pgtype.UUID        `json:"skill_id"`
+	LabelID   pgtype.UUID        `json:"label_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Squad struct {
@@ -822,6 +984,8 @@ type TaskUsage struct {
 	CacheWriteTokens int64              `json:"cache_write_tokens"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	// Provider-reported cost in 1e-10 USD. NULL when the provider reports none; those rows are priced client-side from the static rate table.
+	CostUsdTicks pgtype.Int8 `json:"cost_usd_ticks"`
 }
 
 type TaskUsageHourly struct {
@@ -839,6 +1003,13 @@ type TaskUsageHourly struct {
 	TaskCount        int64              `json:"task_count"`
 	EventCount       int64              `json:"event_count"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	// Sum of provider-reported cost (1e-10 USD) over the rows in this bucket that had one; 0 when none did.
+	CostUsdTicks int64 `json:"cost_usd_ticks"`
+	// Input tokens from rows with no provider-reported cost — the portion still priced from the static rate table. NULL on buckets not yet recomputed since this column existed; readers COALESCE to input_tokens.
+	UncostedInputTokens      pgtype.Int8 `json:"uncosted_input_tokens"`
+	UncostedOutputTokens     pgtype.Int8 `json:"uncosted_output_tokens"`
+	UncostedCacheReadTokens  pgtype.Int8 `json:"uncosted_cache_read_tokens"`
+	UncostedCacheWriteTokens pgtype.Int8 `json:"uncosted_cache_write_tokens"`
 }
 
 type TaskUsageHourlyDirty struct {
@@ -893,6 +1064,55 @@ type UserComposioConnection struct {
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
 }
 
+type VcsCommitStatus struct {
+	ConnectionID pgtype.UUID        `json:"connection_id"`
+	Sha          string             `json:"sha"`
+	Context      string             `json:"context"`
+	State        string             `json:"state"`
+	TargetUrl    pgtype.Text        `json:"target_url"`
+	Description  pgtype.Text        `json:"description"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type VcsConnection struct {
+	ID                     pgtype.UUID        `json:"id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	Provider               string             `json:"provider"`
+	InstanceUrl            string             `json:"instance_url"`
+	AccountLogin           string             `json:"account_login"`
+	AccessTokenEncrypted   string             `json:"access_token_encrypted"`
+	WebhookSecretEncrypted string             `json:"webhook_secret_encrypted"`
+	ConnectedByID          pgtype.UUID        `json:"connected_by_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
+type VcsPullRequest struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ConnectionID    pgtype.UUID        `json:"connection_id"`
+	Provider        string             `json:"provider"`
+	RepoOwner       string             `json:"repo_owner"`
+	RepoName        string             `json:"repo_name"`
+	PrNumber        int32              `json:"pr_number"`
+	Title           string             `json:"title"`
+	State           string             `json:"state"`
+	HtmlUrl         string             `json:"html_url"`
+	Branch          pgtype.Text        `json:"branch"`
+	HeadSha         string             `json:"head_sha"`
+	AuthorLogin     pgtype.Text        `json:"author_login"`
+	AuthorAvatarUrl pgtype.Text        `json:"author_avatar_url"`
+	MergedAt        pgtype.Timestamptz `json:"merged_at"`
+	ClosedAt        pgtype.Timestamptz `json:"closed_at"`
+	PrCreatedAt     pgtype.Timestamptz `json:"pr_created_at"`
+	PrUpdatedAt     pgtype.Timestamptz `json:"pr_updated_at"`
+	Additions       int32              `json:"additions"`
+	Deletions       int32              `json:"deletions"`
+	ChangedFiles    int32              `json:"changed_files"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type VerificationCode struct {
 	ID        pgtype.UUID        `json:"id"`
 	Email     string             `json:"email"`
@@ -926,6 +1146,10 @@ type WebhookDelivery struct {
 	ReceivedAt             pgtype.Timestamptz `json:"received_at"`
 	LastAttemptAt          pgtype.Timestamptz `json:"last_attempt_at"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	AvailableAt            pgtype.Timestamptz `json:"available_at"`
+	LeaseToken             pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	DispatchAttempts       int32              `json:"dispatch_attempts"`
 }
 
 type Workspace struct {
@@ -941,6 +1165,8 @@ type Workspace struct {
 	IssuePrefix  string             `json:"issue_prefix"`
 	IssueCounter int32              `json:"issue_counter"`
 	AvatarUrl    pgtype.Text        `json:"avatar_url"`
+	// When TRUE, an agent run that resolves to no precise accountable human (would be owner_fallback) is refused at enqueue instead of degrading to the agent owner (MUL-4302 §3.5). Default FALSE = owner_fallback. Never affects authorization (originator_user_id).
+	AttributionFailClosed bool `json:"attribution_fail_closed"`
 }
 
 type WorkspaceInvitation struct {

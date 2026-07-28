@@ -4,6 +4,8 @@ import {
   MULTICA_LOCALE_HEADER,
   resolveLocaleFromSignals,
 } from "./lib/locale-routing";
+import { runtimeRewriteDestination } from "./config/runtime-urls";
+import { isOfficialMarketingHost } from "./lib/public-host";
 
 // Old workspace-scoped route segments that existed before the URL refactor
 // (pre-#1131). Any URL with these as the FIRST segment is a legacy URL that
@@ -46,6 +48,13 @@ function nextWithLocale(req: NextRequest): NextResponse {
 // edge.
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
+  const runtimeDestination = runtimeRewriteDestination(pathname, process.env);
+  if (runtimeDestination) {
+    const url = new URL(runtimeDestination);
+    url.search = req.nextUrl.search;
+    return NextResponse.rewrite(url);
+  }
+
   const hasSession = req.cookies.has("multica_logged_in");
   const lastSlug = req.cookies.get("last_workspace_slug")?.value;
 
@@ -75,7 +84,16 @@ export function proxy(req: NextRequest) {
   }
 
   // --- Root path: redirect logged-in users to their last workspace ---
-  if (pathname === "/" && hasSession && lastSlug) {
+  // The official cloud host also serves the public marketing site. Visiting
+  // https://multica.ai/ must remain a public-site navigation even when a local
+  // desktop/runtime session has fresh auth cookies; explicit app routes such
+  // as /acme/issues and legacy /issues still route to the workspace app.
+  if (
+    pathname === "/" &&
+    hasSession &&
+    lastSlug &&
+    !isOfficialMarketingHost(req.nextUrl.hostname)
+  ) {
     const url = req.nextUrl.clone();
     url.pathname = `/${lastSlug}/issues`;
     return NextResponse.redirect(url);
@@ -88,8 +106,15 @@ export function proxy(req: NextRequest) {
 
 export const config = {
   // i18n header must land on every page request, so we use the standard
-  // negative-lookahead pattern from Next's i18n guide: skip API routes
-  // (Go backend), Next internals, and any path with a file extension
-  // (favicons, sw.js, public/* assets).
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico|.*\\.).*)"],
+  // negative-lookahead pattern from Next's i18n guide, plus explicit runtime
+  // proxy routes whose upstream origins are resolved from process.env at
+  // request time instead of being baked into next.config.js at build time.
+  matcher: [
+    "/api/:path*",
+    "/auth/:path*",
+    "/uploads/:path*",
+    "/docs/:path*",
+    "/ws",
+    "/((?!api|_next/static|_next/image|favicon.ico|.*\\.).*)",
+  ],
 };

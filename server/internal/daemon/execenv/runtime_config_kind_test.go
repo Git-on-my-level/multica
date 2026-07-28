@@ -3,28 +3,9 @@ package execenv
 import (
 	"strings"
 	"testing"
-
-	"github.com/multica-ai/multica/server/pkg/featureflag"
 )
 
-// withSlimBrief enables the `runtime_brief_slim` feature flag for the
-// duration of the test, then restores whatever provider was wired before.
-// Tests that exercise the slim path must call this; everything else gets
-// the default-off behaviour and exercises the legacy path.
-//
-// The helper is NOT t.Parallel-safe because runtimeFlags is a process-wide
-// atomic.Pointer. Tests that need the slim path stay serial. Hardly any
-// slim test takes more than a few ms — serial is fine.
-func withSlimBrief(t *testing.T) {
-	t.Helper()
-	saved := runtimeFlags.Load()
-	provider := featureflag.NewStaticProvider()
-	provider.Set(runtimeBriefSlimFlag, featureflag.Rule{Default: true})
-	runtimeFlags.Store(featureflag.NewService(provider))
-	t.Cleanup(func() { runtimeFlags.Store(saved) })
-}
-
-// TestClassifyTask pins the precedence rule on classifyTask. All five
+// TestClassifyTask pins the precedence rule on classifyTask. All four
 // kinds plus tiebreak cases for safety.
 func TestClassifyTask(t *testing.T) {
 	t.Parallel()
@@ -36,9 +17,9 @@ func TestClassifyTask(t *testing.T) {
 		{"chat", TaskContextForEnv{ChatSessionID: "c"}, kindChat},
 		{"quick-create", TaskContextForEnv{QuickCreatePrompt: "p"}, kindQuickCreate},
 		{"autopilot", TaskContextForEnv{AutopilotRunID: "r"}, kindAutopilotRunOnly},
-		{"comment-triggered", TaskContextForEnv{IssueID: "i", TriggerCommentID: "c"}, kindCommentTriggered},
-		{"assignment-triggered", TaskContextForEnv{IssueID: "i"}, kindAssignmentTriggered},
-		{"assignment-bare", TaskContextForEnv{}, kindAssignmentTriggered},
+		{"issue-comment-triggered", TaskContextForEnv{IssueID: "i", TriggerCommentID: "c"}, kindIssue},
+		{"issue-assignment-triggered", TaskContextForEnv{IssueID: "i"}, kindIssue},
+		{"issue-bare", TaskContextForEnv{}, kindIssue},
 		{"tiebreak-chat-vs-quick", TaskContextForEnv{ChatSessionID: "c", QuickCreatePrompt: "p"}, kindChat},
 		{"tiebreak-quick-vs-autopilot", TaskContextForEnv{QuickCreatePrompt: "p", AutopilotRunID: "r"}, kindQuickCreate},
 		{"tiebreak-autopilot-vs-comment", TaskContextForEnv{AutopilotRunID: "r", IssueID: "i", TriggerCommentID: "c"}, kindAutopilotRunOnly},
@@ -62,8 +43,7 @@ func TestTaskKindHasIssueContext(t *testing.T) {
 		kind taskKind
 		want bool
 	}{
-		{kindCommentTriggered, true},
-		{kindAssignmentTriggered, true},
+		{kindIssue, true},
 		{kindAutopilotRunOnly, false},
 		{kindQuickCreate, false},
 		{kindChat, false},
@@ -75,16 +55,11 @@ func TestTaskKindHasIssueContext(t *testing.T) {
 	}
 }
 
-// TestSlimFlagOffUsesLegacy is the canary that production stays on the
-// legacy brief by default. If a future change accidentally flips the flag
-// default to true (or breaks the dispatcher), this test catches it before
-// it ships.
-func TestSlimFlagOffUsesLegacy(t *testing.T) {
-	// Not parallel: reads runtimeFlags without enabling slim, so any
-	// test that races us by enabling slim would invalidate the assertion.
-	saved := runtimeFlags.Load()
-	t.Cleanup(func() { runtimeFlags.Store(saved) })
-	runtimeFlags.Store(nil)
+// TestBuildMetaSkillContentBriefContent pins that buildMetaSkillContent
+// renders the (now sole) brief: the `issue get` one-liner is present and
+// the retired legacy verbose description is not.
+func TestBuildMetaSkillContentBriefContent(t *testing.T) {
+	t.Parallel()
 
 	out := buildMetaSkillContent("claude", TaskContextForEnv{
 		IssueID:          "issue-1",
@@ -93,35 +68,11 @@ func TestSlimFlagOffUsesLegacy(t *testing.T) {
 		AgentID:          "eve-1",
 	})
 
-	// The legacy brief carries verbose Available Commands prose that the
-	// slim brief drops — `Get full issue details.` is the legacy "issue
-	// get" description, not in slim.
-	if !strings.Contains(out, "Get full issue details.") {
-		t.Errorf("flag-off path should render LEGACY brief, but the legacy `issue get` description is missing — did the dispatcher leak to slim?\n---\n%s", out)
-	}
-}
-
-// TestSlimFlagOnUsesSlim is the symmetric canary: when the flag is on,
-// buildMetaSkillContent must route to the slim path. Asserts a sentinel
-// substring that exists only in the slim brief.
-func TestSlimFlagOnUsesSlim(t *testing.T) {
-	withSlimBrief(t)
-
-	out := buildMetaSkillContent("claude", TaskContextForEnv{
-		IssueID:          "issue-1",
-		TriggerCommentID: "comment-1",
-		AgentName:        "Eve",
-		AgentID:          "eve-1",
-	})
-
-	// Slim Available Commands description for `issue get` is "full
-	// issue."; legacy is "Get full issue details." Distinct enough that
-	// either is decisive.
 	if !strings.Contains(out, "- `multica issue get <id> --output json` — full issue.\n") {
-		t.Errorf("flag-on path should render SLIM brief, but the slim `issue get` one-liner is missing\n---\n%s", out)
+		t.Errorf("brief is missing the `issue get` one-liner\n---\n%s", out)
 	}
 	if strings.Contains(out, "Get full issue details.") {
-		t.Errorf("flag-on path leaked the LEGACY `issue get` description into the slim brief\n---\n%s", out)
+		t.Errorf("brief still carries the retired legacy `issue get` description\n---\n%s", out)
 	}
 }
 
@@ -131,7 +82,6 @@ func TestSlimFlagOnUsesSlim(t *testing.T) {
 // (preceded by newline + followed by newline) so inline references like
 // "see ## Comment Formatting" do not trip the absence assertions.
 func TestBuildMetaSkillContentSlimKindMatrix(t *testing.T) {
-	withSlimBrief(t)
 
 	baseRepo := []RepoContextForEnv{{URL: "https://example.com/x.git", Description: "x"}}
 	baseSkill := []SkillContextForEnv{{Name: "skill-x", Description: "x"}}
@@ -141,12 +91,10 @@ func TestBuildMetaSkillContentSlimKindMatrix(t *testing.T) {
 		mustHave map[taskKind]bool
 	}
 	allKinds := map[taskKind]bool{
-		kindCommentTriggered: true, kindAssignmentTriggered: true,
-		kindAutopilotRunOnly: true, kindQuickCreate: true, kindChat: true,
+		kindIssue: true, kindAutopilotRunOnly: true,
+		kindQuickCreate: true, kindChat: true,
 	}
-	issueKinds := map[taskKind]bool{
-		kindCommentTriggered: true, kindAssignmentTriggered: true,
-	}
+	issueKinds := map[taskKind]bool{kindIssue: true}
 	checks := []sectionCheck{
 		{"# Multica Agent Runtime", allKinds},
 		{"## Background Task Safety", allKinds},
@@ -157,15 +105,13 @@ func TestBuildMetaSkillContentSlimKindMatrix(t *testing.T) {
 		{"## Output", allKinds},
 		{"## Comment Formatting", issueKinds},
 		{"## Repositories", map[taskKind]bool{
-			kindCommentTriggered: true, kindAssignmentTriggered: true,
-			kindAutopilotRunOnly: true, kindChat: true,
+			kindIssue: true, kindAutopilotRunOnly: true, kindChat: true,
 		}},
 		{"## Issue Metadata", issueKinds},
-		{"## Instruction Precedence", map[taskKind]bool{kindAssignmentTriggered: true}},
+		{"## Instruction Precedence", issueKinds},
 		{"## Sub-issue Creation", issueKinds},
 		{"## Skills", map[taskKind]bool{
-			kindCommentTriggered: true, kindAssignmentTriggered: true,
-			kindAutopilotRunOnly: true, kindChat: true,
+			kindIssue: true, kindAutopilotRunOnly: true, kindChat: true,
 		}},
 		{"## Mentions", issueKinds},
 		{"## Attachments", issueKinds},
@@ -178,9 +124,7 @@ func TestBuildMetaSkillContentSlimKindMatrix(t *testing.T) {
 			Repos: baseRepo, AgentSkills: baseSkill},
 		kindAutopilotRunOnly: {AutopilotRunID: "r-1", AgentName: "Eve", AgentID: "eve-1",
 			Repos: baseRepo, AgentSkills: baseSkill},
-		kindCommentTriggered: {IssueID: "i-1", TriggerCommentID: "tc-1",
-			AgentName: "Eve", AgentID: "eve-1", Repos: baseRepo, AgentSkills: baseSkill},
-		kindAssignmentTriggered: {IssueID: "i-1", AgentName: "Eve", AgentID: "eve-1",
+		kindIssue: {IssueID: "i-1", AgentName: "Eve", AgentID: "eve-1",
 			Repos: baseRepo, AgentSkills: baseSkill},
 	}
 
@@ -205,7 +149,6 @@ func TestBuildMetaSkillContentSlimKindMatrix(t *testing.T) {
 // for quick-create's Available Commands: `issue create` present, every
 // other Core command absent (the hard guardrails forbid the call).
 func TestSlimQuickCreateAvailableCommands(t *testing.T) {
-	withSlimBrief(t)
 
 	out := buildMetaSkillContent("codex", TaskContextForEnv{
 		QuickCreatePrompt: "create an issue about flaky tests",
@@ -242,46 +185,6 @@ func TestSlimQuickCreateAvailableCommands(t *testing.T) {
 	}
 }
 
-// TestSlimBriefIsSubstantiallyShorter is the headline check: on a
-// realistic comment-triggered fixture, the slim brief is at least 30%
-// shorter than the legacy brief. The exact number is in flux as we
-// continue to tune; the assertion just guards against a future change
-// that accidentally bloats the slim path back up to legacy levels.
-func TestSlimBriefIsSubstantiallyShorter(t *testing.T) {
-	// Not t.Parallel-safe because we toggle the global flag inside.
-	ctx := TaskContextForEnv{
-		IssueID: "11111111-2222-3333-4444-555555555555", TriggerCommentID: "66666666-7777-8888-9999-aaaaaaaaaaaa", TriggerThreadID: "66666666-7777-8888-9999-aaaaaaaaaaaa",
-		AgentName: "Eve", AgentID: "eve-1",
-		InitiatorName: "Yushen", InitiatorType: "member", InitiatorEmail: "yushen@devv.ai",
-		Repos: []RepoContextForEnv{
-			{URL: "https://github.com/multica-ai/multica", Description: "Managed agents platform"},
-			{URL: "git@github.com:multica-ai/multica-cloud.git", Description: "Internal cloud platform"},
-		},
-		AgentSkills: []SkillContextForEnv{
-			{Name: "Multica Git Workflow", Description: "Multica development workflow"},
-			{Name: "PR review", Description: "Review PRs"},
-		},
-	}
-
-	saved := runtimeFlags.Load()
-	t.Cleanup(func() { runtimeFlags.Store(saved) })
-
-	runtimeFlags.Store(nil)
-	legacy := buildMetaSkillContent("claude", ctx)
-
-	withSlimBrief(t)
-	slim := buildMetaSkillContent("claude", ctx)
-
-	if len(slim) >= len(legacy) {
-		t.Fatalf("slim brief (%d chars) should be shorter than legacy (%d chars)", len(slim), len(legacy))
-	}
-	ratio := 1.0 - float64(len(slim))/float64(len(legacy))
-	if ratio < 0.30 {
-		t.Errorf("slim brief reduction is only %.1f%% (slim=%d, legacy=%d); expected >= 30%%", ratio*100, len(slim), len(legacy))
-	}
-	t.Logf("slim brief reduction: %.1f%% (legacy=%d, slim=%d, Δ=%d)", ratio*100, len(legacy), len(slim), len(legacy)-len(slim))
-}
-
 // TestBackgroundTaskSafetySlimHardPins asserts the slim brief carries the
 // same hardened Background Task Safety pins as the legacy brief (MUL-4140).
 // The verbose path is covered by
@@ -290,7 +193,6 @@ func TestSlimBriefIsSubstantiallyShorter(t *testing.T) {
 // the no-background-and-yield / no-"standing by" guardrails that address
 // the MUL-4091 mechanism.
 func TestBackgroundTaskSafetySlimHardPins(t *testing.T) {
-	withSlimBrief(t)
 
 	out := buildMetaSkillContent("claude", TaskContextForEnv{
 		IssueID: "i-1", TriggerCommentID: "tc-1",
@@ -304,12 +206,46 @@ func TestBackgroundTaskSafetySlimHardPins(t *testing.T) {
 		"run the work synchronously instead",
 		"Never background-and-yield",
 		"foreground tool call that blocks",
-		"gh run watch",
+		// MUL-5274: an explicitly requested persistent local service is a
+		// completed handoff, not unfinished run-owned work. Pin the narrow
+		// exception and its readiness / cleanup / honesty requirements.
+		"persistent service handoff",
+		"running service itself is the requested deliverable",
+		"stdio redirected to durable logs",
+		"PID/profile",
+		"verify readiness before replying",
+		"survival as best-effort, not guaranteed",
+		"does not cover tests, builds, CI polling",
+		"are not agent-owned background tasks",
+		"GitHub Actions after a successful push",
+		"Do not wait for them by default",
+		// MUL-5223 pins: named tool-shape bans, merge requirements
+		// denied as acceptance criteria, replacement hand-off phrasing,
+		// and the scoped escape hatch that keeps an explicitly requested
+		// CI result both permitted and executable.
+		"do NOT run `gh pr checks --watch`",
+		"any sleep / retry loop that polls check status",
+		"NOT your delivery acceptance criteria",
+		"CI running: <PR link>",
+		"unless the explicit exception below applies",
+		"The one exception",
+		"ONE foreground blocking call (`gh pr checks <pr> --watch`)",
 		"running in the background so you can keep working",
 		"standing by",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("slim Background Task Safety missing hardened pin %q\n---\n%s", want, out)
 		}
+	}
+	// `gh run watch` may only appear as a banned command, never as the
+	// section's example of how to wait properly.
+	if strings.Contains(out, "e.g. `gh run watch`") {
+		t.Errorf("slim Background Task Safety should not suggest waiting for external GitHub CI\n---\n%s", out)
+	}
+	// MUL-5274 review: with the persistent-service exception in the list, a
+	// "The rules above ..." scoping sentence would sweep in work that is
+	// precisely no longer run-owned after handoff.
+	if strings.Contains(out, "The rules above") {
+		t.Errorf("slim Background Task Safety must not reintroduce the ambiguous \"The rules above\" scoping sentence\n---\n%s", out)
 	}
 }

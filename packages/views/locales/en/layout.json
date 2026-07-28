@@ -1,6 +1,7 @@
 {
   "nav": {
     "inbox": "Inbox",
+    "chat": "Chat",
     "my_issues": "My Issues",
     "issues": "Issues",
     "projects": "Projects",
@@ -12,12 +13,27 @@
     "skills": "Skills",
     "settings": "Settings"
   },
+  "tab": {
+    "issue": "Issue",
+    "project": "Project",
+    "autopilot": "Autopilot",
+    "agent": "Agent",
+    "member": "Member",
+    "squad": "Squad",
+    "skill": "Skill",
+    "machine": "Machine",
+    "runtime": "Runtime",
+    "attachment": "Attachment",
+    "create_agent": "Create Agent",
+    "unknown": "Unknown page"
+  },
   "help": {
     "trigger": "Help",
     "docs": "Docs",
     "changelog": "Change log",
     "discord": "Discord",
-    "feedback": "Feedback"
+    "feedback": "Feedback",
+    "server_version": "Server version {{version}}"
   },
   "workspace_loader": {
     "loading_workspace": "Loading workspace…",

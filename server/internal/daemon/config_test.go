@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,12 @@ func TestPatternsFromEnv_DefaultsWhenUnset(t *testing.T) {
 	got[0] = "mutated"
 	if defaults[0] == "mutated" {
 		t.Fatal("patternsFromEnv must not return a slice aliased with defaults")
+	}
+}
+
+func TestDefaultGCIntervalIsTwoHours(t *testing.T) {
+	if DefaultGCInterval != 2*time.Hour {
+		t.Fatalf("DefaultGCInterval = %s, want 2h", DefaultGCInterval)
 	}
 }
 
@@ -243,6 +250,44 @@ func stageFakeAgent(t *testing.T) string {
 	return binDir
 }
 
+func TestLoadConfig_DiscoversQwenCode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture is unavailable on Windows")
+	}
+	binDir := stageFakeAgent(t)
+	qwen := filepath.Join(binDir, "qwen")
+	if err := os.WriteFile(qwen, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake qwen: %v", err)
+	}
+	// Avoid consulting an inherited interactive shell for all deliberately
+	// absent providers; this test is about ordinary PATH discovery.
+	t.Setenv("SHELL", "/usr/bin/fish")
+	t.Setenv("MULTICA_QWEN_MODEL", "qwen3.8-max-preview")
+	t.Setenv("MULTICA_QWEN_ARGS", "--verbose --foo=bar")
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	entry, ok := cfg.Agents["qwen"]
+	if !ok {
+		t.Fatalf("qwen was not discovered: %v", cfg.Agents)
+	}
+	wantPath, err := filepath.EvalSymlinks(qwen)
+	if err != nil {
+		t.Fatalf("eval symlinks for qwen: %v", err)
+	}
+	if entry.Path != wantPath || entry.Command != "qwen" || entry.Model != "qwen3.8-max-preview" {
+		t.Fatalf("qwen entry = %+v, want path=%q command=qwen model=qwen3.8-max-preview", entry, wantPath)
+	}
+	if got, want := strings.Join(cfg.QwenArgs, " "), "--verbose --foo=bar"; got != want {
+		t.Fatalf("QwenArgs = %q, want %q", got, want)
+	}
+}
+
 func TestLoadConfig_SkipsMulticaHooksShadowingAgentBinaries(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell not available on Windows")
@@ -379,6 +424,101 @@ func TestLoadConfig_AutoUpdateDefault_SelfHostOff(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_CodexHandshakeTimeout(t *testing.T) {
+	stageFakeAgent(t)
+	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "")
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with default: %v", err)
+	}
+	if cfg.CodexHandshakeTimeout != DefaultCodexHandshakeTimeout {
+		t.Fatalf("CodexHandshakeTimeout = %s, want default %s", cfg.CodexHandshakeTimeout, DefaultCodexHandshakeTimeout)
+	}
+
+	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "47s")
+
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with env: %v", err)
+	}
+	if cfg.CodexHandshakeTimeout != 47*time.Second {
+		t.Fatalf("CodexHandshakeTimeout = %s, want 47s from env", cfg.CodexHandshakeTimeout)
+	}
+
+	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "0")
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with zero env: %v", err)
+	}
+	if cfg.CodexHandshakeTimeout != DefaultCodexHandshakeTimeout {
+		t.Fatalf("CodexHandshakeTimeout = %s, want default %s for zero env", cfg.CodexHandshakeTimeout, DefaultCodexHandshakeTimeout)
+	}
+
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:             "http://localhost:8080",
+		WorkspacesRoot:        t.TempDir(),
+		CodexHandshakeTimeout: 12 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with override: %v", err)
+	}
+	if cfg.CodexHandshakeTimeout != 12*time.Second {
+		t.Fatalf("CodexHandshakeTimeout = %s, want 12s from override", cfg.CodexHandshakeTimeout)
+	}
+}
+
+func TestLoadConfig_OpenCodeIdleWatchdog(t *testing.T) {
+	stageFakeAgent(t)
+	t.Setenv("MULTICA_OPENCODE_IDLE_WATCHDOG", "")
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with default: %v", err)
+	}
+	if cfg.OpenCodeIdleWatchdog != DefaultOpenCodeIdleWatchdog {
+		t.Fatalf("OpenCodeIdleWatchdog = %s, want default %s", cfg.OpenCodeIdleWatchdog, DefaultOpenCodeIdleWatchdog)
+	}
+
+	t.Setenv("MULTICA_OPENCODE_IDLE_WATCHDOG", "7m")
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with env: %v", err)
+	}
+	if cfg.OpenCodeIdleWatchdog != 7*time.Minute {
+		t.Fatalf("OpenCodeIdleWatchdog = %s, want 7m from env", cfg.OpenCodeIdleWatchdog)
+	}
+
+	// Zero disables the OpenCode-specific override while leaving the generic
+	// AgentIdleWatchdog as the fallback for OpenCode runs.
+	t.Setenv("MULTICA_OPENCODE_IDLE_WATCHDOG", "0")
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with zero env: %v", err)
+	}
+	if cfg.OpenCodeIdleWatchdog != 0 {
+		t.Fatalf("OpenCodeIdleWatchdog = %s, want zero from env", cfg.OpenCodeIdleWatchdog)
+	}
+}
+
 // TestLoadConfig_AutoUpdateDefault_CloudOn confirms the symmetric case: a
 // daemon pointed at Multica's hosted cloud keeps the historical opt-in
 // auto-update default. We pass the WSS form of the URL to also exercise that
@@ -496,7 +636,11 @@ func TestResolveAgentsViaLoginShell_StripsAliasShadowing(t *testing.T) {
 	// scenario the test couldn't actually set up.
 	t.Setenv("SHELL", sh)
 	t.Setenv("ENV", rc)
-	probe, err := exec.Command(sh, "-ilc", "alias fakeclaude 2>/dev/null").Output()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer probeCancel()
+	probeCmd := exec.CommandContext(probeCtx, sh, "-ilc", "alias fakeclaude 2>/dev/null")
+	probeCmd.Stdin = strings.NewReader("")
+	probe, err := probeCmd.Output()
 	if err != nil || !strings.Contains(string(probe), "fakeclaude") {
 		t.Skipf("test host's /bin/sh did not load alias from $ENV; cannot simulate shadowing (probe=%q err=%v)", string(probe), err)
 	}
@@ -660,6 +804,80 @@ func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
 	}
 }
 
+// Regression for #5205: after OpenAI moved the Desktop app to ChatGPT.app,
+// Multica must resolve the bundled CLI under ChatGPT.app (and prefer it over
+// the legacy Codex.app path when both exist).
+func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
+	pathDir := t.TempDir()
+	fakeChatGPT := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex")
+	fakeLegacy := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
+	for _, p := range []string{fakeChatGPT, fakeLegacy} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake CLI: %v", err)
+		}
+	}
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	// Prefer ChatGPT first, matching production ordering.
+	codexDesktopAppBundlePaths = func() []string { return []string{fakeChatGPT, fakeLegacy} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	pinNonCodexAgentsToMissingPaths(t)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex agent from ChatGPT.app bundle, got %#v", cfg.Agents)
+	}
+	if got.Path != fakeChatGPT {
+		t.Fatalf("codex path = %q, want ChatGPT.app path %q", got.Path, fakeChatGPT)
+	}
+}
+
+func TestCodexDesktopAppBundlePaths_IncludesChatGPTAndLegacy(t *testing.T) {
+	paths := codexDesktopAppBundlePaths()
+	var hasChatGPT, hasLegacy bool
+	for _, p := range paths {
+		if strings.Contains(p, "ChatGPT.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
+			hasChatGPT = true
+		}
+		if strings.Contains(p, "Codex.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
+			hasLegacy = true
+		}
+	}
+	if !hasChatGPT {
+		t.Fatalf("codexDesktopAppBundlePaths missing ChatGPT.app entry: %#v", paths)
+	}
+	if !hasLegacy {
+		t.Fatalf("codexDesktopAppBundlePaths missing legacy Codex.app entry: %#v", paths)
+	}
+	// New path must be preferred (listed before legacy).
+	chatgptIdx, legacyIdx := -1, -1
+	for i, p := range paths {
+		if chatgptIdx < 0 && strings.Contains(p, "ChatGPT.app") {
+			chatgptIdx = i
+		}
+		if legacyIdx < 0 && strings.Contains(p, "Codex.app") {
+			legacyIdx = i
+		}
+	}
+	if chatgptIdx < 0 || legacyIdx < 0 || chatgptIdx > legacyIdx {
+		t.Fatalf("expected ChatGPT.app before Codex.app, got indices chat=%d legacy=%d paths=%#v", chatgptIdx, legacyIdx, paths)
+	}
+}
+
 func TestLoadConfig_CodexDesktopFallbackDoesNotOverrideExplicitPath(t *testing.T) {
 	pathDir := t.TempDir()
 	fakeCodex := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
@@ -710,6 +928,7 @@ func pinNonCodexAgentsToMissingPaths(t *testing.T) {
 		"MULTICA_COPILOT_PATH",
 		"MULTICA_KIMI_PATH",
 		"MULTICA_KIRO_PATH",
+		"MULTICA_GROK_PATH",
 	} {
 		t.Setenv(name, filepath.Join(missingDir, strings.ToLower(name)))
 	}

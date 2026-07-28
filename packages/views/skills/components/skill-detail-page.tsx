@@ -38,7 +38,11 @@ import {
   workspaceKeys,
 } from "@multica/core/workspace/queries";
 import { resolvePublicFileUrl } from "@multica/core/workspace/avatar-url";
-import { runtimeListOptions } from "@multica/core/runtimes";
+import {
+  runtimeDisplayLabel,
+  runtimeDisplayName,
+  runtimeListOptions,
+} from "@multica/core/runtimes";
 import { ActorAvatar } from "@multica/ui/components/common/actor-avatar";
 import { Button, buttonVariants } from "@multica/ui/components/ui/button";
 import {
@@ -71,6 +75,7 @@ import {
   type SkillActionsContext,
 } from "./skill-list-actions";
 import { useT } from "../../i18n";
+import { ResourceLabelPicker } from "../../labels/resource-label-picker";
 
 const SKILL_MD = "SKILL.md";
 
@@ -174,7 +179,7 @@ function UsedBySection({ agents }: { agents: Agent[] }) {
             initials={a.name.slice(0, 2).toUpperCase()}
             avatarUrl={resolvePublicFileUrl(a.avatar_url)}
             isAgent
-            size={22}
+            size="md"
           />
           <div className="min-w-0 flex-1">
             <div className="truncate text-xs font-medium">{a.name}</div>
@@ -222,7 +227,7 @@ function OriginSidebarCard({
       </div>
       {runtime && (
         <div className="mt-1 break-all text-xs text-foreground">
-          {runtime.name}
+          {runtimeDisplayName(runtime)}
         </div>
       )}
       {origin.source_path && (
@@ -561,7 +566,9 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
     if (!origin) return null;
     if (origin.type === "runtime_local") {
       return originRuntime
-        ? t(($) => $.detail.subline.origin_runtime_named, { name: originRuntime.name })
+        ? t(($) => $.detail.subline.origin_runtime_named, {
+            name: runtimeDisplayLabel(originRuntime),
+          })
         : origin.provider
           ? t(($) => $.detail.subline.origin_runtime_provider, { provider: origin.provider })
           : t(($) => $.detail.subline.origin_runtime_unknown);
@@ -719,6 +726,11 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
                 className="resize-none text-sm read-only:cursor-default"
               />
             </div>
+            <ResourceLabelPicker
+              resourceType="skill"
+              resourceId={skill.id}
+              canEdit={canEdit}
+            />
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
               {originLabel && (
                 <span className="inline-flex items-center gap-1">
@@ -746,7 +758,7 @@ export function SkillDetailPage({ skillId }: { skillId: string }) {
                       name={creator.name}
                       initials={creator.name.slice(0, 2).toUpperCase()}
                       avatarUrl={resolvePublicFileUrl(creator.avatar_url)}
-                      size={14}
+                      size="xs"
                     />
                     {t(($) => $.detail.subline.by_creator, { name: creator.name })}
                   </span>

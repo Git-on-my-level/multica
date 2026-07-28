@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -28,10 +30,14 @@ type ProjectResponse struct {
 	Priority    string  `json:"priority"`
 	LeadType    *string `json:"lead_type"`
 	LeadID      *string `json:"lead_id"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
-	IssueCount  int64   `json:"issue_count"`
-	DoneCount   int64   `json:"done_count"`
+	// StartDate / DueDate are calendar days ("YYYY-MM-DD"), no time-of-day or
+	// timezone — same contract as issue.start_date / issue.due_date.
+	StartDate  *string `json:"start_date"`
+	DueDate    *string `json:"due_date"`
+	CreatedAt  string  `json:"created_at"`
+	UpdatedAt  string  `json:"updated_at"`
+	IssueCount int64   `json:"issue_count"`
+	DoneCount  int64   `json:"done_count"`
 	// ResourceCount is a breadcrumb pointing at the sub-collection at
 	// /api/projects/{id}/resources. Resources themselves stay out of this
 	// payload to keep parent metadata and child collections separate; clients
@@ -50,6 +56,8 @@ func projectToResponse(p db.Project) ProjectResponse {
 		Priority:    p.Priority,
 		LeadType:    textToPtr(p.LeadType),
 		LeadID:      uuidToPtr(p.LeadID),
+		StartDate:   dateToPtr(p.StartDate),
+		DueDate:     dateToPtr(p.DueDate),
 		CreatedAt:   timestampToString(p.CreatedAt),
 		UpdatedAt:   timestampToString(p.UpdatedAt),
 	}
@@ -79,6 +87,8 @@ type CreateProjectRequest struct {
 	Priority    string                                `json:"priority"`
 	LeadType    *string                               `json:"lead_type"`
 	LeadID      *string                               `json:"lead_id"`
+	StartDate   *string                               `json:"start_date"`
+	DueDate     *string                               `json:"due_date"`
 	Resources   []CreateProjectResourceRequestPayload `json:"resources,omitempty"`
 }
 
@@ -100,6 +110,8 @@ type UpdateProjectRequest struct {
 	Priority    *string `json:"priority"`
 	LeadType    *string `json:"lead_type"`
 	LeadID      *string `json:"lead_id"`
+	StartDate   *string `json:"start_date"`
+	DueDate     *string `json:"due_date"`
 }
 
 func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +277,27 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// start_date / due_date are optional calendar days; an absent or empty
+	// value leaves the column NULL. Mirrors CreateIssue's date handling.
+	var startDate pgtype.Date
+	if req.StartDate != nil && *req.StartDate != "" {
+		d, err := util.ParseCalendarDate(*req.StartDate)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid start_date format, expected YYYY-MM-DD")
+			return
+		}
+		startDate = d
+	}
+	var dueDate pgtype.Date
+	if req.DueDate != nil && *req.DueDate != "" {
+		d, err := util.ParseCalendarDate(*req.DueDate)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid due_date format, expected YYYY-MM-DD")
+			return
+		}
+		dueDate = d
+	}
+
 	// Pre-validate every resource payload before opening a transaction so an
 	// invalid ref produces a clean 400 with no DB work. For local_directory we
 	// also enforce one row per daemon_id within the batch — the daemon-side
@@ -310,6 +343,8 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		LeadType:    leadType,
 		LeadID:      leadID,
 		Priority:    priority,
+		StartDate:   startDate,
+		DueDate:     dueDate,
 	}
 
 	// Without resources, keep the simple non-tx path.
@@ -441,6 +476,8 @@ func (h *Handler) UpdateProject(w http.ResponseWriter, r *http.Request) {
 		Icon:        prevProject.Icon,
 		LeadType:    prevProject.LeadType,
 		LeadID:      prevProject.LeadID,
+		StartDate:   prevProject.StartDate,
+		DueDate:     prevProject.DueDate,
 	}
 	if req.Title != nil {
 		params.Title = pgtype.Text{String: *req.Title, Valid: true}
@@ -489,6 +526,32 @@ func (h *Handler) UpdateProject(w http.ResponseWriter, r *http.Request) {
 			params.LeadID = pgtype.UUID{Valid: false}
 		}
 	}
+	// Dates follow the issue contract: a present key with an empty/null value
+	// clears the date; an absent key leaves the prior value untouched.
+	if _, ok := rawFields["start_date"]; ok {
+		if req.StartDate != nil && *req.StartDate != "" {
+			d, err := util.ParseCalendarDate(*req.StartDate)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid start_date format, expected YYYY-MM-DD")
+				return
+			}
+			params.StartDate = d
+		} else {
+			params.StartDate = pgtype.Date{Valid: false} // explicit null = clear date
+		}
+	}
+	if _, ok := rawFields["due_date"]; ok {
+		if req.DueDate != nil && *req.DueDate != "" {
+			d, err := util.ParseCalendarDate(*req.DueDate)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid due_date format, expected YYYY-MM-DD")
+				return
+			}
+			params.DueDate = d
+		} else {
+			params.DueDate = pgtype.Date{Valid: false} // explicit null = clear date
+		}
+	}
 	project, err := h.Queries.UpdateProject(r.Context(), params)
 	if err != nil {
 		h.writeProjectWriteError(w, r, err, "update")
@@ -524,11 +587,41 @@ func (h *Handler) DeleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := uuidToString(requester.UserID)
-	if err := h.Queries.DeleteProject(r.Context(), db.DeleteProjectParams{
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	if _, err := qtx.LockProjectForDelete(r.Context(), db.LockProjectForDeleteParams{
+		ID:          project.ID,
+		WorkspaceID: project.WorkspaceID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to lock project")
+		return
+	}
+	if err := qtx.ClearChatSessionProjectByProject(r.Context(), db.ClearChatSessionProjectByProjectParams{
+		ProjectID:   project.ID,
+		WorkspaceID: project.WorkspaceID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to clear project chat context")
+		return
+	}
+	if err := qtx.DeleteProject(r.Context(), db.DeleteProjectParams{
 		ID:          project.ID,
 		WorkspaceID: project.WorkspaceID,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete project")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit project delete")
 		return
 	}
 	h.publish(protocol.EventProjectDeleted, workspaceID, "member", userID, map[string]any{"project_id": uuidToString(project.ID)})
@@ -653,6 +746,7 @@ func buildProjectSearchQuery(phrase string, terms []string, includeClosed bool) 
 
 	query := fmt.Sprintf(`SELECT p.id, p.workspace_id, p.title, p.description, p.icon,
 		p.status, p.priority, p.lead_type, p.lead_id,
+		p.start_date, p.due_date,
 		p.created_at, p.updated_at,
 		COUNT(*) OVER() AS total_count,
 		%s AS match_source
@@ -730,6 +824,8 @@ func (h *Handler) SearchProjects(w http.ResponseWriter, r *http.Request) {
 				&row.project.Priority,
 				&row.project.LeadType,
 				&row.project.LeadID,
+				&row.project.StartDate,
+				&row.project.DueDate,
 				&row.project.CreatedAt,
 				&row.project.UpdatedAt,
 				&row.totalCount,

@@ -18,6 +18,14 @@ import { useT } from "../../../i18n";
 const HIGHLIGHT_CLASS = "bg-accent";
 const ITEM_SELECTOR = "button[data-picker-item]:not(:disabled)";
 
+/**
+ * Default class of the picker popover trigger. Shared with the deferred
+ * (pre-mount) lookalike trigger in `DeferredPopup` call sites so the swap on
+ * first interaction is pixel-identical.
+ */
+export const PICKER_TRIGGER_CLASS =
+  "flex items-center gap-1.5 cursor-pointer rounded px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden";
+
 // ---------------------------------------------------------------------------
 // PropertyPicker — generic Popover shell with optional search
 // ---------------------------------------------------------------------------
@@ -96,17 +104,20 @@ export function PropertyPicker({
     }
   }, [highlightedIndex, getItems, children]); // re-run when children change (filtered list updates)
 
-  const handleOpenChange = useCallback(
-    (v: boolean) => {
-      onOpenChange(v);
-      if (!v) {
-        setQuery("");
-        setHighlightedIndex(-1);
-        onSearchChange?.("");
-      }
-    },
-    [onOpenChange, onSearchChange],
-  );
+  // Reset the search state on the open -> closed transition rather than inside
+  // an open-change handler. Every picker closes itself after a selection by
+  // calling its own `setOpen(false)`, which flips this `open` prop directly and
+  // never routes through the popover's `onOpenChange` — so a handler-only reset
+  // left the stale query (and the filtered list) in place on the next open.
+  const wasOpen = useRef(open);
+  useEffect(() => {
+    if (wasOpen.current && !open) {
+      setQuery("");
+      setHighlightedIndex(-1);
+      onSearchChange?.("");
+    }
+    wasOpen.current = open;
+  }, [open, onSearchChange]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -145,7 +156,7 @@ export function PropertyPicker({
 
   const popoverTrigger = (
     <PopoverTrigger
-      className={triggerRender ? undefined : "flex items-center gap-1.5 cursor-pointer rounded px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden"}
+      className={triggerRender ? undefined : PICKER_TRIGGER_CLASS}
       render={triggerRender}
     >
       {trigger}
@@ -153,7 +164,7 @@ export function PropertyPicker({
   );
 
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
+    <Popover open={open} onOpenChange={onOpenChange}>
       {tooltip ? (
         <Tooltip open={tooltipOpen} onOpenChange={setTooltipHover}>
           <TooltipTrigger render={popoverTrigger} />

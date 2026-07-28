@@ -25,6 +25,8 @@ import { useNavigation } from "../../navigation";
 import { TitleEditor, ContentEditor, type ContentEditorRef } from "../../editor";
 import { PriorityIcon } from "../../issues/components/priority-icon";
 import { ProjectResourcesSection } from "./project-resources-section";
+import { ProjectStartDatePicker } from "./project-start-date-picker";
+import { ProjectDueDatePicker } from "./project-due-date-picker";
 import { IssueSurface } from "../../issues/surface/issue-surface";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Button } from "@multica/ui/components/ui/button";
@@ -331,7 +333,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                   <button type="button" className="inline-flex items-center gap-1.5 text-xs hover:text-foreground transition-colors">
                     {project.lead_type && project.lead_id ? (
                       <>
-                        <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={16} enableHoverCard showStatusDot />
+                        <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size="sm" enableHoverCard showStatusDot />
                         <span className="cursor-pointer">{getActorName(project.lead_type, project.lead_id)}</span>
                       </>
                     ) : (
@@ -369,7 +371,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                           onClick={() => { handleUpdateField({ lead_type: "member", lead_id: m.user_id }); setLeadOpen(false); }}
                           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
                         >
-                          <ActorAvatar actorType="member" actorId={m.user_id} size={16} />
+                          <ActorAvatar actorType="member" actorId={m.user_id} size="sm" />
                           <span>{m.name}</span>
                         </button>
                       ))}
@@ -385,7 +387,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                           onClick={() => { handleUpdateField({ lead_type: "agent", lead_id: a.id }); setLeadOpen(false); }}
                           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
                         >
-                          <ActorAvatar actorType="agent" actorId={a.id} size={16} showStatusDot />
+                          <ActorAvatar actorType="agent" actorId={a.id} size="sm" showStatusDot />
                           <span>{a.name}</span>
                         </button>
                       ))}
@@ -397,6 +399,12 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                 </div>
               </PopoverContent>
             </Popover>
+          </PropRow>
+          <PropRow label={t(($) => $.detail.prop_start_date)}>
+            <ProjectStartDatePicker startDate={project.start_date} onUpdate={handleUpdateField} />
+          </PropRow>
+          <PropRow label={t(($) => $.detail.prop_due_date)}>
+            <ProjectDueDatePicker dueDate={project.due_date} onUpdate={handleUpdateField} />
           </PropRow>
         </div>}
       </div>
@@ -443,7 +451,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
           <ContentEditor
             ref={descEditorRef}
             key={projectId}
-            defaultValue={project.description || ""}
+            value={project.description || ""}
             placeholder={t(($) => $.detail.description_placeholder)}
             onUpdate={(md) => handleUpdateField({ description: md || null })}
             debounceMs={1500}
@@ -536,7 +544,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
 
           <IssueSurface
             scope={issueScope}
-            modes={["board", "list", "swimlane", "gantt"]}
+            modes={["board", "list", "table", "swimlane", "gantt"]}
           />
           </div>
         </ResizablePanel>

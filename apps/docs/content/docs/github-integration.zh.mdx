@@ -17,8 +17,33 @@ import { Callout } from "fumadocs-ui/components/callout";
 | **Issue 详情侧栏 → Pull requests** | 列出所有自动关联到该 issue 的 PR，含标题、仓库、状态（`Open` / `Draft` / `Merged` / `Closed`）和作者。点一行跳到 GitHub。 |
 | **Webhook（后台）** | 每次 `pull_request` 事件触发：upsert PR 行 → 扫描里面的 issue 编号 →（重新）建立 link。幂等——重投 delivery 不会产生重复记录。 |
 | **Merge 自动改 status** | PR 转 `merged` 时，所有已关联且状态不是 `Done` / `Cancelled` 的 issue 会被推到 `Done`。时间线里以 source 为 `github_pr_merged` 记录。 |
+| **PR 卡片 → CI 与可合并性** | 对每个关联的 PR，Multica 从 GitHub API 拉取一份经鉴权的快照，把它的 **CI 状态**和**可合并性**镜像到卡片上（见下方 **PR 卡片展示什么**）。 |
 
-只镜像 PR 本身。Commit、没开 PR 的分支、CI 检查状态都**不**入库——集成有意保持窄边界。
+除了 PR 自身的状态，集成还会为每个关联的 PR 镜像它的 **CI 状态**（全部通过、x 个失败并点名、或 x 个进行中）和**可合并性**（可合并、有冲突、blocked、behind），数据来自一份经鉴权的 GitHub API 快照。Commit、没开 PR 的分支仍然不入库。
+
+## PR 卡片展示什么
+
+每个关联 PR 的卡片上有两个**互相独立**的元素，各自基于一份经鉴权的 GitHub API 快照：
+
+- **CI 状态**——三态之一：**全部通过**（带计数，例如 `7/7`）、**x 个失败**（点出失败的 check 名）、或 **x 个进行中**（还在跑）。还没配任何 check 的 PR 两者都不显示——「没有 check」绝不会被当成通过。
+- **可合并性**——四态之一：**可合并**（仅当 GitHub 报告合并状态为 clean，即无冲突**且**满足分支保护时才显示）、**有冲突**、**blocked**、或 **behind**。
+
+两个元素互不遮挡——一个 PR 可以同时显示 check 失败**和**合并冲突。已合并 / 已关闭的 PR 两者都不显示；行首的状态图标已经表达了。
+
+快照从 GitHub API 拉取，并在 webhook 事件（`pull_request`、`check_run`、`check_suite`、`status`）到达时、打开卡片时、以及 PR 仍处于 open 且未决时周期性地刷新。GitHub 临时故障期间，卡片会继续显示上一次已知的快照并标记为 **stale**，而不是清空。
+
+## 多个工作区
+
+同一个 GitHub App installation 可以同时连接到**多个**工作区——比如同一组织下不同团队各自用独立工作区。此时每个已连接的工作区都会**各自独立**收到每个仓库的 `pull_request` 事件：
+
+- 每个工作区各自镜像 PR，并按**自己的** [issue 前缀](/workspaces) 和 GitHub 功能开关做自动关联。一个同时引用 `MUL-1` 和 `ENG-2` 的 PR，会在前缀为 `MUL` 的工作区关联 `MUL-1`、在前缀为 `ENG` 的工作区关联 `ENG-2`，两边互不可见对方的 issue。
+- 从某个工作区断开连接，只会让**该**工作区停止接收事件，其它工作区照常工作。
+
+仓库范围由你授予 GitHub App 的权限决定（全部仓库或指定子集）。在工作区连接这个 installation 本身就是一次订阅——Multica 里不需要再单独逐仓库勾选。
+
+<Callout type="warning">
+**升级 self-host 部署时注意：** 事件投递以 GitHub 连接为准，而不是工作区的代码仓库列表。如果某个工作区之前是在**没有**连接 GitHub 的情况下、仅靠代码仓库列表里登记该仓库来接收 PR 事件，升级后它将不再收到事件。要恢复投递，需在该工作区的 **Settings → GitHub** 里**连接同一个 GitHub installation**。
+</Callout>
 
 ## 编号是怎么匹配的
 
@@ -67,13 +92,13 @@ PR **关闭但没合并**——只更新 PR 卡片的状态为 `Closed`，issue 
 
 - **Connect / Disconnect** 需要工作区 **owner 或 admin**。普通成员能看到卡片描述但看不到 Connect 按钮
 - **Pull requests** 侧栏对所有能看到该 issue 的成员可见——和 issue 详情页其他部分权限一致
-- GitHub App 申请的是 PR 和 Metadata 的 **只读** 权限。Multica 从不向 GitHub 推 commit、评论或 status check
+- GitHub App 申请的是 PR、Checks、Commit statuses 和 Metadata 的 **只读** 权限。Multica 从不向 GitHub 推 commit、评论或 status check——卡片上的 CI 状态与可合并性都是只读拉取，绝不写回
 
 ## Self-Host 配置
 
 如果你在 Multica Cloud 上，集成已经配好——跳过本节。
 
-Self-Host 需要：建一个 GitHub App、指向你的 server、设两个环境变量。完整流程如下。
+Self-Host 需要：建一个 GitHub App、指向你的 server、设好环境变量。完整流程如下。
 
 ### 1. 创建一个 GitHub App
 
@@ -94,9 +119,19 @@ Self-Host 需要：建一个 GitHub App、指向你的 server、设两个环境�
 | **Webhook URL** | `https://<api-host>/api/webhooks/github` |
 | **Webhook secret** | 生成一个长随机字符串（例如 `openssl rand -hex 32`）。这个值会同样填到 step 2 的 env 里 |
 | **Permissions → Repository → Pull requests** | **Read-only** |
+| **Permissions → Repository → Checks** | **Read-only**——驱动 PR 卡片的 CI 状态 |
+| **Permissions → Repository → Commit statuses** | **Read-only**——CI 汇总里 legacy status context 的那一半 |
 | **Permissions → Repository → Metadata** | Read-only（必填）|
-| **Subscribe to events** | 勾选 **Pull request** |
+| **Subscribe to events** | 勾选 **Pull request**、**Check suite**、**Check run**、**Status** |
 | **Where can this GitHub App be installed?** | 自选。单组织部署建议选 `Only on this account` |
+
+<Callout type="warning">
+**只给 read，别给 write，也别多给。** **不要**授予 **Checks: Read and write**——写权限会让 GitHub 期待这个 App 自己上报 check run，结果 check 永久卡在 pending。只读才对。这个功能也**不需要** **Actions: read** 或 **Contents: read**——别加。
+</Callout>
+
+<Callout type="warning">
+**给一个已安装的 App 新增这些权限需要 accept。** 当你给现有 App 补上 Checks、Commit statuses、Check run、Status 时，GitHub 会把变更挂起为一条**待批准的权限请求**——直到每个 installation 的 owner 点 accept（在 GitHub 上该 installation 的设置里）它才生效。在某个 installation 批准之前，它名下仓库的 PR 卡片不会显示 CI / merge 状态。
+</Callout>
 
 点 **Create GitHub App** 之后，从详情页记下两件事：
 
@@ -115,17 +150,18 @@ API server 上：
 GITHUB_APP_SLUG=multica-acme
 GITHUB_WEBHOOK_SECRET=<你刚生成的 webhook secret>
 
-# 可选但建议配置——安装完成时直接拿到关联账号名，而不是等第一次 webhook 才刷新：
+# CI 状态与可合并性必填。不配这两个，集成仍会镜像 PR、自动关联 / 自动
+# 关闭 issue，但 PR 卡片不显示任何 CI 或 merge 状态：
 GITHUB_APP_ID=<App 设置页上的数字 App ID>
 GITHUB_APP_PRIVATE_KEY=<完整 PEM 块，包含 BEGIN/END 行>
 ```
 
-`GITHUB_APP_SLUG` 和 `GITHUB_WEBHOOK_SECRET` 必填。任何一个缺失：
+`GITHUB_APP_SLUG` 和 `GITHUB_WEBHOOK_SECRET` 是集成启动的必填项。任何一个缺失：
 
 - Settings 里 `Connect GitHub` 按钮会被 **disable**，并显示「not configured」提示
 - `/api/webhooks/github` 直接返回 **`503 github webhooks not configured`**——Multica 在 secret 没配置时拒绝处理事件，不会出现「没 secret 也接受 webhook」的安全坑
 
-`GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY` **可选**。配上之后，setup 回调可以用 App JWT 鉴权调用 GitHub `/app/installations/{id}`，安装完成那一刻就拿到真实的组织名/用户名。不配的话，连接卡片会先显示 `已连接到 unknown`，等 GitHub 的 `installation.created` webhook 到达（通常几秒内），Multica 会刷新 row 并通过 realtime 推送让 Settings 页面无需手动刷新即可更新。私钥从 App 设置页 **Private keys → Generate a private key** 生成，把整段 PEM（含 `-----BEGIN/END RSA PRIVATE KEY-----` 两行）粘到 env 里，保留换行。
+`GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY` 同时用于 **PR 卡片的 CI 状态与可合并性**和 **Settings → Repositories → 从 GitHub 选择**。它们让 Multica 以 App 身份鉴权（App JWT → installation token）、拉取 PR 卡片依赖的 GitHub API 快照，并签发仅有 metadata read 权限的短效 token 来列出 installation 的仓库。私钥从 App 设置页 **Private keys → Generate a private key** 生成，把整段 PEM（含 `-----BEGIN/END RSA PRIVATE KEY-----` 两行）粘到 env 里，保留换行。不配这两个时集成会**干净降级**：PR 照常镜像、issue 照常自动关联并在 merge 时转 Done、关联账号名仍由 `installation.created` webhook 解析——但 PR 卡片不显示 CI/merge 状态，仓库浏览也会被禁用。
 
 `FRONTEND_ORIGIN` 也必须设置（任何生产 self-host 都已经设了）——setup 回调结束后用它把用户跳回 `<FRONTEND_ORIGIN>/settings?tab=github`。
 
@@ -173,12 +209,28 @@ curl -i -X POST https://<api-host>/api/webhooks/github \
 | `401 invalid signature` | server 加载的 secret **不是**你以为的那个 | 进容器确认 env 实际生效（例如 `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" \| wc -c`），重新部署 |
 | `503 github webhooks not configured` | `GITHUB_WEBHOOK_SECRET` 在进程里是空的 | 配上 env，重启 API |
 
+**确认 App 的事件与权限。** 公开的 App 元数据接口会如实返回你授予的内容——不需要鉴权：
+
+```bash
+curl -s https://api.github.com/apps/<slug>
+```
+
+- `events` 数组里应包含 `pull_request`、`check_suite`、`check_run`、`status`。
+- `permissions` 对象里应包含 `checks: read` 和 `statuses: read`，以及 `pull_requests: read` 和 `metadata: read`。
+
+如果缺了，去修 App 的 **Subscribe to events** / **Permissions**——并记住：给一个已安装的 App 新增权限，要等每个 installation 的 owner 批准待处理的请求后才会生效。
+
+**「PR 卡片不显示 CI / merge 状态」。** 卡片能正常镜像 PR，但从不显示 check 或可合并性：
+
+- 确认运行中的 API 进程里配了 `GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY`——快照拉取靠它们鉴权。
+- 确认每个 installation 都**批准了 Checks 与 Commit statuses 的待处理权限请求**（见上面的探针）。
+
 ## 已知限制
 
 目前还没做的几个边界：
 
 - **手动 link UI 暂未提供**——关联 PR 的唯一方法是把 issue 编号写到 PR 分支 / 标题 / 正文
-- **不读 CI / check 状态**——只镜像 PR 本身，构建状态、reviewer 评论、reviewer 列表都没接进 Multica
+- **不接 review 讨论和 reviewer 列表**——CI 状态与可合并性现在会展示在 PR 卡片上（见 **PR 卡片展示什么**），但 review 评论、具体 reviewer 及其审批状态没接进 Multica
 - **没有工作区级别的 merge → status 映射配置**——默认固定是 `merged → done`（cancelled 除外）。可配置映射是后续迭代
 - **同 issue 多 PR 时，merge 行为偏激进**——两个 PR 都引用 `MUL-123` 时，第一个 merge 就把 issue 转 Done。"等所有关联 PR 都解决再推进 issue 状态"的优化已经在做了
 

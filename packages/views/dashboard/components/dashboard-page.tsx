@@ -5,6 +5,12 @@ import { BarChart3, FolderKanban, Trash2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import {
+  CompactNumberFlow,
+  CurrencyNumberFlow,
+  NumberFlow,
+  NumberFlowGroup,
+} from "@multica/ui/components/ui/number-flow";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -20,7 +26,12 @@ import {
   dashboardUsageByAgentOptions,
   dashboardAgentRunTimeOptions,
   dashboardRunTimeDailyOptions,
+  dashboardFailuresDailyOptions,
+  dashboardFailuresByAgentOptions,
+  FAILURE_CLASSES,
+  type FailureClass,
 } from "@multica/core/dashboard";
+import { useWorkspacePaths } from "@multica/core/paths";
 import { useCustomPricingStore } from "@multica/core/runtimes/custom-pricing-store";
 import { useViewingTimezone } from "../../common/use-viewing-timezone";
 import { PageHeader } from "../../layout/page-header";
@@ -30,13 +41,18 @@ import {
   DailyTokensChart,
   DailyTimeChart,
   DailyTasksChart,
+  DailyErrorsChart,
   WeeklyCostChart,
   WeeklyTokensChart,
   WeeklyTimeChart,
   WeeklyTasksChart,
+  WeeklyErrorsChart,
+  FAILURE_CLASS_COLOR,
+  formatRate,
 } from "../../runtimes/components/charts";
 import { ProjectIcon } from "../../projects/components/project-icon";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { AppLink } from "../../navigation";
 import {
   addDaysIso,
   aggregateByWeek,
@@ -45,19 +61,35 @@ import {
 } from "../../runtimes/utils";
 import { useT } from "../../i18n";
 import {
+  aggregateAgentFailures,
   aggregateAgentTokens,
   aggregateDailyCost,
+  aggregateDailyErrors,
   aggregateDailyTasks,
   aggregateDailyTime,
   aggregateDailyTokens,
+  aggregateFailureClasses,
+  aggregateFailureReasons,
+  aggregateWeeklyErrors,
   aggregateWeeklyTasks,
   aggregateWeeklyTime,
   bucketUnknownAgentRows,
+  anonymizeUnresolvedAgentRows,
   computeDailyTotals,
+  computeFailureTotals,
   DELETED_AGENTS_ROW_ID,
   formatDuration,
+  hasRateSample,
   mergeAgentDashboardRows,
+  MIN_RATE_SAMPLE,
+  OFFENDER_METRIC,
+  sortAgentFailures,
   type AgentDashboardRow,
+  type AgentFailureRow,
+  type FailureClassRow,
+  type FailureReasonRow,
+  type FailureTotals,
+  type OffenderSort,
 } from "../utils";
 
 // Period selector — mirrors the runtime detail page so users see the same
@@ -101,31 +133,44 @@ const EMPTY_DAILY: import("@multica/core/types").DashboardUsageDaily[] = [];
 const EMPTY_BY_AGENT: import("@multica/core/types").DashboardUsageByAgent[] = [];
 const EMPTY_RUNTIME: import("@multica/core/types").DashboardAgentRunTime[] = [];
 const EMPTY_RUNTIME_DAILY: import("@multica/core/types").DashboardRunTimeDaily[] = [];
+const EMPTY_FAILURE_DAILY: import("@multica/core/types").DashboardFailureDaily[] = [];
+const EMPTY_FAILURE_BY_AGENT: import("@multica/core/types").DashboardFailureByAgent[] =
+  [];
 const EMPTY_AGENTS: Agent[] = [];
-
-function fmtMoney(n: number): string {
-  if (n >= 100) return `$${n.toFixed(0)}`;
-  return `$${n.toFixed(2)}`;
-}
 
 // Local segmented control — same visual language the runtime usage section
 // uses for its period / tab toggles. shadcn's Tabs is wired for full tab
 // pages with ARIA semantics the compact toolbar pill doesn't need.
+//
+// Which option is active was expressed only as a colour swap, which no screen
+// reader can see, so `aria-pressed` carries it too. `label` is required rather
+// than optional because a naked group of toggle buttons is announced without
+// saying WHAT it toggles — "Rate, pressed" is useless until you know the group
+// is the offender ranking. Toggle buttons rather than a radiogroup: a
+// radiogroup owes the user arrow-key roving focus, and these are tab stops
+// wherever they appear in the page.
 function Segmented<T extends string | number>({
   value,
   onChange,
   options,
+  label,
 }: {
   value: T;
   onChange: (v: T) => void;
   options: readonly { label: string; value: T }[];
+  label: string;
 }) {
   return (
-    <div className="inline-flex items-center gap-0.5 rounded-md bg-muted p-0.5">
+    <div
+      role="group"
+      aria-label={label}
+      className="inline-flex items-center gap-0.5 rounded-md bg-muted p-0.5"
+    >
       {options.map((o) => (
         <button
           key={String(o.value)}
           type="button"
+          aria-pressed={o.value === value}
           onClick={() => onChange(o.value)}
           className={`rounded-sm px-2.5 py-1 text-xs font-medium transition-colors ${
             o.value === value
@@ -137,6 +182,43 @@ function Segmented<T extends string | number>({
         </button>
       ))}
     </div>
+  );
+}
+
+function DurationNumberFlow({
+  seconds,
+  lessThanMinuteLabel,
+  locales,
+}: {
+  seconds: number;
+  lessThanMinuteLabel: string;
+  locales?: Intl.LocalesArgument;
+}) {
+  const label = formatDuration(seconds, lessThanMinuteLabel);
+  const parts = Array.from(label.matchAll(/(\d+)([a-z]+)/gi), (match) => ({
+    value: Number(match[1]),
+    unit: match[2] ?? "",
+  }));
+
+  if (parts.length === 0) return label;
+
+  return (
+    <>
+      <span className="sr-only">{label}</span>
+      <NumberFlowGroup>
+        <span aria-hidden className="inline-flex items-baseline gap-1">
+          {parts.map((part) => (
+            <NumberFlow
+              key={part.unit}
+              value={part.value}
+              locales={locales}
+              suffix={part.unit}
+              format={{ maximumFractionDigits: 0, useGrouping: false }}
+            />
+          ))}
+        </span>
+      </NumberFlowGroup>
+    </>
   );
 }
 
@@ -152,9 +234,10 @@ function Segmented<T extends string | number>({
  * and the runtime page using one pricing table.
  */
 export function DashboardPage() {
-  const { t } = useT("usage");
+  const { t, i18n } = useT("usage");
   const wsId = useWorkspaceId();
   const viewTZ = useViewingTimezone();
+  const locales = i18n.resolvedLanguage ?? i18n.language;
   const [dim, setDim] = useState<Dim>("daily");
   const [days, setDays] = useState<TimeRange>(30);
   const [projectValue, setProjectValue] = useState<string>(ALL_PROJECTS);
@@ -208,11 +291,19 @@ export function DashboardPage() {
   const runTimeDailyQuery = useQuery(
     dashboardRunTimeDailyOptions(wsId, chartFetchDays, projectId, viewTZ),
   );
+  const failuresDailyQuery = useQuery(
+    dashboardFailuresDailyOptions(wsId, chartFetchDays, projectId, viewTZ),
+  );
+  const failuresByAgentQuery = useQuery(
+    dashboardFailuresByAgentOptions(wsId, days, projectId, viewTZ),
+  );
 
   const dailyUsage = dailyQuery.data ?? EMPTY_DAILY;
   const byAgentUsage = byAgentQuery.data ?? EMPTY_BY_AGENT;
   const runTimeRows = runTimeQuery.data ?? EMPTY_RUNTIME;
   const runTimeDailyRows = runTimeDailyQuery.data ?? EMPTY_RUNTIME_DAILY;
+  const failureDailyRows = failuresDailyQuery.data ?? EMPTY_FAILURE_DAILY;
+  const failureByAgentRows = failuresByAgentQuery.data ?? EMPTY_FAILURE_BY_AGENT;
 
   // Daily-aggregation surfaces (cost/tokens/time/tasks KPIs and the Daily
   // trend chart) re-scope to the user-selected `days` even when we
@@ -233,14 +324,20 @@ export function DashboardPage() {
     () => runTimeDailyRows.filter((r) => r.date >= dailyCutoffIso),
     [runTimeDailyRows, dailyCutoffIso],
   );
+  const failureDailyInWindow = useMemo(
+    () => failureDailyRows.filter((r) => r.date >= dailyCutoffIso),
+    [failureDailyRows, dailyCutoffIso],
+  );
 
   const isLoading =
     dailyQuery.isLoading ||
     byAgentQuery.isLoading ||
     runTimeQuery.isLoading ||
-    runTimeDailyQuery.isLoading;
+    runTimeDailyQuery.isLoading ||
+    failuresDailyQuery.isLoading ||
+    failuresByAgentQuery.isLoading;
 
-  // Four independent rollups, but the empty-state is one decision — only
+  // Six independent rollups, but the empty-state is one decision — only
   // show "no data yet" when ALL came back empty so a project with tokens
   // but no runs (or vice-versa) doesn't look broken.
   const hasNoData =
@@ -248,7 +345,9 @@ export function DashboardPage() {
     dailyUsage.length === 0 &&
     byAgentUsage.length === 0 &&
     runTimeRows.length === 0 &&
-    runTimeDailyRows.length === 0;
+    runTimeDailyRows.length === 0 &&
+    failureDailyRows.length === 0 &&
+    failureByAgentRows.length === 0;
 
   // Cost / token math — re-derived when usage, days, or pricings change.
   const totals = useMemo(
@@ -271,6 +370,56 @@ export function DashboardPage() {
     () => aggregateDailyTasks(runTimeDailyInWindow),
     [runTimeDailyInWindow],
   );
+  const dailyErrors = useMemo(
+    () => aggregateDailyErrors(failureDailyInWindow),
+    [failureDailyInWindow],
+  );
+
+  // Failure summaries for the Errors breakdown card.
+  //
+  // Totals / classes / reasons are derived from the DATE-BUCKETED rollup after
+  // the same `dailyCutoffIso` trim the charts use, not from the per-agent one.
+  // `parseSinceParamInTZ` deliberately returns N+1 calendar days of headroom
+  // (see sinceFromDays in server/internal/handler/runtime.go), and only a
+  // series carrying a date can trim that back client-side. Reading these off
+  // the per-agent rollup put the card one calendar day wider than the chart
+  // directly above it — at 1D the chart could show no failures while the card
+  // counted yesterday's.
+  const failureTotals = useMemo(
+    () => computeFailureTotals(failureDailyInWindow),
+    [failureDailyInWindow],
+  );
+  const failureClassRows = useMemo(
+    () => aggregateFailureClasses(failureDailyInWindow),
+    [failureDailyInWindow],
+  );
+  const failureReasonRows = useMemo(
+    () => aggregateFailureReasons(failureDailyInWindow),
+    [failureDailyInWindow],
+  );
+  // Which agent ids this viewer can actually resolve to a name. Declared here
+  // rather than next to the leaderboard because the Errors aggregation below
+  // needs it too — see anonymizeUnresolvedAgentRows.
+  const knownAgentIds = useMemo(
+    () => (agentsQuery.isSuccess ? new Set(agents.map((a) => a.id)) : null),
+    [agentsQuery.isSuccess, agents],
+  );
+
+  // The per-agent split has no date to trim on, so its window is closed
+  // server-side instead — GetDashboardFailuresByAgent uses the exact N-day
+  // cutoff rather than the N+1 one.
+  //
+  // Anonymize BEFORE aggregating: the sentinel then behaves like any other
+  // agent id, so the bucket's failure classes are summed from real
+  // per-(agent, reason) rows instead of being reconstructed from rows that
+  // have already collapsed to a single dominant class.
+  const agentFailureRows = useMemo(
+    () =>
+      aggregateAgentFailures(
+        anonymizeUnresolvedAgentRows(failureByAgentRows, knownAgentIds),
+      ),
+    [failureByAgentRows, knownAgentIds],
+  );
 
   // Weekly aggregates — built from the over-fetched per-date queries so the
   // leftmost trailing week always has data even when the user-selected `days`
@@ -291,6 +440,10 @@ export function DashboardPage() {
   const weeklyTasks = useMemo(
     () => aggregateWeeklyTasks(runTimeDailyRows, viewTZ, weekCount),
     [runTimeDailyRows, viewTZ, weekCount],
+  );
+  const weeklyErrors = useMemo(
+    () => aggregateWeeklyErrors(failureDailyRows, viewTZ, weekCount),
+    [failureDailyRows, viewTZ, weekCount],
   );
   const agentTokenRows = useMemo(
     () => aggregateAgentTokens(byAgentUsage),
@@ -323,10 +476,6 @@ export function DashboardPage() {
   // archived included); only truly-removed agents collapse into the bucket.
   // Skip bucketing until the agent list has loaded so a slow agents fetch
   // doesn't transiently merge every row.
-  const knownAgentIds = useMemo(
-    () => (agentsQuery.isSuccess ? new Set(agents.map((a) => a.id)) : null),
-    [agentsQuery.isSuccess, agents],
-  );
   const visibleAgentRows = useMemo(
     () => bucketUnknownAgentRows(agentRows, knownAgentIds),
     [agentRows, knownAgentIds],
@@ -359,6 +508,7 @@ export function DashboardPage() {
             onChange={setProjectValue}
           />
           <Segmented
+            label={t(($) => $.dim.label)}
             value={dim}
             onChange={handleDimChange}
             options={[
@@ -367,6 +517,7 @@ export function DashboardPage() {
             ]}
           />
           <Segmented
+            label={t(($) => $.filter.period_label)}
             value={days}
             onChange={setDays}
             options={allowedRanges.map((r) => ({ label: r.label, value: r.days }))}
@@ -389,13 +540,23 @@ export function DashboardPage() {
               <div className="grid grid-cols-1 divide-y rounded-lg border bg-card sm:grid-cols-2 sm:divide-x sm:divide-y-0 lg:grid-cols-4">
                 <KpiCard
                   label={t(($) => $.kpi.cost_label, { days })}
-                  value={fmtMoney(totals.cost)}
+                  value={
+                    <CurrencyNumberFlow value={totals.cost} locales={locales} />
+                  }
                 />
                 <KpiCard
                   label={t(($) => $.kpi.tokens_label, { days })}
-                  value={formatTokens(
-                    totals.input + totals.output + totals.cacheRead + totals.cacheWrite,
-                  )}
+                  value={
+                    <CompactNumberFlow
+                      value={
+                        totals.input +
+                        totals.output +
+                        totals.cacheRead +
+                        totals.cacheWrite
+                      }
+                      locales={locales}
+                    />
+                  }
                   hint={t(($) => $.kpi.tokens_hint, {
                     input: formatTokens(totals.input),
                     output: formatTokens(totals.output),
@@ -403,17 +564,33 @@ export function DashboardPage() {
                 />
                 <KpiCard
                   label={t(($) => $.kpi.run_time_label, { days })}
-                  value={formatDuration(
-                    runTimeTotals.totalSeconds,
-                    t(($) => $.duration.less_than_minute),
-                  )}
+                  value={
+                    <DurationNumberFlow
+                      seconds={runTimeTotals.totalSeconds}
+                      lessThanMinuteLabel={t(($) => $.duration.less_than_minute)}
+                      locales={locales}
+                    />
+                  }
                   hint={t(($) => $.kpi.run_time_hint, {
                     tasks: runTimeTotals.taskCount,
                   })}
                 />
                 <KpiCard
                   label={t(($) => $.kpi.tasks_label, { days })}
-                  value={String(runTimeTotals.taskCount)}
+                  value={
+                    <NumberFlow
+                      value={runTimeTotals.taskCount}
+                      locales={locales}
+                      format={{ maximumFractionDigits: 0 }}
+                      aria-label={String(runTimeTotals.taskCount)}
+                    />
+                  }
+                  // Deliberately still sourced from `runTimeTotals`, not the
+                  // failure rollup: the tile's own value counts started tasks
+                  // only, so quoting the failure rollup's larger failure count
+                  // here would put two different denominators in one tile. The
+                  // Errors card below states its rate with the denominator
+                  // spelled out instead.
                   hint={t(($) => $.kpi.tasks_hint, {
                     failed: runTimeTotals.failedCount,
                   })}
@@ -421,21 +598,23 @@ export function DashboardPage() {
                 />
               </div>
 
-              {/* Trend chart — toggle picks Tokens / Cost / Time / Tasks
-                  and the parent's dim selector decides whether the bars are
-                  per-day or per-calendar-week. All four metrics share the
-                  same x-axis so the user can mentally overlay them by
-                  flipping the toggle. */}
+              {/* Trend chart — toggle picks Tokens / Cost / Time / Tasks /
+                  Errors and the parent's dim selector decides whether the
+                  bars are per-day or per-calendar-week. All five metrics
+                  share the same x-axis so the user can mentally overlay them
+                  by flipping the toggle. */}
               <TrendBlock
                 dim={dim}
                 dailyCost={dailyCost}
                 dailyTokens={dailyTokens}
                 dailyTime={dailyTime}
                 dailyTasks={dailyTasks}
+                dailyErrors={dailyErrors}
                 weeklyCost={weeklyCost}
                 weeklyTokens={weeklyTokens}
                 weeklyTime={weeklyTime}
                 weeklyTasks={weeklyTasks}
+                weeklyErrors={weeklyErrors}
                 lessThanMinuteLabel={t(($) => $.duration.less_than_minute)}
               />
 
@@ -446,6 +625,18 @@ export function DashboardPage() {
                 agents={agents}
                 deletedAgentCount={deletedAgentCount}
                 lessThanMinuteLabel={t(($) => $.duration.less_than_minute)}
+              />
+
+              {/* Failure breakdown — what broke and who it broke for. Rendered
+                  unconditionally (not only when failures exist) so "no failed
+                  runs" is an answer the page gives rather than an absence the
+                  reader has to infer. */}
+              <ErrorsBreakdown
+                totals={failureTotals}
+                classRows={failureClassRows}
+                reasonRows={failureReasonRows}
+                agentRows={agentFailureRows}
+                agents={agents}
               />
             </>
           )}
@@ -469,9 +660,14 @@ function ProjectFilter({
   const selected = projects.find((p) => p.id === value);
   const selectedTitle =
     value === ALL_PROJECTS ? allLabel : selected?.title ?? allLabel;
+  const projectItems = [
+    { value: ALL_PROJECTS, label: allLabel },
+    ...projects.map((project) => ({ value: project.id, label: project.title })),
+  ];
 
   return (
     <Select
+      items={projectItems}
       value={value}
       onValueChange={(v) => onChange(v ?? ALL_PROJECTS)}
     >
@@ -512,7 +708,7 @@ function ProjectFilter({
   );
 }
 
-type DailyMetric = "tokens" | "cost" | "time" | "tasks";
+type DailyMetric = "tokens" | "cost" | "time" | "tasks" | "errors";
 
 function TrendBlock({
   dim,
@@ -520,10 +716,12 @@ function TrendBlock({
   dailyTokens,
   dailyTime,
   dailyTasks,
+  dailyErrors,
   weeklyCost,
   weeklyTokens,
   weeklyTime,
   weeklyTasks,
+  weeklyErrors,
   lessThanMinuteLabel,
 }: {
   dim: Dim;
@@ -531,10 +729,12 @@ function TrendBlock({
   dailyTokens: ReturnType<typeof aggregateDailyTokens>;
   dailyTime: ReturnType<typeof aggregateDailyTime>;
   dailyTasks: ReturnType<typeof aggregateDailyTasks>;
+  dailyErrors: ReturnType<typeof aggregateDailyErrors>;
   weeklyCost: ReturnType<typeof aggregateByWeek>["weeklyCostStack"];
   weeklyTokens: ReturnType<typeof aggregateByWeek>["weeklyTokens"];
   weeklyTime: ReturnType<typeof aggregateWeeklyTime>;
   weeklyTasks: ReturnType<typeof aggregateWeeklyTasks>;
+  weeklyErrors: ReturnType<typeof aggregateWeeklyErrors>;
   lessThanMinuteLabel: string;
 }) {
   const { t } = useT("usage");
@@ -547,6 +747,7 @@ function TrendBlock({
   const tokensData = dim === "weekly" ? weeklyTokens : dailyTokens;
   const timeData = dim === "weekly" ? weeklyTime : dailyTime;
   const tasksData = dim === "weekly" ? weeklyTasks : dailyTasks;
+  const errorsData = dim === "weekly" ? weeklyErrors : dailyErrors;
 
   const totalCost = costData.reduce((sum, d) => sum + d.total, 0);
   const totalTokens = tokensData.reduce(
@@ -558,6 +759,10 @@ function TrendBlock({
     (sum, d) => sum + d.completed + d.failed,
     0,
   );
+  // A window with runs but zero failures is a *good* outcome, not missing
+  // data — but an all-zero bar chart says nothing a sentence can't say
+  // better, so it still routes to the empty state.
+  const totalFailed = errorsData.reduce((sum, d) => sum + d.failed, 0);
   const isEmpty =
     metric === "cost"
       ? totalCost === 0
@@ -565,7 +770,9 @@ function TrendBlock({
         ? totalTokens === 0
         : metric === "time"
           ? totalSeconds === 0
-          : totalTasks === 0;
+          : metric === "tasks"
+            ? totalTasks === 0
+            : totalFailed === 0;
 
   const title =
     dim === "weekly"
@@ -575,20 +782,25 @@ function TrendBlock({
           ? t(($) => $.weekly.title_tokens)
           : metric === "time"
             ? t(($) => $.weekly.title_time)
-            : t(($) => $.weekly.title_tasks)
+            : metric === "tasks"
+              ? t(($) => $.weekly.title_tasks)
+              : t(($) => $.weekly.title_errors)
       : metric === "cost"
         ? t(($) => $.daily.title_cost)
         : metric === "tokens"
           ? t(($) => $.daily.title_tokens)
           : metric === "time"
             ? t(($) => $.daily.title_time)
-            : t(($) => $.daily.title_tasks);
+            : metric === "tasks"
+              ? t(($) => $.daily.title_tasks)
+              : t(($) => $.daily.title_errors);
 
   return (
     <div className="rounded-lg border bg-card p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <h4 className="text-sm font-semibold">{title}</h4>
         <Segmented
+          label={t(($) => $.daily.metric_label)}
           value={metric}
           onChange={setMetric}
           options={[
@@ -596,6 +808,7 @@ function TrendBlock({
             { label: t(($) => $.daily.metric_cost), value: "cost" as const },
             { label: t(($) => $.daily.metric_time), value: "time" as const },
             { label: t(($) => $.daily.metric_tasks), value: "tasks" as const },
+            { label: t(($) => $.daily.metric_errors), value: "errors" as const },
           ]}
         />
       </div>
@@ -604,7 +817,9 @@ function TrendBlock({
           <div className="flex aspect-[3/1] flex-col items-center justify-center gap-2 rounded-md border border-dashed bg-muted/20 p-6 text-center">
             <BarChart3 className="h-5 w-5 text-muted-foreground/50" />
             <p className="text-xs text-muted-foreground">
-              {t(($) => $.daily.no_data)}
+              {metric === "errors"
+                ? t(($) => $.errors.no_data)
+                : t(($) => $.daily.no_data)}
             </p>
           </div>
         ) : dim === "weekly" ? (
@@ -618,8 +833,10 @@ function TrendBlock({
               formatY={(s) => formatDuration(s, lessThanMinuteLabel)}
               formatTooltip={(s) => formatDuration(s, lessThanMinuteLabel)}
             />
-          ) : (
+          ) : metric === "tasks" ? (
             <WeeklyTasksChart data={weeklyTasks} />
+          ) : (
+            <WeeklyErrorsChart data={weeklyErrors} />
           )
         ) : metric === "cost" ? (
           <DailyCostChart data={dailyCost} />
@@ -631,11 +848,441 @@ function TrendBlock({
             formatY={(s) => formatDuration(s, lessThanMinuteLabel)}
             formatTooltip={(s) => formatDuration(s, lessThanMinuteLabel)}
           />
-        ) : (
+        ) : metric === "tasks" ? (
           <DailyTasksChart data={dailyTasks} />
+        ) : (
+          <DailyErrorsChart data={dailyErrors} />
         )}
       </div>
     </div>
+  );
+}
+
+// Translated label for a failure class. The mapping is a switch rather than
+// an index into a lookup object so the type checker flags a class added to
+// FAILURE_CLASSES without matching copy.
+function useFailureClassLabel(): (c: FailureClass) => string {
+  const { t } = useT("usage");
+  return (c) => {
+    switch (c) {
+      case "auth":
+        return t(($) => $.errors.class.auth);
+      case "rate_limit":
+        return t(($) => $.errors.class.rate_limit);
+      case "timeout":
+        return t(($) => $.errors.class.timeout);
+      case "provider":
+        return t(($) => $.errors.class.provider);
+      case "runtime":
+        return t(($) => $.errors.class.runtime);
+      case "agent":
+        return t(($) => $.errors.class.agent);
+      case "other":
+        return t(($) => $.errors.class.other);
+    }
+  };
+}
+
+// How many offenders the list shows before collapsing the tail behind a
+// toggle. The list is ranked by absolute failure count, so the tail is
+// agents that failed once or twice — real, but not what anyone opens this
+// card to see. Eight keeps the card roughly as tall as the class summary
+// plus a header, instead of running to 30+ rows on a busy workspace.
+const TOP_OFFENDER_LIMIT = 8;
+
+// Shared by the offender column header and every offender row, so the two
+// cannot drift out of alignment.
+const OFFENDER_GRID =
+  "grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_4rem_4rem_4rem] items-center gap-3";
+
+/**
+ * Failure breakdown for the selected window: what class of thing broke, and
+ * which agents it broke for.
+ *
+ * Laid out as two stacked full-width sections rather than side-by-side
+ * columns. The two halves have structurally different lengths — classes are
+ * capped at seven and usually show three or four, while the agent list is
+ * unbounded — so a 2-column grid left one side stranded next to a column of
+ * whitespace. Stacking also lets each section use the full width for what it
+ * actually needs: proportion for the classes, a leaderboard-shaped row for
+ * the agents.
+ */
+function ErrorsBreakdown({
+  totals,
+  classRows,
+  reasonRows,
+  agentRows,
+  agents,
+}: {
+  totals: FailureTotals;
+  classRows: FailureClassRow[];
+  reasonRows: FailureReasonRow[];
+  agentRows: AgentFailureRow[];
+  agents: { id: string; name: string }[];
+}) {
+  const { t } = useT("usage");
+  const classLabel = useFailureClassLabel();
+  const [showReasons, setShowReasons] = useState(false);
+  const [showAllAgents, setShowAllAgents] = useState(false);
+  const [sortBy, setSortBy] = useState<OffenderSort>("failed");
+
+  const sortOptions = useMemo(
+    () => [
+      { value: "failed" as const, label: t(($) => $.errors.sort_failed) },
+      { value: "rate" as const, label: t(($) => $.errors.sort_rate) },
+    ],
+    [t],
+  );
+
+  const sortedAgents = useMemo(
+    () => sortAgentFailures(agentRows, sortBy),
+    [agentRows, sortBy],
+  );
+
+  // The leader fills the track, measured over every row rather than the
+  // visible ones so a bar means the same thing collapsed and expanded. Reading
+  // it off the leader (instead of a max over the raw rows) also keeps the Rate
+  // scale usable: a demoted small-sample row can out-rate the leader, and
+  // scaling to it would squash every meaningful bar to a sliver.
+  const leader = sortedAgents[0];
+  const maxValue = leader ? OFFENDER_METRIC[sortBy](leader) : 0;
+
+  const visibleAgents = showAllAgents
+    ? sortedAgents
+    : sortedAgents.slice(0, TOP_OFFENDER_LIMIT);
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 pt-4 pb-3">
+        <h4 className="text-sm font-semibold">{t(($) => $.errors.title)}</h4>
+        <span className="text-xs text-muted-foreground">
+          {totals.failed > 0
+            ? t(($) => $.errors.summary, {
+                failed: totals.failed,
+                total: totals.total,
+                rate: formatRate(totals.failed, totals.total),
+              })
+            : t(($) => $.errors.no_data)}
+        </span>
+      </div>
+
+      {totals.failed === 0 ? null : (
+        <>
+          <div className="border-b p-4">
+            <div className="mb-2.5 flex items-center justify-between gap-2">
+              {/* Spells out its own denominator. The header above quotes a
+                  rate over every run (3.3% of 8575); this section splits the
+                  failures alone (287). Two percentages one above the other
+                  with different denominators read as a contradiction unless
+                  each says what it is counting. */}
+              <h5 className="text-xs font-medium text-muted-foreground">
+                {t(($) => $.errors.mix_title, { failed: totals.failed })}
+              </h5>
+              <button
+                type="button"
+                onClick={() => setShowReasons((v) => !v)}
+                className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                {showReasons
+                  ? t(($) => $.errors.hide_reasons)
+                  : t(($) => $.errors.show_reasons)}
+              </button>
+            </div>
+            {showReasons ? (
+              <ReasonList rows={reasonRows} />
+            ) : (
+              <ClassComposition rows={classRows} classLabel={classLabel} />
+            )}
+          </div>
+
+          <div className="p-4">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h5 className="text-xs font-medium text-muted-foreground">
+                {t(($) => $.errors.by_agent)}
+              </h5>
+              <div className="flex flex-wrap items-center justify-end gap-3">
+                <Segmented
+                  label={t(($) => $.errors.sort_label)}
+                  value={sortBy}
+                  onChange={setSortBy}
+                  options={sortOptions}
+                />
+                {sortedAgents.length > TOP_OFFENDER_LIMIT ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllAgents((v) => !v)}
+                    className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    {showAllAgents
+                      ? t(($) => $.errors.show_less, {
+                          count: TOP_OFFENDER_LIMIT,
+                        })
+                      : t(($) => $.errors.show_all, {
+                          count: sortedAgents.length,
+                        })}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            {/* Column headers, as on the leaderboard: `4 / 10 · 40%` was one
+                unlabelled blob and the reader had to guess which number was
+                which. The active metric's column is emphasised so it is
+                obvious what the ranking and the bars measure. */}
+            {sortedAgents.length > 0 ? (
+              <div
+                className={`${OFFENDER_GRID} border-b py-2 text-xs font-medium text-muted-foreground`}
+              >
+                <span>{t(($) => $.errors.header_agent)}</span>
+                <span />
+                <span
+                  className={`text-right ${sortBy === "failed" ? "text-foreground" : ""}`}
+                >
+                  {t(($) => $.errors.header_failed)}
+                </span>
+                <span className="text-right">
+                  {t(($) => $.errors.header_runs)}
+                </span>
+                <span
+                  className={`text-right ${sortBy === "rate" ? "text-foreground" : ""}`}
+                >
+                  {t(($) => $.errors.header_rate)}
+                </span>
+              </div>
+            ) : null}
+            <ul aria-label={t(($) => $.errors.by_agent)} className="divide-y">
+              {visibleAgents.map((row) => (
+                <AgentFailureItem
+                  key={row.agentId}
+                  row={row}
+                  name={agents.find((a) => a.id === row.agentId)?.name ?? null}
+                  maxValue={maxValue}
+                  sortBy={sortBy}
+                  classLabel={classLabel}
+                />
+              ))}
+            </ul>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Class breakdown as one 100%-stacked bar plus a legend.
+ *
+ * Replaces seven stacked progress bars. The question this answers is "what is
+ * the mix", and a single bar shows share-of-total directly — with separate
+ * bars the reader has to compare lengths and mentally total them. It also
+ * collapses ~340px of vertical space into ~70px, which is what let the card
+ * stop being a column of whitespace.
+ */
+function ClassComposition({
+  rows,
+  classLabel,
+}: {
+  rows: FailureClassRow[];
+  classLabel: (c: FailureClass) => string;
+}) {
+  const { t } = useT("usage");
+  const total = rows.reduce((sum, r) => sum + r.count, 0);
+  if (total === 0) return null;
+
+  return (
+    <div className="space-y-2.5">
+      {/* Segments are ordered by count desc (the aggregator's order), so the
+          bar reads heaviest-first left to right. */}
+      <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
+        {rows.map((row) => (
+          <div
+            key={row.failureClass}
+            className="h-full transition-[width] duration-300 ease-out"
+            style={{
+              width: `${(row.count / total) * 100}%`,
+              backgroundColor: FAILURE_CLASS_COLOR[row.failureClass],
+            }}
+          />
+        ))}
+      </div>
+      <ul
+        aria-label={t(($) => $.errors.mix_label)}
+        className="flex flex-wrap items-center gap-x-4 gap-y-1.5"
+      >
+        {rows.map((row) => (
+          <li key={row.failureClass} className="flex items-center gap-1.5">
+            <span
+              aria-hidden
+              className="h-2 w-2 shrink-0 rounded-[2px]"
+              style={{ backgroundColor: FAILURE_CLASS_COLOR[row.failureClass] }}
+            />
+            <span className="text-xs">{classLabel(row.failureClass)}</span>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {row.count}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * Raw `failure_reason` values behind the class summary. Unlocalised on
+ * purpose: they are the backend's wire enum, and an operator pasting one into
+ * a log search or an issue needs the exact string.
+ *
+ * Two columns on wide viewports — the list runs to ~20 rows at its longest,
+ * and the card now has the full page width to spend on it.
+ */
+function ReasonList({ rows }: { rows: FailureReasonRow[] }) {
+  const { t } = useT("usage");
+  return (
+    <ul
+      aria-label={t(($) => $.errors.codes_label)}
+      className="grid grid-cols-1 gap-x-6 gap-y-1.5 sm:grid-cols-2"
+    >
+      {rows.map((row) => (
+        <li key={row.reason} className="flex items-center justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-2">
+            <span
+              aria-hidden
+              className="h-2 w-2 shrink-0 rounded-[2px]"
+              style={{ backgroundColor: FAILURE_CLASS_COLOR[row.failureClass] }}
+            />
+            <code className="truncate text-xs text-muted-foreground">
+              {row.reason}
+            </code>
+          </span>
+          <span className="shrink-0 text-xs tabular-nums">{row.count}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * One offender row, shaped like the leaderboard row directly above this card:
+ * identity, then a proportional bar, then one column per number.
+ *
+ * The bar measures whatever the list is currently sorted by, and the matching
+ * column is emphasised — the same lockstep the leaderboard keeps. Before, the
+ * bar always measured absolute failures while the loudest number on the row
+ * was the rate, so the worst-rate agent could sit near the bottom with one of
+ * the shortest bars.
+ *
+ * The bar is stacked by failure class, which is also the only thing its colour
+ * means. A row that fails one way is a solid block; a row failing five ways is
+ * visibly striped — a distinction the old single dominant-class badge erased.
+ */
+function AgentFailureItem({
+  row,
+  name,
+  maxValue,
+  sortBy,
+  classLabel,
+}: {
+  row: AgentFailureRow;
+  name: string | null;
+  maxValue: number;
+  sortBy: OffenderSort;
+  classLabel: (c: FailureClass) => string;
+}) {
+  const { t } = useT("usage");
+  const wsPaths = useWorkspacePaths();
+
+  const segments = FAILURE_CLASSES.filter((c) => row.classes[c] > 0);
+  // Text equivalent of the stacked bar. The bar is the only place the class
+  // split is rendered now that the badge is gone, so it has to carry a name
+  // for screen readers as well as a hover affordance for everyone else.
+  const composition = segments
+    .map((c) => `${classLabel(c)} ${row.classes[c]}`)
+    .join(" · ");
+
+  // Clamped, not just scaled: under the Rate ranking a small-sample row is
+  // demoted below the leader while still able to carry a higher rate, and an
+  // unclamped width would overflow the track.
+  const value = OFFENDER_METRIC[sortBy](row);
+  const pct = maxValue > 0 ? Math.min(100, (value / maxValue) * 100) : 0;
+
+  // Below MIN_RATE_SAMPLE runs the rate is arithmetic, not signal (1/1 is
+  // 100%). Those rows sort last under Rate and never take the emphasis that
+  // marks the active column, but they keep rendering and say why on hover.
+  const weakSample = !hasRateSample(row);
+
+  // The row links into the agent's Overview, whose ActivityTab lists recent
+  // runs with each failure's reason — the drill-down from "this agent is the
+  // problem" to the actual failed runs. NOT the Work tab: that one lists the
+  // issues assigned to the agent, which is a different question entirely.
+  //
+  // An agent with no resolvable name is either hard-deleted or private to
+  // someone else; either way there is no page to open and no name to show,
+  // so the row degrades to a neutral placeholder. Rendering `row.agentId`
+  // here would leak a bare UUID — and, for a private agent, leak its
+  // existence and failure profile to a member who cannot see it.
+  const label = (
+    <span
+      className={`block truncate text-xs${name ? "" : " italic text-muted-foreground"}`}
+    >
+      {name ?? t(($) => $.errors.other_agents)}
+    </span>
+  );
+
+  return (
+    <li className={`${OFFENDER_GRID} py-2`}>
+      {name ? (
+        <AppLink
+          href={`${wsPaths.agentDetail(row.agentId)}?view=overview`}
+          newTabTitle={name}
+          className="min-w-0 hover:underline"
+        >
+          {label}
+        </AppLink>
+      ) : (
+        label
+      )}
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          role="img"
+          aria-label={composition}
+          title={composition}
+          className="flex h-full overflow-hidden rounded-full transition-[width] duration-300 ease-out"
+          style={{ width: `${pct}%` }}
+        >
+          {segments.map((c) => (
+            <div
+              key={c}
+              className="h-full"
+              style={{
+                width: `${(row.classes[c] / row.failed) * 100}%`,
+                backgroundColor: FAILURE_CLASS_COLOR[c],
+              }}
+            />
+          ))}
+        </div>
+      </div>
+      <span
+        className={`text-right text-xs tabular-nums ${sortBy === "failed" ? "font-medium text-foreground" : "text-muted-foreground"}`}
+      >
+        {row.failed}
+      </span>
+      <span className="text-right text-xs tabular-nums text-muted-foreground">
+        {row.total}
+      </span>
+      <span
+        title={
+          weakSample
+            ? t(($) => $.errors.low_sample, { count: MIN_RATE_SAMPLE })
+            : undefined
+        }
+        className={`text-right text-xs tabular-nums ${
+          sortBy === "rate" && !weakSample
+            ? "font-medium text-foreground"
+            : "text-muted-foreground"
+        }`}
+      >
+        {formatRate(row.failed, row.total)}
+      </span>
+    </li>
   );
 }
 
@@ -651,6 +1298,13 @@ const SORT_METRIC: Record<LeaderboardSort, (r: AgentDashboardRow) => number> = {
   tasks: (r) => r.taskCount,
 };
 
+// How many agents the leaderboard ranks before collapsing the tail behind a
+// toggle, mirroring the Errors card's top-offenders cap. A workspace with
+// dozens of agents rendered every one of them, which pushed the Errors card a
+// full screen or more below the fold (MUL-5388). Ten answers "who is spending
+// the most" — the tail is reachable via the toggle.
+const LEADERBOARD_LIMIT = 10;
+
 function Leaderboard({
   rows,
   agents,
@@ -664,6 +1318,7 @@ function Leaderboard({
 }) {
   const { t } = useT("usage");
   const [sortBy, setSortBy] = useState<LeaderboardSort>("tokens");
+  const [showAll, setShowAll] = useState(false);
 
   const sortOptions = useMemo(
     () => [
@@ -683,10 +1338,17 @@ function Leaderboard({
     return rows.toSorted((a, b) => metric(b) - metric(a));
   }, [rows, sortBy]);
 
+  // Measured across every row, not just the visible ones, so a bar's width
+  // means the same thing collapsed and expanded — the leader always fills the
+  // track and nothing re-scales when the tail comes into view.
   const maxValue = useMemo(() => {
     const metric = SORT_METRIC[sortBy];
     return sortedRows.reduce((m, r) => Math.max(m, metric(r)), 0);
   }, [sortedRows, sortBy]);
+
+  const visibleRows = showAll
+    ? sortedRows
+    : sortedRows.slice(0, LEADERBOARD_LIMIT);
 
   // Active column gets foreground text; others stay muted. Helps the user
   // see "this is what the bar is measuring" at a glance.
@@ -697,8 +1359,13 @@ function Leaderboard({
     <div className="rounded-lg border bg-card">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 pt-4 pb-3">
         <h4 className="text-sm font-semibold">{t(($) => $.leaderboard.title)}</h4>
-        <div className="flex items-center gap-3">
-          <Segmented value={sortBy} onChange={setSortBy} options={sortOptions} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <Segmented
+            label={t(($) => $.leaderboard.sort_label)}
+            value={sortBy}
+            onChange={setSortBy}
+            options={sortOptions}
+          />
           <span className="text-xs text-muted-foreground">
             {deletedAgentCount > 0
               ? t(($) => $.leaderboard.caption_with_deleted, {
@@ -707,6 +1374,21 @@ function Leaderboard({
                 })
               : t(($) => $.leaderboard.caption, { count: rows.length })}
           </span>
+          {/* The caption right beside this already states how many agents the
+              window covers, so the toggle carries a count only when
+              collapsing — spelling the total out twice reads as two different
+              numbers once the deleted-agents bucket splits the caption. */}
+          {sortedRows.length > LEADERBOARD_LIMIT ? (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              {showAll
+                ? t(($) => $.leaderboard.show_less, { count: LEADERBOARD_LIMIT })
+                : t(($) => $.leaderboard.show_all)}
+            </button>
+          ) : null}
         </div>
       </div>
       {sortedRows.length === 0 ? (
@@ -723,8 +1405,11 @@ function Leaderboard({
             <span className={colClass("time")}>{t(($) => $.leaderboard.header_time)}</span>
             <span className={colClass("tasks")}>{t(($) => $.leaderboard.header_tasks)}</span>
           </div>
-          <div className="divide-y">
-            {sortedRows.map((row) => {
+          {/* A real list, like the Errors card's offender list: the rows are
+              now a truncated ranking, so screen readers need the count and the
+              item boundaries rather than a bag of divs. */}
+          <ul aria-label={t(($) => $.leaderboard.title)} className="divide-y">
+            {visibleRows.map((row) => {
               // The deleted-agents bucket is a synthetic row, not a real agent:
               // render a neutral placeholder (no avatar fetch / hover card / UUID)
               // and dash out Time/Tasks, which it never carries (see
@@ -734,7 +1419,7 @@ function Leaderboard({
               const value = SORT_METRIC[sortBy](row);
               const pct = maxValue > 0 ? (value / maxValue) * 100 : 0;
               return (
-                <div
+                <li
                   key={row.agentId}
                   className="grid grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_5rem_5rem_5rem_4rem] items-center gap-3 px-4 py-2"
                 >
@@ -753,7 +1438,7 @@ function Leaderboard({
                         <ActorAvatar
                           actorType="agent"
                           actorId={row.agentId}
-                          size={22}
+                          size="md"
                           enableHoverCard
                         />
                         <span className="cursor-pointer truncate text-sm font-medium">
@@ -790,10 +1475,10 @@ function Leaderboard({
                   >
                     {isDeletedBucket ? "—" : row.taskCount}
                   </div>
-                </div>
+                </li>
               );
             })}
-          </div>
+          </ul>
         </>
       )}
     </div>

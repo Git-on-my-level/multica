@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { renderWithI18n } from "../../test/i18n";
+import { NavigationProvider } from "../../navigation";
+import type { NavigationAdapter } from "../../navigation";
 
 // The viewing timezone flows: auth store `user.timezone` → useViewingTimezone()
 // → every dashboard query key. This test pins that chain: when the stored
@@ -10,6 +13,15 @@ import { renderWithI18n } from "../../test/i18n";
 // Capture every queryKey passed to useQuery. queryOptions() inside the
 // dashboard options builders runs for real, so the key is the production key.
 const queryKeys = vi.hoisted(() => [] as unknown[][]);
+const dashboardDataRef = vi.hoisted(() => ({ current: false }));
+// Swaps the per-agent fixtures for ones with enough agents to exercise the
+// top-offenders and leaderboard caps. Kept off by default so the other tests
+// keep their exact 4-of-10 arithmetic.
+const manyAgentsRef = vi.hoisted(() => ({ current: false }));
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
 
 vi.mock("@tanstack/react-query", async () => {
   const actual =
@@ -20,6 +32,134 @@ vi.mock("@tanstack/react-query", async () => {
     ...actual,
     useQuery: (opts: { queryKey: unknown[] }) => {
       queryKeys.push(opts.queryKey);
+      if (dashboardDataRef.current) {
+        // ["workspaces", wsId, "agents"] — needed so the Errors breakdown can
+        // resolve agent-1 to a name and render its drill-down link.
+        if (opts.queryKey[0] === "workspaces" && opts.queryKey[2] === "agents") {
+          return {
+            data: manyAgentsRef.current
+              ? Array.from({ length: 12 }, (_, i) => ({
+                  id: `bulk-${i}`,
+                  name: `Bulk Agent ${i}`,
+                }))
+              : [{ id: "agent-1", name: "Agent One" }],
+            isLoading: false,
+            isSuccess: true,
+          };
+        }
+        const kind = opts.queryKey[2];
+        // Bulk fixture: 12 agents, every per-agent metric strictly descending
+        // so both caps (leaderboard top 10, offenders top 8) are testable by
+        // rank without the ties an equal-valued fixture would create. The
+        // date-bucketed series stay on the small fixture below — the caps are
+        // a property of the per-agent lists only.
+        const bulkRows =
+          !manyAgentsRef.current
+            ? null
+            : kind === "by-agent"
+              ? Array.from({ length: 12 }, (_, i) => ({
+                  agent_id: `bulk-${i}`,
+                  provider: "anthropic",
+                  model: "claude-sonnet-4-6",
+                  input_tokens: (12 - i) * 1_000,
+                  output_tokens: 0,
+                  cache_read_tokens: 0,
+                  cache_write_tokens: 0,
+                  task_count: 12 - i,
+                }))
+              : kind === "agent-runtime"
+                ? Array.from({ length: 12 }, (_, i) => ({
+                    agent_id: `bulk-${i}`,
+                    total_seconds: (12 - i) * 600,
+                    task_count: 12 - i,
+                    failed_count: 12 - i,
+                  }))
+                : kind === "failures-by-agent"
+                  ? Array.from({ length: 12 }, (_, i) => [
+                      {
+                        agent_id: `bulk-${i}`,
+                        failure_reason: "",
+                        task_count: 100,
+                      },
+                      {
+                        agent_id: `bulk-${i}`,
+                        failure_reason: "timeout",
+                        task_count: 12 - i,
+                      },
+                    ]).flat()
+                  : null;
+        if (bulkRows) {
+          return { data: bulkRows, isLoading: false, isSuccess: true };
+        }
+        const data =
+          kind === "daily"
+            ? [
+                {
+                  date: todayIso(),
+                  provider: "anthropic",
+                  model: "claude-sonnet-4-6",
+                  input_tokens: 1_000,
+                  output_tokens: 2_000,
+                  cache_read_tokens: 0,
+                  cache_write_tokens: 0,
+                  task_count: 2,
+                },
+              ]
+            : kind === "agent-runtime"
+              ? [
+                  {
+                    agent_id: "agent-1",
+                    total_seconds: 3 * 3_600 + 17 * 60,
+                    task_count: 12,
+                    failed_count: 1,
+                  },
+                ]
+              : kind === "runtime-daily"
+                ? [
+                    {
+                      date: todayIso(),
+                      total_seconds: 3 * 3_600 + 17 * 60,
+                      task_count: 12,
+                      failed_count: 1,
+                    },
+                  ]
+                : // `failure_reason: ""` is the succeeded bucket — the
+                  // denominator behind every rate the Errors surface shows.
+                  kind === "failures-daily"
+                  ? [
+                      { date: todayIso(), failure_reason: "", task_count: 6 },
+                      {
+                        date: todayIso(),
+                        failure_reason: "agent_error.provider_auth_or_access",
+                        task_count: 3,
+                      },
+                      { date: todayIso(), failure_reason: "timeout", task_count: 1 },
+                    ]
+                  : kind === "failures-by-agent"
+                    ? [
+                        { agent_id: "agent-1", failure_reason: "", task_count: 6 },
+                        {
+                          agent_id: "agent-1",
+                          failure_reason: "agent_error.provider_auth_or_access",
+                          task_count: 3,
+                        },
+                        {
+                          agent_id: "agent-1",
+                          failure_reason: "timeout",
+                          task_count: 1,
+                        },
+                        // Not in the agent list below — a private agent this
+                        // member cannot see, or a deleted one. The rollup
+                        // still returns it.
+                        {
+                          agent_id: "0f9d1c2e-private-agent-uuid",
+                          failure_reason: "agent_error.provider_auth_or_access",
+                          task_count: 2,
+                        },
+                      ]
+                    : [];
+        return { data, isLoading: false, isSuccess: true };
+      }
       return { data: undefined, isLoading: true };
     },
   };
@@ -27,6 +167,18 @@ vi.mock("@tanstack/react-query", async () => {
 
 vi.mock("@multica/core/hooks", () => ({
   useWorkspaceId: () => "ws-1",
+}));
+
+// The leaderboard renders ActorAvatar, which resolves avatar URLs through
+// the api singleton. Only the base-URL read is exercised here.
+vi.mock("@multica/core/api", () => ({
+  api: { getBaseUrl: () => "https://example.test" },
+}));
+
+vi.mock("@multica/core/paths", () => ({
+  useWorkspacePaths: () => ({
+    agentDetail: (id: string) => `/acme/agents/${id}`,
+  }),
 }));
 
 const tzRef = vi.hoisted(() => ({ current: "UTC" as string | null }));
@@ -53,9 +205,49 @@ vi.mock("@multica/core/runtimes/custom-pricing-store", () => {
 
 import { DashboardPage } from "./dashboard-page";
 
+// A minimal adapter — the Errors breakdown's drill-down renders an <AppLink>,
+// which reads the navigation context. Asserting on the rendered href (rather
+// than a push spy) keeps the test on the contract that matters: the row points
+// at the agent's Overview, whose ActivityTab lists its runs and each failure's
+// reason.
+const navAdapter: NavigationAdapter = {
+  push: vi.fn(),
+  replace: vi.fn(),
+  back: vi.fn(),
+  pathname: "/acme/usage",
+  searchParams: new URLSearchParams(),
+  getShareableUrl: (path: string) => `https://example.test${path}`,
+};
+
+function renderDashboard() {
+  return renderWithI18n(
+    <NavigationProvider value={navAdapter}>
+      <DashboardPage />
+    </NavigationProvider>,
+  );
+}
+
+// The Top offenders section — the sort control and column headers sit beside
+// the list, not inside it.
+function offenderCard(): HTMLElement {
+  return screen.getByRole("list", { name: "Top offenders" })
+    .parentElement as HTMLElement;
+}
+
+// The filled part of one offender row's bar. `role="img"` is on the fill (it
+// carries the class-split label), and its inline width is the metric the list
+// is currently ranked by.
+function offenderBar(index: number): HTMLElement {
+  const rows = within(
+    screen.getByRole("list", { name: "Top offenders" }),
+  ).getAllByRole("listitem");
+  return within(rows[index] as HTMLElement).getByRole("img");
+}
+
 describe("DashboardPage — viewing timezone drives the query key", () => {
   beforeEach(() => {
     queryKeys.length = 0;
+    dashboardDataRef.current = false;
     cleanup();
   });
 
@@ -96,5 +288,299 @@ describe("DashboardPage — viewing timezone drives the query key", () => {
     for (let i = 0; i < utcKeys.length; i++) {
       expect(utcKeys[i]).not.toEqual(tokyoKeys[i]);
     }
+  });
+
+  it("renders every workspace KPI as an animated number", () => {
+    dashboardDataRef.current = true;
+    tzRef.current = "UTC";
+
+    const { container } = renderDashboard();
+    const flows = Array.from(
+      container.querySelectorAll("number-flow-react"),
+    );
+
+    expect(flows).toHaveLength(5);
+    expect(flows.map((flow) => flow.getAttribute("aria-label"))).toEqual(
+      expect.arrayContaining(["$0.03", "3K", "12"]),
+    );
+    expect(container).toHaveTextContent("3h 17m");
+    expect(
+      flows.every(
+        (flow) =>
+          (flow as HTMLElement & { respectMotionPreference?: boolean })
+            .respectMotionPreference === true,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("DashboardPage — failure visibility", () => {
+  beforeEach(() => {
+    queryKeys.length = 0;
+    dashboardDataRef.current = true;
+    tzRef.current = "UTC";
+    cleanup();
+  });
+
+  it("states the error rate with its denominator spelled out", () => {
+    // The run-time rollup sees 1 failure out of 12 tasks — it only counts
+    // tasks that actually started. The failure rollup also sees tasks that
+    // never started, so it reports 4 out of 10. The Errors card quotes the
+    // latter *with* its denominator, which is what keeps it from reading as
+    // a contradiction of the Tasks tile above.
+    renderDashboard();
+
+    expect(screen.getByText("4 of 10 runs failed · 40%")).toBeInTheDocument();
+    // The Tasks tile keeps its own started-tasks-only figure.
+    expect(screen.getByText("1 failed")).toBeInTheDocument();
+  });
+
+  it("breaks failures down by class and links the offending agent to its runs", () => {
+    renderDashboard();
+
+    // Auth (3) outranks Timeout (1), and both are named by class rather than
+    // by the raw failure_reason enum.
+    const byClass = within(screen.getByRole("list", { name: "Failure mix" }));
+    expect(byClass.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Auth3",
+      "Timeout1",
+    ]);
+    // The section names its own denominator: the header above it quotes a
+    // rate over all 10 runs, this one splits the 4 failures.
+    expect(screen.getByText("Failure mix · 4")).toBeInTheDocument();
+
+    const byAgent = within(screen.getByRole("list", { name: "Top offenders" }));
+    const link = byAgent.getByRole("link", { name: /Agent One/ });
+    // Overview, NOT ?view=work: Work lists the issues assigned to the agent,
+    // while its recent runs (and each failure's reason) live in the Overview
+    // pane's ActivityTab.
+    expect(link).toHaveAttribute("href", "/acme/agents/agent-1?view=overview");
+    // One labelled column per number instead of the old unlabelled
+    // `4 / 10 · 40%` blob.
+    const row = byAgent.getAllByRole("listitem")[0] as HTMLElement;
+    expect(within(row).getByText("4")).toBeInTheDocument();
+    expect(within(row).getByText("10")).toBeInTheDocument();
+    expect(within(row).getByText("40%")).toBeInTheDocument();
+    // The bar is the only place the class split lives now that the dominant-
+    // class badge is gone, so it has to name that split for screen readers.
+    expect(within(row).getByRole("img")).toHaveAccessibleName("Auth 3 · Timeout 1");
+  });
+
+  it("moves the bar onto whichever metric the list is ranked by", async () => {
+    const user = userEvent.setup();
+    renderDashboard();
+
+    // Agent One failed 4 of 10; the anonymous bucket failed 2 of 2. Under
+    // Failures the bucket is half the leader's bar. Under Rate it is 100% —
+    // a bar that stayed on the failure count while the row shouted "100%" is
+    // exactly the mismatch this control exists to remove.
+    expect(offenderBar(1).style.width).toBe("50%");
+
+    await user.click(within(offenderCard()).getByRole("button", { name: "Rate" }));
+
+    expect(offenderBar(1).style.width).toBe("100%");
+  });
+
+  it("says which metric the list is ranked by without relying on colour", async () => {
+    const user = userEvent.setup();
+    renderDashboard();
+
+    // The active option used to be a colour swap and nothing else, which is
+    // invisible to a screen reader. The group is named too — "Rate, pressed"
+    // means nothing until you know the group ranks the offender list.
+    const group = screen.getByRole("group", { name: "Rank offenders by" });
+    expect(
+      within(group).getByRole("button", { name: "Failures" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(within(group).getByRole("button", { name: "Rate" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    await user.click(within(group).getByRole("button", { name: "Rate" }));
+
+    expect(within(group).getByRole("button", { name: "Rate" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("keeps a two-run agent from hijacking the rate ranking", async () => {
+    const user = userEvent.setup();
+    renderDashboard();
+
+    await user.click(within(offenderCard()).getByRole("button", { name: "Rate" }));
+
+    // 2/2 is a 100% rate and 4/10 is 40%, but two runs is not evidence. The
+    // small-sample row is demoted, not dropped — the list still has to
+    // reconcile with the workspace failure count above it.
+    const rows = within(screen.getByRole("list", { name: "Top offenders" }))
+      .getAllByRole("listitem")
+      .map((li) => li.textContent);
+    expect(rows[0]).toMatch(/Agent One/);
+    expect(rows[1]).toMatch(/Other agents/);
+  });
+
+  it("reveals the raw failure_reason values behind the class summary", async () => {
+    const user = userEvent.setup();
+    renderDashboard();
+
+    expect(
+      screen.queryByText("agent_error.provider_auth_or_access"),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Show error codes" }));
+
+    // Raw and unlocalised: an operator pastes this exact string into a log
+    // search, so it must not be translated or prettified.
+    expect(
+      screen.getByText("agent_error.provider_auth_or_access"),
+    ).toBeInTheDocument();
+  });
+
+  it("adds Errors to the trend toggle without disturbing the other metrics", async () => {
+    const user = userEvent.setup();
+    const { container } = renderDashboard();
+
+    await user.click(screen.getByRole("button", { name: "Errors" }));
+
+    expect(container).toHaveTextContent("Daily errors");
+  });
+});
+
+describe("DashboardPage — the Errors list never exposes an agent the viewer can't see", () => {
+  beforeEach(() => {
+    queryKeys.length = 0;
+    dashboardDataRef.current = true;
+    tzRef.current = "UTC";
+    cleanup();
+  });
+
+  it("folds an unresolvable agent into an anonymous row instead of printing its UUID", () => {
+    // The failure rollups are workspace-scoped and deliberately skip
+    // per-agent visibility, but the agent list does not: a private agent
+    // this member can't see never appears there. Rendering `row.agentId`
+    // would leak its existence, failure count and failure rate.
+    const { container } = renderDashboard();
+
+    expect(container).not.toHaveTextContent("0f9d1c2e-private-agent-uuid");
+
+    const byAgent = within(screen.getByRole("list", { name: "Top offenders" }));
+    expect(byAgent.getByText("Other agents")).toBeInTheDocument();
+    // Anonymous, and therefore not a link — there is no page to open.
+    expect(
+      byAgent.queryByRole("link", { name: /Other agents/ }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("DashboardPage — Errors card placement and density", () => {
+  beforeEach(() => {
+    queryKeys.length = 0;
+    dashboardDataRef.current = true;
+    manyAgentsRef.current = false;
+    tzRef.current = "UTC";
+    cleanup();
+  });
+
+  it("renders the Errors card after the leaderboard, at the bottom of the page", () => {
+    // Spend is the headline; failures are the follow-up question you ask
+    // after seeing who is spending. Asserting document order rather than a
+    // class name keeps this about the reading sequence.
+    renderDashboard();
+
+    // By heading, not by text: "Errors" also names the trend-chart toggle.
+    const leaderboard = screen.getByRole("heading", { name: "Leaderboard" });
+    const errors = screen.getByRole("heading", { name: "Errors" });
+
+    expect(
+      leaderboard.compareDocumentPosition(errors) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("caps the offender list and expands it on demand", async () => {
+    manyAgentsRef.current = true;
+    const user = userEvent.setup();
+    renderDashboard();
+
+    const list = () => screen.getByRole("list", { name: "Top offenders" });
+    // 12 agents have failures, but an unbounded list is what made this card
+    // taller than the rest of the page put together.
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+    // The toggle is the truncation signal — its label carries the full count,
+    // so the cap is never silent.
+    await user.click(screen.getByRole("button", { name: "Show all 12" }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(12);
+
+    await user.click(screen.getByRole("button", { name: "Show top 8" }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+  });
+
+  it("shows no expand affordance when every offender already fits", () => {
+    renderDashboard();
+
+    expect(
+      screen.queryByRole("button", { name: /Show all/ }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("DashboardPage — leaderboard density", () => {
+  beforeEach(() => {
+    queryKeys.length = 0;
+    dashboardDataRef.current = true;
+    manyAgentsRef.current = false;
+    tzRef.current = "UTC";
+    cleanup();
+  });
+
+  it("ranks the top 10 agents and keeps the tail behind a toggle", async () => {
+    manyAgentsRef.current = true;
+    const user = userEvent.setup();
+    renderDashboard();
+
+    const list = () => within(screen.getByRole("list", { name: "Leaderboard" }));
+    // 12 agents have usage. Flattening all of them is what pushed the Errors
+    // card a full screen below the fold (MUL-5388).
+    expect(list().getAllByRole("listitem")).toHaveLength(10);
+    // Ranked by tokens desc, so the two smallest spenders are the ones cut.
+    expect(list().getByText("Bulk Agent 0")).toBeInTheDocument();
+    expect(list().queryByText("Bulk Agent 10")).not.toBeInTheDocument();
+    expect(list().queryByText("Bulk Agent 11")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Show all" }));
+    expect(list().getAllByRole("listitem")).toHaveLength(12);
+    expect(list().getByText("Bulk Agent 11")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Show top 10" }));
+    expect(list().getAllByRole("listitem")).toHaveLength(10);
+  });
+
+  it("keeps the cap honest when the ranking metric changes", async () => {
+    manyAgentsRef.current = true;
+    const user = userEvent.setup();
+    renderDashboard();
+
+    // Scoped to the leaderboard card — the trend chart's metric toggle owns
+    // a "Time" button too.
+    const card = screen.getByRole("list", { name: "Leaderboard" })
+      .parentElement as HTMLElement;
+    // Re-ranking must not quietly reveal the tail: the cap belongs to the
+    // list, not to one metric.
+    await user.click(within(card).getByRole("button", { name: "Time" }));
+
+    const list = within(screen.getByRole("list", { name: "Leaderboard" }));
+    expect(list.getAllByRole("listitem")).toHaveLength(10);
+  });
+
+  it("shows no expand affordance when every agent already fits", () => {
+    renderDashboard();
+
+    const list = within(screen.getByRole("list", { name: "Leaderboard" }));
+    expect(list.getAllByRole("listitem")).toHaveLength(1);
+    expect(
+      screen.queryByRole("button", { name: "Show all" }),
+    ).not.toBeInTheDocument();
   });
 });
