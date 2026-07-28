@@ -173,7 +173,7 @@ func TestStageProgressSummary_SkipsUnstaged(t *testing.T) {
 		child(2, "backlog"),
 	}
 	summary, next := stageProgressSummary(children, 1)
-	want := "Stage 1: 2/2 done; Stage 2: 0/1 done (next)"
+	want := "Stage 1: 2/2 ready; Stage 2: 0/1 ready (next)"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}

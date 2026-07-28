@@ -334,7 +334,7 @@ func TestBatchChildDoneCrossStage_OneComment(t *testing.T) {
 		if !strings.Contains(content, "Stage 2 of this issue is complete") {
 			t.Errorf("expected the comment to announce the top closed stage (Stage 2), got: %s", content)
 		}
-		if !strings.Contains(content, "Stage 1: 2/2 done; Stage 2: 2/2 done") {
+		if !strings.Contains(content, "Stage 1: 2/2 ready; Stage 2: 2/2 ready") {
 			t.Errorf("expected the final-state stage summary, got: %s", content)
 		}
 		// The bug: a mid-batch snapshot told the parent to advance a stage this
@@ -398,7 +398,7 @@ func TestBatchChildDoneClosesLowerStageOnly(t *testing.T) {
 	if !strings.Contains(content, "Stage 1 of this issue is complete") {
 		t.Errorf("expected Stage 1 completion announcement, got: %s", content)
 	}
-	if !strings.Contains(content, "Stage 2: 0/2 done (next)") {
+	if !strings.Contains(content, "Stage 2: 0/2 ready (next)") {
 		t.Errorf("expected accurate next-stage progress, got: %s", content)
 	}
 	if !strings.Contains(content, "Stage 2 is next") {
