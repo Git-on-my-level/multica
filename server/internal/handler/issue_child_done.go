@@ -723,21 +723,61 @@ func (h *Handler) triggerChildDoneAgent(ctx context.Context, parent db.Issue, tr
 		return
 	}
 
+	h.enqueueParentAssigneeChildWake(ctx, parent, agent, nil, triggerCommentID, func() error {
+		_, err := h.TaskService.EnqueueTaskForMention(ctx, parent, parent.AssigneeID, triggerCommentID)
+		return err
+	}, "child done: enqueue parent agent task failed")
+}
+
+// enqueueParentAssigneeChildWake enqueues a child-done/blocked parent wake, or
+// folds the system comment into an already-queued task (MUL-4195) instead of
+// dropping a follow-up wake when HasPendingTaskForIssueAndAgent is true.
+func (h *Handler) enqueueParentAssigneeChildWake(
+	ctx context.Context,
+	parent db.Issue,
+	agent db.Agent,
+	squad *db.Squad,
+	triggerCommentID pgtype.UUID,
+	enqueue func() error,
+	logMsg string,
+) {
 	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
 		IssueID: parent.ID,
-		AgentID: parent.AssigneeID,
+		AgentID: agent.ID,
 		// Key dedup on the reviewed head (TEN-356).
 		HeadSha: h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID),
 	})
-	if err != nil || hasPending {
+	if err != nil {
 		return
 	}
-
-	if _, err := h.TaskService.EnqueueTaskForMention(ctx, parent, parent.AssigneeID, triggerCommentID); err != nil {
-		slog.Warn("child done: enqueue parent agent task failed",
+	if hasPending {
+		trigger := commentAgentTrigger{
+			Agent:  agent,
+			Source: commentTriggerSourceIssueAssignee,
+		}
+		if squad != nil {
+			trigger.Squad = squad
+		}
+		if _, _, terminal := commentMergeTerminalOutcome(
+			h.mergeCommentIntoPendingTask(ctx, parent, trigger, triggerCommentID),
+		); terminal {
+			return
+		}
+		active, activeErr := h.hasActiveTaskForIssueAndAgent(ctx, parent.ID, agent.ID)
+		if _, _, enqueueFresh := decidePostMergeMiss(active, activeErr); !enqueueFresh {
+			return
+		}
+	}
+	if err := enqueue(); err != nil {
+		fields := []any{
 			"error", err,
 			"parent_id", uuidToString(parent.ID),
-			"agent_id", uuidToString(parent.AssigneeID))
+			"agent_id", uuidToString(agent.ID),
+		}
+		if squad != nil {
+			fields = append(fields, "squad_id", uuidToString(squad.ID))
+		}
+		slog.Warn(logMsg, fields...)
 	}
 }
 
@@ -780,21 +820,8 @@ func (h *Handler) triggerChildDoneSquad(ctx context.Context, parent db.Issue, tr
 		return
 	}
 
-	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
-		IssueID: parent.ID,
-		AgentID: squad.LeaderID,
-		// Key dedup on the reviewed head (TEN-356).
-		HeadSha: h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID),
-	})
-	if err != nil || hasPending {
-		return
-	}
-
-	if _, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, parent, squad.LeaderID, squad.ID, triggerCommentID); err != nil {
-		slog.Warn("child done: enqueue parent squad leader task failed",
-			"error", err,
-			"parent_id", uuidToString(parent.ID),
-			"squad_id", uuidToString(squad.ID),
-			"leader_id", uuidToString(squad.LeaderID))
-	}
+	h.enqueueParentAssigneeChildWake(ctx, parent, agent, &squad, triggerCommentID, func() error {
+		_, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, parent, squad.LeaderID, squad.ID, triggerCommentID)
+		return err
+	}, "child done: enqueue parent squad leader task failed")
 }
