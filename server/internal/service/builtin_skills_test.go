@@ -230,6 +230,9 @@ func TestWorkingOnIssuesSkillCoversIssueLoopContracts(t *testing.T) {
 		"--status backlog",
 		"pr_url",
 		"references/working-on-issues-source-map.md",
+		"Child / sub-issue completion (prescriptive)",
+		"Do **not** finish as `in_review`",
+		"multica issue status <child-id> done",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(body, want) {

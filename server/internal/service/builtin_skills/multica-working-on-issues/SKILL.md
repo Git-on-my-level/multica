@@ -229,15 +229,24 @@ on it. These are the contracts, not advice:
 - **`in_progress` / `in_review` on assignment runs** are agent-managed CLI
   mutations, not `StartTask` / `CompleteTask` side effects. The assignment
   runtime brief asks ordinary agents for `todo`/`backlog` → `in_progress` then
-  `in_review` when they have delivered. Squad leaders share the opening
-  `in_progress` step on the first assignment turn, keep the parent there while
-  members work, and only move to `in_review` when a later re-trigger confirms
-  the overall goal is met.
-- **`in_review`** is an accepted issue status. Some workflows use it while a PR
-  is open and awaiting review; moving to it is an explicit mutation.
-- **`done`** on a child issue posts a system comment on its parent. If a PR
-  carries close intent (`Closes MUL-XXXX`), it advances the issue to `done`
-  itself on merge — you do not also need to flip it manually.
+  `in_review` when they have delivered. **Exception for child/sub-issues under
+  a parent:** finish **`done`** (not `in_review`) so the parent stage barrier can
+  fire — see *Child / sub-issue completion* below. Squad leaders share the
+  opening `in_progress` step on the first assignment turn, keep the **parent**
+  there while members/children work, and only move the parent to `in_review`
+  when a later re-trigger confirms the overall goal / PR handoff is met.
+- **`in_review`** is the PR/handoff status for the issue that **owns** the
+  deliverable (usually a parent or solo implementer). It is **not** terminal for
+  parent stage barriers and does **not** wake a parent assignee.
+- **`done`** and **`cancelled`** are the only child statuses that count as
+  terminal for stage barriers. Entering either from a non-terminal status can
+  close a stage and wake the parent (system comment + assignee task) once every
+  sibling in that stage is terminal. If a PR carries close intent
+  (`Closes MUL-XXXX`), merge can advance the linked issue to `done` — you do not
+  also need to flip it manually when that path applies.
+- **`blocked`** is non-terminal: it holds the stage open and does not wake the
+  parent via the child-done path. Use it only for a true hard stop (then
+  @mention the parent assignee).
 - **`cancelled`** is a terminal, user-driven decision to close the issue. Like
   `done` it enqueues no new agent work, but it does **not** stop tasks already in
   flight — a run in progress keeps going (MUL-4465). To stop a running task,
@@ -245,6 +254,24 @@ on it. These are the contracts, not advice:
 - **Failed issue-triggered tasks** may roll an issue from `in_progress` back to
   `todo` when no active task / retry remains — that is the main server-owned
   status write on the agent-run path.
+
+### Child / sub-issue completion (prescriptive)
+
+When **this issue is a child** (has a parent) and its job is a unit of work the
+parent will synthesize or gate on:
+
+1. After the final comment with evidence/artifacts, set status to **`done`**.
+2. Do **not** finish as `in_review`. Parent review/synthesis is the parent's
+   job; `in_review` never wakes the parent and stalls the stage barrier.
+3. Use **`blocked`** only when you cannot make further progress without external
+   input (missing auth, human decision, hard dependency). State the exact blocker
+   in the final comment and @mention the parent assignee on the parent (or this
+   child). Do not use `blocked` for "needs parent review of my results."
+4. Use **`cancelled`** only if this unit of work is abandoned.
+
+When **creating** sub-issues under a parent you own, put that completion contract
+in each child description before assign. Prefer child acceptance status `done`
+in the parent gate ("stage N opens when children are done").
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
@@ -272,10 +299,11 @@ Creating every serial step as `todo` enqueues the whole chain at once.
 `--stage <N>` (N ≥ 1) groups sub-issues under the same parent into ordered
 stages. The parent assignee is woken **once, when a whole stage finishes** —
 i.e. every sub-issue in the lowest unfinished stage has reached a terminal
-status (`done`/`cancelled`). A completion that does not close a stage is silent
-(no comment, no wake). A sibling set with **no** stages is one implicit stage,
-so the parent is woken once when the *last* sub-issue finishes — not on every
-child.
+status (`done`/`cancelled` only — not `in_review` or `blocked`). A completion
+that does not close a stage is silent (no comment, no wake). A sibling set with
+**no** stages is one implicit stage, so the parent is woken once when the *last*
+sub-issue finishes — not on every child. Children should therefore finish
+**`done`** unless truly blocked (see *Child / sub-issue completion* above).
 
 Advancement is agent-driven: the server only detects the closed barrier and
 wakes the parent assignee, who then decides whether to promote the next stage's
@@ -322,6 +350,19 @@ multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --s
 multica issue create --title "Step 1" --parent <issue-id> --assignee <agent> --stage 1 --status todo
 multica issue create --title "Step 2" --parent <issue-id> --assignee <agent> --stage 2 --status backlog
 multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --stage 3 --status backlog
+```
+
+Child finish status (stage barrier / parent wake):
+
+```text
+# incorrect — child ends in_review; parent never auto-wakes
+multica issue status <child-id> in_review
+
+# correct — child finished its unit; parent can wake when the stage barrier closes
+multica issue status <child-id> done
+
+# correct only for a true hard stop (then @mention parent assignee)
+multica issue status <child-id> blocked
 ```
 
 ## References
