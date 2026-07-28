@@ -1624,6 +1624,17 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	} else if req.RuntimeID != nil {
+		var existingArgs []string
+		if len(existing.CustomArgs) > 0 {
+			_ = json.Unmarshal(existing.CustomArgs, &existingArgs)
+		}
+		if targetProvider == "codex" {
+			if err := agent.ValidateCodexAppServerArgs(existingArgs); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 	}
 	// Invocation permission (MUL-3963). OWNER-ONLY write: access is the one
 	// agent property a workspace admin may NOT change (only the owner decides
