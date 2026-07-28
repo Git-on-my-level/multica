@@ -268,6 +268,11 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("omp session created", "session_id", sessionID)
+		// Surface the session id on the message bus immediately so the daemon
+		// can PinTaskSession mid-flight. Without this, a daemon restart during
+		// a long OMP turn loses the resume pointer (OMP never emits a later
+		// system/status event carrying sessionId the way Claude/Codex do).
+		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 
 		if opts.Model != "" {
 			// OMP exposes the model selector as a session config option, not
