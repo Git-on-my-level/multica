@@ -3526,6 +3526,24 @@ func TestBuildCodexArgsExtraArgsBeforeCustomArgsAndFiltersBoth(t *testing.T) {
 	}
 }
 
+func TestValidateCodexAppServerArgsRejectsInteractiveFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, args := range [][]string{
+		{"--yolo"},
+		{"'--yolo'"},
+		{"--yolo=true"},
+		{"--dangerously-bypass-approvals-and-sandbox"},
+	} {
+		if err := ValidateCodexAppServerArgs(args); err == nil {
+			t.Errorf("ValidateCodexAppServerArgs(%v) succeeded, want rejection", args)
+		}
+	}
+	if err := ValidateCodexAppServerArgs([]string{"--sandbox", "workspace-write"}); err != nil {
+		t.Fatalf("valid app-server args rejected: %v", err)
+	}
+}
+
 func TestBuildCodexArgsExplicitFastOverridesLowerPriorityDisable(t *testing.T) {
 	t.Parallel()
 

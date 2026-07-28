@@ -29,6 +29,11 @@ import (
 // share the `-c` flag with legitimate non-MCP overrides like `-c model=…`.
 var codexBlockedArgs = map[string]blockedArgMode{
 	"--listen": blockedWithValue, // stdio:// transport for daemon communication
+	// These flags belong to the interactive `codex` command, not its
+	// app-server subcommand. Passing either makes app-server exit before the
+	// JSON-RPC handshake.
+	"--yolo": blockedStandalone,
+	"--dangerously-bypass-approvals-and-sandbox": blockedStandalone,
 }
 
 const (
@@ -174,6 +179,26 @@ func buildCodexArgs(opts ExecOptions, logger *slog.Logger) []string {
 		launchArgs = enforceCodexFastMode(launchArgs, logger)
 	}
 	return append(args, launchArgs...)
+}
+
+// ValidateCodexAppServerArgs rejects known interactive-Codex flags before a
+// task is started. Normalization remains a defensive second boundary for old
+// persisted records and daemon-wide defaults, but silently filtering a saved
+// agent setting is not an acceptable substitute for telling its owner that it
+// cannot be used with the app-server protocol.
+func ValidateCodexAppServerArgs(args []string) error {
+	for _, raw := range args {
+		arg := unshellQuoteArg(raw)
+		flag := arg
+		if idx := strings.IndexByte(flag, '='); idx > 0 {
+			flag = flag[:idx]
+		}
+		switch flag {
+		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
+			return fmt.Errorf("codex app-server does not accept CLI-only argument %q; configure permissions through Multica instead", flag)
+		}
+	}
+	return nil
 }
 
 // NormalizeCodexLaunchArgs returns the user-supplied Codex args (extra then

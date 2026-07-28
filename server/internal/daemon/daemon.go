@@ -4606,6 +4606,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		customArgs = task.Agent.CustomArgs
 		mcpConfig = effectiveMcpConfig
 	}
+	if provider == "codex" {
+		allArgs := append(append([]string{}, extraArgs...), customArgs...)
+		if err := agent.ValidateCodexAppServerArgs(allArgs); err != nil {
+			return TaskResult{}, fmt.Errorf("invalid codex app-server arguments: %w", err)
+		}
+	}
 	if provider == "hermes" {
 		customArgs = hermesLaunchArgs(customArgs, env != nil && env.HermesHome != "")
 	}

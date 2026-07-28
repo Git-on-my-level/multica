@@ -1069,6 +1069,12 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("service_tier %q is not a recognised value for runtime %q", req.ServiceTier, runtime.Provider))
 		return
 	}
+	if runtime.Provider == "codex" {
+		if err := agent.ValidateCodexAppServerArgs(req.CustomArgs); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	// Probe workspace agent count BEFORE the insert so the funnel has a
 	// clean "first agent ever in this workspace" signal — Step 4 of
@@ -1556,6 +1562,8 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		params.RuntimeConfig = rc
 	}
 	if req.CustomArgs != nil {
+		// Validate against the runtime selected by this request when present;
+		// otherwise targetProvider is resolved below before it is used.
 		ca, _ := json.Marshal(*req.CustomArgs)
 		params.CustomArgs = ca
 	}
@@ -1599,6 +1607,34 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		params.RuntimeMode = pgtype.Text{String: runtime.RuntimeMode, Valid: true}
 		targetRuntimeID = runtime.ID
 		targetProvider = runtime.Provider
+	}
+	if req.CustomArgs != nil {
+		provider := targetProvider
+		if provider == "" {
+			var resolved bool
+			provider, resolved = h.resolveAgentProvider(r, existing.WorkspaceID, targetRuntimeID)
+			if !resolved {
+				writeError(w, http.StatusInternalServerError, "failed to resolve runtime for custom_args validation")
+				return
+			}
+		}
+		if provider == "codex" {
+			if err := agent.ValidateCodexAppServerArgs(*req.CustomArgs); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	} else if req.RuntimeID != nil {
+		var existingArgs []string
+		if len(existing.CustomArgs) > 0 {
+			_ = json.Unmarshal(existing.CustomArgs, &existingArgs)
+		}
+		if targetProvider == "codex" {
+			if err := agent.ValidateCodexAppServerArgs(existingArgs); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 	}
 	// Invocation permission (MUL-3963). OWNER-ONLY write: access is the one
 	// agent property a workspace admin may NOT change (only the owner decides
