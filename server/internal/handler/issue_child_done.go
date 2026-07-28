@@ -14,18 +14,30 @@ import (
 )
 
 // notifyParentOfChildDone posts a top-level system comment on the parent
-// issue when a child issue transitions from non-done into done. This replaces
+// issue when a child issue transitions into a parent-wake status. This replaces
 // the agent-prompt rule that previously made child agents post the
 // notification themselves (PR #2918 user feedback — the agent rule caused
 // self-mention loops, planner ping-pong, and accidental `MUL-` prefix
 // hardcoding because the agent did not always know the workspace prefix).
 //
-// Guards on whether the comment fires at all:
-//   - the child must transition from a non-terminal status INTO a terminal one
-//     (done or cancelled). Repeat saves of an already-terminal child do not
-//     re-fire; only the entering transition does. Cancelled counts because a
-//     cancelled sibling never finishes and so closes its stage (see the entry
-//     guard and isTerminalChildStatus).
+// Two wake paths (fork-friendly parent/child orchestration):
+//  1. Stage-closing handoff — child enters a stage-terminal status
+//     (done, cancelled, OR in_review). The stage barrier still applies: the
+//     parent wakes only when every sibling in the stage is stage-terminal.
+//     in_review counts because review/handoff children often finish there
+//     rather than done; treating only done/cancelled as terminal stranded
+//     parents while children sat in_review.
+//  2. Attention — child enters blocked. Fires immediately (no stage barrier)
+//     so the parent can unblock, reassign, or escalate. blocked does NOT
+//     close a stage: a blocked sibling still holds the barrier open.
+//
+// Guards on whether any comment fires at all:
+//   - stage path: non-terminal → stage-terminal (done|cancelled|in_review).
+//     Repeat saves of an already-terminal child do not re-fire. Cancelled
+//     counts because a cancelled sibling never finishes and so closes its
+//     stage (see isTerminalChildStatus).
+//   - blocked path: non-blocked → blocked (see isChildBlockedStatus /
+//     notifyParentOfChildBlocked).
 //   - issue.ParentIssueID must be set
 //   - parent must not be "done" or "cancelled" — the parent is already
 //     closed and a notification has no follow-up to drive
@@ -69,13 +81,17 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	if !issue.ParentIssueID.Valid {
 		return
 	}
-	// Fire on a transition INTO a terminal status (done OR cancelled), not only
-	// `done`. A cancelled child can close a stage too: isTerminalChildStatus
-	// treats cancelled as terminal (a cancelled sibling never finishes, so it
-	// must not hold the stage open), so the barrier has to be evaluated when the
-	// last open child of a stage is cancelled. Keying on the transition also
-	// makes a later cancelled -> done edit a no-op (terminal -> terminal), which
-	// avoids a lagging duplicate wake.
+	// Attention path first: entering blocked wakes the parent immediately and
+	// does not participate in the stage barrier (a blocked sibling still holds
+	// its stage open). Keyed on the entering transition only.
+	if !isChildBlockedStatus(prev.Status) && isChildBlockedStatus(issue.Status) {
+		h.notifyParentOfChildBlocked(ctx, issue)
+		return
+	}
+	// Stage-closing path: transition INTO a stage-terminal status (done,
+	// cancelled, or in_review). A cancelled child can close a stage too.
+	// Keying on the transition also makes later terminal→terminal edits a
+	// no-op (e.g. in_review→done), which avoids a lagging duplicate wake.
 	if isTerminalChildStatus(prev.Status) || !isTerminalChildStatus(issue.Status) {
 		return
 	}
@@ -87,21 +103,7 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 			"parent_id", uuidToString(issue.ParentIssueID))
 		return
 	}
-	if parent.Status == "done" || parent.Status == "cancelled" {
-		return
-	}
-	// A parent parked in backlog is deliberately held for later. Posting the
-	// system comment would wake its assignee, and the woken agent can then
-	// promote sibling backlog sub-issues into todo — the surprise auto-
-	// activation reported in #4320 / MUL-3497. Skip the whole notification so
-	// a backlog parent stays inert until the user explicitly promotes it.
-	if parent.Status == "backlog" {
-		return
-	}
-	// Human-assigned parents read their own timeline; an automated system
-	// comment is just noise and there is no agent task to trigger. Skip the
-	// whole notification (comment + mention + inbox row) — MUL-2538.
-	if parent.AssigneeType.Valid && parent.AssigneeType.String == "member" {
+	if !parentEligibleForChildWake(parent) {
 		return
 	}
 
@@ -112,7 +114,7 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	// sub-issue finishes" instead of the old fire-on-every-child behavior that
 	// caused the surprise cascade. A completion that does not close a stage is
 	// silent: no comment, no wake. ListChildIssues already reflects this child's
-	// committed `done` status (the status update commits before this runs).
+	// committed status (the status update commits before this runs).
 	children, err := h.Queries.ListChildIssues(ctx, parent.ID)
 	if err != nil {
 		slog.Warn("child done: failed to list siblings for stage barrier",
@@ -133,6 +135,91 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 		closedStage = issue.Stage.Int32
 	}
 	h.postChildDoneComment(ctx, parent, issue, children, staged, closedStage, false)
+}
+
+// parentEligibleForChildWake is the shared parent guard for stage-closing and
+// blocked-attention wakes. Closed / backlog / human-assigned parents stay inert.
+func parentEligibleForChildWake(parent db.Issue) bool {
+	if parent.Status == "done" || parent.Status == "cancelled" {
+		return false
+	}
+	// A parent parked in backlog is deliberately held for later. Posting the
+	// system comment would wake its assignee, and the woken agent can then
+	// promote sibling backlog sub-issues into todo — the surprise auto-
+	// activation reported in #4320 / MUL-3497.
+	if parent.Status == "backlog" {
+		return false
+	}
+	// Human-assigned parents read their own timeline; an automated system
+	// comment is pure noise and there is no agent task to trigger (MUL-2538).
+	if parent.AssigneeType.Valid && parent.AssigneeType.String == "member" {
+		return false
+	}
+	return true
+}
+
+// notifyParentOfChildBlocked posts a system comment and wakes the parent
+// assignee when a child enters blocked. Unlike the stage-closing path this
+// does not wait for siblings: blocked is an attention signal, not a handoff.
+// Best-effort: failures are logged and never roll back the status write.
+func (h *Handler) notifyParentOfChildBlocked(ctx context.Context, issue db.Issue) {
+	if !issue.ParentIssueID.Valid {
+		return
+	}
+	parent, err := h.Queries.GetIssue(ctx, issue.ParentIssueID)
+	if err != nil {
+		slog.Warn("child blocked: failed to load parent",
+			"error", err,
+			"child_id", uuidToString(issue.ID),
+			"parent_id", uuidToString(issue.ParentIssueID))
+		return
+	}
+	if !parentEligibleForChildWake(parent) {
+		return
+	}
+	h.postChildBlockedComment(ctx, parent, issue)
+}
+
+// postChildBlockedComment builds the attention system comment and dispatches
+// the parent-assignee trigger. Does not claim a stage is complete.
+func (h *Handler) postChildBlockedComment(ctx context.Context, parent, blocked db.Issue) {
+	prefix := h.getIssuePrefix(ctx, blocked.WorkspaceID)
+	identifier := prefix + "-" + strconv.Itoa(int(blocked.Number))
+	childID := uuidToString(blocked.ID)
+	title := sanitizeChildTitleForSystemComment(blocked.Title)
+	parentID := uuidToString(parent.ID)
+	mentionPrefix := h.buildParentAssigneeMention(ctx, parent)
+
+	content := fmt.Sprintf(
+		`%sSub-issue [%s](mention://issue/%s) — "%s" — is blocked. This is an attention wake, not a stage completion: do not promote the next stage until the blocker is resolved or the child is cancelled. Inspect the child, clear the blocker or re-scope, then continue. Parent id: %s.`,
+		mentionPrefix, identifier, childID, title, parentID,
+	)
+
+	comment, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{
+		IssueID:     parent.ID,
+		WorkspaceID: parent.WorkspaceID,
+		AuthorType:  "system",
+		AuthorID:    pgtype.UUID{Valid: true},
+		Content:     content,
+		Type:        "system",
+		ParentID:    pgtype.UUID{Valid: false},
+	})
+	if err != nil {
+		slog.Warn("child blocked: create system comment failed",
+			"error", err,
+			"child_id", childID,
+			"parent_id", parentID)
+		return
+	}
+
+	h.publish(protocol.EventCommentCreated, uuidToString(parent.WorkspaceID), "system", "", map[string]any{
+		"comment":             commentToResponse(comment, nil, nil),
+		"issue_title":         parent.Title,
+		"issue_assignee_type": textToPtr(parent.AssigneeType),
+		"issue_assignee_id":   uuidToPtr(parent.AssigneeID),
+		"issue_status":        parent.Status,
+	})
+	h.dispatchParentAssigneeTrigger(ctx, parent, comment)
 }
 
 // notifyParentsOfBatchChildDone emits child-done parent notifications for a
@@ -184,14 +271,8 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 				"error", err, "parent_id", uuidToString(g.parentID))
 			continue
 		}
-		// Same parent guards as the single path (see notifyParentOfChildDone).
-		if parent.Status == "done" || parent.Status == "cancelled" {
-			continue
-		}
-		if parent.Status == "backlog" {
-			continue
-		}
-		if parent.AssigneeType.Valid && parent.AssigneeType.String == "member" {
+		// Same parent guards as the single path (see parentEligibleForChildWake).
+		if !parentEligibleForChildWake(parent) {
 			continue
 		}
 
@@ -242,6 +323,16 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			continue
 		}
 		h.postChildDoneComment(ctx, parent, rep, children, true, bestStage, batch)
+	}
+}
+
+// notifyParentsOfBatchChildBlocked emits immediate attention wakes for every
+// child that entered blocked during a batch update. Unlike the stage-closing
+// batch aggregator, each blocked child gets its own comment (order-independent
+// and not barrier-gated). Best-effort.
+func (h *Handler) notifyParentsOfBatchChildBlocked(ctx context.Context, blocked []db.Issue) {
+	for _, c := range blocked {
+		h.notifyParentOfChildBlocked(ctx, c)
 	}
 }
 
@@ -335,10 +426,24 @@ func (h *Handler) postChildDoneComment(ctx context.Context, parent, completed db
 }
 
 // isTerminalChildStatus reports whether a child issue status counts as
-// "finished" for stage-barrier purposes. Cancelled counts as terminal: a
-// cancelled sibling will never complete, so it must not hold a stage open.
+// "finished" for stage-barrier purposes (stage-closing handoff).
+//
+//   - done / cancelled — historical terminals; cancelled never finishes work
+//     so it must not hold a stage open.
+//   - in_review — fork expansion: children that hand results back for parent
+//     synthesis commonly finish here. Without counting in_review, a whole
+//     stage can sit complete-from-the-agent's-perspective while the parent
+//     never wakes.
+//
+// blocked is intentionally NOT terminal: it holds the stage open and uses the
+// separate immediate attention path (notifyParentOfChildBlocked).
 func isTerminalChildStatus(status string) bool {
-	return status == "done" || status == "cancelled"
+	return status == "done" || status == "cancelled" || status == "in_review"
+}
+
+// isChildBlockedStatus reports the attention-wake status for a child.
+func isChildBlockedStatus(status string) bool {
+	return status == "blocked"
 }
 
 // siblingsAreStaged reports whether any child in the set carries an explicit
@@ -423,7 +528,7 @@ func stageProgressSummary(children []db.Issue, closedStage int32) (summary strin
 	parts := make([]string, 0, len(order))
 	for _, s := range order {
 		a := byStage[s]
-		label := fmt.Sprintf("Stage %d: %d/%d done", s, a.done, a.total)
+		label := fmt.Sprintf("Stage %d: %d/%d ready", s, a.done, a.total)
 		if nextStage == 0 && s > closedStage && a.done < a.total {
 			nextStage = s
 			label += " (next)"
@@ -618,21 +723,61 @@ func (h *Handler) triggerChildDoneAgent(ctx context.Context, parent db.Issue, tr
 		return
 	}
 
+	h.enqueueParentAssigneeChildWake(ctx, parent, agent, nil, triggerCommentID, func() error {
+		_, err := h.TaskService.EnqueueTaskForMention(ctx, parent, parent.AssigneeID, triggerCommentID)
+		return err
+	}, "child done: enqueue parent agent task failed")
+}
+
+// enqueueParentAssigneeChildWake enqueues a child-done/blocked parent wake, or
+// folds the system comment into an already-queued task (MUL-4195) instead of
+// dropping a follow-up wake when HasPendingTaskForIssueAndAgent is true.
+func (h *Handler) enqueueParentAssigneeChildWake(
+	ctx context.Context,
+	parent db.Issue,
+	agent db.Agent,
+	squad *db.Squad,
+	triggerCommentID pgtype.UUID,
+	enqueue func() error,
+	logMsg string,
+) {
 	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
 		IssueID: parent.ID,
-		AgentID: parent.AssigneeID,
+		AgentID: agent.ID,
 		// Key dedup on the reviewed head (TEN-356).
 		HeadSha: h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID),
 	})
-	if err != nil || hasPending {
+	if err != nil {
 		return
 	}
-
-	if _, err := h.TaskService.EnqueueTaskForMention(ctx, parent, parent.AssigneeID, triggerCommentID); err != nil {
-		slog.Warn("child done: enqueue parent agent task failed",
+	if hasPending {
+		trigger := commentAgentTrigger{
+			Agent:  agent,
+			Source: commentTriggerSourceIssueAssignee,
+		}
+		if squad != nil {
+			trigger.Squad = squad
+		}
+		if _, _, terminal := commentMergeTerminalOutcome(
+			h.mergeCommentIntoPendingTask(ctx, parent, trigger, triggerCommentID),
+		); terminal {
+			return
+		}
+		active, activeErr := h.hasActiveTaskForIssueAndAgent(ctx, parent.ID, agent.ID)
+		if _, _, enqueueFresh := decidePostMergeMiss(active, activeErr); !enqueueFresh {
+			return
+		}
+	}
+	if err := enqueue(); err != nil {
+		fields := []any{
 			"error", err,
 			"parent_id", uuidToString(parent.ID),
-			"agent_id", uuidToString(parent.AssigneeID))
+			"agent_id", uuidToString(agent.ID),
+		}
+		if squad != nil {
+			fields = append(fields, "squad_id", uuidToString(squad.ID))
+		}
+		slog.Warn(logMsg, fields...)
 	}
 }
 
@@ -675,21 +820,8 @@ func (h *Handler) triggerChildDoneSquad(ctx context.Context, parent db.Issue, tr
 		return
 	}
 
-	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
-		IssueID: parent.ID,
-		AgentID: squad.LeaderID,
-		// Key dedup on the reviewed head (TEN-356).
-		HeadSha: h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID),
-	})
-	if err != nil || hasPending {
-		return
-	}
-
-	if _, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, parent, squad.LeaderID, squad.ID, triggerCommentID); err != nil {
-		slog.Warn("child done: enqueue parent squad leader task failed",
-			"error", err,
-			"parent_id", uuidToString(parent.ID),
-			"squad_id", uuidToString(squad.ID),
-			"leader_id", uuidToString(squad.LeaderID))
-	}
+	h.enqueueParentAssigneeChildWake(ctx, parent, agent, &squad, triggerCommentID, func() error {
+		_, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, parent, squad.LeaderID, squad.ID, triggerCommentID)
+		return err
+	}, "child done: enqueue parent squad leader task failed")
 }

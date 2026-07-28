@@ -173,6 +173,76 @@ func TestChildDoneNotificationIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestChildInReviewNotifiesParent — a child finishing as in_review must wake
+// the parent through the same stage-barrier path as done (fork parent/child
+// handoff). Without this, review children left parents stranded.
+func TestChildInReviewNotifiesParent(t *testing.T) {
+	fx := newChildDoneFixture(t, "in_progress")
+
+	updateChildStatus(t, fx.child.ID, "in_review")
+
+	if got := countSystemCommentsOn(t, fx.parent.ID); got != 1 {
+		t.Fatalf("expected exactly 1 system comment on parent after child in_review, got %d", got)
+	}
+	content, _, _, _ := systemCommentOn(t, fx.parent.ID)
+	if !strings.Contains(content, fx.child.Identifier) {
+		t.Errorf("expected comment to contain child identifier %q, got: %s", fx.child.Identifier, content)
+	}
+	// in_review → done is terminal→terminal; must not double-fire.
+	updateChildStatus(t, fx.child.ID, "done")
+	if got := countSystemCommentsOn(t, fx.parent.ID); got != 1 {
+		t.Fatalf("in_review→done must be idempotent for parent wake, got %d comments", got)
+	}
+}
+
+// TestChildBlockedNotifiesParentImmediately — blocked is an attention wake:
+// fires even when it would not close a multi-child stage barrier, and does
+// not claim stage completion.
+func TestChildBlockedNotifiesParentImmediately(t *testing.T) {
+	fx := newChildDoneFixture(t, "in_progress")
+
+	// Second open sibling so a pure stage-terminal path would stay silent.
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":           "child-blocked sibling " + time.Now().Format(time.RFC3339Nano),
+		"status":          "in_progress",
+		"parent_issue_id": fx.parent.ID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create sibling: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var sibling IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&sibling); err != nil {
+		t.Fatalf("decode sibling: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, sibling.ID)
+	})
+
+	updateChildStatus(t, fx.child.ID, "blocked")
+
+	if got := countSystemCommentsOn(t, fx.parent.ID); got != 1 {
+		t.Fatalf("expected exactly 1 system comment on parent after child blocked, got %d", got)
+	}
+	content, _, _, _ := systemCommentOn(t, fx.parent.ID)
+	if !strings.Contains(content, "blocked") {
+		t.Errorf("expected blocked attention wording, got: %s", content)
+	}
+	if strings.Contains(strings.ToLower(content), "stage") && strings.Contains(strings.ToLower(content), "complete") {
+		t.Errorf("blocked wake must not claim stage completion, got: %s", content)
+	}
+	if !strings.Contains(content, fx.child.Identifier) {
+		t.Errorf("expected child identifier %q, got: %s", fx.child.Identifier, content)
+	}
+
+	// Re-saving blocked is not a new transition.
+	updateChildStatus(t, fx.child.ID, "blocked")
+	if got := countSystemCommentsOn(t, fx.parent.ID); got != 1 {
+		t.Fatalf("blocked re-save must be idempotent, got %d", got)
+	}
+}
+
 // TestChildReopenAndDoneFiresAgain — done → in_progress → done IS a real
 // new completion event and should produce a second notification. This
 // captures the "reopen + done counts as a new event" line from MUL-2538.
