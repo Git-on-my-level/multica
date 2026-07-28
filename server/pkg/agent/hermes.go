@@ -431,6 +431,8 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("hermes session created", "session_id", sessionID)
+		// Mid-flight pin: daemon PinTaskSession keys off MessageStatus+SessionID.
+		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask hermes to switch the session to it
