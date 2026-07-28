@@ -44,6 +44,21 @@ func TestStageBarrierClosed_Unstaged(t *testing.T) {
 			children: []db.Issue{child(0, "done"), child(0, "cancelled")},
 			want:     true,
 		},
+		{
+			name:     "in_review counts as stage-terminal",
+			children: []db.Issue{child(0, "done"), child(0, "in_review")},
+			want:     true,
+		},
+		{
+			name:     "all in_review closes the implicit stage",
+			children: []db.Issue{child(0, "in_review"), child(0, "in_review")},
+			want:     true,
+		},
+		{
+			name:     "blocked does not count as stage-terminal",
+			children: []db.Issue{child(0, "done"), child(0, "blocked")},
+			want:     false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,6 +95,26 @@ func TestStageBarrierClosed_Staged(t *testing.T) {
 		}
 	})
 
+	t.Run("stage 1 closes when siblings are in_review", func(t *testing.T) {
+		children := []db.Issue{
+			child(1, "in_review"), child(1, "in_review"),
+			child(2, "backlog"),
+		}
+		if !stageBarrierClosed(children, child(1, "in_review")) {
+			t.Fatal("expected stage 1 barrier to close on in_review")
+		}
+	})
+
+	t.Run("blocked sibling keeps stage 1 open", func(t *testing.T) {
+		children := []db.Issue{
+			child(1, "done"), child(1, "blocked"),
+			child(2, "backlog"),
+		}
+		if stageBarrierClosed(children, child(1, "done")) {
+			t.Fatal("blocked sibling must hold the stage barrier open")
+		}
+	})
+
 	t.Run("closing stage 2 fires when stages 1 and 2 are terminal", func(t *testing.T) {
 		children := []db.Issue{
 			child(1, "done"), child(1, "done"),
@@ -110,7 +145,7 @@ func TestStageProgressSummary(t *testing.T) {
 		child(3, "backlog"), child(3, "backlog"),
 	}
 	summary, next := stageProgressSummary(children, 1)
-	want := "Stage 1: 3/3 done; Stage 2: 0/4 done (next); Stage 3: 0/2 done"
+	want := "Stage 1: 3/3 ready; Stage 2: 0/4 ready (next); Stage 3: 0/2 ready"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}
