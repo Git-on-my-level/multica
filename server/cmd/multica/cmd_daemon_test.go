@@ -69,6 +69,27 @@ func TestPrintDaemonStatusIncludesCLIVersion(t *testing.T) {
 	}
 }
 
+func TestPrintDaemonStatusIncludesRegistrationSkips(t *testing.T) {
+	t.Parallel()
+
+	health := map[string]any{
+		"status": "running",
+		"pid":    float64(1234),
+		"uptime": "1h2m3s",
+		"registration_skips": []any{map[string]any{
+			"name":     "cursor",
+			"error":    "signal: killed",
+			"attempts": float64(3),
+		}},
+	}
+
+	var out bytes.Buffer
+	printDaemonStatusReport(&out, "Daemon", health)
+	if got := out.String(); !strings.Contains(got, "Registration skips:  cursor (attempt 3: signal: killed)\n") {
+		t.Fatalf("daemon status output = %q, want registration skip line", got)
+	}
+}
+
 func TestBuildDaemonStartArgsForwardsCodexHandshakeTimeout(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.Flags().Duration("codex-handshake-timeout", 0, "")

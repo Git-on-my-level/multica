@@ -1105,6 +1105,25 @@ func printDaemonStatusReport(w io.Writer, label string, health map[string]any) {
 		}
 		rows = append(rows, row{"Agents", strings.Join(parts, ", ")})
 	}
+	if skips, ok := health["registration_skips"].([]any); ok && len(skips) > 0 {
+		parts := make([]string, 0, len(skips))
+		for _, raw := range skips {
+			skip, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := skip["name"].(string)
+			errText, _ := skip["error"].(string)
+			attempts := fmt.Sprint(skip["attempts"])
+			if name == "" {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%s (attempt %s: %s)", name, attempts, errText))
+		}
+		if len(parts) > 0 {
+			rows = append(rows, row{"Registration skips", strings.Join(parts, "; ")})
+		}
+	}
 	if ws, ok := health["workspaces"].([]any); ok {
 		rows = append(rows, row{"Workspaces", strconv.Itoa(len(ws))})
 	}

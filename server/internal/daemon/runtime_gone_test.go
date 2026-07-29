@@ -25,6 +25,7 @@ func freshDaemon(serverURL string) *Daemon {
 		runtimeIndex:              make(map[string]Runtime),
 		runtimeSet:                newRuntimeSetWatcher(),
 		agentVersions:             make(map[string]string),
+		registrationSkips:         make(map[string]runtimeRegistrationSkip),
 		wsHBLastAck:               make(map[string]time.Time),
 		activeEnvRoots:            make(map[string]int),
 		runtimeGoneInflight:       make(map[string]struct{}),
