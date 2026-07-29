@@ -239,6 +239,14 @@ type Daemon struct {
 	versionsMu    sync.RWMutex      // guards agentVersions
 	agentVersions map[string]string // provider -> detected CLI version (set during registration)
 
+	// registrationSkips remembers configured built-in providers whose version
+	// probe or registration failed.  A failed probe used to be logged and then
+	// forgotten for the rest of the daemon lifetime, which left a transiently
+	// broken CLI permanently offline until a restart.  The retry loop owns the
+	// next-attempt schedule; health reads a snapshot for operator visibility.
+	registrationSkipsMu sync.RWMutex
+	registrationSkips   map[string]runtimeRegistrationSkip
+
 	// resolvedPathsMu guards resolvedPaths, the self-healed executable paths.
 	// The daemon pins each agent's absolute path at startup so a later PATH
 	// change can't redirect a task launch. When that pinned path later vanishes
@@ -384,6 +392,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		profileLaunchSpecs:        make(map[string]profileLaunchSpec),
 		runtimeSet:                newRuntimeSetWatcher(),
 		agentVersions:             make(map[string]string),
+		registrationSkips:         make(map[string]runtimeRegistrationSkip),
 		resolvedPaths:             make(map[string]healedAgent),
 		wsHBLastAck:               make(map[string]time.Time),
 		activeEnvRoots:            make(map[string]int),
@@ -422,6 +431,89 @@ func (d *Daemon) agentVersion(provider string) string {
 	d.versionsMu.RLock()
 	defer d.versionsMu.RUnlock()
 	return d.agentVersions[provider]
+}
+
+// RuntimeRegistrationSkip is a configured built-in runtime that the daemon
+// could not make available yet. It is exposed from /health so configured
+// providers that silently missed initial registration are observable.
+type RuntimeRegistrationSkip struct {
+	Name          string    `json:"name"`
+	Error         string    `json:"error"`
+	Attempts      int       `json:"attempts"`
+	LastAttemptAt time.Time `json:"last_attempt_at"`
+}
+
+type runtimeRegistrationSkip struct {
+	RuntimeRegistrationSkip
+	nextAttemptAt time.Time
+}
+
+const runtimeRegistrationRetryTick = 30 * time.Second
+
+// registrationRetryDelay spaces retries for a broken executable without
+// making a one-off process-spawn failure wait for a daemon restart. The first
+// retry is quick; permanent failures settle at a quiet five-minute cadence.
+func registrationRetryDelay(attempts int) time.Duration {
+	switch {
+	case attempts <= 1:
+		return 30 * time.Second
+	case attempts == 2:
+		return time.Minute
+	case attempts == 3:
+		return 2 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
+}
+
+func (d *Daemon) recordRuntimeRegistrationSkip(name string, err error, attemptedAt time.Time) {
+	if name == "" || err == nil {
+		return
+	}
+	d.registrationSkipsMu.Lock()
+	defer d.registrationSkipsMu.Unlock()
+	if d.registrationSkips == nil {
+		d.registrationSkips = make(map[string]runtimeRegistrationSkip)
+	}
+	skip := d.registrationSkips[name]
+	skip.Name = name
+	skip.Error = err.Error()
+	skip.Attempts++
+	skip.LastAttemptAt = attemptedAt
+	skip.nextAttemptAt = attemptedAt.Add(registrationRetryDelay(skip.Attempts))
+	d.registrationSkips[name] = skip
+}
+
+func (d *Daemon) clearRuntimeRegistrationSkips(names ...string) {
+	d.registrationSkipsMu.Lock()
+	defer d.registrationSkipsMu.Unlock()
+	for _, name := range names {
+		delete(d.registrationSkips, name)
+	}
+}
+
+func (d *Daemon) dueRuntimeRegistrationSkips(now time.Time) []string {
+	d.registrationSkipsMu.RLock()
+	names := make([]string, 0, len(d.registrationSkips))
+	for name, skip := range d.registrationSkips {
+		if !now.Before(skip.nextAttemptAt) {
+			names = append(names, name)
+		}
+	}
+	d.registrationSkipsMu.RUnlock()
+	sort.Strings(names)
+	return names
+}
+
+func (d *Daemon) runtimeRegistrationSkips() []RuntimeRegistrationSkip {
+	d.registrationSkipsMu.RLock()
+	skips := make([]RuntimeRegistrationSkip, 0, len(d.registrationSkips))
+	for _, skip := range d.registrationSkips {
+		skips = append(skips, skip.RuntimeRegistrationSkip)
+	}
+	d.registrationSkipsMu.RUnlock()
+	sort.Slice(skips, func(i, j int) bool { return skips[i].Name < skips[j].Name })
+	return skips
 }
 
 // healedAgent bundles a self-healed executable path with the CLI version
@@ -1077,6 +1169,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	taskWakeups := make(chan taskWakeup, 256)
 	go d.taskWakeupLoop(ctx, taskWakeups)
 	go d.heartbeatLoop(ctx)
+	go d.runtimeRegistrationRetryLoop(ctx)
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
@@ -1087,7 +1180,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// readiness wait blocks on, so success is reported only after startup
 	// actually completed, not merely because the health port came up.
 	d.ready.Store(true)
-	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, gc, auto-update, token-renewal); health now reporting ready")
+	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, runtime-registration-retry, gc, auto-update, token-renewal); health now reporting ready")
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
 	return err
@@ -1227,6 +1320,14 @@ const runtimeVersionProbeConcurrency = 8
 // detect a version or is below the minimum supported version is logged and
 // skipped, exactly as the serial loop did.
 func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) []map[string]string {
+	return d.detectBuiltinRuntimesForProviders(ctx, nil)
+}
+
+// detectBuiltinRuntimesForProviders is detectBuiltinRuntimes restricted to a
+// known set of configured providers. A nil provider list means all configured
+// built-ins; retry uses the restricted form so healthy CLIs are never probed
+// again solely because a sibling was transiently unavailable.
+func (d *Daemon) detectBuiltinRuntimesForProviders(ctx context.Context, providers []string) []map[string]string {
 	type detected struct {
 		name    string
 		version string
@@ -1237,7 +1338,19 @@ func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) []map[string]string 
 		g       errgroup.Group
 	)
 	g.SetLimit(runtimeVersionProbeConcurrency)
-	for name, entry := range d.cfg.Agents {
+	entries := make(map[string]AgentEntry, len(d.cfg.Agents))
+	if providers == nil {
+		for name, entry := range d.cfg.Agents {
+			entries[name] = entry
+		}
+	} else {
+		for _, name := range providers {
+			if entry, ok := d.cfg.Agents[name]; ok {
+				entries[name] = entry
+			}
+		}
+	}
+	for name, entry := range entries {
 		name, entry := name, entry
 		g.Go(func() error {
 			// Self-heal a pinned executable path an in-place upgrade deleted
@@ -1250,10 +1363,12 @@ func (d *Daemon) detectBuiltinRuntimes(ctx context.Context) []map[string]string 
 			version, err := detectAgentVersion(ctx, entry.Path)
 			if err != nil {
 				d.logger.Warn("skip registering runtime", "name", name, "error", err)
+				d.recordRuntimeRegistrationSkip(name, err, time.Now())
 				return nil
 			}
 			if err := checkAgentMinVersion(name, version); err != nil {
 				d.logger.Warn("skip registering runtime: version too old", "name", name, "version", version, "error", err)
+				d.recordRuntimeRegistrationSkip(name, fmt.Errorf("version %s: %w", version, err), time.Now())
 				return nil
 			}
 			d.setAgentVersion(name, version)
@@ -1316,6 +1431,17 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 		return nil, profileSig, ErrNoRuntimesToRegister
 	}
 
+	resp, err := d.registerRuntimePayload(ctx, workspaceID, runtimes, failedProfiles)
+	if err != nil {
+		return nil, "", err
+	}
+	return resp, profileSig, nil
+}
+
+func (d *Daemon) registerRuntimePayload(ctx context.Context, workspaceID string, runtimes, failedProfiles []map[string]string) (*RegisterResponse, error) {
+	if len(runtimes) == 0 && len(failedProfiles) == 0 {
+		return nil, ErrNoRuntimesToRegister
+	}
 	req := map[string]any{
 		"workspace_id":      workspaceID,
 		"daemon_id":         d.cfg.DaemonID,
@@ -1329,13 +1455,23 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 
 	resp, err := d.client.Register(ctx, req)
 	if err != nil {
-		return nil, "", fmt.Errorf("register runtimes: %w", err)
+		return nil, fmt.Errorf("register runtimes: %w", err)
 	}
 	if len(resp.Runtimes) == 0 && len(failedProfiles) == 0 {
-		return nil, "", fmt.Errorf("register runtimes: empty response")
+		return nil, fmt.Errorf("register runtimes: empty response")
 	}
 	d.logger.Debug("register response", "workspace_id", workspaceID, "runtimes", len(resp.Runtimes), "repos", len(resp.Repos), "repos_version", resp.ReposVersion)
-	return resp, profileSig, nil
+	return resp, nil
+}
+
+func builtinRuntimeProviders(runtimes []map[string]string) []string {
+	providers := make([]string, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime["profile_id"] == "" && runtime["type"] != "" {
+			providers = append(providers, runtime["type"])
+		}
+	}
+	return providers
 }
 
 // appendProfileRuntimes fetches the workspace's enabled custom runtime
@@ -2299,6 +2435,106 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 			sync()
 		}
 	}
+}
+
+// runtimeRegistrationRetryLoop gives a skipped built-in CLI a chance to come
+// online after a transient version-probe failure. It deliberately runs apart
+// from task activity: runtime registration is safe while tasks are active and
+// an offline provider cannot claim any work until its upsert succeeds.
+func (d *Daemon) runtimeRegistrationRetryLoop(ctx context.Context) {
+	ticker := time.NewTicker(runtimeRegistrationRetryTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			d.retrySkippedRuntimeRegistrations(ctx, now)
+		}
+	}
+}
+
+// retrySkippedRuntimeRegistrations detects only due, previously skipped
+// providers, then upserts them into every currently tracked workspace. The
+// normal registration endpoint is additive, so this avoids reprobing healthy
+// providers and preserves the runtime IDs that are already serving tasks.
+func (d *Daemon) retrySkippedRuntimeRegistrations(ctx context.Context, now time.Time) {
+	names := d.dueRuntimeRegistrationSkips(now)
+	if len(names) == 0 {
+		return
+	}
+	runtimes := d.detectBuiltinRuntimesForProviders(ctx, names)
+	if len(runtimes) == 0 {
+		return // detectBuiltinRuntimesForProviders refreshed the failure state.
+	}
+
+	d.mu.Lock()
+	workspaceIDs := make([]string, 0, len(d.workspaces))
+	for id := range d.workspaces {
+		workspaceIDs = append(workspaceIDs, id)
+	}
+	d.mu.Unlock()
+	if len(workspaceIDs) == 0 {
+		// A workspace may have been removed between a failed initial
+		// registration and this retry. There is nothing left to bring online.
+		d.clearRuntimeRegistrationSkips(builtinRuntimeProviders(runtimes)...)
+		return
+	}
+	sort.Strings(workspaceIDs)
+
+	providers := builtinRuntimeProviders(runtimes)
+	registeredEverywhere := true
+	changed := false
+	for _, workspaceID := range workspaceIDs {
+		resp, err := d.registerRuntimePayload(ctx, workspaceID, runtimes, nil)
+		if err != nil {
+			registeredEverywhere = false
+			d.logger.Warn("retry skipped runtime registration failed", "workspace_id", workspaceID, "providers", providers, "error", err)
+			continue
+		}
+		if d.applyPartialRegisterResponse(workspaceID, resp) {
+			changed = true
+		}
+	}
+	if !registeredEverywhere {
+		for _, provider := range providers {
+			d.recordRuntimeRegistrationSkip(provider, fmt.Errorf("retry registration did not complete for every workspace"), now)
+		}
+		return
+	}
+	d.clearRuntimeRegistrationSkips(providers...)
+	if changed {
+		d.notifyRuntimeSetChanged()
+	}
+}
+
+// applyPartialRegisterResponse merges a retry's additive registration response
+// into local state. Unlike applyRegisterResponseInPlace, it must not treat the
+// response as authoritative because retry intentionally sent only providers
+// that were previously skipped.
+func (d *Daemon) applyPartialRegisterResponse(workspaceID string, resp *RegisterResponse) bool {
+	if resp == nil || len(resp.Runtimes) == 0 {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ws, ok := d.workspaces[workspaceID]
+	if !ok {
+		return false
+	}
+	known := make(map[string]struct{}, len(ws.runtimeIDs))
+	for _, id := range ws.runtimeIDs {
+		known[id] = struct{}{}
+	}
+	for _, runtime := range resp.Runtimes {
+		d.runtimeIndex[runtime.ID] = runtime
+		if _, exists := known[runtime.ID]; !exists {
+			ws.runtimeIDs = append(ws.runtimeIDs, runtime.ID)
+			known[runtime.ID] = struct{}{}
+		}
+		d.logger.Info("registered previously skipped runtime", "workspace_id", workspaceID, "runtime_id", runtime.ID, "provider", runtime.Provider)
+	}
+	return true
 }
 
 // runRuntimeHeartbeat owns the HTTP heartbeat schedule for a single runtime.

@@ -25,15 +25,16 @@ type HealthResponse struct {
 	// lifecycle CLI (`daemon start/stop`) acts on the host process namespace,
 	// so a foreign-OS daemon can't be started/stopped by the app even though
 	// /health is reachable. See #3916.
-	OS              string            `json:"os"`
-	Uptime          string            `json:"uptime"`
-	DaemonID        string            `json:"daemon_id"`
-	DeviceName      string            `json:"device_name"`
-	ServerURL       string            `json:"server_url"`
-	CLIVersion      string            `json:"cli_version"`
-	ActiveTaskCount int64             `json:"active_task_count"`
-	Agents          []string          `json:"agents"`
-	Workspaces      []healthWorkspace `json:"workspaces"`
+	OS                string                    `json:"os"`
+	Uptime            string                    `json:"uptime"`
+	DaemonID          string                    `json:"daemon_id"`
+	DeviceName        string                    `json:"device_name"`
+	ServerURL         string                    `json:"server_url"`
+	CLIVersion        string                    `json:"cli_version"`
+	ActiveTaskCount   int64                     `json:"active_task_count"`
+	Agents            []string                  `json:"agents"`
+	RegistrationSkips []RuntimeRegistrationSkip `json:"registration_skips"`
+	Workspaces        []healthWorkspace         `json:"workspaces"`
 }
 
 type healthWorkspace struct {
@@ -94,17 +95,18 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 		}
 
 		resp := HealthResponse{
-			Status:          status,
-			PID:             os.Getpid(),
-			OS:              runtime.GOOS,
-			Uptime:          time.Since(startedAt).Truncate(time.Second).String(),
-			DaemonID:        d.cfg.DaemonID,
-			DeviceName:      d.cfg.DeviceName,
-			ServerURL:       d.cfg.ServerBaseURL,
-			CLIVersion:      d.cfg.CLIVersion,
-			ActiveTaskCount: d.activeTasks.Load(),
-			Agents:          agents,
-			Workspaces:      wsList,
+			Status:            status,
+			PID:               os.Getpid(),
+			OS:                runtime.GOOS,
+			Uptime:            time.Since(startedAt).Truncate(time.Second).String(),
+			DaemonID:          d.cfg.DaemonID,
+			DeviceName:        d.cfg.DeviceName,
+			ServerURL:         d.cfg.ServerBaseURL,
+			CLIVersion:        d.cfg.CLIVersion,
+			ActiveTaskCount:   d.activeTasks.Load(),
+			Agents:            agents,
+			RegistrationSkips: d.runtimeRegistrationSkips(),
+			Workspaces:        wsList,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
