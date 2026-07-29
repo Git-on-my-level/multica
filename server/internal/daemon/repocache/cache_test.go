@@ -514,6 +514,113 @@ func TestCreateWorktree(t *testing.T) {
 	}
 }
 
+func TestCreateWorktreeUsableWithBareWorktreeConfig(t *testing.T) {
+	// Apple Git 2.50 + bare cache with extensions.worktreeConfig=true leaves
+	// empty config.worktree; without Multica's repair, git -C fails with
+	// "this operation must be run in a work tree".
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cacheRoot := t.TempDir()
+
+	cache := New(cacheRoot, testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	if barePath == "" {
+		t.Fatal("bare path missing after sync")
+	}
+	if out, err := exec.Command("git", "-C", barePath, "config", "extensions.worktreeConfig", "true").CombinedOutput(); err != nil {
+		t.Fatalf("enable worktreeConfig on bare: %v\n%s", err, out)
+	}
+
+	workDir := t.TempDir()
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-1",
+		RepoURL:     sourceRepo,
+		WorkDir:     workDir,
+		AgentName:   "Code Reviewer",
+		TaskID:      "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	out, err := exec.Command("git", "-C", result.Path, "rev-parse", "--is-inside-work-tree").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		t.Fatalf("worktree unusable after CreateWorktree: out=%q err=%v", string(out), err)
+	}
+	// core.bare must be false in the private worktree config
+	bareOut, err := exec.Command("git", "-C", result.Path, "config", "--worktree", "--get", "core.bare").CombinedOutput()
+	if err != nil {
+		t.Fatalf("get core.bare: %v\n%s", err, bareOut)
+	}
+	if got := strings.TrimSpace(string(bareOut)); got != "false" {
+		t.Fatalf("core.bare=%q want false", got)
+	}
+
+	// Reuse path (update existing) must stay usable.
+	result2, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-1",
+		RepoURL:     sourceRepo,
+		WorkDir:     workDir,
+		AgentName:   "Code Reviewer",
+		TaskID:      "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+	})
+	if err != nil {
+		t.Fatalf("second CreateWorktree failed: %v", err)
+	}
+	out, err = exec.Command("git", "-C", result2.Path, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("status on reused worktree failed: %v\n%s", err, out)
+	}
+}
+
+func TestEnsureLinkedWorktreeUsableRepairsEmptyConfig(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	if out, err := exec.Command("git", "-C", barePath, "config", "extensions.worktreeConfig", "true").CombinedOutput(); err != nil {
+		t.Fatalf("worktreeConfig: %v\n%s", err, out)
+	}
+
+	// Raw git worktree add without Multica repair — reproduces broken empty config.worktree.
+	wt := filepath.Join(t.TempDir(), "raw-wt")
+	branch := "agent/test-empty-config"
+	if out, err := exec.Command("git", "-C", barePath, "worktree", "add", "-B", branch, wt, "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("raw worktree add: %v\n%s", err, out)
+	}
+	// Confirm broken before repair (empty config.worktree).
+	gdBytes, err := os.ReadFile(filepath.Join(wt, ".git"))
+	if err != nil {
+		t.Fatalf("read .git: %v", err)
+	}
+	gd := strings.TrimSpace(strings.TrimPrefix(string(gdBytes), "gitdir: "))
+	cfgPath := filepath.Join(gd, "config.worktree")
+	if st, err := os.Stat(cfgPath); err != nil || st.Size() != 0 {
+		// Some git versions may already write bare=false; force empty to test repair.
+		if err := os.WriteFile(cfgPath, nil, 0o644); err != nil {
+			t.Fatalf("force empty config.worktree: %v", err)
+		}
+	}
+	if out, err := exec.Command("git", "-C", wt, "rev-parse", "--is-inside-work-tree").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) == "true" {
+		t.Fatalf("expected broken worktree before repair, got usable")
+	}
+
+	if err := ensureLinkedWorktreeUsable(wt); err != nil {
+		t.Fatalf("ensureLinkedWorktreeUsable: %v", err)
+	}
+	out, err := exec.Command("git", "-C", wt, "rev-parse", "--is-inside-work-tree").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		t.Fatalf("still broken after ensure: %q err=%v", string(out), err)
+	}
+}
+
 func TestCreateWorktreeWithIsolatedGitMetadata(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)
