@@ -221,9 +221,6 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 			Name: "test-agent",
 			CustomEnv: map[string]string{
 				"CAPTURE_FILE": captureFile,
-				"TMPDIR":       "/shared/tmp",
-				"TMP":          "/shared/tmp",
-				"TEMP":         "/shared/tmp",
 			},
 		},
 	}

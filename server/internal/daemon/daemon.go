@@ -5950,7 +5950,7 @@ func validateProviderHomeEnv(key, value string) error {
 func codexShellAuthorizedCustomEnvNames(customEnv map[string]string) []string {
 	names := make([]string, 0, len(customEnv))
 	for key := range customEnv {
-		if key == "" || isBlockedEnvKey(key) {
+		if key == "" || isBlockedEnvKey(key) || isProviderHomeEnvKey(key) {
 			continue
 		}
 		names = append(names, key)
