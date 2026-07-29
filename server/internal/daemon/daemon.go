@@ -3342,6 +3342,24 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	default:
 	}
 
+	// A daemon-root cancellation is a local lifecycle interruption (restart,
+	// upgrade, or controlled shutdown), not an operator cancellation and not a
+	// provider failure. Report it through the server's bounded retry path so it
+	// atomically creates exactly one successor that inherits this task's
+	// workdir/session. A poll cancellation is checked above and wins: the
+	// server already made that task terminal, so it must never be revived.
+	if d.rootCtx != nil && d.rootCtx.Err() != nil {
+		if err != nil {
+			taskLog.Info("task interrupted by daemon lifecycle", "requeue_reason", "daemon_lifecycle", "error", err)
+		} else {
+			taskLog.Info("task interrupted by daemon lifecycle", "requeue_reason", "daemon_lifecycle")
+		}
+		result.Status = "failed"
+		result.Comment = "task interrupted by local daemon lifecycle; retrying once with preserved session/workdir"
+		result.FailureReason = "daemon_lifecycle"
+		err = nil
+	}
+
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
 		// runTask returned without a TaskResult, so we don't have a SessionID
