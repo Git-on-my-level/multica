@@ -4566,7 +4566,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if task.Agent != nil {
 		agentCustomEnv = task.Agent.CustomEnv
 	}
-	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if err := layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger); err != nil {
+		return TaskResult{}, err
+	}
 	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
 		return TaskResult{}, err
 	}
@@ -4681,12 +4683,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				"error", err,
 			)
 		} else if !ok {
-			taskLog.Warn("thinking_level: not valid for this (provider, model); skipping injection",
-				"provider", provider,
-				"model", model,
-				"thinking_level", thinkingLevel,
-			)
-			thinkingLevel = ""
+			return TaskResult{}, fmt.Errorf("thinking_level %q is not supported by %s model %q; refusing to start with an inert effort pin", thinkingLevel, provider, model)
 		}
 	}
 	var idleWatchdogTimeout time.Duration
@@ -5833,7 +5830,7 @@ func isBlockedEnvKey(key string) bool {
 		return true
 	}
 	switch upper {
-	case "HOME", "PATH", "USER", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "CODEX_HOME", "CURSOR_DATA_DIR", execenv.CursorMcpAuthSourceEnv, "OPENCLAW_CONFIG_PATH", "OPENCLAW_INCLUDE_ROOTS":
+	case "HOME", "PATH", "USER", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "CURSOR_DATA_DIR", execenv.CursorMcpAuthSourceEnv, "OPENCLAW_CONFIG_PATH", "OPENCLAW_INCLUDE_ROOTS":
 		return true
 	}
 	return false
@@ -5881,19 +5878,55 @@ func hermesLaunchArgs(customArgs []string, overlayActive bool) []string {
 	return agent.StripHermesProfileArgs(customArgs, sel)
 }
 
-func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayHome string, logger *slog.Logger) {
+func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayHome string, logger *slog.Logger) error {
 	for k, v := range customEnv {
+		if isProviderHomeEnvKey(k) {
+			if err := validateProviderHomeEnv(k, v); err != nil {
+				return fmt.Errorf("custom_env %s: %w", k, err)
+			}
+			agentEnv[k] = v
+			continue
+		}
 		if isBlockedEnvKey(k) {
 			if logger != nil {
-				logger.Warn("custom_env: blocked key skipped", "key", k)
+				logger.Warn("custom_env: blocked key", "key", k)
 			}
-			continue
+			return fmt.Errorf("custom_env contains blocked key %q", k)
 		}
 		agentEnv[k] = v
 	}
 	if overlayHome != "" {
 		agentEnv["HERMES_HOME"] = overlayHome
 	}
+	return nil
+}
+
+func isProviderHomeEnvKey(key string) bool {
+	switch strings.ToUpper(strings.TrimSpace(key)) {
+	case "CODEX_HOME", "CLAUDE_CONFIG_DIR":
+		return true
+	default:
+		return false
+	}
+}
+
+// validateProviderHomeEnv limits the exceptional provider-home override to a
+// real local directory. These keys select credentials and persistent state, so
+// accepting a token, relative path, or a missing directory would otherwise
+// silently fall back to the daemon identity that the agent was trying to
+// isolate.
+func validateProviderHomeEnv(key, value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") || !filepath.IsAbs(value) {
+		return fmt.Errorf("must be an absolute local directory path")
+	}
+	info, err := os.Stat(value)
+	if err != nil {
+		return fmt.Errorf("directory is unavailable: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("must name a directory")
+	}
+	return nil
 }
 
 // codexShellAuthorizedCustomEnvNames returns names from the current agent's
