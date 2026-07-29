@@ -4415,8 +4415,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// sessions (MUL-4424 isolates them). Drop the resume before the brief is
 	// generated below if it isn't, so we never tell the agent it is continuing a
 	// conversation Codex will silently restart from scratch.
+	var agentCustomEnv map[string]string
+	if task.Agent != nil {
+		agentCustomEnv = task.Agent.CustomEnv
+	}
 	if reused {
-		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
+		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, effectiveCodexHome(env.CodexHome, agentCustomEnv), taskLog)
 	}
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
@@ -4562,14 +4566,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Bedrock). These are set per-agent via the agent settings UI.
 	// Critical internal variables are blocklisted to prevent accidental or
 	// malicious override of daemon-set values.
-	var agentCustomEnv map[string]string
-	if task.Agent != nil {
-		agentCustomEnv = task.Agent.CustomEnv
-	}
 	if err := layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger); err != nil {
 		return TaskResult{}, err
 	}
-	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
+	if err := configureCodexTaskShellEnvironment(provider, strings.TrimSpace(agentEnv["CODEX_HOME"]), os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
 		return TaskResult{}, err
 	}
 	backend, err := agent.New(provider, agent.Config{
@@ -5908,6 +5908,20 @@ func isProviderHomeEnvKey(key string) bool {
 	default:
 		return false
 	}
+}
+
+// effectiveCodexHome is the CODEX_HOME the Codex child will use after custom_env
+// is layered onto the task-prepared home.
+func effectiveCodexHome(taskCodexHome string, customEnv map[string]string) string {
+	for k, v := range customEnv {
+		if strings.ToUpper(strings.TrimSpace(k)) != "CODEX_HOME" {
+			continue
+		}
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return taskCodexHome
 }
 
 // validateProviderHomeEnv limits the exceptional provider-home override to a
