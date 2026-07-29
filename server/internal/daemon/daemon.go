@@ -1435,6 +1435,7 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 	if err != nil {
 		return nil, "", err
 	}
+	d.clearRuntimeRegistrationSkips(builtinRuntimeProviders(runtimes)...)
 	return resp, profileSig, nil
 }
 
