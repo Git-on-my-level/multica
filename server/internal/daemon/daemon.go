@@ -5891,7 +5891,7 @@ func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayH
 			if logger != nil {
 				logger.Warn("custom_env: blocked key", "key", k)
 			}
-			return fmt.Errorf("custom_env contains blocked key %q", k)
+			continue
 		}
 		agentEnv[k] = v
 	}

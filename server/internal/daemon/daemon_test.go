@@ -259,13 +259,19 @@ func TestProviderHomeCustomEnvValidation(t *testing.T) {
 	for name, custom := range map[string]map[string]string{
 		"relative home": {"CODEX_HOME": ".codex"},
 		"missing home":  {"CODEX_HOME": filepath.Join(home, "missing")},
-		"blocked key":   {"MULTICA_TOKEN": "secret"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := layerCustomEnvAndHermesHome(map[string]string{}, custom, "", nil); err == nil {
 				t.Fatal("expected custom env validation error")
 			}
 		})
+	}
+	blocked := map[string]string{}
+	if err := layerCustomEnvAndHermesHome(blocked, map[string]string{"MULTICA_TOKEN": "secret"}, "", nil); err != nil {
+		t.Fatalf("ordinary blocked key should keep its legacy skip behavior: %v", err)
+	}
+	if _, ok := blocked["MULTICA_TOKEN"]; ok {
+		t.Fatal("blocked key was applied")
 	}
 }
 
