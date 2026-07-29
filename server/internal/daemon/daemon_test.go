@@ -2122,7 +2122,6 @@ func TestExecuteAndDrain_ContextCancelled_ReportsCancelled(t *testing.T) {
 	}
 }
 
-
 // lateSessionCancelBackend models the OMP/daemon-restart race: it reveals a
 // session id via MessageStatus, then only emits Result after the parent ctx
 // is cancelled. executeAndDrain must still return that SessionID so FailTask
@@ -2904,6 +2903,20 @@ func TestDefaultArgsForProvider(t *testing.T) {
 	}
 	if got := defaultArgsForProvider(cfg, "unsupported"); got != nil {
 		t.Fatalf("expected nil for unsupported provider, got %#v", got)
+	}
+}
+
+func TestDaemonLifecycleCancellationIsDistinctFromTaskCancellation(t *testing.T) {
+	t.Parallel()
+
+	root, cancel := context.WithCancel(context.Background())
+	d := &Daemon{rootCtx: root}
+	if d.rootCtx.Err() != nil {
+		t.Fatal("fresh daemon root context is unexpectedly cancelled")
+	}
+	cancel()
+	if d.rootCtx.Err() == nil {
+		t.Fatal("daemon lifecycle cancellation was not observable")
 	}
 }
 

@@ -187,6 +187,8 @@ func TestProviderNetworkRetrySchedule(t *testing.T) {
 		{provNet, 5, 5},                          // higher configured budget → kept (widen-only)
 		{"timeout", 2, 2},                        // unrelated reason → column value untouched
 		{"timeout", 1, 1},                        // unrelated + disabled → untouched
+		{"daemon_lifecycle", 2, 2},               // one retry after local daemon restart
+		{"daemon_lifecycle", 5, daemonLifecycleMaxAttempts}, // never fan out retries after a lifecycle interruption
 	}
 	for _, tc := range ceilingCases {
 		if got := retryAttemptCeiling(tc.reason, tc.max); got != tc.want {
@@ -255,6 +257,7 @@ func TestTaskFailureClassifiers(t *testing.T) {
 		// resume-safe so the retry continues the truncated conversation.
 		{reason: "agent_error.provider_network", wantType: "agent_error", wantResumeOK: true, wantRetry: true},
 		{reason: "runtime_recovery", wantType: "runtime", wantResumeOK: true, wantRetry: true},
+		{reason: "daemon_lifecycle", wantType: "agent_error", wantResumeOK: true, wantRetry: true},
 		{reason: "iteration_limit", wantType: "agent_output", wantResumeOK: false, wantRetry: false},
 		{reason: "api_invalid_request", wantType: "agent_error", wantResumeOK: false, wantRetry: false},
 		{reason: "agent_error.context_overflow", wantType: "agent_error", wantResumeOK: false, wantRetry: false},
