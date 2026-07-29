@@ -555,8 +555,7 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 				"error", err,
 			)
 			if rmErr := removeLinkedWorktree(barePath, worktreePath); rmErr != nil {
-				// Best-effort path wipe if git metadata is too broken to remove.
-				_ = os.RemoveAll(worktreePath)
+				return nil, fmt.Errorf("remove unusable linked worktree: %w", rmErr)
 			}
 		} else {
 			actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
