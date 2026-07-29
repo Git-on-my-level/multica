@@ -547,41 +547,54 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	// If worktree already exists (reused environment from a prior task),
 	// update it to the latest remote code instead of creating a new one.
 	if isGitWorktree(worktreePath) {
-		actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
-		if err != nil {
-			return nil, fmt.Errorf("update existing worktree: %w", err)
-		}
-
-		for _, pattern := range agentGitExcludePatterns {
-			_ = excludeFromGit(worktreePath, pattern)
-		}
-
-		// Install or remove the Co-authored-by hook based on the workspace
-		// setting. The hook lives in the bare repo's shared hooks dir, so we
-		// must actively remove it when disabled — otherwise a previously
-		// installed hook keeps appending the trailer to every commit even
-		// after the user toggles the setting off.
-		if params.CoAuthoredByEnabled {
-			if err := installCoAuthoredByHook(worktreePath); err != nil {
-				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+		// Repair empty config.worktree from bare+worktreeConfig before any
+		// git -C worktree command (reset/clean/checkout) can run.
+		if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
+			c.logger.Warn("repo checkout: unusable linked worktree; recreating",
+				"path", worktreePath,
+				"error", err,
+			)
+			if rmErr := removeLinkedWorktree(barePath, worktreePath); rmErr != nil {
+				// Best-effort path wipe if git metadata is too broken to remove.
+				_ = os.RemoveAll(worktreePath)
 			}
 		} else {
-			if err := removeCoAuthoredByHook(worktreePath); err != nil {
-				c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+			actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
+			if err != nil {
+				return nil, fmt.Errorf("update existing worktree: %w", err)
 			}
+
+			for _, pattern := range agentGitExcludePatterns {
+				_ = excludeFromGit(worktreePath, pattern)
+			}
+
+			// Install or remove the Co-authored-by hook based on the workspace
+			// setting. The hook lives in the bare repo's shared hooks dir, so we
+			// must actively remove it when disabled — otherwise a previously
+			// installed hook keeps appending the trailer to every commit even
+			// after the user toggles the setting off.
+			if params.CoAuthoredByEnabled {
+				if err := installCoAuthoredByHook(worktreePath); err != nil {
+					c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+				}
+			} else {
+				if err := removeCoAuthoredByHook(worktreePath); err != nil {
+					c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+				}
+			}
+
+			c.logger.Info("repo checkout: existing worktree updated",
+				"url", params.RepoURL,
+				"path", worktreePath,
+				"branch", actualBranch,
+				"base", baseRef,
+			)
+
+			return &WorktreeResult{
+				Path:       worktreePath,
+				BranchName: actualBranch,
+			}, nil
 		}
-
-		c.logger.Info("repo checkout: existing worktree updated",
-			"url", params.RepoURL,
-			"path", worktreePath,
-			"branch", actualBranch,
-			"base", baseRef,
-		)
-
-		return &WorktreeResult{
-			Path:       worktreePath,
-			BranchName: actualBranch,
-		}, nil
 	}
 
 	// Create a new worktree. createWorktree may rename the branch to avoid
@@ -954,6 +967,11 @@ func createWorktree(gitRoot, worktreePath, branchName, baseRef string) (string, 
 	if err != nil {
 		return "", err
 	}
+	// Apple Git 2.50 + bare caches with extensions.worktreeConfig=true leave an
+	// empty config.worktree, so core.bare stays true and the checkout is unusable.
+	if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
+		return "", err
+	}
 	return branchName, nil
 }
 
@@ -983,6 +1001,52 @@ func isBranchCollisionError(err error) bool {
 func isGitWorktree(path string) bool {
 	info, err := os.Stat(filepath.Join(path, ".git"))
 	return err == nil && !info.IsDir()
+}
+
+// ensureLinkedWorktreeUsable repairs linked worktrees created from a bare
+// cache that has extensions.worktreeConfig=true.
+//
+// Apple Git 2.50 creates an empty config.worktree in that configuration. The
+// common bare config still has core.bare=true, so every `git -C <worktree>`
+// command fails with "fatal: this operation must be run in a work tree" until
+// the worktree-private config sets core.bare=false.
+//
+// `git config --worktree` still works against these broken checkouts (verified
+// on Studio), so we always write bare=false and then verify usability.
+func ensureLinkedWorktreeUsable(worktreePath string) error {
+	if out, err := runGitCombinedOutput("-C", worktreePath, "config", "--worktree", "core.bare", "false"); err != nil {
+		// Fallback for exotic git builds: write the private config file directly.
+		if werr := writeLinkedWorktreeBareFalse(worktreePath); werr != nil {
+			return fmt.Errorf("set core.bare=false: git config: %s (%w); write: %v", strings.TrimSpace(string(out)), err, werr)
+		}
+	}
+	out, err := runGitOutput("-C", worktreePath, "rev-parse", "--is-inside-work-tree")
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		return fmt.Errorf("linked worktree still unusable at %s: %s: %v", worktreePath, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+func writeLinkedWorktreeBareFalse(worktreePath string) error {
+	gitFile := filepath.Join(worktreePath, ".git")
+	raw, err := os.ReadFile(gitFile)
+	if err != nil {
+		return err
+	}
+	// .git file format: "gitdir: /abs/path\n"
+	line := strings.TrimSpace(string(raw))
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(strings.ToLower(line), prefix) {
+		return fmt.Errorf("unexpected .git file contents in %s", worktreePath)
+	}
+	gitDir := strings.TrimSpace(line[len(prefix):])
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(worktreePath, gitDir)
+	}
+	cfgPath := filepath.Join(gitDir, "config.worktree")
+	// Multica-owned worktree private configs are empty or minimal; rewrite.
+	body := "[core]\n\tbare = false\n"
+	return os.WriteFile(cfgPath, []byte(body), 0o644)
 }
 
 // updateExistingWorktree resets the worktree to a clean state and checks out a
