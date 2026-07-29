@@ -153,7 +153,7 @@ func TestIsBlockedEnvKey(t *testing.T) {
 		{key: "TMPDIR", want: true},
 		{key: "tmp", want: true},
 		{key: "TEMP", want: true},
-		{key: "CODEX_HOME", want: true},
+		{key: "CODEX_HOME", want: false},
 		{key: "CURSOR_DATA_DIR", want: true},
 		{key: "cursor_data_dir", want: true},
 		{key: "CURSOR_MCP_AUTH_SOURCE", want: true},
@@ -210,11 +210,10 @@ func TestLayerCustomEnvAndHermesHome(t *testing.T) {
 			wantHermes:  "",
 		},
 		{
-			name:        "blocklisted key dropped, overlay still applied",
-			customEnv:   map[string]string{"CODEX_HOME": "/evil", "MULTICA_TOKEN": "x"},
+			name:        "ordinary env and overlay",
+			customEnv:   map[string]string{"ANTHROPIC_API_KEY": "x"},
 			overlayHome: "/tmp/task/hermes-home",
 			wantHermes:  "/tmp/task/hermes-home",
-			wantAbsent:  []string{"CODEX_HOME", "MULTICA_TOKEN"},
 		},
 	}
 
@@ -222,7 +221,9 @@ func TestLayerCustomEnvAndHermesHome(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			agentEnv := map[string]string{}
-			layerCustomEnvAndHermesHome(agentEnv, tt.customEnv, tt.overlayHome, nil)
+			if err := layerCustomEnvAndHermesHome(agentEnv, tt.customEnv, tt.overlayHome, nil); err != nil {
+				t.Fatal(err)
+			}
 
 			if got, ok := agentEnv["HERMES_HOME"]; tt.wantHermes == "" {
 				if ok {
@@ -237,6 +238,40 @@ func TestLayerCustomEnvAndHermesHome(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProviderHomeCustomEnvValidation(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	env := map[string]string{}
+	if err := layerCustomEnvAndHermesHome(env, map[string]string{
+		"CODEX_HOME":        home,
+		"CLAUDE_CONFIG_DIR": home,
+	}, "", nil); err != nil {
+		t.Fatalf("valid provider homes rejected: %v", err)
+	}
+	if env["CODEX_HOME"] != home || env["CLAUDE_CONFIG_DIR"] != home {
+		t.Fatalf("provider homes were not applied: %v", env)
+	}
+
+	for name, custom := range map[string]map[string]string{
+		"relative home": {"CODEX_HOME": ".codex"},
+		"missing home":  {"CODEX_HOME": filepath.Join(home, "missing")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := layerCustomEnvAndHermesHome(map[string]string{}, custom, "", nil); err == nil {
+				t.Fatal("expected custom env validation error")
+			}
+		})
+	}
+	blocked := map[string]string{}
+	if err := layerCustomEnvAndHermesHome(blocked, map[string]string{"MULTICA_TOKEN": "secret"}, "", nil); err != nil {
+		t.Fatalf("ordinary blocked key should keep its legacy skip behavior: %v", err)
+	}
+	if _, ok := blocked["MULTICA_TOKEN"]; ok {
+		t.Fatal("blocked key was applied")
 	}
 }
 
@@ -2121,7 +2156,6 @@ func TestExecuteAndDrain_ContextCancelled_ReportsCancelled(t *testing.T) {
 		t.Fatalf("expected status=cancelled when parent ctx is cancelled, got %q (err=%q)", result.Status, result.Error)
 	}
 }
-
 
 // lateSessionCancelBackend models the OMP/daemon-restart race: it reveals a
 // session id via MessageStatus, then only emits Result after the parent ctx
@@ -4068,7 +4102,9 @@ func TestHermesLaunchArgsAndEnvByScenario(t *testing.T) {
 		t.Errorf("skill-less task must keep its profile flags, got %v", noOverlayArgs)
 	}
 	noOverlayEnv := map[string]string{}
-	layerCustomEnvAndHermesHome(noOverlayEnv, customEnv, "", nil)
+	if err := layerCustomEnvAndHermesHome(noOverlayEnv, customEnv, "", nil); err != nil {
+		t.Fatal(err)
+	}
 	if noOverlayEnv["HERMES_HOME"] != "/home/u/.hermes" {
 		t.Errorf("skill-less task must keep the user HERMES_HOME, got %q", noOverlayEnv["HERMES_HOME"])
 	}
@@ -4079,7 +4115,9 @@ func TestHermesLaunchArgsAndEnvByScenario(t *testing.T) {
 		t.Errorf("overlay task must strip profile flags, got %v", overlayArgs)
 	}
 	overlayEnv := map[string]string{}
-	layerCustomEnvAndHermesHome(overlayEnv, customEnv, "/task/hermes-home", nil)
+	if err := layerCustomEnvAndHermesHome(overlayEnv, customEnv, "/task/hermes-home", nil); err != nil {
+		t.Fatal(err)
+	}
 	if overlayEnv["HERMES_HOME"] != "/task/hermes-home" {
 		t.Errorf("overlay task must redirect HERMES_HOME to the overlay, got %q", overlayEnv["HERMES_HOME"])
 	}
