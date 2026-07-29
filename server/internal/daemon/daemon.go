@@ -3348,7 +3348,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// atomically creates exactly one successor that inherits this task's
 	// workdir/session. A poll cancellation is checked above and wins: the
 	// server already made that task terminal, so it must never be revived.
-	if d.rootCtx != nil && d.rootCtx.Err() != nil {
+	if d.rootCtx != nil && d.rootCtx.Err() != nil && result.Status != "completed" {
 		if err != nil {
 			taskLog.Info("task interrupted by daemon lifecycle", "requeue_reason", "daemon_lifecycle", "error", err)
 		} else {
