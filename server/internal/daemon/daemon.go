@@ -3176,8 +3176,12 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 	go func() {
 		ticker := time.NewTicker(pollInterval)
 		defer ticker.Stop()
-		check := func() bool {
-			status, err := d.client.GetTaskStatus(ctx, taskID)
+		var closeOnce sync.Once
+		signalCancelled := func() {
+			closeOnce.Do(func() { close(cancelled) })
+		}
+		check := func(checkCtx context.Context) bool {
+			status, err := d.client.GetTaskStatus(checkCtx, taskID)
 			if !shouldInterruptAgent(status, err) {
 				return false
 			}
@@ -3186,12 +3190,21 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 			} else {
 				taskLog.Info("task reached terminal state server-side, interrupting agent", "status", status)
 			}
-			close(cancelled)
+			signalCancelled()
 			return true
 		}
 		for {
 			select {
 			case <-ctx.Done():
+				// Daemon shutdown cancels runCtx before the next poll tick
+				// observes a server-side terminal state. One last status read
+				// with a fresh context closes cancelled so handleTask does not
+				// misclassify operator cancel as a retryable lifecycle fail.
+				if d.rootCtx != nil && d.rootCtx.Err() != nil {
+					shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					check(shutdownCtx)
+					shutdownCancel()
+				}
 				return
 			case <-reconcileCh:
 				// Refresh the subscription before issuing the request so a
@@ -3199,11 +3212,11 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 				if d.reconcile != nil {
 					reconcileCh = d.reconcile.notify()
 				}
-				if check() {
+				if check(ctx) {
 					return
 				}
 			case <-ticker.C:
-				if check() {
+				if check(ctx) {
 					return
 				}
 			}
@@ -3342,6 +3355,39 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	default:
 	}
 
+	// A daemon-root cancellation is a local lifecycle interruption (restart,
+	// upgrade, or controlled shutdown), not an operator cancellation and not a
+	// provider failure. Report it through the server's bounded retry path so it
+	// atomically creates exactly one successor that inherits this task's
+	// workdir/session. A poll cancellation is checked above and wins: the
+	// server already made that task terminal, so it must never be revived.
+	// Successful runner exits (err == nil) are left on the normal completion
+	// path even if shutdown began while usage was reported.
+	if d.rootCtx != nil && d.rootCtx.Err() != nil && err != nil {
+		statusCheckCtx, statusCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		status, statusErr := d.client.GetTaskStatus(statusCheckCtx, task.ID)
+		statusCancel()
+		if shouldInterruptAgent(status, statusErr) {
+			taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", statusErr)
+			if result.SessionID != "" || result.WorkDir != "" {
+				pinCtx, pinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if pinErr := d.client.PinTaskSession(pinCtx, task.ID, result.SessionID, result.WorkDir); pinErr != nil {
+					taskLog.Debug("pin session on cancel failed", "error", pinErr)
+				}
+				pinCancel()
+			}
+			if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+				taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
+			}
+			return
+		}
+		taskLog.Info("task interrupted by daemon lifecycle", "requeue_reason", "daemon_lifecycle", "error", err)
+		result.Status = "failed"
+		result.Comment = "task interrupted by local daemon lifecycle; retrying once with preserved session/workdir"
+		result.FailureReason = "daemon_lifecycle"
+		err = nil
+	}
+
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
 		// runTask returned without a TaskResult, so we don't have a SessionID
@@ -3368,8 +3414,14 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// outright, skip reporting — the complete/fail callbacks would fail
 	// anyway. Reuse shouldInterruptAgent so this guard honors the same
 	// signals as the in-flight watcher.
-	if status, err := d.client.GetTaskStatus(ctx, task.ID); shouldInterruptAgent(status, err) {
-		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
+	statusCtx := ctx
+	if ctx.Err() != nil {
+		var statusCancel context.CancelFunc
+		statusCtx, statusCancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer statusCancel()
+	}
+	if status, statusErr := d.client.GetTaskStatus(statusCtx, task.ID); shouldInterruptAgent(status, statusErr) {
+		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", statusErr)
 		if result.SessionID != "" || result.WorkDir != "" {
 			pinCtx, pinCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if pinErr := d.client.PinTaskSession(pinCtx, task.ID, result.SessionID, result.WorkDir); pinErr != nil {

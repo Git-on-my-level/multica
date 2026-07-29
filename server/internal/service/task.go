@@ -3165,6 +3165,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 var retryableReasons = map[string]bool{
 	"runtime_offline":           true,
 	"runtime_recovery":          true,
+	"daemon_lifecycle":          true,
 	"timeout":                   true,
 	"codex_semantic_inactivity": true,
 	string(taskfailure.ReasonAgentProviderNetwork): true,
@@ -3178,6 +3179,7 @@ var retryableReasons = map[string]bool{
 const (
 	providerNetworkMaxAttempts    = 3
 	providerNetworkFinalRetryWait = 5 * time.Second
+	daemonLifecycleMaxAttempts    = 2
 )
 
 // retryAttemptCeiling reports how many attempts the auto-retry path allows for
@@ -3197,6 +3199,9 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 	}
 	if reason == string(taskfailure.ReasonAgentProviderNetwork) && taskMaxAttempts < providerNetworkMaxAttempts {
 		return providerNetworkMaxAttempts
+	}
+	if reason == "daemon_lifecycle" && taskMaxAttempts > daemonLifecycleMaxAttempts {
+		return daemonLifecycleMaxAttempts
 	}
 	return taskMaxAttempts
 }

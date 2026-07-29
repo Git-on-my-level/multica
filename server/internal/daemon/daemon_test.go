@@ -2941,6 +2941,20 @@ func TestDefaultArgsForProvider(t *testing.T) {
 	}
 }
 
+func TestDaemonLifecycleCancellationIsDistinctFromTaskCancellation(t *testing.T) {
+	t.Parallel()
+
+	root, cancel := context.WithCancel(context.Background())
+	d := &Daemon{rootCtx: root}
+	if d.rootCtx.Err() != nil {
+		t.Fatal("fresh daemon root context is unexpectedly cancelled")
+	}
+	cancel()
+	if d.rootCtx.Err() == nil {
+		t.Fatal("daemon lifecycle cancellation was not observable")
+	}
+}
+
 // reportTaskResultRecorder captures which terminal endpoint
 // (.../complete or .../fail) reportTaskResult hits and the body it
 // posts, so the tests can assert the disposition (success vs fail)
