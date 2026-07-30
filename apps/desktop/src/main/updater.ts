@@ -1,6 +1,6 @@
 import { autoUpdater, type UpdateDownloadedEvent } from "electron-updater";
 import { app, type BrowserWindow, ipcMain } from "electron";
-import { githubReleasesLatestPageUrl } from "./github-release-base";
+import { resolveGithubRepo, githubReleasesLatestPageUrl } from "./github-release-base";
 import type {
   ManualUpdateCheckResult,
   UpdaterPreferences,
@@ -17,6 +17,25 @@ import {
 // downloaded and ready to install on next quit.
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
+
+/**
+ * Pin the GitHub provider feed from resolveGithubRepo() so a wrongly baked
+ * upstream app-update.yml (older fork DMGs) cannot keep offering upstream
+ * releases. Channel selection below still applies on top of this provider.
+ */
+export function configureGithubUpdateFeed(
+  updater: { setFeedURL: (options: { provider: "github"; owner: string; repo: string }) => void },
+  repoSlug: string = resolveGithubRepo(),
+): string {
+  const [owner, repo] = repoSlug.split("/");
+  if (!owner || !repo) {
+    throw new Error(`invalid GitHub repo slug for updater feed: ${repoSlug}`);
+  }
+  updater.setFeedURL({ provider: "github", owner, repo });
+  return `${owner}/${repo}`;
+}
+
+configureGithubUpdateFeed(autoUpdater);
 
 // Windows arm64 ships its own update metadata channel because
 // electron-builder's `latest.yml` is not arch-suffixed on Windows — both

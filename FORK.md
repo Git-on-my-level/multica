@@ -7,6 +7,9 @@ This is a fork-only operational contract. Preserve it when merging upstream.
 - Native OMP runtime/provider support.
 - Fork install, update, and repository URLs (`install-fork`), without an
   upstream Homebrew tap.
+- Desktop updater feed defaults to `Git-on-my-level/multica` (baked into
+  `app-update.yml` at package time). Upstream releases must never be offered
+  to fork installs.
 - Manual issue-to-PR linking: authorization, canonical HTTPS URLs, explicit
   `close_intent`, member-owned overrides, already-merged evaluation, sibling
   PR gates, and safe unlinking.

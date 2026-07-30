@@ -4,6 +4,7 @@ import {
   githubLatestDownloadBase,
   githubRepoFromAppUpdateYaml,
   githubReleasesLatestPageUrl,
+  normalizeDesktopGithubRepo,
   resolveGithubRepo,
 } from "./github-release-base";
 
@@ -19,6 +20,21 @@ describe("githubRepoFromAppUpdateYaml", () => {
   });
 });
 
+describe("normalizeDesktopGithubRepo", () => {
+  it("remaps a wrongly baked upstream feed to this fork", () => {
+    expect(normalizeDesktopGithubRepo("multica-ai/multica")).toBe(
+      "Git-on-my-level/multica",
+    );
+  });
+
+  it("preserves non-upstream repos", () => {
+    expect(normalizeDesktopGithubRepo("acme/multica")).toBe("acme/multica");
+    expect(normalizeDesktopGithubRepo("Git-on-my-level/multica")).toBe(
+      "Git-on-my-level/multica",
+    );
+  });
+});
+
 describe("resolveGithubRepo", () => {
   afterEach(() => {
     delete process.env.MULTICA_GITHUB_REPO;
@@ -29,8 +45,8 @@ describe("resolveGithubRepo", () => {
     expect(resolveGithubRepo()).toBe("acme/multica");
   });
 
-  it("falls back to the upstream default when env is unset", () => {
-    expect(resolveGithubRepo()).toBe("multica-ai/multica");
+  it("falls back to this fork when env is unset", () => {
+    expect(resolveGithubRepo()).toBe("Git-on-my-level/multica");
   });
 });
 
@@ -39,9 +55,9 @@ describe("githubLatestDownloadBase", () => {
     delete process.env.MULTICA_GITHUB_REPO;
   });
 
-  it("uses the default repo when MULTICA_GITHUB_REPO is unset", () => {
+  it("uses this fork when MULTICA_GITHUB_REPO is unset", () => {
     expect(githubLatestDownloadBase()).toBe(
-      "https://github.com/multica-ai/multica/releases/latest/download",
+      "https://github.com/Git-on-my-level/multica/releases/latest/download",
     );
   });
 
