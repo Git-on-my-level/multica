@@ -177,7 +177,7 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
           type="button"
           variant="link"
           size="xs"
-          className="h-5 px-1 text-[11px] text-muted-foreground"
+          className="h-5 px-1 text-micro text-muted-foreground"
           onClick={() => {
             resetLinkDialog();
             setLinkOpen(true);
@@ -191,9 +191,9 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
       {handoff ? <PullRequestHandoffStatus handoff={handoff} /> : null}
 
       {isLoading ? (
-        <p className="text-xs text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>
+        <p className="text-caption text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>
       ) : prs.length === 0 ? (
-        <p className="text-xs text-muted-foreground px-2">
+        <p className="text-caption text-muted-foreground px-2">
           {t(($) => $.detail.pull_requests_empty)}
         </p>
       ) : (
@@ -231,11 +231,11 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
               autoFocus
             />
             {showUrlError ? (
-              <p className="text-xs text-destructive">
+              <p className="text-caption text-destructive">
                 {t(($) => $.detail.pull_request_link_url_invalid)}
               </p>
             ) : null}
-            {error ? <p className="text-xs text-destructive">{error}</p> : null}
+            {error ? <p className="text-caption text-destructive">{error}</p> : null}
             <Label
               htmlFor="pr-link-close-intent"
               className="font-normal text-muted-foreground"
@@ -284,7 +284,7 @@ export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: stri
             </AlertDialogTitle>
           </AlertDialogHeader>
           {unlinkError ? (
-            <p className="text-xs text-destructive">{unlinkError}</p>
+            <p className="text-caption text-destructive">{unlinkError}</p>
           ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={unlinkMutation.isPending}>
@@ -342,7 +342,7 @@ function PullRequestHandoffStatus({ handoff }: { handoff: IssuePullRequestHandof
       data-testid="pull-request-handoff"
       data-handoff-state={state}
       className={cn(
-        "flex items-start gap-1.5 rounded-md px-2 py-1.5 text-[11px]",
+        "flex items-start gap-1.5 rounded-md px-2 py-1.5 text-micro",
         state === "linked"
           ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
           : state === "invalid_external_pr" || state === "multiple_candidates_needs_review"
@@ -407,7 +407,7 @@ function PullRequestRows({
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="block w-[calc(100%+1rem)] -mx-2 rounded-md px-2 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
+            className="block w-[calc(100%+1rem)] -mx-2 rounded-md px-2 py-1.5 text-left text-micro text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
           >
             {expanded
               ? t(($) => $.detail.pull_request_card_show_less)
@@ -465,10 +465,10 @@ function PullRequestRow({
       >
         <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
         <div className="min-w-0 flex-1">
-          <p className="text-xs font-medium leading-snug truncate group-hover:text-foreground">
+          <p className="text-caption font-medium leading-snug truncate group-hover:text-foreground">
             {pr.title}
           </p>
-          <p className="text-[11px] text-muted-foreground truncate">
+          <p className="text-micro text-muted-foreground truncate">
             {pr.repo_owner}/{pr.repo_name}#{pr.number} · {stateLabel}
             {pr.author_login ? ` · @${pr.author_login}` : null}
           </p>
@@ -524,7 +524,7 @@ function PullRequestRowDetails({
     !isTerminal && !!conflictsBadge && statusKind !== "conflicts" && statusKind !== "ready";
 
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-muted-foreground">
       {showStats ? <PullRequestStats pr={pr} /> : null}
       <PullRequestProgressStrip segments={segments} />
       <PullRequestStatusText kind={statusKind} text={statusText} />

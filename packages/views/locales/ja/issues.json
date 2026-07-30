@@ -341,7 +341,25 @@
     "link_copy_failed": "リンクをコピーできませんでした",
     "workdir_path_copied": "作業ディレクトリのパスをコピーしました",
     "workdir_path_copy_failed": "作業ディレクトリのパスをコピーできませんでした",
-    "workdir_path_unavailable": "まだローカルの作業ディレクトリがありません。ローカルエージェントがこのイシューを実行していません"
+    "workdir_path_unavailable": "まだローカルの作業ディレクトリがありません。ローカルエージェントがこのイシューを実行していません",
+    "pull_request_card_draft_prefix": "ドラフト · {{status}}",
+    "pull_request_card_status_checks_failed": "一部のチェックが失敗しました",
+    "pull_request_card_status_checks_passed": "チェックに成功しました",
+    "pull_request_card_status_checks_pending": "一部のチェックがまだ完了していません",
+    "pull_request_card_status_closed": "マージせずにクローズ",
+    "pull_request_card_status_conflicts": "マージコンフリクトあり",
+    "pull_request_card_status_merged": "マージ済み",
+    "pull_request_card_status_ready": "マージ可能",
+    "pull_request_card_status_unknown": "まだチェック結果がありません",
+    "pull_request_checks_failed": "チェック失敗",
+    "pull_request_checks_passed": "チェック成功",
+    "pull_request_checks_pending": "チェック待機中",
+    "pull_request_conflicts_clean": "コンフリクトなし",
+    "pull_request_conflicts_dirty": "コンフリクトあり",
+    "pull_request_card_files_count": {
+      "one": "{{count}} ファイル",
+      "other": "{{count}} ファイル"
+    }
   },
   "timeline": {
     "loading": "読み込み中..."

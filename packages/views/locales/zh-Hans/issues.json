@@ -341,7 +341,25 @@
     "link_copy_failed": "复制链接失败",
     "workdir_path_copied": "已复制本地 workdir 路径",
     "workdir_path_copy_failed": "复制本地 workdir 路径失败",
-    "workdir_path_unavailable": "暂无本地 workdir — 这个 issue 还没被本地 agent 运行过"
+    "workdir_path_unavailable": "暂无本地 workdir — 这个 issue 还没被本地 agent 运行过",
+    "pull_request_card_draft_prefix": "Draft · {{status}}",
+    "pull_request_card_status_checks_failed": "部分检查失败",
+    "pull_request_card_status_checks_passed": "检查通过",
+    "pull_request_card_status_checks_pending": "部分检查仍在运行",
+    "pull_request_card_status_closed": "已关闭，未合入",
+    "pull_request_card_status_conflicts": "存在合并冲突",
+    "pull_request_card_status_merged": "已合入",
+    "pull_request_card_status_ready": "可以合入",
+    "pull_request_card_status_unknown": "暂无检查信息",
+    "pull_request_checks_failed": "Checks 失败",
+    "pull_request_checks_passed": "Checks 通过",
+    "pull_request_checks_pending": "Checks 运行中",
+    "pull_request_conflicts_clean": "无冲突",
+    "pull_request_conflicts_dirty": "存在冲突",
+    "pull_request_card_files_count": {
+      "one": "{{count}} 个文件",
+      "other": "{{count}} 个文件"
+    }
   },
   "timeline": {
     "loading": "加载中…"

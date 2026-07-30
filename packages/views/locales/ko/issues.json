@@ -341,7 +341,25 @@
     "link_copy_failed": "링크를 복사하지 못했습니다",
     "workdir_path_copied": "작업 디렉터리 경로를 복사했습니다",
     "workdir_path_copy_failed": "작업 디렉터리 경로를 복사하지 못했습니다",
-    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 이슈를 실행하지 않았습니다"
+    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 이슈를 실행하지 않았습니다",
+    "pull_request_card_draft_prefix": "초안 · {{status}}",
+    "pull_request_card_status_checks_failed": "일부 검사 실패",
+    "pull_request_card_status_checks_passed": "검사 통과",
+    "pull_request_card_status_checks_pending": "일부 검사가 아직 끝나지 않았습니다",
+    "pull_request_card_status_closed": "병합 없이 닫힘",
+    "pull_request_card_status_conflicts": "병합 충돌 있음",
+    "pull_request_card_status_merged": "병합됨",
+    "pull_request_card_status_ready": "병합 가능",
+    "pull_request_card_status_unknown": "아직 검사 결과가 없습니다",
+    "pull_request_checks_failed": "검사 실패",
+    "pull_request_checks_passed": "검사 통과",
+    "pull_request_checks_pending": "검사 대기 중",
+    "pull_request_conflicts_clean": "충돌 없음",
+    "pull_request_conflicts_dirty": "충돌 있음",
+    "pull_request_card_files_count": {
+      "one": "파일 {{count}}개",
+      "other": "파일 {{count}}개"
+    }
   },
   "timeline": {
     "loading": "불러오는 중..."

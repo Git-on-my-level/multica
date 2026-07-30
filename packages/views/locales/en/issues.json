@@ -344,7 +344,25 @@
     "link_copy_failed": "Failed to copy link",
     "workdir_path_copied": "Workdir path copied",
     "workdir_path_copy_failed": "Failed to copy workdir path",
-    "workdir_path_unavailable": "No local workdir yet — issue has not been run by a local agent"
+    "workdir_path_unavailable": "No local workdir yet — issue has not been run by a local agent",
+    "pull_request_card_draft_prefix": "Draft · {{status}}",
+    "pull_request_card_status_checks_failed": "Some checks failed",
+    "pull_request_card_status_checks_passed": "Checks passed",
+    "pull_request_card_status_checks_pending": "Some checks haven't completed yet",
+    "pull_request_card_status_closed": "Closed without merging",
+    "pull_request_card_status_conflicts": "Has merge conflicts",
+    "pull_request_card_status_merged": "Merged",
+    "pull_request_card_status_ready": "Ready to merge",
+    "pull_request_card_status_unknown": "Checks haven't reported yet",
+    "pull_request_checks_failed": "Checks failed",
+    "pull_request_checks_passed": "Checks passed",
+    "pull_request_checks_pending": "Checks pending",
+    "pull_request_conflicts_clean": "No conflicts",
+    "pull_request_conflicts_dirty": "Conflicts",
+    "pull_request_card_files_count": {
+      "one": "{{count}} file",
+      "other": "{{count}} files"
+    }
   },
   "timeline": {
     "loading": "Loading..."
