@@ -57,7 +57,7 @@ export function UpdateNotification() {
             <AlertCircle className="size-4 text-destructive" />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium">Update could not be installed</p>
+            <p className="text-body font-medium">Update could not be installed</p>
             <p className="text-caption text-muted-foreground mt-0.5">
               {state.version
                 ? `v${state.version} downloaded but could not replace the installed app automatically. Install the macOS DMG from GitHub Releases instead.`
