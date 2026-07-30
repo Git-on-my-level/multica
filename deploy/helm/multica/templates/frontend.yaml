@@ -45,14 +45,10 @@ spec:
             {{- if .Values.frontend.config.publicWsUrl }}
             - name: NEXT_PUBLIC_WS_URL
               value: {{ .Values.frontend.config.publicWsUrl | quote }}
-            {{- if .Values.backend.config.githubRepo }}
+            {{- end }}
+
             - name: MULTICA_GITHUB_REPO
               value: {{ .Values.backend.config.githubRepo | quote }}
-            {{- end }}
-            {{- if .Values.backend.config.githubBranch }}
-            - name: MULTICA_GITHUB_BRANCH
-              value: {{ .Values.backend.config.githubBranch | quote }}
-            {{- end }}
           resources:
             {{- toYaml .Values.frontend.resources | nindent 12 }}
       {{- with .Values.frontend.affinity }}

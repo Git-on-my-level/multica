@@ -25,7 +25,6 @@ import type {
   ListIssuePullRequestsResponse,
   GroupedIssuesResponse,
   GitHubConnectResponse,
-  GitHubPullRequest,
   InboxItem,
   InboxWorkspaceUnread,
   Label,
@@ -944,33 +943,8 @@ export const ChildIssuesResponseSchema = z.object({
 // `.loose()` lets unknown field pass through so a future field addition on
 // either side doesn't fail the parse. `parseWithFallback` returns the EMPTY
 // record below when the contract drifts, keeping the PR list rendering.
+// GitHubPullRequestSchema is defined once above (shared with list endpoints).
 // ---------------------------------------------------------------------------
-export const GitHubPullRequestSchema = z.object({
-  id: z.string(),
-  workspace_id: z.string(),
-  repo_owner: z.string(),
-  repo_name: z.string(),
-  number: z.number(),
-  title: z.string(),
-  state: z.string(),
-  html_url: z.string(),
-  branch: z.string().nullable().optional(),
-  author_login: z.string().nullable().optional(),
-  author_avatar_url: z.string().nullable().optional(),
-  merged_at: z.string().nullable().optional(),
-  closed_at: z.string().nullable().optional(),
-  pr_created_at: z.string(),
-  pr_updated_at: z.string(),
-  mergeable_state: z.string().nullable().optional(),
-  checks_conclusion: z.string().nullable().optional(),
-  checks_passed: z.number().optional().default(0),
-  checks_failed: z.number().optional().default(0),
-  checks_pending: z.number().optional().default(0),
-  additions: z.number().optional().default(0),
-  deletions: z.number().optional().default(0),
-  changed_files: z.number().optional().default(0),
-}).loose();
-
 export const IssuePullRequestResponseSchema = z
   .object({ pull_request: GitHubPullRequestSchema })
   .loose();
