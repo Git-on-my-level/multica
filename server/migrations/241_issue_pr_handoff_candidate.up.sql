@@ -2,7 +2,10 @@
 -- explicit teardown sweeps elsewhere. Completion takes KEY SHARE locks on the
 -- workspace+issue and issue deletion takes UPDATE before sweeping, which closes
 -- the insert-after-sweep race without adding cascade paths to this table.
-CREATE TABLE issue_pr_handoff_candidate (
+--
+-- IF NOT EXISTS: fork previously applied this as 214_issue_pr_handoff_candidate
+-- before upstream claimed 214 for chat_session_project; renumber to 241.
+CREATE TABLE IF NOT EXISTS issue_pr_handoff_candidate (
     id           UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     issue_id     UUID NOT NULL,
