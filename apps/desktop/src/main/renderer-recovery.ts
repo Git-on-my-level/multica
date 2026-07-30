@@ -64,6 +64,9 @@ export function installRendererRecoveryHandlers(
   // True once a breadcrumb has been written for the current hang. A later
   // `responsive` clears it; only a hang that never returns survives to report.
   let unresponsiveBreadcrumbWritten = false;
+  // Tracks whether the window is responsive. `reportHang` awaits stack capture,
+  // so recovery during that wait must abort the in-flight hang report.
+  let windowResponsive = true;
   const mergeDiagnosticContext = (context: Record<string, unknown>) => ({
     ...readDiagnosticContext(getDiagnosticContext),
     ...context,
@@ -102,6 +105,7 @@ export function installRendererRecoveryHandlers(
 
   window.on("unresponsive", () => {
     if (isDev || unresponsivePromptTimer) return;
+    windowResponsive = false;
     unresponsivePromptTimer = setTimeout(() => {
       unresponsivePromptTimer = null;
       void reportHang();
@@ -114,6 +118,7 @@ export function installRendererRecoveryHandlers(
   // failure just means the hang is reported without a stack.
   const reportHang = async () => {
     const stack = captureStack ? await readStack(captureStack, log) : null;
+    if (windowResponsive) return;
     const payload: ReloadPromptPayload = {
       kind: "unresponsive",
       context: mergeDiagnosticContext(stack ? { stack } : {}),
@@ -124,6 +129,7 @@ export function installRendererRecoveryHandlers(
   };
 
   window.on("responsive", () => {
+    windowResponsive = true;
     if (unresponsivePromptTimer) {
       clearTimeout(unresponsivePromptTimer);
       unresponsivePromptTimer = null;
