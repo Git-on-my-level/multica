@@ -741,11 +741,12 @@ func (h *Handler) enqueueParentAssigneeChildWake(
 	enqueue func() error,
 	logMsg string,
 ) {
+	headSha := h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID)
 	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
 		IssueID: parent.ID,
 		AgentID: agent.ID,
 		// Key dedup on the reviewed head (TEN-356).
-		HeadSha: h.TaskService.ResolveIssueReviewSHAParam(ctx, parent.ID),
+		HeadSha: headSha,
 	})
 	if err != nil {
 		return
@@ -759,7 +760,7 @@ func (h *Handler) enqueueParentAssigneeChildWake(
 			trigger.Squad = squad
 		}
 		if _, _, terminal := commentMergeTerminalOutcome(
-			h.mergeCommentIntoPendingTask(ctx, parent, trigger, triggerCommentID),
+			h.mergeCommentIntoPendingTask(ctx, parent, trigger, triggerCommentID, headSha),
 		); terminal {
 			return
 		}

@@ -67,7 +67,7 @@ func (h *Handler) InspectIssueCoordination(w http.ResponseWriter, r *http.Reques
 	}
 	prs := make([]GitHubPullRequestResponse, 0, len(prRows))
 	for _, row := range prRows {
-		prs = append(prs, issuePullRequestRowToResponse(row))
+		prs = append(prs, issuePullRequestRowToResponse(row, h.PRRefresh.Enabled()))
 	}
 	handoff, err := h.loadIssuePRHandoff(r.Context(), issue.ID, len(prs) > 0)
 	if err != nil {
@@ -321,7 +321,7 @@ func (h *Handler) RouteIssueCoordination(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		for _, row := range rows {
-			matchingPRs = append(matchingPRs, githubPullRequestToResponse(row))
+			matchingPRs = append(matchingPRs, githubPullRequestToResponse(row, h.PRRefresh.Enabled()))
 		}
 	}
 

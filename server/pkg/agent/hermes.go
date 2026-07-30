@@ -259,14 +259,21 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 
-	var outputMu sync.Mutex
-	var output strings.Builder
+	// Hermes streams interim narration and the final answer as the same
+	// agent_message_chunk type; the tracker keeps only the post-tool-call block
+	// for Result.Output while retaining the full text for error detection.
+	var deliverable acpDeliverableTracker
 	// streamingCurrentTurn gates all session updates so that history
 	// replay (Hermes sends full prior-turn transcripts on session/resume,
 	// and may flush queued chunks before our session/prompt response
 	// streams) is dropped instead of duplicating the previous answer
 	// into output. We flip it to true only after session/prompt is sent.
 	var streamingCurrentTurn atomic.Bool
+	// turnActivity counts the session updates accepted for the current turn.
+	// Zero means the agent produced nothing at all — no text, no thought, no
+	// tool call — which is what separates a dead-session refusal from a model
+	// that genuinely refused the request. See hermesResumeSessionLost.
+	var turnActivity atomic.Int64
 
 	promptDone := make(chan hermesPromptResult, 1)
 	activity := make(chan struct{}, 1)
@@ -289,11 +296,8 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if !streamingCurrentTurn.Load() {
 				return
 			}
-			if msg.Type == MessageText {
-				outputMu.Lock()
-				output.WriteString(msg.Content)
-				outputMu.Unlock()
-			}
+			turnActivity.Add(1)
+			deliverable.observe(msg)
 			trySend(msgCh, msg)
 		},
 		onPromptDone: func(result hermesPromptResult) {
@@ -345,6 +349,10 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// resume. Only that is curable by starting a fresh session, so
 		// handshake/network failures below must leave it false.
 		var resumeRejected bool
+		// The stop reason session/prompt reported, when it answered at all.
+		// Read once the turn has fully settled — see the resumed-session check
+		// after the provider-error promotion below.
+		var promptStopReason string
 		effectiveModel := strings.TrimSpace(opts.Model)
 		// The model id the runtime reports as current right after
 		// session/new or session/resume. Used to skip a redundant
@@ -544,6 +552,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// from the response parsing.
 			select {
 			case pr := <-promptDone:
+				promptStopReason = pr.stopReason
 				if pr.stopReason == "cancelled" {
 					finalStatus = "aborted"
 					finalError = "hermes cancelled the prompt"
@@ -588,9 +597,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 		streamingCurrentTurn.Store(false)
 
-		outputMu.Lock()
-		finalOutput := output.String()
-		outputMu.Unlock()
+		finalOutput, providerErrorOutput := deliverable.result()
 
 		// Hermes reports stopReason=end_turn even when the upstream
 		// LLM call ultimately fails (HTTP 429 rate-limit, expired
@@ -600,7 +607,40 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// warning), the agent text stream contains the synthetic
 		// "API call failed after N retries..." turn the adapter
 		// injects on give-up, or there's no output to fall back on.
-		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, finalOutput, providerErr)
+		// It reads the full text stream, not the deliverable, so a
+		// give-up turn that lands before a tool call stays visible.
+		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, providerErrorOutput, providerErr)
+
+		// A resumed session Hermes could not rebuild.
+		//
+		// Evaluated HERE, not at the quiescence boundary above: the quiet
+		// window closing does not end the turn. stdin EOF and the pipe drain
+		// do, and Hermes legitimately delivers a turn's final chunk in that
+		// gap — TestHermesBackendDrainsLateFinalNotificationAfterPromptResponse
+		// exists because of it. Deciding earlier would freeze
+		// turnActivity == 0 while a real answer was still in flight and
+		// discard a healthy session (plus re-run the turn) for a runtime that
+		// merely answered slowly. By this point streamingCurrentTurn is off
+		// and every accepted update has been counted, so the reading is final.
+		//
+		// Runs after the promotion above on purpose: when the sniffer captured
+		// why the rebuild failed (e.g. the provider identity the session
+		// persisted no longer resolves), that message is far more useful to the
+		// user than the generic one here, so we only supply a reason when
+		// nothing else did. Without this, such a turn reports "completed" with
+		// empty output — a task that silently did nothing at all.
+		if hermesResumeSessionLost(opts.ResumeSessionID, promptStopReason, turnActivity.Load()) {
+			b.cfg.Logger.Warn("resumed session refused with no agent activity; treating it as gone and clearing the session id so the daemon retries fresh",
+				"backend", "hermes",
+				"session_id", sessionID,
+			)
+			if finalStatus == "completed" {
+				finalStatus = "failed"
+				finalError = hermesResumeLostError
+			}
+			sessionID = ""
+			resumeRejected = true
+		}
 
 		// Build usage map.
 		c.usageMu.Lock()
@@ -1054,6 +1094,35 @@ func isACPSessionNotFound(err error) bool {
 	text := strings.ToLower(rpcErr.Message + " " + rpcErr.Data)
 	return strings.Contains(text, "session not found") ||
 		strings.Contains(text, "no session found")
+}
+
+// hermesResumeLostError is the fallback reason for a resumed session Hermes
+// could not rebuild, used only when nothing more specific was captured.
+const hermesResumeLostError = "hermes could not restore the resumed session; it refused the turn without running the agent"
+
+// hermesResumeSessionLost reports whether a *successful* session/prompt
+// response means the session we resumed is gone on the agent side.
+//
+// isACPSessionNotFound cannot answer this, because Hermes never reports an
+// unknown session as a JSON-RPC error. Its ACP adapter answers
+// `session/prompt` for a session it cannot load with an ordinary success
+// frame carrying stopReason=refusal (acp_adapter/server.py, the one place it
+// emits that reason), and `session/resume` echoes nothing back — the ACP
+// ResumeSessionResponse schema has no sessionId field at all, unlike
+// NewSessionResponse — so resolveResumedSessionID keeps the id we asked for.
+// Nothing in the exchange is an error, which is why the isACPSessionNotFound
+// branches at set_model and prompt time never fire for this runtime and every
+// later dispatch on the same (agent, issue) pair loops on the dead session
+// (GH #6150).
+//
+// Both conditions are required. stopReason=refusal alone is a legitimate
+// model refusal, and refusing a resumed turn after real work is not a lost
+// session — only a refusal with no agent activity whatsoever (no text, no
+// thought, no tool call) is Hermes telling us it never had the session. The
+// fresh-session retry this unlocks is itself gated on tools == 0 in
+// shouldRetryWithFreshSession, so a turn that acted is never re-run.
+func hermesResumeSessionLost(resumeSessionID, stopReason string, turnActivity int64) bool {
+	return resumeSessionID != "" && stopReason == "refusal" && turnActivity == 0
 }
 
 func (c *hermesClient) handleResponse(raw map[string]json.RawMessage) {
@@ -2193,6 +2262,13 @@ type acpProviderErrorSniffer struct {
 	lines    []string // captured error lines, bounded
 	seen     map[string]bool
 	terminal bool // sticky: at least one line matched acpTerminalErrorRe
+	// echoJSON tracks an incomplete structured payload from a Python
+	// INFO/DEBUG root-logger record. The JSON scanner state is persisted
+	// across Write calls so only actual payload continuations are skipped.
+	echoJSON     bool
+	echoDepth    int
+	echoInString bool
+	echoEscaped  bool
 }
 
 // acpErrorHeaderRe matches the first line of an API-error block.
@@ -2223,6 +2299,33 @@ var acpAgentOutputTerminalRe = regexp.MustCompile(`API call failed after \d+ ret
 
 const acpMaxErrorLines = 8
 
+// acpLogRecordPrefixRe matches the start of a Python `logging` record that
+// Hermes writes to stderr: "YYYY-MM-DD HH:MM:SS[,mmm] [LEVEL] logger: ...".
+// Capture groups are level, logger, and payload. Matching every logger is
+// important because a non-root ERROR record also ends a preceding root INFO
+// record and must remain visible to the provider-error matchers.
+var acpLogRecordPrefixRe = regexp.MustCompile(
+	`^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:,[0-9]+)? \[([A-Z]+)\] ([A-Za-z0-9_.-]+):\s*(.*)$`,
+)
+
+// acpEchoLogLevels are the Python root-logger levels Hermes uses purely to
+// echo conversation and tool data to stderr. Those records are arbitrary
+// payload, never a provider error, even when they embed strings such as
+// "❌", "Error:", "HTTP 429", or "API call failed". ERROR / WARNING /
+// CRITICAL records are real diagnostics and must still be matched.
+var acpEchoLogLevels = map[string]bool{"INFO": true, "DEBUG": true}
+
+// acpMaxErrorLineLen bounds the length of the persisted provider-error
+// summary. Genuine ACP provider-error lines are short (an error header plus
+// a one-line "Error: ..." detail — see TestHermesProviderErrorSniffer, ~150
+// bytes), but an oversized echo that slips past the log-record filter could
+// otherwise store tens of KB. This bound is applied only when BUILDING the
+// stored message, never as a precondition for *classifying* a line as an
+// error: a real provider failure whose single line happens to exceed this
+// length must still fail the run, not be silently dropped (GitHub
+// multica#5862 — do not gate matching on length).
+const acpMaxErrorLineLen = 4096
+
 // newACPProviderErrorSniffer returns a sniffer that tags its messages
 // with the given provider name (e.g. "hermes", "kimi") so failure
 // strings make it obvious which runtime produced the error.
@@ -2248,10 +2351,41 @@ func (s *acpProviderErrorSniffer) Write(p []byte) (int, error) {
 	complete = string(data[:nl])
 	s.remains = append(s.remains[:0], data[nl+1:]...)
 
-	for _, line := range strings.Split(complete, "\n") {
-		line = strings.TrimSpace(line)
+	for _, rawLine := range strings.Split(complete, "\n") {
+		rawLine = strings.TrimSuffix(rawLine, "\r")
+		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
+		}
+		// INFO/DEBUG root records are conversation/tool echoes and never
+		// reach the error matchers. When their payload is structured JSON,
+		// track brace depth across physical lines and skip only until that
+		// JSON closes. A complete single-line echo therefore cannot hide a
+		// following bare provider error. Any Python logger prefix also
+		// starts a new record, so non-root ERROR diagnostics remain visible
+		// (GitHub multica#5862).
+		if m := acpLogRecordPrefixRe.FindStringSubmatch(line); m != nil {
+			s.resetEchoJSON()
+			if acpEchoLogLevels[m[1]] && m[2] == "root" {
+				s.startEchoJSON(m[3])
+				continue
+			}
+		} else if s.echoJSON {
+			// A strong, unindented provider-error header is a new bare
+			// error block even if a malformed echo never closed. Indented
+			// error-looking text remains part of the structured echo. This
+			// also applies when the echo was truncated inside a JSON string:
+			// an unescaped physical newline is not valid inside that string.
+			indented := rawLine[0] == ' ' || rawLine[0] == '\t'
+			bareError := strings.HasPrefix(line, "⚠️") ||
+				strings.HasPrefix(line, "❌") ||
+				strings.HasPrefix(line, "[ERROR]")
+			if !indented && bareError && acpErrorHeaderRe.MatchString(line) {
+				s.resetEchoJSON()
+			} else {
+				s.consumeEchoJSON(rawLine)
+				continue
+			}
 		}
 		if !(acpErrorHeaderRe.MatchString(line) || acpErrorDetailRe.MatchString(line)) {
 			continue
@@ -2269,6 +2403,55 @@ func (s *acpProviderErrorSniffer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+func (s *acpProviderErrorSniffer) startEchoJSON(payload string) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || (payload[0] != '{' && payload[0] != '[') {
+		return
+	}
+	s.echoJSON = true
+	s.consumeEchoJSON(payload)
+}
+
+// consumeEchoJSON tracks only structural JSON bytes. It avoids buffering
+// arbitrary conversation/tool payloads while still recognizing their exact
+// multi-line boundary, including braces inside quoted strings.
+func (s *acpProviderErrorSniffer) consumeEchoJSON(fragment string) {
+	for i := 0; i < len(fragment); i++ {
+		switch {
+		case s.echoEscaped:
+			s.echoEscaped = false
+		case s.echoInString:
+			switch fragment[i] {
+			case '\\':
+				s.echoEscaped = true
+			case '"':
+				s.echoInString = false
+			}
+		default:
+			switch fragment[i] {
+			case '"':
+				s.echoInString = true
+			case '{', '[':
+				s.echoDepth++
+			case '}', ']':
+				if s.echoDepth > 0 {
+					s.echoDepth--
+				}
+			}
+		}
+	}
+	if s.echoDepth == 0 {
+		s.resetEchoJSON()
+	}
+}
+
+func (s *acpProviderErrorSniffer) resetEchoJSON() {
+	s.echoJSON = false
+	s.echoDepth = 0
+	s.echoInString = false
+	s.echoEscaped = false
 }
 
 // message returns a single-line summary suitable for the task
@@ -2311,16 +2494,27 @@ func (s *acpProviderErrorSniffer) messageLocked() string {
 		if m := acpErrorDetailRe.FindStringSubmatch(line); m != nil {
 			detail := strings.TrimSpace(m[1])
 			if detail != "" {
-				return prefix + detail
+				return acpTruncateError(prefix + detail)
 			}
 		}
 	}
 	for _, line := range s.lines {
 		if acpErrorHeaderRe.MatchString(line) {
-			return prefix + line
+			return acpTruncateError(prefix + line)
 		}
 	}
 	return ""
+}
+
+// acpTruncateError bounds a persisted provider-error summary to
+// acpMaxErrorLineLen bytes on a valid UTF-8 boundary, marking any cut.
+// Classification already happened by the time this runs; it only limits
+// how much of an oversized message is stored, never whether a run fails.
+func acpTruncateError(msg string) string {
+	if len(msg) <= acpMaxErrorLineLen {
+		return msg
+	}
+	return strings.ToValidUTF8(msg[:acpMaxErrorLineLen], "") + "…(truncated)"
 }
 
 // promoteACPResultOnProviderError flips finalStatus to "failed" if

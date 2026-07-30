@@ -25,9 +25,14 @@ type Backend interface {
 type ExecOptions struct {
 	Cwd   string
 	Model string
-	// SystemPrompt is consumed only by providers that can pass or safely inline
-	// developer/system instructions. Hermes ACP intentionally ignores it and
-	// relies on cwd-scoped context files such as AGENTS.md instead.
+	// SystemPrompt carries the Multica runtime brief for the few providers
+	// that cannot pick it up from disk. The daemon leaves it empty for every
+	// other provider (see daemon.providerNeedsInlineSystemPrompt), because the
+	// brief is already delivered as a per-task context file in the workdir —
+	// CLAUDE.md, AGENTS.md, CODEBUDDY.md or QWEN.md depending on the runtime.
+	//
+	// A backend must therefore NOT assume this is populated, and adding a new
+	// backend that only reads SystemPrompt will silently receive nothing.
 	SystemPrompt              string
 	ThreadName                string
 	MaxTurns                  int
@@ -166,9 +171,15 @@ type Result struct {
 	SessionID  string
 	Usage      map[string]TokenUsage // keyed by model name
 	// ResumeRejected is positive evidence that this run's requested resume
-	// was itself refused — the transcript is gone, or the session belongs to
-	// another provider account. Only a refused resume can be cured by starting
-	// over, so it is what the daemon's fresh-session fallback looks for first.
+	// was itself refused — the transcript is gone, the session belongs to
+	// another provider account, OR the session still exists but its history
+	// can no longer be replayed to the provider (e.g. GH #5975: a stored
+	// image now exceeds the provider's max dimensions, so every resumed
+	// session/prompt is rejected before the turn runs). What unites these is
+	// that the resume CANNOT continue and only starting over can cure it, so
+	// it is what the daemon's fresh-session fallback looks for first. Note the
+	// last case keeps a non-empty SessionID (the id is real, only its history
+	// is unusable) — the daemon gates on this boolean, not an empty id.
 	//
 	// false is NOT evidence of the opposite. For a backend listed in
 	// ResumeRejectionUndetectable it means "could not tell"; for every other
