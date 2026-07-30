@@ -58,7 +58,7 @@ export function UpdateNotification() {
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium">Update could not be installed</p>
-            <p className="text-xs text-muted-foreground mt-0.5">
+            <p className="text-caption text-muted-foreground mt-0.5">
               {state.version
                 ? `v${state.version} downloaded but could not replace the installed app automatically. Install the macOS DMG from GitHub Releases instead.`
                 : "The downloaded update could not replace the installed app automatically. Install the latest macOS DMG from GitHub Releases instead."}
@@ -67,14 +67,14 @@ export function UpdateNotification() {
               <button
                 type="button"
                 onClick={() => setDismissed(true)}
-                className="inline-flex items-center rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-accent transition-colors"
+                className="inline-flex items-center rounded-md border border-border bg-background px-3 py-1.5 text-caption font-medium text-foreground hover:bg-accent transition-colors"
               >
                 Dismiss
               </button>
               <button
                 type="button"
                 onClick={openReleases}
-                className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+                className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-caption font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
               >
                 Open Releases
               </button>
