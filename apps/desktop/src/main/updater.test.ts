@@ -27,6 +27,7 @@ vi.mock("electron-updater", () => {
     autoInstallOnAppQuit: false,
     channel: undefined as string | undefined,
     allowDowngrade: false,
+    setFeedURL: vi.fn(),
     on: vi.fn((event: string, handler: Handler) => {
       const handlers = ctx.handlers.get(event) ?? [];
       handlers.push(handler);
@@ -52,10 +53,25 @@ vi.mock("electron", () => ({
 }));
 
 import {
+  configureGithubUpdateFeed,
   configureMacX64UpdateChannel,
   setupAutoUpdater,
 } from "./updater";
 import { updaterPreferencesPath } from "./updater-preferences";
+
+describe("configureGithubUpdateFeed", () => {
+  it("pins the GitHub provider to the resolved owner/repo", () => {
+    const setFeedURL = vi.fn();
+    expect(
+      configureGithubUpdateFeed({ setFeedURL }, "Git-on-my-level/multica"),
+    ).toBe("Git-on-my-level/multica");
+    expect(setFeedURL).toHaveBeenCalledWith({
+      provider: "github",
+      owner: "Git-on-my-level",
+      repo: "multica",
+    });
+  });
+});
 
 describe("macOS x64 update channel", () => {
   it("does not touch established architecture paths", () => {

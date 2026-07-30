@@ -27,13 +27,114 @@
 // real `git describe` invocation against a throwaway repo.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(here, "..");
+const repoRoot = resolve(desktopRoot, "..", "..");
 const bundleCliScript = resolve(here, "bundle-cli.mjs");
+
+/** This fork's Desktop updater / publish default (matches electron-builder.yml). */
+export const FORK_DEFAULT_GITHUB_REPO = "Git-on-my-level/multica";
+
+const PUBLISH_OWNER_ARG = "--config.publish.owner";
+const PUBLISH_REPO_ARG = "--config.publish.repo";
+
+export function parseGithubRepoSlug(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes("://")) return null;
+  const parts = trimmed.split("/");
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts.map((part) => part.trim());
+  if (!owner || !repo || owner.includes("/") || repo.includes("/")) return null;
+  return `${owner}/${repo}`;
+}
+
+export function githubRepoFromRemoteUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  const https = trimmed.match(
+    /^(?:https?:\/\/)?(?:www\.)?github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i,
+  );
+  if (https) return parseGithubRepoSlug(`${https[1]}/${https[2]}`);
+  const ssh = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (ssh) return parseGithubRepoSlug(`${ssh[1]}/${ssh[2]}`);
+  return null;
+}
+
+export function githubRepoFromPackageRepositoryUrl(url) {
+  return githubRepoFromRemoteUrl(url);
+}
+
+function publishArgValue(args, flag) {
+  const eqPrefix = `${flag}=`;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token.startsWith(eqPrefix)) return token.slice(eqPrefix.length);
+    if (token === flag && i + 1 < args.length) return args[i + 1];
+  }
+  return null;
+}
+
+export function publishGithubRepoFromArgs(args = []) {
+  const owner = publishArgValue(args, PUBLISH_OWNER_ARG)?.trim();
+  const repo = publishArgValue(args, PUBLISH_REPO_ARG)?.trim();
+  if (owner && repo) return parseGithubRepoSlug(`${owner}/${repo}`);
+  return null;
+}
+
+/**
+ * Resolve the GitHub owner/repo embedded into app-update.yml at package time.
+ * Explicit electron-builder publish flags win, then MULTICA_GITHUB_REPO, then
+ * git origin / package.json repository, then this fork's default.
+ */
+export function resolvePublishGithubRepo({
+  env = process.env,
+  sharedArgs = [],
+  gitRemoteUrl = "",
+  packageRepositoryUrl = "",
+  defaultRepo = FORK_DEFAULT_GITHUB_REPO,
+} = {}) {
+  return (
+    publishGithubRepoFromArgs(sharedArgs) ||
+    parseGithubRepoSlug(env.MULTICA_GITHUB_REPO) ||
+    githubRepoFromRemoteUrl(gitRemoteUrl) ||
+    githubRepoFromPackageRepositoryUrl(packageRepositoryUrl) ||
+    defaultRepo
+  );
+}
+
+export function publishOwnerRepoArgs(repoSlug) {
+  const parsed = parseGithubRepoSlug(repoSlug);
+  if (!parsed) {
+    throw new Error(`[package] invalid publish GitHub repo slug: ${repoSlug}`);
+  }
+  const [owner, repo] = parsed.split("/");
+  return [
+    `${PUBLISH_OWNER_ARG}=${owner}`,
+    `${PUBLISH_REPO_ARG}=${repo}`,
+  ];
+}
+
+/** Append publish owner/repo unless both are already present in args. */
+export function withPublishOwnerRepoArgs(args, repoSlug) {
+  if (publishGithubRepoFromArgs(args)) return [...args];
+  return [...args, ...publishOwnerRepoArgs(repoSlug)];
+}
+
+function readDesktopPackageRepositoryUrl() {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(resolve(desktopRoot, "package.json"), "utf-8"),
+    );
+    return pkg?.repository?.url ?? "";
+  } catch {
+    return "";
+  }
+}
 
 const PLATFORM_CONFIG = {
   mac: {
@@ -314,6 +415,7 @@ export function builderArgsForTarget(
     disableMacNotarize = false,
     hostPlatform = process.platform,
     useScopedOutputDir = false,
+    publishGithubRepo = FORK_DEFAULT_GITHUB_REPO,
   } = {},
 ) {
   const builderArgs = [];
@@ -334,7 +436,12 @@ export function builderArgsForTarget(
     builderArgs.push(...requestedTargets);
   }
   builderArgs.push(`--${target.arch}`);
-  builderArgs.push(...parsed.sharedArgs);
+  // Always embed owner/repo into app-update.yml. electron-builder.yml alone is
+  // not enough: upstream merges can restore multica-ai, and CI/local callers
+  // that forget --config.publish.* would ship the wrong updater feed.
+  builderArgs.push(
+    ...withPublishOwnerRepoArgs(parsed.sharedArgs, publishGithubRepo),
+  );
   if (useScopedOutputDir) {
     builderArgs.push(
       `-c.directories.output=dist/${target.platform}-${target.arch}`,
@@ -436,6 +543,13 @@ function main() {
   }
 
   const useScopedOutputDir = buildMatrix.length > 1;
+  const publishGithubRepo = resolvePublishGithubRepo({
+    env: process.env,
+    sharedArgs: parsed.sharedArgs,
+    gitRemoteUrl: git(["remote", "get-url", "origin"], repoRoot),
+    packageRepositoryUrl: readDesktopPackageRepositoryUrl(),
+  });
+  console.log(`[package] updater publish feed → ${publishGithubRepo}`);
 
   // Step 3: for each requested target, build the matching CLI into
   // resources/bin/ and package that target in isolation.
@@ -460,6 +574,7 @@ function main() {
       disableMacNotarize,
       hostPlatform: process.platform,
       useScopedOutputDir,
+      publishGithubRepo,
     });
 
     // Step 4: invoke electron-builder for the current target only.

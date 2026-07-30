@@ -9,11 +9,16 @@ import {
   deriveVersion,
   DESCRIBE_ARGS,
   envWithLocalBins,
+  FORK_DEFAULT_GITHUB_REPO,
+  githubRepoFromRemoteUrl,
   normalizeGitVersion,
+  parseGithubRepoSlug,
   parsePackageArgs,
   resolveBuildMatrix,
+  resolvePublishGithubRepo,
   shouldDisableMacNotarize,
   stripLeadingSeparator,
+  withPublishOwnerRepoArgs,
 } from "./package.mjs";
 import {
   assertUpdaterPayload,
@@ -77,6 +82,74 @@ describe("macOS arm64 release payload contract", () => {
       alreadyPublished: [names.zip],
       upload: [names.dmg, names.manifest, names.blockmap],
     });
+  });
+});
+
+describe("resolvePublishGithubRepo", () => {
+  it("defaults to this fork", () => {
+    expect(FORK_DEFAULT_GITHUB_REPO).toBe("Git-on-my-level/multica");
+    expect(resolvePublishGithubRepo({})).toBe("Git-on-my-level/multica");
+  });
+
+  it("parses HTTPS and SSH GitHub remotes", () => {
+    expect(githubRepoFromRemoteUrl("https://github.com/acme/multica.git")).toBe(
+      "acme/multica",
+    );
+    expect(githubRepoFromRemoteUrl("git@github.com:acme/multica.git")).toBe(
+      "acme/multica",
+    );
+    expect(parseGithubRepoSlug("not a slug")).toBeNull();
+  });
+
+  it("prefers explicit publish args, then env, then remotes", () => {
+    expect(
+      resolvePublishGithubRepo({
+        sharedArgs: [
+          "--config.publish.owner=from-args",
+          "--config.publish.repo=multica",
+        ],
+        env: { MULTICA_GITHUB_REPO: "from-env/multica" },
+        gitRemoteUrl: "https://github.com/from-remote/multica.git",
+        packageRepositoryUrl: "https://github.com/from-pkg/multica.git",
+      }),
+    ).toBe("from-args/multica");
+    expect(
+      resolvePublishGithubRepo({
+        env: { MULTICA_GITHUB_REPO: "from-env/multica" },
+        gitRemoteUrl: "https://github.com/from-remote/multica.git",
+      }),
+    ).toBe("from-env/multica");
+    expect(
+      resolvePublishGithubRepo({
+        gitRemoteUrl: "https://github.com/from-remote/multica.git",
+        packageRepositoryUrl: "https://github.com/from-pkg/multica.git",
+      }),
+    ).toBe("from-remote/multica");
+    expect(
+      resolvePublishGithubRepo({
+        packageRepositoryUrl: "https://github.com/from-pkg/multica.git",
+      }),
+    ).toBe("from-pkg/multica");
+  });
+
+  it("does not duplicate publish owner/repo when already present", () => {
+    const existing = [
+      "--publish",
+      "never",
+      "--config.publish.owner=acme",
+      "--config.publish.repo=multica",
+    ];
+    expect(withPublishOwnerRepoArgs(existing, "Git-on-my-level/multica")).toEqual(
+      existing,
+    );
+    expect(
+      withPublishOwnerRepoArgs(["--publish", "never"], "Git-on-my-level/multica"),
+    ).toEqual([
+      "--publish",
+      "never",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
+    ]);
   });
 });
 
@@ -400,6 +473,8 @@ describe("builderArgsForTarget", () => {
       "--arm64",
       "--publish",
       "never",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
       "-c.directories.output=dist/win-arm64",
       "-c.publish.channel=latest-arm64",
     ]);
@@ -426,6 +501,8 @@ describe("builderArgsForTarget", () => {
       "--x64",
       "--publish",
       "always",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
       "-c.directories.output=dist/win-x64",
     ]);
   });
@@ -452,6 +529,8 @@ describe("builderArgsForTarget", () => {
       "--x64",
       "--publish",
       "always",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
       "-c.directories.output=dist/mac-x64",
       "-c.mac.minimumSystemVersion=12.0.0",
       "-c.publish.channel=latest-x64",
@@ -478,6 +557,8 @@ describe("builderArgsForTarget", () => {
       "--arm64",
       "--publish",
       "always",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
       "-c.directories.output=dist/mac-arm64",
     ]);
   });
@@ -503,6 +584,41 @@ describe("builderArgsForTarget", () => {
       "--x64",
       "--publish",
       "never",
+      "--config.publish.owner=Git-on-my-level",
+      "--config.publish.repo=multica",
+    ]);
+  });
+
+  it("honors an explicit publish owner/repo without duplicating it", () => {
+    expect(
+      builderArgsForTarget(
+        { platform: "mac", arch: "arm64" },
+        {
+          allPlatforms: false,
+          sharedArgs: [
+            "--publish",
+            "never",
+            "--config.publish.owner=acme",
+            "--config.publish.repo=multica",
+          ],
+          platformTargets: { mac: [], win: [], linux: [] },
+          requestedPlatforms: ["mac"],
+          requestedArchs: ["arm64"],
+        },
+        "1.2.3",
+        {
+          hostPlatform: "darwin",
+          publishGithubRepo: "Git-on-my-level/multica",
+        },
+      ),
+    ).toEqual([
+      "-c.extraMetadata.version=1.2.3",
+      "--mac",
+      "--arm64",
+      "--publish",
+      "never",
+      "--config.publish.owner=acme",
+      "--config.publish.repo=multica",
     ]);
   });
 });
@@ -582,5 +698,13 @@ describe("electron-builder.yml packaging config", () => {
     const entries = readFilesBlock(readFileSync(configPath, "utf-8"));
     expect(entries.length).toBeGreaterThan(0);
     expect(entries).toContain("!dist/**");
+  });
+
+  it("defaults the packaged updater feed to this fork", () => {
+    expect(configPath, "electron-builder.yml not found").toBeTruthy();
+    const raw = readFileSync(configPath, "utf-8");
+    expect(raw).toMatch(/publish:\n(?:.*\n)*?\s+owner:\s*Git-on-my-level/);
+    expect(raw).toMatch(/publish:\n(?:.*\n)*?\s+repo:\s*multica/);
+    expect(raw).not.toMatch(/publish:\n(?:.*\n)*?\s+owner:\s*multica-ai/);
   });
 });

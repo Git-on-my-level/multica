@@ -117,9 +117,11 @@ win:
   artifactName: multica-desktop-${version}-windows-${arch}.${ext}
 publish:
   provider: github
-  # Default to upstream; CI always overrides owner/repo from github.repository
-  # so forks publish to themselves without committing a fork-specific owner.
-  owner: multica-ai
+  # This fork's Desktop builds must embed Git-on-my-level/multica into
+  # app-update.yml. electron-updater reads that file at runtime; MULTICA_GITHUB_REPO
+  # does not retarget an already-packaged feed. Upstream CI still passes
+  # --config.publish.owner/repo when building from multica-ai/multica.
+  owner: Git-on-my-level
   repo: multica
   # Align with our CLI release flow which pre-creates a *published* GitHub
   # Release via `gh release create`. The electron-builder default of
