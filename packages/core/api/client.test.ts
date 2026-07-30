@@ -5,6 +5,70 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("ApiClient pull-request response schema", () => {
+  const validPR = {
+    id: "pr-1",
+    provider: "github",
+    workspace_id: "ws-1",
+    repo_owner: "acme",
+    repo_name: "widget",
+    number: 7,
+    title: "MUL-1: fix",
+    state: "open",
+    html_url: "https://github.example/acme/widget/pull/7",
+    branch: "fix/mul-1",
+    author_login: "octocat",
+    author_avatar_url: null,
+    merged_at: null,
+    closed_at: null,
+    pr_created_at: "2026-01-01T00:00:00Z",
+    pr_updated_at: "2026-01-01T00:00:00Z",
+    snapshot_available: true,
+    checks_rollup: "failure",
+    failed_check_names: ["backend"],
+  };
+
+  it("parses and defaults a valid pull-request list", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ pull_requests: [validPR] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const result = await new ApiClient("https://api.example.test").listIssuePullRequests("issue-1");
+    expect(result.pull_requests[0]).toMatchObject({
+      id: "pr-1",
+      failed_check_names: ["backend"],
+      checks_total: 0,
+    });
+  });
+
+  it("falls back safely when failed_check_names is malformed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            pull_requests: [{ ...validPR, failed_check_names: "backend" }],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      ),
+    );
+
+    await expect(
+      new ApiClient("https://api.example.test").listIssuePullRequests("issue-1"),
+    ).resolves.toEqual({ pull_requests: [] });
+  });
+});
+
 describe("ApiClient server Table query", () => {
   it("posts the canonical query to the group and branch endpoints", async () => {
     const fetchMock = vi
@@ -360,10 +424,20 @@ describe("ApiClient workspace working agents", () => {
       client.getWorkspaceWorkingAgents("issue"),
     ).resolves.toEqual(payload);
     await expect(client.getWorkspaceWorkingAgents()).resolves.toEqual(payload);
+    await expect(
+      client.getWorkspaceWorkingAgents("issue", undefined, "parent-1"),
+    ).resolves.toEqual(payload);
+    // The server rejects parent alongside scope, so a My Issues relation wins
+    // and the parent is dropped rather than sent into a 400.
+    await expect(
+      client.getWorkspaceWorkingAgents("issue", "assigned", "parent-1"),
+    ).resolves.toEqual(payload);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "https://api.example.test/api/working-agents?type=issue&scope=mine&relation=assigned",
       "https://api.example.test/api/working-agents?type=issue",
       "https://api.example.test/api/working-agents",
+      "https://api.example.test/api/working-agents?type=issue&parent=parent-1",
+      "https://api.example.test/api/working-agents?type=issue&scope=mine&relation=assigned",
     ]);
   });
 });
@@ -1109,8 +1183,26 @@ describe("ApiClient", () => {
 
     it("falls back to the legacy full-list endpoint when the paged route 404s", async () => {
       const legacy = [
-        { id: "m1", role: "user", content: "hi", created_at: "2026-06-01T00:00:00Z" },
-        { id: "m2", role: "assistant", content: "yo", created_at: "2026-06-01T00:00:01Z" },
+        {
+          id: "m1",
+          chat_session_id: "session-1",
+          role: "user",
+          content: "hi",
+          task_id: null,
+          created_at: "2026-06-01T00:00:00Z",
+          quick_actions: [],
+        },
+        {
+          id: "m2",
+          chat_session_id: "session-1",
+          role: "assistant",
+          content: "yo",
+          task_id: "task-1",
+          created_at: "2026-06-01T00:00:01Z",
+          quick_actions: [
+            { label: "Continue", prompt: "Continue with the next step", primary: true },
+          ],
+        },
       ];
       const fetchMock = vi
         .fn()
@@ -1129,6 +1221,36 @@ describe("ApiClient", () => {
         "https://api.example.test/api/chat/sessions/session-1/messages",
       );
       expect(page).toEqual({ messages: legacy, limit: 50, has_more: false, next_cursor: null });
+    });
+
+    it("keeps a valid reply when its optional quick actions are malformed", async () => {
+      const malformed = [{
+        id: "m1",
+        chat_session_id: "session-1",
+        role: "assistant",
+        content: "safe reply",
+        task_id: "task-1",
+        created_at: "2026-06-01T00:00:00Z",
+        quick_actions: [{ label: 42, prompt: false }],
+      }];
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(malformed, 200)));
+
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.listChatMessages("session-1")).resolves.toEqual([
+        expect.objectContaining({ content: "safe reply", quick_actions: [] }),
+      ]);
+    });
+
+    it("falls back to an empty page for a malformed paged response", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(jsonResponse({ messages: "broken" }, 200)),
+      );
+
+      const client = new ApiClient("https://api.example.test");
+      await expect(
+        client.listChatMessagesPage("session-1", { limit: 25 }),
+      ).resolves.toEqual({ messages: [], limit: 25, has_more: false, next_cursor: null });
     });
 
     it("does NOT fall back on a cursor request — a 404 there propagates", async () => {
@@ -1357,6 +1479,45 @@ describe("ApiClient", () => {
       expect(body.get("comment_id")).toBeNull();
     });
 
+    it("threads an AbortSignal into fetch so the coordinator can cancel it (MUL-5181)", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ id: "att-1", url: "https://cdn/x" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const client = new ApiClient("https://api.example.test");
+      const controller = new AbortController();
+      const file = new File(["hi"], "hi.png", { type: "image/png" });
+      await client.uploadFile(file, { issueId: "issue-1" }, controller.signal);
+
+      const [, init] = fetchMock.mock.calls[0]!;
+      expect(init?.signal).toBe(controller.signal);
+    });
+
+    it("rejects with the fetch AbortError when the signal is already aborted", async () => {
+      const fetchMock = vi.fn().mockImplementation((_url, init?: RequestInit) => {
+        if (init?.signal?.aborted) {
+          const err = new Error("The operation was aborted");
+          err.name = "AbortError";
+          return Promise.reject(err);
+        }
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const client = new ApiClient("https://api.example.test");
+      const controller = new AbortController();
+      controller.abort();
+      const file = new File(["hi"], "hi.png", { type: "image/png" });
+
+      await expect(
+        client.uploadFile(file, undefined, controller.signal),
+      ).rejects.toMatchObject({ name: "AbortError" });
+    });
+
     it("sendChatMessage serialises attachment_ids onto the JSON body when present", async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         new Response(JSON.stringify({ message_id: "m1", task_id: "t1", created_at: "" }), {
@@ -1394,5 +1555,89 @@ describe("ApiClient", () => {
       expect(JSON.parse(fetchMock.mock.calls[0]![1]?.body as string)).toEqual({ content: "hello" });
       expect(JSON.parse(fetchMock.mock.calls[1]![1]?.body as string)).toEqual({ content: "again" });
     });
+  });
+});
+
+describe("ApiClient model discovery response schema", () => {
+  const completed = {
+    id: "req-1",
+    runtime_id: "rt-1",
+    status: "completed",
+    supported: true,
+    created_at: "2026-07-29T00:00:00Z",
+    updated_at: "2026-07-29T00:00:01Z",
+    models: [{ id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" }],
+  };
+
+  function stubJSON(body: unknown) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+  }
+
+  it("parses a live completed discovery", async () => {
+    stubJSON(completed);
+
+    const result = await new ApiClient("https://api.example.test")
+      .initiateListModels("rt-1");
+
+    expect(result).toMatchObject({
+      status: "completed",
+      supported: true,
+      models: [{ id: "claude-sonnet-4-6" }],
+    });
+  });
+
+  it("keeps the cache markers on a server-cached snapshot", async () => {
+    stubJSON({ ...completed, cached: true, cached_at: "2026-07-29T00:00:00Z" });
+
+    const result = await new ApiClient("https://api.example.test")
+      .initiateListModels("rt-1");
+
+    expect(result.cached).toBe(true);
+    expect(result.cached_at).toBe("2026-07-29T00:00:00Z");
+  });
+
+  // The picker drives a state machine off `status`, so a malformed body must
+  // become an explicit failure — not a fabricated empty catalog, and not an
+  // endless "discovering models" spinner.
+  it("degrades a malformed initiate response to an explicit failure", async () => {
+    stubJSON({ status: 7, models: "nope" });
+
+    const result = await new ApiClient("https://api.example.test")
+      .initiateListModels("rt-1");
+
+    expect(result.status).toBe("failed");
+    expect(result.supported).toBe(true);
+    expect(result.error).toBe("invalid model discovery response");
+    expect(result.runtime_id).toBe("rt-1");
+  });
+
+  it("degrades a malformed poll response to an explicit failure", async () => {
+    stubJSON("not-an-object");
+
+    const result = await new ApiClient("https://api.example.test")
+      .getListModelsResult("rt-1", "req-9");
+
+    expect(result.status).toBe("failed");
+    expect(result.id).toBe("req-9");
+    expect(result.runtime_id).toBe("rt-1");
+  });
+
+  it("stays usable against a backend that omits supported", async () => {
+    const { supported: _omitted, ...withoutSupported } = completed;
+    stubJSON(withoutSupported);
+
+    const result = await new ApiClient("https://api.example.test")
+      .getListModelsResult("rt-1", "req-1");
+
+    expect(result.supported).toBe(true);
+    expect(result.status).toBe("completed");
   });
 });

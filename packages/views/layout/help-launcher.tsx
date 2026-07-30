@@ -42,7 +42,7 @@ export function HelpLauncher() {
         >
           <BookOpen className="h-3.5 w-3.5" />
           {t(($) => $.help.docs)}
-          <ArrowUpRight className="size-3 translate-y-px text-muted-foreground/50" />
+          <ArrowUpRight className="size-3 translate-y-px text-faint-foreground" />
         </DropdownMenuItem>
         <DropdownMenuItem
           render={
@@ -55,7 +55,7 @@ export function HelpLauncher() {
         >
           <History className="h-3.5 w-3.5" />
           {t(($) => $.help.changelog)}
-          <ArrowUpRight className="size-3 translate-y-px text-muted-foreground/50" />
+          <ArrowUpRight className="size-3 translate-y-px text-faint-foreground" />
         </DropdownMenuItem>
         <DropdownMenuItem
           render={
@@ -64,7 +64,7 @@ export function HelpLauncher() {
         >
           <DiscordIcon className="h-3.5 w-3.5" />
           {t(($) => $.help.discord)}
-          <ArrowUpRight className="size-3 translate-y-px text-muted-foreground/50" />
+          <ArrowUpRight className="size-3 translate-y-px text-faint-foreground" />
         </DropdownMenuItem>
         <DropdownMenuItem
           onClick={() => useModalStore.getState().open("feedback")}

@@ -1,70 +1,37 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   CheckCircle2,
+  Circle,
   CircleDashed,
+  CircleSlash,
   GitMerge,
   GitPullRequest,
   GitPullRequestArrow,
   GitPullRequestClosed,
   GitPullRequestDraft,
-  Loader2,
   TriangleAlert,
-  Unlink,
   XCircle,
 } from "lucide-react";
-import { issueKeys } from "@multica/core/issues/queries";
 import {
   issuePullRequestsOptions,
-  derivePullRequestStatusKind,
-  derivePullRequestProgressSegments,
+  deriveChecksStatus,
+  deriveMergeStatus,
   shouldShowPullRequestStats,
-  type PullRequestStatusKind,
-  type PullRequestProgressSegment,
+  type PullRequestChecksStatus,
+  type PullRequestMergeStatus,
 } from "@multica/core/github";
-import { api } from "@multica/core/api";
-import type {
-  GitHubPullRequest,
-  GitHubPullRequestChecksConclusion,
-  GitHubPullRequestState,
-  IssuePullRequestHandoff,
-} from "@multica/core/types";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@multica/ui/components/ui/dialog";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@multica/ui/components/ui/alert-dialog";
-import { Button } from "@multica/ui/components/ui/button";
-import { Checkbox } from "@multica/ui/components/ui/checkbox";
-import { Input } from "@multica/ui/components/ui/input";
-import { Label } from "@multica/ui/components/ui/label";
+import type { GitHubPullRequest, GitHubPullRequestState } from "@multica/core/types";
 import { cn } from "@multica/ui/lib/utils";
-import { useT } from "../../i18n";
+import { useT, useTimeAgo } from "../../i18n";
 
 type IssuesT = ReturnType<typeof useT<"issues">>["t"];
 
 // Keep the existing sidebar density: show the first 3 PR rows inline, then
 // collapse the rest once the section reaches 4 rows.
 const PR_LIMIT_BEFORE_COLLAPSE = 4;
-
-// Canonical GitHub PR URL. The server canonicalises and additionally requires
-// the PR to already be mirrored in this workspace; this is only a client-side
-// shape guard so the submit button stays disabled until the input looks like a
-// real PR link, and a clear inline error replaces a round-trip 400.
-const GITHUB_PR_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+\/?(\?.*)?$/i;
 
 const STATE_ICON: Record<
   GitHubPullRequestState,
@@ -76,313 +43,22 @@ const STATE_ICON: Record<
   closed: { icon: GitPullRequestClosed, className: "text-rose-600 dark:text-rose-400" },
 };
 
-const CHECKS_ICON: Record<
-  GitHubPullRequestChecksConclusion,
-  { icon: React.ComponentType<{ className?: string }>; className: string }
-> = {
-  passed: { icon: CheckCircle2, className: "text-emerald-600 dark:text-emerald-400" },
-  failed: { icon: XCircle, className: "text-rose-600 dark:text-rose-400" },
-  pending: { icon: CircleDashed, className: "text-amber-600 dark:text-amber-400" },
-};
-
-// Status line treatment per status kind. Only the *actionable* kinds get an
-// icon and a color: CI outcome and merge conflicts are the signals a reader
-// scans this row for, and rendering them in plain muted text made them
-// indistinguishable from the neighbouring diff stats (MUL-5180).
-//
-// Terminal kinds (closed / merged) and `unknown` stay muted on purpose — the
-// state icon at the head of the row already carries that meaning, so a second
-// colored glyph would be noise.
-const STATUS_KIND_STYLE: Partial<
-  Record<
-    PullRequestStatusKind,
-    { icon: React.ComponentType<{ className?: string }>; className: string }
-  >
-> = {
-  checks_failed: { icon: XCircle, className: "text-rose-600 dark:text-rose-400" },
-  checks_pending: { icon: CircleDashed, className: "text-amber-600 dark:text-amber-400" },
-  checks_passed: { icon: CheckCircle2, className: "text-emerald-600 dark:text-emerald-400" },
-  conflicts: { icon: TriangleAlert, className: "text-rose-600 dark:text-rose-400" },
-  ready: { icon: CheckCircle2, className: "text-emerald-600 dark:text-emerald-400" },
-};
-
-export function PullRequestList({ issueId, wsId }: { issueId: string; wsId: string }) {
-  const { t } = useT("issues");
-  const qc = useQueryClient();
-  const { data, isLoading } = useQuery(issuePullRequestsOptions(issueId));
-  const prs = data?.pull_requests ?? [];
-  const handoff = data?.handoff;
-
-  // Link dialog state. The dialog stays open on error so the user can fix the
-  // URL or read the server message (e.g. "PR not mirrored in this workspace").
-  const [linkOpen, setLinkOpen] = useState(false);
-  const [url, setUrl] = useState("");
-  const [closeIntent, setCloseIntent] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Unlink confirm dialog state. One dialog at the list level rather than one
-  // per row — the target PR is captured here when a row's unlink button fires.
-  const [unlinkTarget, setUnlinkTarget] = useState<GitHubPullRequest | null>(null);
-  const [unlinkError, setUnlinkError] = useState<string | null>(null);
-
-  const resetLinkDialog = () => {
-    setUrl("");
-    setCloseIntent(false);
-    setError(null);
-  };
-
-  const linkMutation = useMutation({
-    mutationFn: (vars: { url: string; closeIntent: boolean }) =>
-      api.linkIssuePullRequest(issueId, vars.url, vars.closeIntent),
-    onSuccess: (_data, vars) => {
-      // Realtime also invalidates this tree on pull_request:linked, but we
-      // invalidate directly so the UI converges even without an open socket.
-      qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
-      // Close intent on an already-merged PR can advance the issue to done in
-      // the same response; refresh issue caches when the socket is absent.
-      if (vars.closeIntent) {
-        qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, issueId) });
-        qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
-        qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
-      }
-      setLinkOpen(false);
-      resetLinkDialog();
-    },
-    onError: (e: unknown) => setError(e instanceof Error ? e.message : String(e)),
-  });
-
-  const unlinkMutation = useMutation({
-    mutationFn: (prUrl: string) => api.unlinkIssuePullRequest(issueId, prUrl),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["github", "pull-requests"] });
-      setUnlinkTarget(null);
-      setUnlinkError(null);
-    },
-    onError: (e: unknown) => setUnlinkError(e instanceof Error ? e.message : String(e)),
-  });
-
-  const trimmedUrl = url.trim();
-  const urlValid = GITHUB_PR_URL_RE.test(trimmedUrl);
-  const showUrlError = trimmedUrl.length > 0 && !urlValid;
-
-  const handleSubmitLink = () => {
-    if (!urlValid || linkMutation.isPending) return;
-    linkMutation.mutate({ url: trimmedUrl, closeIntent });
-  };
-
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-end -mx-2 px-2">
-        <Button
-          type="button"
-          variant="link"
-          size="xs"
-          className="h-5 px-1 text-[11px] text-muted-foreground"
-          onClick={() => {
-            resetLinkDialog();
-            setLinkOpen(true);
-          }}
-        >
-          <GitPullRequestArrow className="h-3 w-3" />
-          {t(($) => $.detail.pull_request_link_action)}
-        </Button>
-      </div>
-
-      {handoff ? <PullRequestHandoffStatus handoff={handoff} /> : null}
-
-      {isLoading ? (
-        <p className="text-xs text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>
-      ) : prs.length === 0 ? (
-        <p className="text-xs text-muted-foreground px-2">
-          {t(($) => $.detail.pull_requests_empty)}
-        </p>
-      ) : (
-        <PullRequestRows
-          prs={prs}
-          onUnlink={(pr) => {
-            setUnlinkError(null);
-            setUnlinkTarget(pr);
-          }}
-        />
-      )}
-
-      <Dialog
-        open={linkOpen}
-        onOpenChange={(open) => {
-          setLinkOpen(open);
-          if (!open && !linkMutation.isPending) resetLinkDialog();
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t(($) => $.detail.pull_request_link_dialog_title)}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="pr-link-url">{t(($) => $.detail.pull_request_link_url_label)}</Label>
-            <Input
-              id="pr-link-url"
-              value={url}
-              onChange={(e) => {
-                setUrl(e.target.value);
-                setError(null);
-              }}
-              placeholder={t(($) => $.detail.pull_request_link_url_placeholder)}
-              aria-invalid={showUrlError || !!error}
-              autoFocus
-            />
-            {showUrlError ? (
-              <p className="text-xs text-destructive">
-                {t(($) => $.detail.pull_request_link_url_invalid)}
-              </p>
-            ) : null}
-            {error ? <p className="text-xs text-destructive">{error}</p> : null}
-            <Label
-              htmlFor="pr-link-close-intent"
-              className="font-normal text-muted-foreground"
-            >
-              <Checkbox
-                id="pr-link-close-intent"
-                checked={closeIntent}
-                onCheckedChange={(checked) => setCloseIntent(checked === true)}
-              />
-              {t(($) => $.detail.pull_request_link_close_intent)}
-            </Label>
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={linkMutation.isPending}
-              onClick={() => setLinkOpen(false)}
-            >
-              {t(($) => $.detail.pull_request_link_cancel)}
-            </Button>
-            <Button
-              type="button"
-              onClick={handleSubmitLink}
-              disabled={!urlValid || linkMutation.isPending}
-            >
-              {linkMutation.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : null}
-              {t(($) => $.detail.pull_request_link_submit)}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <AlertDialog
-        open={unlinkTarget !== null}
-        onOpenChange={(open) => {
-          if (!open && !unlinkMutation.isPending) setUnlinkTarget(null);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {t(($) => $.detail.pull_request_link_unlink_confirm)}
-            </AlertDialogTitle>
-          </AlertDialogHeader>
-          {unlinkError ? (
-            <p className="text-xs text-destructive">{unlinkError}</p>
-          ) : null}
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={unlinkMutation.isPending}>
-              {t(($) => $.detail.pull_request_link_cancel)}
-            </AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              disabled={unlinkMutation.isPending || !unlinkTarget}
-              onClick={(event) => {
-                // AlertDialogAction closes by default. Keep the confirmation open
-                // while the mutation runs so a server error remains visible.
-                event.preventDefault();
-                if (unlinkTarget) unlinkMutation.mutate(unlinkTarget.html_url);
-              }}
-            >
-              {unlinkMutation.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : null}
-              {t(($) => $.detail.pull_request_link_unlink_confirm_action)}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </div>
-  );
-}
-
-function PullRequestHandoffStatus({ handoff }: { handoff: IssuePullRequestHandoff }) {
-  const { t } = useT("issues");
-  const candidate = handoff.candidates[0];
-  const state = handoff.state;
-  const Icon =
-    state === "linked"
-      ? CheckCircle2
-      : state === "awaiting_mirror" || state === "candidate_detected"
-        ? CircleDashed
-        : state === "missing"
-          ? GitPullRequest
-          : TriangleAlert;
-  const text =
-    state === "missing"
-      ? t(($) => $.detail.pull_request_handoff_missing)
-      : state === "awaiting_mirror"
-        ? t(($) => $.detail.pull_request_handoff_awaiting_mirror)
-        : state === "linked"
-          ? t(($) => $.detail.pull_request_handoff_linked)
-          : state === "invalid_external_pr"
-            ? t(($) => $.detail.pull_request_handoff_invalid_external)
-            : state === "multiple_candidates_needs_review"
-              ? t(($) => $.detail.pull_request_handoff_multiple)
-              : t(($) => $.detail.pull_request_handoff_candidate_detected);
-
-  return (
-    <div
-      data-testid="pull-request-handoff"
-      data-handoff-state={state}
-      className={cn(
-        "flex items-start gap-1.5 rounded-md px-2 py-1.5 text-[11px]",
-        state === "linked"
-          ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-          : state === "invalid_external_pr" || state === "multiple_candidates_needs_review"
-            ? "bg-amber-500/10 text-amber-800 dark:text-amber-300"
-            : "bg-muted/60 text-muted-foreground",
-      )}
-    >
-      <Icon className="mt-0.5 h-3 w-3 shrink-0" />
-      <span className="min-w-0">
-        {text}
-        {candidate && state !== "missing" ? (
-          <>
-            {" "}
-            <a
-              href={candidate.url}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="font-medium underline underline-offset-2"
-            >
-              {candidate.repo_owner}/{candidate.repo_name}#{candidate.number}
-            </a>
-          </>
-        ) : null}
-      </span>
-    </div>
-  );
-}
-
-// The collapsible PR rows. Split out so the list shell (header button,
-// loading / empty states, dialogs) stays readable; the collapse toggle state
-// lives here next to the rows it controls.
-function PullRequestRows({
-  prs,
-  onUnlink,
-}: {
-  prs: GitHubPullRequest[];
-  onUnlink: (pr: GitHubPullRequest) => void;
-}) {
+export function PullRequestList({ issueId }: { issueId: string }) {
   const { t } = useT("issues");
   const [expanded, setExpanded] = useState(false);
+  const { data, isLoading } = useQuery(issuePullRequestsOptions(issueId));
+  const prs = data?.pull_requests ?? [];
+
+  if (isLoading) {
+    return <p className="text-caption text-muted-foreground px-2">{t(($) => $.detail.pull_requests_loading)}</p>;
+  }
+  if (prs.length === 0) {
+    return (
+      <p className="text-caption text-muted-foreground px-2">
+        {t(($) => $.detail.pull_requests_empty)}
+      </p>
+    );
+  }
 
   // Render rule:
   //   - <  PR_LIMIT_BEFORE_COLLAPSE: every PR row is visible.
@@ -393,21 +69,19 @@ function PullRequestRows({
   const collapsedTail = useCollapse ? prs.slice(PR_LIMIT_BEFORE_COLLAPSE - 1) : [];
 
   return (
-    <>
+    <div className="space-y-1">
       {expandedHead.map((pr) => (
-        <PullRequestRow key={pr.id} pr={pr} onUnlink={onUnlink} />
+        <PullRequestRow key={pr.id} pr={pr} />
       ))}
       {useCollapse ? (
         <div className="space-y-1">
           {expanded
-            ? collapsedTail.map((pr) => (
-                <PullRequestRow key={pr.id} pr={pr} onUnlink={onUnlink} />
-              ))
+            ? collapsedTail.map((pr) => <PullRequestRow key={pr.id} pr={pr} />)
             : null}
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="block w-[calc(100%+1rem)] -mx-2 rounded-md px-2 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
+            className="block w-[calc(100%+1rem)] -mx-2 rounded-md px-2 py-1.5 text-left text-micro text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
           >
             {expanded
               ? t(($) => $.detail.pull_request_card_show_less)
@@ -415,144 +89,77 @@ function PullRequestRows({
           </button>
         </div>
       ) : null}
-    </>
+    </div>
   );
 }
 
-function PullRequestRow({
-  pr,
-  onUnlink,
-}: {
-  pr: GitHubPullRequest;
-  onUnlink: (pr: GitHubPullRequest) => void;
-}) {
+function PullRequestRow({ pr }: { pr: GitHubPullRequest }) {
   const { t } = useT("issues");
   const cfg = STATE_ICON[pr.state] ?? { icon: GitPullRequest, className: "" };
   const StateIcon = cfg.icon;
-  const kind = derivePullRequestStatusKind({
-    state: pr.state,
-    mergeable_state: pr.mergeable_state,
-    checks_failed: pr.checks_failed,
-    checks_pending: pr.checks_pending,
-    checks_passed: pr.checks_passed,
-  });
-  const segments = derivePullRequestProgressSegments({
-    state: pr.state,
-    checks_failed: pr.checks_failed,
-    checks_pending: pr.checks_pending,
-    checks_passed: pr.checks_passed,
-  });
+  const isDraft = pr.state === "draft";
+  const stateLabel = getStateLabel(pr.state, t);
+
+  return (
+    <a
+      data-testid="pull-request-row"
+      href={pr.html_url}
+      target="_blank"
+      rel="noreferrer noopener"
+      className={cn(
+        "flex items-start gap-2 rounded-md px-2 py-1.5 -mx-2 hover:bg-accent/50 transition-colors group",
+        isDraft ? "opacity-80" : null,
+      )}
+    >
+      <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
+      <div className="min-w-0 flex-1">
+        <p className="text-caption font-medium leading-snug truncate group-hover:text-foreground">
+          {pr.title}
+        </p>
+        <p className="text-micro text-muted-foreground truncate">
+          {pr.repo_owner}/{pr.repo_name}#{pr.number} · {stateLabel}
+          {pr.author_login ? ` · @${pr.author_login}` : null}
+        </p>
+        <PullRequestRowDetails pr={pr} />
+      </div>
+    </a>
+  );
+}
+
+function PullRequestRowDetails({ pr }: { pr: GitHubPullRequest }) {
+  const { t } = useT("issues");
+  const timeAgo = useTimeAgo();
+
   const showStats = shouldShowPullRequestStats({
     additions: pr.additions,
     deletions: pr.deletions,
     changed_files: pr.changed_files,
   });
-  const statusText = useStatusText(kind);
-  const draftPrefix = pr.state === "draft";
-  const stateLabel = getStateLabel(pr.state, t);
+
+  // Neither status element is shown for terminal PRs — the leading state icon
+  // already conveys merged / closed, and CI / mergeability are no longer
+  // actionable there.
+  const isTerminal = pr.state === "merged" || pr.state === "closed";
+  const checksBadge = isTerminal ? null : getChecksBadge(deriveChecksStatus(pr), t);
+  const mergeBadge = isTerminal ? null : getMergeBadge(deriveMergeStatus(pr), t);
+
+  // A stale snapshot (GitHub outage / revoked key) greys out both elements and
+  // annotates them with the snapshot age instead of hiding the last-known data.
+  const stale = !isTerminal && pr.snapshot_stale === true;
+  const staleTitle = stale
+    ? pr.snapshot_fetched_at
+      ? t(($) => $.detail.pull_request_snapshot_stale, { time: timeAgo(pr.snapshot_fetched_at) })
+      : t(($) => $.detail.pull_request_snapshot_stale_unknown)
+    : undefined;
+
+  if (!showStats && !checksBadge && !mergeBadge) return null;
 
   return (
-    <div className="group/row relative">
-      <a
-        data-testid="pull-request-row"
-        href={pr.html_url}
-        target="_blank"
-        rel="noreferrer noopener"
-        className={cn(
-          "flex items-start gap-2 rounded-md px-2 py-1.5 pr-7 -mx-2 hover:bg-accent/50 transition-colors group",
-          draftPrefix ? "opacity-80" : null,
-        )}
-      >
-        <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
-        <div className="min-w-0 flex-1">
-          <p className="text-xs font-medium leading-snug truncate group-hover:text-foreground">
-            {pr.title}
-          </p>
-          <p className="text-[11px] text-muted-foreground truncate">
-            {pr.repo_owner}/{pr.repo_name}#{pr.number} · {stateLabel}
-            {pr.author_login ? ` · @${pr.author_login}` : null}
-          </p>
-          <PullRequestRowDetails
-            pr={pr}
-            segments={segments}
-            showStats={showStats}
-            statusText={
-              draftPrefix
-                ? t(($) => $.detail.pull_request_card_draft_prefix, { status: statusText })
-                : statusText
-            }
-            statusKind={kind}
-          />
-        </div>
-      </a>
-      <button
-        type="button"
-        aria-label={t(($) => $.detail.pull_request_link_unlink)}
-        onClick={() => onUnlink(pr)}
-        className="absolute right-0.5 top-1.5 z-10 grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/row:opacity-100"
-      >
-        <Unlink className="h-3 w-3" />
-      </button>
-    </div>
-  );
-}
-
-function PullRequestRowDetails({
-  pr,
-  segments,
-  showStats,
-  statusText,
-  statusKind,
-}: {
-  pr: GitHubPullRequest;
-  segments: PullRequestProgressSegment[] | null;
-  showStats: boolean;
-  statusText: string;
-  statusKind: PullRequestStatusKind;
-}) {
-  const { t } = useT("issues");
-  const checksBadge = getChecksBadge(pr, t);
-  const conflictsBadge = getConflictsBadge(pr, t);
-  const isTerminal = statusKind === "closed" || statusKind === "merged";
-  const showChecksBadge =
-    !isTerminal &&
-    !!checksBadge &&
-    statusKind !== "checks_failed" &&
-    statusKind !== "checks_pending" &&
-    statusKind !== "checks_passed";
-  const showConflictsBadge =
-    !isTerminal && !!conflictsBadge && statusKind !== "conflicts" && statusKind !== "ready";
-
-  return (
-    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-muted-foreground">
       {showStats ? <PullRequestStats pr={pr} /> : null}
-      <PullRequestProgressStrip segments={segments} />
-      <PullRequestStatusText kind={statusKind} text={statusText} />
-      {showChecksBadge ? <PullRequestBadge badge={checksBadge} /> : null}
-      {showConflictsBadge ? <PullRequestBadge badge={conflictsBadge} /> : null}
+      {checksBadge ? <PullRequestBadge badge={checksBadge} stale={stale} title={staleTitle} /> : null}
+      {mergeBadge ? <PullRequestBadge badge={mergeBadge} stale={stale} title={staleTitle} /> : null}
     </div>
-  );
-}
-
-function PullRequestStatusText({
-  kind,
-  text,
-}: {
-  kind: PullRequestStatusKind;
-  text: string;
-}) {
-  const style = STATUS_KIND_STYLE[kind];
-  if (!style) return <span className="truncate">{text}</span>;
-  const Icon = style.icon;
-  return (
-    <span
-      data-testid="pull-request-status"
-      data-status-kind={kind}
-      className={cn("inline-flex min-w-0 items-center gap-1 font-medium", style.className)}
-    >
-      <Icon className="h-3 w-3 shrink-0" />
-      <span className="truncate">{text}</span>
-    </span>
   );
 }
 
@@ -572,89 +179,142 @@ function PullRequestStats({ pr }: { pr: GitHubPullRequest }) {
   );
 }
 
-function PullRequestProgressStrip({
-  segments,
-}: {
-  segments: PullRequestProgressSegment[] | null;
-}) {
-  if (!segments) return null;
-  return (
-    <span className="flex h-1 w-12 shrink-0 overflow-hidden rounded-full bg-muted" aria-hidden="true">
-      {segments.map((seg) => (
-        <span
-          key={seg.kind}
-          className={cn(
-            "h-full block",
-            seg.kind === "failed" && "bg-rose-500 dark:bg-rose-400",
-            seg.kind === "pending" && "bg-amber-500 dark:bg-amber-400",
-            seg.kind === "passed" && "bg-emerald-500 dark:bg-emerald-400",
-          )}
-          style={{ width: `${seg.ratio * 100}%` }}
-        />
-      ))}
-    </span>
-  );
-}
-
 interface PullRequestBadgeConfig {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   className: string;
 }
 
-function PullRequestBadge({ badge }: { badge: PullRequestBadgeConfig }) {
+function PullRequestBadge({
+  badge,
+  stale,
+  title,
+}: {
+  badge: PullRequestBadgeConfig;
+  stale?: boolean;
+  title?: string;
+}) {
   const Icon = badge.icon;
   return (
-    <span className="inline-flex items-center gap-1">
+    <span
+      className={cn("inline-flex items-center gap-1", stale ? "opacity-60" : null)}
+      title={title}
+    >
       <Icon className={cn("h-3 w-3", badge.className)} />
       {badge.label}
     </span>
   );
 }
 
-function getConflictsBadge(
-  pr: GitHubPullRequest,
-  t: IssuesT,
-): PullRequestBadgeConfig | null {
-  const mergeable = pr.mergeable_state ?? null;
-  return mergeable === "dirty"
-    ? {
-        icon: TriangleAlert,
-        label: t(($) => $.detail.pull_request_conflicts_dirty),
-        className: "text-rose-600 dark:text-rose-400",
-      }
-    : mergeable === "clean"
-      ? {
-          icon: CheckCircle2,
-          label: t(($) => $.detail.pull_request_conflicts_clean),
-          className: "text-emerald-600 dark:text-emerald-400",
-        }
-      : null;
-}
-
+// CI element. A current snapshot with a null rollup renders "no checks yet";
+// an unavailable/disabled snapshot renders nothing.
 function getChecksBadge(
-  pr: GitHubPullRequest,
+  status: PullRequestChecksStatus,
   t: IssuesT,
 ): PullRequestBadgeConfig | null {
-  const checks = pr.checks_conclusion ?? null;
-  return checks && CHECKS_ICON[checks]
-    ? {
-        icon: CHECKS_ICON[checks].icon,
-        className: CHECKS_ICON[checks].className,
-        label:
-          checks === "passed"
-            ? t(($) => $.detail.pull_request_checks_passed)
-            : checks === "failed"
-              ? t(($) => $.detail.pull_request_checks_failed)
-              : t(($) => $.detail.pull_request_checks_pending),
-      }
-    : null;
+  switch (status.kind) {
+    case "failed":
+      return {
+        icon: XCircle,
+        className: "text-rose-600 dark:text-rose-400",
+        label: checksFailedLabel(status, t),
+      };
+    case "pending":
+      return {
+        icon: CircleDashed,
+        className: "text-amber-600 dark:text-amber-400",
+        label: t(($) => $.detail.pull_request_checks_running, {
+          passed: status.passed,
+          total: status.total,
+          running: status.running,
+        }),
+      };
+    case "passed":
+      return {
+        icon: CheckCircle2,
+        className: "text-emerald-600 dark:text-emerald-400",
+        label: t(($) => $.detail.pull_request_checks_all_passed, { total: status.total }),
+      };
+    case "none":
+      return {
+        icon: Circle,
+        className: "text-muted-foreground",
+        label: t(($) => $.detail.pull_request_checks_none),
+      };
+    case "unavailable":
+      return null;
+  }
 }
 
-function getStateLabel(
-  state: GitHubPullRequestState,
+function checksFailedLabel(
+  status: Extract<PullRequestChecksStatus, { kind: "failed" }>,
   t: IssuesT,
 ): string {
+  const shown = status.names.slice(0, 2);
+  if (shown.length === 0) {
+    return t(($) => $.detail.pull_request_checks_failed_count, {
+      failed: status.failed,
+      total: status.total,
+    });
+  }
+  const remaining = status.names.length - shown.length;
+  const parts = [...shown];
+  if (remaining > 0) {
+    parts.push(t(($) => $.detail.pull_request_checks_more, { count: remaining }));
+  }
+  return t(($) => $.detail.pull_request_checks_failed_named, {
+    failed: status.failed,
+    total: status.total,
+    names: parts.join(", "),
+  });
+}
+
+// Mergeability element. Returns null for the "none" state — when GitHub has not
+// decided, the card asserts neither "conflict" nor "ready".
+function getMergeBadge(status: PullRequestMergeStatus, t: IssuesT): PullRequestBadgeConfig | null {
+  switch (status.kind) {
+    case "conflicting":
+      return {
+        icon: TriangleAlert,
+        className: "text-amber-600 dark:text-amber-400",
+        label: t(($) => $.detail.pull_request_merge_conflicting),
+      };
+    case "ready":
+      return {
+        icon: CheckCircle2,
+        className: "text-emerald-600 dark:text-emerald-400",
+        label: t(($) => $.detail.pull_request_merge_ready),
+      };
+    case "blocked":
+      return {
+        icon: CircleSlash,
+        className: "text-muted-foreground",
+        label: t(($) => $.detail.pull_request_merge_blocked),
+      };
+    case "behind":
+      return {
+        icon: CircleSlash,
+        className: "text-muted-foreground",
+        label: t(($) => $.detail.pull_request_merge_behind),
+      };
+    case "unstable":
+      return {
+        icon: CircleSlash,
+        className: "text-muted-foreground",
+        label: t(($) => $.detail.pull_request_merge_unstable),
+      };
+    case "has_hooks":
+      return {
+        icon: CircleSlash,
+        className: "text-muted-foreground",
+        label: t(($) => $.detail.pull_request_merge_has_hooks),
+      };
+    case "none":
+      return null;
+  }
+}
+
+function getStateLabel(state: GitHubPullRequestState, t: IssuesT): string {
   return state === "open"
     ? t(($) => $.detail.pull_request_state_open)
     : state === "draft"
@@ -664,26 +324,4 @@ function getStateLabel(
         : state === "closed"
           ? t(($) => $.detail.pull_request_state_closed)
           : state;
-}
-
-function useStatusText(kind: PullRequestStatusKind): string {
-  const { t } = useT("issues");
-  switch (kind) {
-    case "closed":
-      return t(($) => $.detail.pull_request_card_status_closed);
-    case "merged":
-      return t(($) => $.detail.pull_request_card_status_merged);
-    case "conflicts":
-      return t(($) => $.detail.pull_request_card_status_conflicts);
-    case "checks_failed":
-      return t(($) => $.detail.pull_request_card_status_checks_failed);
-    case "checks_pending":
-      return t(($) => $.detail.pull_request_card_status_checks_pending);
-    case "checks_passed":
-      return t(($) => $.detail.pull_request_card_status_checks_passed);
-    case "ready":
-      return t(($) => $.detail.pull_request_card_status_ready);
-    case "unknown":
-      return t(($) => $.detail.pull_request_card_status_unknown);
-  }
 }

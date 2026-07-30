@@ -231,9 +231,9 @@ function IssueSurfaceContent({
             renderEmpty(renderContext)
           ) : (
             <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-3 text-muted-foreground">
-              <ListTodo className="h-10 w-10 text-muted-foreground/40" />
-              <p className="text-sm">{t(($) => $.detail.empty_issues_title)}</p>
-              <p className="text-xs">{t(($) => $.detail.empty_issues_hint)}</p>
+              <ListTodo className="h-10 w-10 text-faint-foreground" />
+              <p className="text-body">{t(($) => $.detail.empty_issues_title)}</p>
+              <p className="text-caption">{t(($) => $.detail.empty_issues_hint)}</p>
               <Button
                 variant="outline"
                 size="sm"
@@ -327,19 +327,16 @@ function IssueSurfaceContent({
   );
 }
 
+// Table is deliberately absent. It owns its own placeholders, drawn as rows
+// inside its real grid so the header, column widths and toolbar are up before
+// any data is — a surface-level stand-in would replace all of that with bars
+// of a different shape and then jump when the rows arrived.
 function IssueSurfaceSkeleton({ mode }: { mode: string }) {
-  if (mode === "list" || mode === "table") {
+  if (mode === "list") {
     return (
       <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2">
-        {mode === "table" && <Skeleton className="mb-1 h-8 w-full" />}
-        {Array.from({ length: mode === "table" ? 8 : 4 }).map((_, i) => (
-          <Skeleton
-            key={i}
-            className={cn(
-              "w-full",
-              mode === "table" ? "h-9 rounded-sm" : "h-10 rounded-lg",
-            )}
-          />
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-10 w-full rounded-lg" />
         ))}
       </div>
     );

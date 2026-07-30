@@ -216,6 +216,56 @@ describe("useIssueSurfaceController", () => {
     );
   });
 
+  // MUL-5477. `tableQuerySpec` is the identity every downstream consumer keys
+  // off: the facet request, the status/group branch hooks, and — the expensive
+  // one — the Table's `useQueries` branch list, which is rebuilt whenever this
+  // object changes. Two of the queries feeding the spec defaulted their data to
+  // a fresh `[]` while un-settled, so for the whole pending window after a
+  // workspace switch every render produced a new-but-identical spec and rebuilt
+  // all of them.
+  it("keeps the table query spec identity while its source queries are still pending", async () => {
+    setApiInstance({
+      listIssues,
+      listIssueTableRows,
+      listIssueTableFacets,
+      listGroupedIssues: vi.fn(() => never()),
+      listProjects: vi.fn(() => never()),
+      getAgentTaskSnapshot,
+      getChildIssueProgress: vi.fn(() => never()),
+      // Both held pending: this is the state right after a workspace switch,
+      // and it is the state in which the identity used to churn.
+      listProperties: vi.fn(() => never()),
+      getWorkspaceWorkingAgents: vi.fn(() => never()),
+    } as unknown as ApiClient);
+
+    const store = getIssueSurfaceViewStore("workspace:identity");
+    const { result, rerender } = renderHook(
+      () =>
+        useIssueSurfaceController({
+          scope: { type: "workspace", actorKind: "all" },
+          modes: ["table"],
+        }),
+      { wrapper: makeWrapper(qc, "workspace:identity") },
+    );
+
+    const first = result.current.tableQuerySpec;
+    rerender();
+    rerender();
+    expect(result.current.tableQuerySpec).toBe(first);
+
+    // A real change to the query must still produce a new identity, otherwise
+    // this would be pinned rather than stable.
+    act(() => store.getState().setSortBy("priority"));
+    await waitFor(() =>
+      expect(result.current.tableQuerySpec.sort.field).toBe("priority"),
+    );
+    const afterSort = result.current.tableQuerySpec;
+    expect(afterSort).not.toBe(first);
+
+    rerender();
+    expect(result.current.tableQuerySpec).toBe(afterSort);
+  });
+
   it("uses the unified workspace query for workspace scope", async () => {
     const { result } = renderHook(
       () =>
@@ -858,7 +908,7 @@ describe("useIssueSurfaceController", () => {
     );
     expect(result.current.tableQuerySpec.filters.assignees).toBeUndefined();
     expect(result.current.tableQuerySpec.filters.working_only).toBeUndefined();
-    expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined);
+    expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined, undefined);
     expect(listIssues).not.toHaveBeenCalled();
   });
 
@@ -891,6 +941,7 @@ describe("useIssueSurfaceController", () => {
       expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith(
         "issue",
         "assigned",
+        undefined,
       ),
     );
     expect(result.current.tableQuerySpec.filters.working_issue_ids).toEqual([]);
@@ -927,7 +978,7 @@ describe("useIssueSurfaceController", () => {
       );
       expect(result.current.tableQuerySpec.filters.assignees).toBeUndefined();
       expect(result.current.tableQuerySpec.filters.working_only).toBeUndefined();
-      expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined);
+      expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined, undefined);
       expect(getAgentTaskSnapshot).not.toHaveBeenCalled();
     },
   );
@@ -1336,7 +1387,7 @@ describe("useIssueSurfaceController", () => {
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.workingScopeIssues).toEqual([]);
-    expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined);
+    expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith("issue", undefined, undefined);
     expect(getAgentTaskSnapshot).not.toHaveBeenCalled();
   });
 
@@ -1508,6 +1559,7 @@ describe("useIssueSurfaceController", () => {
     await waitFor(() =>
       expect(getWorkspaceWorkingAgents).toHaveBeenCalledWith(
         "issue",
+        undefined,
         undefined,
       ),
     );

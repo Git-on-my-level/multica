@@ -51,6 +51,7 @@ import { Button } from "@multica/ui/components/ui/button";
 import { StatusHeading } from "./status-heading";
 import { HiddenColumnsPanel, HiddenColumnRow } from "./hidden-columns-panel";
 import { InfiniteScrollSentinel } from "./infinite-scroll-sentinel";
+import { ListLoadMoreFooter } from "./list-load-more-footer";
 import { AppLink } from "../../navigation";
 import { ProjectIcon } from "../../projects/components/project-icon";
 import { ActorAvatar } from "../../common/actor-avatar";
@@ -1402,7 +1403,7 @@ function SwimLaneViewImpl({
         {groupBranches?.isError && laneGroups.length === 0 && (
           <button
             type="button"
-            className="py-8 text-sm text-destructive hover:underline"
+            className="py-8 text-body text-destructive hover:underline"
             onClick={groupBranches.retryGroups}
           >
             {t(($) => $.table.load_more_failed_retry)}
@@ -1609,7 +1610,7 @@ function DraggableSwimLane({
       >
         {!lane.isPinned && (
           <GripVertical
-            className="!size-3 shrink-0 cursor-grab text-muted-foreground/60"
+            className="!size-3 shrink-0 cursor-grab text-faint-foreground"
             aria-hidden
           />
         )}
@@ -1633,13 +1634,13 @@ function DraggableSwimLane({
               size="sm"
             />
           )}
-          <span className="truncate text-sm font-semibold">{lane.title}</span>
+          <span className="truncate text-body font-semibold">{lane.title}</span>
           {lane.identifier && (
-            <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+            <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-micro font-medium tabular-nums text-muted-foreground">
               {lane.identifier}
             </span>
           )}
-          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+          <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
             {laneTotal}
           </span>
         </button>
@@ -1771,24 +1772,20 @@ function SwimLaneCell({
           ))}
         </SortableContext>
         {issueIds.length === 0 && (
-          <p className="py-6 text-center text-xs text-muted-foreground">
+          <p className="py-6 text-center text-caption text-muted-foreground">
             &mdash;
           </p>
         )}
-        {page?.isError ? (
-          <button
-            type="button"
-            className="w-full py-2 text-xs text-destructive hover:underline"
-            onClick={page.retry}
-          >
-            {t(($) => $.table.load_more_failed_retry)}
-          </button>
-        ) : page?.hasMore ? (
-          <InfiniteScrollSentinel
-            onVisible={page.loadMore}
-            loading={page.isLoading || page.isFetching}
+        {page && (
+          <ListLoadMoreFooter
+            hasMore={page.hasMore}
+            isLoading={page.isLoading || page.isFetching}
+            total={page.total}
+            onLoadMore={page.loadMore}
+            isError={page.isError}
+            onRetry={page.retry}
           />
-        ) : null}
+        )}
       </div>
       {/* One of these per lane×status cell (~170 on a real swimlane) —
           eagerly mounted tooltip roots here were the single largest slice
