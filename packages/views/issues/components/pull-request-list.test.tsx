@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@multica/core/i18n/react";
-import type { GitHubPullRequest, IssuePullRequestHandoff } from "@multica/core/types";
+import type { GitHubPullRequest } from "@multica/core/types";
 import enCommon from "../../locales/en/common.json";
 import enIssues from "../../locales/en/issues.json";
 
@@ -16,31 +16,15 @@ vi.mock("@multica/core/github/queries", async () => {
     ...actual,
     issuePullRequestsOptions: (issueId: string) => ({
       queryKey: ["github", "pull-requests", issueId],
-      queryFn: async () => ({ pull_requests: mockPRs, handoff: mockHandoff }),
+      queryFn: async () => ({ pull_requests: mockPRs }),
       enabled: !!issueId,
     }),
   };
 });
 
-vi.mock("@multica/core/api", () => ({
-  api: {
-    linkIssuePullRequest: (...args: unknown[]) => mockLinkIssuePullRequest(...args),
-    unlinkIssuePullRequest: (...args: unknown[]) => mockUnlinkIssuePullRequest(...args),
-  },
-}));
-
 import { PullRequestList } from "./pull-request-list";
 
 let mockPRs: GitHubPullRequest[] = [];
-let mockHandoff: IssuePullRequestHandoff | undefined;
-
-const mockLinkIssuePullRequest = vi.fn();
-const mockUnlinkIssuePullRequest = vi.fn();
-
-beforeEach(() => {
-  mockPRs = [];
-  mockHandoff = undefined;
-});
 
 function makePR(overrides: Partial<GitHubPullRequest> = {}): GitHubPullRequest {
   return {
@@ -80,16 +64,13 @@ function makePR(overrides: Partial<GitHubPullRequest> = {}): GitHubPullRequest {
 
 function renderList() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return {
-    qc,
-    ...render(
-      <QueryClientProvider client={qc}>
-        <I18nProvider resources={TEST_RESOURCES} locale="en">
-          <PullRequestList issueId="issue-1" wsId="ws-1" />
-        </I18nProvider>
-      </QueryClientProvider>,
-    ),
-  };
+  return render(
+    <QueryClientProvider client={qc}>
+      <I18nProvider resources={TEST_RESOURCES} locale="en">
+        <PullRequestList issueId="issue-1" />
+      </I18nProvider>
+    </QueryClientProvider>,
+  );
 }
 
 async function waitForRender() {
@@ -379,192 +360,5 @@ describe("PullRequestList sidebar rows", () => {
     expect(screen.getByText("PR-C")).toBeInTheDocument();
     expect(screen.queryByText("PR-D")).not.toBeInTheDocument();
     expect(screen.getByText("Show 1 more")).toBeInTheDocument();
-  });
-});
-
-describe("PullRequestList PR handoff state", () => {
-  it("shows a missing handoff when no PR was reported", async () => {
-    mockHandoff = { state: "missing", candidates: [] };
-    renderList();
-    const status = await screen.findByTestId("pull-request-handoff");
-    expect(status).toHaveAttribute("data-handoff-state", "missing");
-    expect(status).toHaveTextContent("No agent-reported pull request is available");
-  });
-
-  it("shows an awaiting-mirror candidate with its canonical PR link", async () => {
-    mockHandoff = {
-      state: "awaiting_mirror",
-      candidates: [{
-        url: "https://github.com/acme/widget/pull/42",
-        state: "awaiting_mirror",
-        task_id: "task-1",
-        repo_owner: "acme",
-        repo_name: "widget",
-        number: 42,
-      }],
-    };
-    renderList();
-    const status = await screen.findByTestId("pull-request-handoff");
-    expect(status).toHaveAttribute("data-handoff-state", "awaiting_mirror");
-    expect(status).toHaveTextContent("Waiting for GitHub to mirror the reported pull request");
-    expect(within(status).getByRole("link", { name: "acme/widget#42" })).toHaveAttribute(
-      "href",
-      "https://github.com/acme/widget/pull/42",
-    );
-  });
-
-  it("shows a linked handoff once the native PR exists", async () => {
-    mockPRs = [makePR({ number: 42 })];
-    mockHandoff = {
-      state: "linked",
-      candidates: [{
-        url: "https://github.com/acme/widget/pull/42",
-        state: "linked",
-        task_id: "task-1",
-        repo_owner: "acme",
-        repo_name: "widget",
-        number: 42,
-      }],
-    };
-    renderList();
-    const status = await screen.findByTestId("pull-request-handoff");
-    expect(status).toHaveAttribute("data-handoff-state", "linked");
-    expect(status).toHaveTextContent("Reported pull request linked");
-  });
-});
-
-describe("PullRequestList link / unlink", () => {
-  beforeEach(() => {
-    mockLinkIssuePullRequest.mockReset();
-    mockUnlinkIssuePullRequest.mockReset();
-  });
-
-  it("opens the link dialog when 'Link PR' is clicked", async () => {
-    mockPRs = [];
-    renderList();
-    await screen.findByText(/No linked pull requests/i);
-    fireEvent.click(screen.getByRole("button", { name: /Link PR/i }));
-    expect(screen.getByRole("heading", { name: /Link a pull request/i })).toBeInTheDocument();
-    expect(screen.getByLabelText(/Pull request URL/i)).toBeInTheDocument();
-  });
-
-  it("shows the invalid-URL error and disables Link for a bad URL; a valid URL enables it", async () => {
-    mockPRs = [];
-    renderList();
-    await screen.findByText(/No linked pull requests/i);
-    fireEvent.click(screen.getByRole("button", { name: /Link PR/i }));
-    const input = screen.getByLabelText(/Pull request URL/i);
-    const linkBtn = within(screen.getByRole("dialog")).getByRole("button", { name: /^Link$/i });
-
-    fireEvent.change(input, { target: { value: "not a url" } });
-    expect(screen.getByText(/Enter a valid GitHub pull request URL/i)).toBeInTheDocument();
-    expect(linkBtn).toBeDisabled();
-
-    fireEvent.change(input, { target: { value: "https://github.com/acme/widget/pull/123" } });
-    expect(screen.queryByText(/Enter a valid GitHub pull request URL/i)).not.toBeInTheDocument();
-    expect(linkBtn).not.toBeDisabled();
-  });
-
-  it("submits with the url + close intent and closes the dialog on success", async () => {
-    mockLinkIssuePullRequest.mockResolvedValue(makePR());
-    mockPRs = [];
-    const { qc } = renderList();
-    const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
-    await screen.findByText(/No linked pull requests/i);
-    fireEvent.click(screen.getByRole("button", { name: /Link PR/i }));
-    fireEvent.change(screen.getByLabelText(/Pull request URL/i), {
-      target: { value: "https://github.com/acme/widget/pull/123" },
-    });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Mark done when merged/i }));
-    fireEvent.click(
-      within(screen.getByRole("dialog")).getByRole("button", { name: /^Link$/i }),
-    );
-
-    await waitFor(() => {
-      expect(mockLinkIssuePullRequest).toHaveBeenCalledWith(
-        "issue-1",
-        "https://github.com/acme/widget/pull/123",
-        true,
-      );
-    });
-    // On success the dialog closes.
-    await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: /Link a pull request/i })).not.toBeInTheDocument();
-    });
-    // A merged PR can move the issue to done in this mutation. Refresh the
-    // issue caches directly so the status is correct even without a socket.
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["issues", "ws-1", "detail", "issue-1"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["issues", "ws-1", "list"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["issues", "ws-1", "my"],
-    });
-  });
-
-  it("shows the server error and keeps the dialog open when linking fails", async () => {
-    mockLinkIssuePullRequest.mockRejectedValue(
-      new Error("PR not mirrored in this workspace"),
-    );
-    mockPRs = [];
-    renderList();
-    await screen.findByText(/No linked pull requests/i);
-    fireEvent.click(screen.getByRole("button", { name: /Link PR/i }));
-    fireEvent.change(screen.getByLabelText(/Pull request URL/i), {
-      target: { value: "https://github.com/acme/widget/pull/123" },
-    });
-    fireEvent.click(
-      within(screen.getByRole("dialog")).getByRole("button", { name: /^Link$/i }),
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/PR not mirrored in this workspace/i)).toBeInTheDocument();
-    });
-    // Dialog stays open so the user can read the message / fix the URL.
-    expect(screen.getByRole("heading", { name: /Link a pull request/i })).toBeInTheDocument();
-  });
-
-  it("calls unlink with the issue id + PR url after confirming", async () => {
-    mockUnlinkIssuePullRequest.mockResolvedValue(undefined);
-    mockPRs = [makePR({ html_url: "https://github.com/acme/widget/pull/42" })];
-    renderList();
-    await waitForRender();
-
-    // The row's unlink button (aria-label "Unlink") opens the confirm.
-    fireEvent.click(screen.getByRole("button", { name: /^Unlink$/i }));
-    expect(screen.getByText(/Unlink this pull request/i)).toBeInTheDocument();
-
-    // Confirm action lives inside the alert dialog.
-    fireEvent.click(
-      within(screen.getByRole("alertdialog")).getByRole("button", { name: /^Unlink$/i }),
-    );
-    await waitFor(() => {
-      expect(mockUnlinkIssuePullRequest).toHaveBeenCalledWith(
-        "issue-1",
-        "https://github.com/acme/widget/pull/42",
-      );
-    });
-  });
-
-  it("shows the server error in the confirm dialog when unlinking fails", async () => {
-    mockUnlinkIssuePullRequest.mockRejectedValue(
-      new Error("pull request is not linked to this issue"),
-    );
-    mockPRs = [makePR({ html_url: "https://github.com/acme/widget/pull/42" })];
-    renderList();
-    await waitForRender();
-
-    fireEvent.click(screen.getByRole("button", { name: /^Unlink$/i }));
-    fireEvent.click(
-      within(screen.getByRole("alertdialog")).getByRole("button", { name: /^Unlink$/i }),
-    );
-
-    // The error surfaces inside the confirm dialog and the dialog stays open.
-    await waitFor(() => {
-      expect(screen.getByText(/not linked to this issue/i)).toBeInTheDocument();
-    });
-    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
   });
 });
