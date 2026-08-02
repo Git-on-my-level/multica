@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { render } from "@testing-library/react";
 import {
   formatEntityPageTitle,
   formatIssuePageTitle,
   truncatePageTitle,
 } from "./page-title";
 import { dashboardRouteTitle } from "@/components/dashboard-page-title";
+import { PageTitle } from "@/components/page-title";
 
 describe("browser page title formatting", () => {
   it("keeps the issue identifier first and truncates only the issue title", () => {
@@ -28,5 +30,32 @@ describe("browser page title formatting", () => {
 
   it("normalizes whitespace before truncating", () => {
     expect(truncatePageTitle("  One\n  title  ")).toBe("One title");
+  });
+
+  it("classifies an issue detail path so the first paint can leave Project workspace", () => {
+    const route = dashboardRouteTitle(
+      "/scaling-forever/issues/SCA-286",
+      null,
+    );
+    expect(route).toEqual({
+      fallback: "Issue",
+      detail: { kind: "issue", id: "SCA-286" },
+    });
+    expect(formatIssuePageTitle(undefined, undefined)).toBe("Issue");
+    expect(
+      formatIssuePageTitle(
+        "SCA-286",
+        "fix(desktop): eliminate recurring Gemini timeout blind spots",
+      ),
+    ).toMatch(/^SCA-286 /);
+  });
+});
+
+describe("PageTitle", () => {
+  it("renders a title element and syncs document.title on first paint", () => {
+    document.title = "Project workspace";
+    const label = "SCA-286 fix(desktop): eliminate recurring Gemini…";
+    render(<PageTitle title={label} />);
+    expect(document.title).toBe(label);
   });
 });
