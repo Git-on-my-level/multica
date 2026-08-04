@@ -21,7 +21,10 @@ const sourceDir = path.join(root, ".source");
 const exclusiveLock = path.join(sourceDir, ".generate.exclusive");
 const timeoutMs = 120_000;
 
-const READY_FILES = ["index.ts", "source.config.mjs"];
+// fumadocs-mdx CLI writes index.ts; Next's createMDX loader may materialize
+// additional files under .source during build. Treat index.ts as the ready
+// signal so concurrent turbo tasks no-op instead of regenerating mid-build.
+const READY_FILES = ["index.ts"];
 
 function isReady() {
   return READY_FILES.every((name) => fs.existsSync(path.join(sourceDir, name)));
