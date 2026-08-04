@@ -9,19 +9,21 @@ import { DashboardPageTitle } from "@/components/dashboard-page-title";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <DashboardLayout
-      loadingIndicator={<MulticaIcon className="size-6" />}
-      searchSlot={<SearchTrigger />}
-      extra={
-        <>
-          <SearchCommand />
-          <WebNotificationBridge />
-          <FloatingChat />
-        </>
-      }
-    >
+    <>
       <DashboardPageTitle />
-      {children}
-    </DashboardLayout>
+      <DashboardLayout
+        loadingIndicator={<MulticaIcon className="size-6" />}
+        searchSlot={<SearchTrigger />}
+        extra={
+          <>
+            <SearchCommand />
+            <WebNotificationBridge />
+            <FloatingChat />
+          </>
+        }
+      >
+        {children}
+      </DashboardLayout>
+    </>
   );
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 import {
   formatEntityPageTitle,
   formatIssuePageTitle,
@@ -38,10 +38,10 @@ describe("browser page title formatting", () => {
       null,
     );
     expect(route).toEqual({
-      fallback: "Issue",
+      fallback: "SCA-286",
       detail: { kind: "issue", id: "SCA-286" },
     });
-    expect(formatIssuePageTitle(undefined, undefined)).toBe("Issue");
+    expect(formatIssuePageTitle(route.detail?.id, undefined)).toBe("SCA-286");
     expect(
       formatIssuePageTitle(
         "SCA-286",
@@ -57,5 +57,14 @@ describe("PageTitle", () => {
     const label = "SCA-286 fix(desktop): eliminate recurring Gemini…";
     render(<PageTitle title={label} />);
     expect(document.title).toBe(label);
+  });
+
+  it("restores its title when another owner resets the layout default", async () => {
+    const label = "SCA-286 fix(desktop): eliminate recurring Gemini…";
+    render(<PageTitle title={label} />);
+
+    document.title = "Project workspace";
+
+    await waitFor(() => expect(document.title).toBe(label));
   });
 });
