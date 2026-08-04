@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { useWorkspaceId } from "@multica/core/hooks";
+import { useCurrentWorkspace } from "@multica/core/paths";
 import { issueDetailOptions } from "@multica/core/issues/queries";
 import { projectDetailOptions } from "@multica/core/projects/queries";
 import { autopilotListOptions } from "@multica/core/autopilots/queries";
@@ -19,6 +19,10 @@ import { formatEntityPageTitle, formatIssuePageTitle } from "@/lib/page-title";
 import { PageTitle } from "./page-title";
 
 const SETTINGS_DEFAULT_TAB = "profile";
+
+function isIssueIdentifier(value: string) {
+  return /^[A-Za-z][A-Za-z0-9]*-\d+$/.test(value);
+}
 
 function findRuntimeMachine(
   machines: ReturnType<typeof buildRuntimeMachines>,
@@ -70,7 +74,12 @@ export function dashboardRouteTitle(pathname: string, settingsTab: string | null
 
   switch (section) {
     case "issues":
-      return id ? { fallback: "Issue", detail: { kind: "issue", id } } : { fallback: "Issues" };
+      return id
+        ? {
+            fallback: isIssueIdentifier(id) ? formatIssuePageTitle(id) : "Issue",
+            detail: { kind: "issue", id },
+          }
+        : { fallback: "Issues" };
     case "my-issues": return { fallback: "My issues" };
     case "projects":
       return id ? { fallback: "Project", detail: { kind: "project", id } } : { fallback: "Projects" };
@@ -119,31 +128,36 @@ function entityName(value: unknown): string | undefined {
 export function DashboardPageTitle() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const workspaceId = useWorkspaceId();
+  const workspace = useCurrentWorkspace();
+  const workspaceId = workspace?.id ?? "";
   const route = useMemo(
     () => dashboardRouteTitle(pathname, searchParams.get("tab")),
     [pathname, searchParams],
   );
   const detail = route.detail;
   const isDetail = (kind: DetailKind) => detail?.kind === kind;
+  const isWorkspaceDetail = (kind: DetailKind) => Boolean(workspaceId) && isDetail(kind);
 
   const { data: issue } = useQuery({
     ...issueDetailOptions(workspaceId, isDetail("issue") ? detail?.id ?? "" : ""),
-    enabled: isDetail("issue"),
+    enabled: isWorkspaceDetail("issue"),
   });
   const { data: project } = useQuery({
     ...projectDetailOptions(workspaceId, isDetail("project") ? detail?.id ?? "" : ""),
-    enabled: isDetail("project"),
+    enabled: isWorkspaceDetail("project"),
   });
-  const { data: agents = [] } = useQuery({ ...agentListOptions(workspaceId), enabled: isDetail("agent") });
-  const { data: autopilots = [] } = useQuery({ ...autopilotListOptions(workspaceId), enabled: isDetail("autopilot") });
-  const { data: runtimes = [] } = useQuery({ ...runtimeListOptions(workspaceId), enabled: isDetail("runtime") });
-  const { data: skills = [] } = useQuery({ ...skillListOptions(workspaceId), enabled: isDetail("skill") });
-  const { data: squads = [] } = useQuery({ ...squadListOptions(workspaceId), enabled: isDetail("squad") });
-  const { data: members = [] } = useQuery({ ...memberListOptions(workspaceId), enabled: isDetail("member") });
+  const { data: agents = [] } = useQuery({ ...agentListOptions(workspaceId), enabled: isWorkspaceDetail("agent") });
+  const { data: autopilots = [] } = useQuery({ ...autopilotListOptions(workspaceId), enabled: isWorkspaceDetail("autopilot") });
+  const { data: runtimes = [] } = useQuery({ ...runtimeListOptions(workspaceId), enabled: isWorkspaceDetail("runtime") });
+  const { data: skills = [] } = useQuery({ ...skillListOptions(workspaceId), enabled: isWorkspaceDetail("skill") });
+  const { data: squads = [] } = useQuery({ ...squadListOptions(workspaceId), enabled: isWorkspaceDetail("squad") });
+  const { data: members = [] } = useQuery({ ...memberListOptions(workspaceId), enabled: isWorkspaceDetail("member") });
 
   let title = route.fallback;
-  if (isDetail("issue")) title = formatIssuePageTitle(issue?.identifier, issue?.title);
+  if (isDetail("issue")) {
+    const routeIdentifier = detail && isIssueIdentifier(detail.id) ? detail.id : undefined;
+    title = formatIssuePageTitle(issue?.identifier ?? routeIdentifier, issue?.title);
+  }
   if (isDetail("project")) title = formatEntityPageTitle("Project", entityName(project));
   if (isDetail("agent")) title = formatEntityPageTitle("Agent", entityName(agents.find((agent) => agent.id === detail?.id)));
   if (isDetail("autopilot")) title = formatEntityPageTitle("Autopilot", entityName(autopilots.find((autopilot) => autopilot.id === detail?.id)));
