@@ -504,6 +504,8 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	}
 	b.WriteString("6. Before exiting: only if this run produced a fact that clears the high bar (important AND likely to be re-read by future runs on this same issue, e.g. a new PR URL or deploy URL), or you noticed a metadata key from entry that is now stale, pin or clear it via `multica issue metadata set`/`delete`. Most runs write nothing here — that is the expected outcome, not a gap. When in doubt, do not write. See the `## Issue Metadata` section above for the full bar.\n\n")
 
+	b.WriteString("**PR identifier contract.** If work on this issue creates or updates a pull request, read the issue `identifier` from the `multica issue get` response and include it in the PR title, body, or branch. Prefer the link-only title form `IDENTIFIER: <summary>`. This establishes association only: do not add `Closes`, `Fixes`, or `Resolves` solely to satisfy this contract; use an explicit closing keyword only when merge-close intent is authorized.\n\n")
+
 	b.WriteString("**Ownership mode only — you own the issue status this run**\n\n")
 	fmt.Fprintf(b, "- Before step 4, run `multica issue status %s in_progress` unless your Agent Identity forbids issue status changes; if it does, skip it.\n", ctx.IssueID)
 	if ctx.IsSquadLeader {

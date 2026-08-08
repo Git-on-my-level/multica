@@ -281,6 +281,63 @@ func TestPRHandoffCandidateLinksOnlyAfterMirrorAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// A canonical URL reported by the completing agent is sufficient to associate
+// a PR after its webhook mirror arrives. This keeps a missing identifier in
+// title/body/branch from being misdiagnosed as an awaiting_mirror failure while
+// the runtime prompt separately prevents new agent-authored PRs from omitting it.
+func TestPRHandoffCandidateLinksAfterMirrorWithoutIssueIdentifier(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const (
+		installationID int64 = 990043
+		owner                = "acme"
+		repo                 = "handoff-without-identifier"
+		number         int32 = 43
+	)
+	secret := "handoff-without-identifier-secret"
+	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
+
+	issueID := createManualLinkIssue(t, "in_progress")
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	candidate, err := testHandler.Queries.UpsertIssuePRHandoffCandidate(ctx, db.UpsertIssuePRHandoffCandidateParams{
+		WorkspaceID: issue.WorkspaceID,
+		IssueID:     issue.ID,
+		TaskID:      parseUUID("33333333-3333-3333-3333-333333333333"),
+		Url:         "https://github.com/acme/handoff-without-identifier/pull/43",
+		RepoOwner:   owner,
+		RepoName:    repo,
+		PrNumber:    number,
+		State:       "awaiting_mirror",
+	})
+	if err != nil {
+		t.Fatalf("UpsertIssuePRHandoffCandidate: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_pr_handoff_candidate WHERE id = $1`, candidate.ID)
+		testPool.Exec(context.Background(), `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4`, issue.WorkspaceID, owner, repo, number)
+	})
+
+	seedManualLinkInstallation(t, testWorkspaceID, installationID)
+	firePullRequestWebhookRaw(t, secret, installationID, owner, repo, number, "opened", "open", false,
+		"Fix mobile auth redirect", "No issue identifier in this PR body.", "agent/m1-studio/auth-redirect")
+
+	if got := countLinks(t, issueID); got != 1 {
+		t.Fatalf("links after mirror = %d, want 1", got)
+	}
+	var state string
+	if err := testPool.QueryRow(ctx, `SELECT state FROM issue_pr_handoff_candidate WHERE id = $1`, candidate.ID).Scan(&state); err != nil {
+		t.Fatalf("load handoff state: %v", err)
+	}
+	if state != "linked" {
+		t.Fatalf("candidate state = %q, want linked", state)
+	}
+}
+
 func TestPRHandoffSurvivesLaterCompletedTaskWithoutCandidate(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

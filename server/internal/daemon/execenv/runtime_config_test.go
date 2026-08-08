@@ -318,6 +318,23 @@ func TestSessionContinuityNoticeLivesOutsideBrief(t *testing.T) {
 	}
 }
 
+func TestIssueWorkflowRequiresIdentifierForAgentCreatedPRs(t *testing.T) {
+	t.Parallel()
+	out := buildMetaSkillContent("claude", TaskContextForEnv{IssueID: "77777777-8888-9999-aaaa-bbbbbbbbbbbb"})
+
+	for _, want := range []string{
+		"**PR identifier contract.**",
+		"read the issue `identifier` from the `multica issue get` response",
+		"include it in the PR title, body, or branch",
+		"`IDENTIFIER: <summary>`",
+		"do not add `Closes`, `Fixes`, or `Resolves` solely to satisfy this contract",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("issue brief missing PR identifier contract %q\n---\n%s", want, out)
+		}
+	}
+}
+
 // The issue workflow must keep every Agent Identity guardrail after the
 // comment/assignment branches were merged into one byte-stable section.
 func TestIssueWorkflowHonorsAgentIdentity(t *testing.T) {
