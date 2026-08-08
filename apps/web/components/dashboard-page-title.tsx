@@ -15,10 +15,9 @@ import {
   squadListOptions,
 } from "@multica/core/workspace/queries";
 import { buildRuntimeMachines } from "@multica/views/runtimes";
+import { resolveSettingsTab } from "@multica/views/settings";
 import { formatEntityPageTitle, formatIssuePageTitle } from "@/lib/page-title";
 import { PageTitle } from "./page-title";
-
-const SETTINGS_DEFAULT_TAB = "profile";
 
 function isIssueIdentifier(value: string) {
   return /^[A-Za-z][A-Za-z0-9]*-\d+$/.test(value);
@@ -66,7 +65,10 @@ const SETTINGS_TITLES: Record<string, string> = {
   members: "Members",
   labels: "Labels",
   properties: "Properties",
+  "quick-actions": "Quick actions",
 };
+
+const SETTINGS_TAB_KEYS = Object.keys(SETTINGS_TITLES);
 
 export function dashboardRouteTitle(pathname: string, settingsTab: string | null): RouteTitle {
   // The first pathname part is the workspace slug for dashboard routes.
@@ -98,8 +100,7 @@ export function dashboardRouteTitle(pathname: string, settingsTab: string | null
     case "members":
       return id ? { fallback: "Member", detail: { kind: "member", id } } : { fallback: "Members" };
     case "settings": {
-      const tabKey =
-        settingsTab && SETTINGS_TITLES[settingsTab] ? settingsTab : SETTINGS_DEFAULT_TAB;
+      const tabKey = resolveSettingsTab(settingsTab, SETTINGS_TAB_KEYS);
       const tab = SETTINGS_TITLES[tabKey];
       return { fallback: tab ? `Settings · ${tab}` : "Settings" };
     }
@@ -124,6 +125,7 @@ function entityName(value: unknown): string | undefined {
 /**
  * Owns tab titles for the authenticated web shell. The fallback appears on
  * navigation; detail queries then add the most useful entity signal.
+ * Public/landing pages keep Multica brand titles from root metadata.
  */
 export function DashboardPageTitle() {
   const pathname = usePathname();

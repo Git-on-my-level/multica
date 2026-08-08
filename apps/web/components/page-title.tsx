@@ -8,9 +8,9 @@ import { useLayoutEffect } from "react";
  * Prefer React 19's hoisted `<title>` so Next's metadata manager and the
  * document stay on the same value. Also assign `document.title` in
  * `useLayoutEffect` so a first paint after a cold issue-link open cannot
- * linger on the root layout default ("Project workspace"). While mounted,
- * observe the document head and restore the owner title if Next's metadata
- * manager later re-applies that default after hydration.
+ * linger on the root layout default. While mounted, observe the document head
+ * and restore the owner title if Next's metadata manager later re-applies the
+ * public brand default after hydration.
  */
 export function PageTitle({ title }: { title: string }) {
   useLayoutEffect(() => {
@@ -21,7 +21,11 @@ export function PageTitle({ title }: { title: string }) {
     synchronizeTitle();
 
     const observer = new MutationObserver(synchronizeTitle);
-    observer.observe(document.head, { childList: true, subtree: true, characterData: true });
+    observer.observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
     return () => observer.disconnect();
   }, [title]);
 

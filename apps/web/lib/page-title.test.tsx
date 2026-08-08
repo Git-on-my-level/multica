@@ -5,6 +5,10 @@ import {
   formatIssuePageTitle,
   truncatePageTitle,
 } from "./page-title";
+import {
+  PUBLIC_DEFAULT_TITLE,
+  PUBLIC_TITLE_TEMPLATE,
+} from "./public-page-title";
 import { dashboardRouteTitle } from "@/components/dashboard-page-title";
 import { PageTitle } from "@/components/page-title";
 
@@ -32,7 +36,7 @@ describe("browser page title formatting", () => {
     expect(truncatePageTitle("  One\n  title  ")).toBe("One title");
   });
 
-  it("classifies an issue detail path so the first paint can leave Project workspace", () => {
+  it("classifies an issue detail path so the first paint can leave the public brand default", () => {
     const route = dashboardRouteTitle(
       "/scaling-forever/issues/SCA-286",
       null,
@@ -49,21 +53,47 @@ describe("browser page title formatting", () => {
       ),
     ).toMatch(/^SCA-286 /);
   });
+
+  it("maps legacy settings ?tab=lark to Integrations and unknown tabs to Profile", () => {
+    expect(dashboardRouteTitle("/acme/settings", "lark").fallback).toBe(
+      "Settings · Integrations",
+    );
+    expect(dashboardRouteTitle("/acme/settings", "not-a-tab").fallback).toBe(
+      "Settings · Profile",
+    );
+    expect(dashboardRouteTitle("/acme/settings", null).fallback).toBe(
+      "Settings · Profile",
+    );
+  });
+});
+
+describe("public brand title policy", () => {
+  it("keeps Multica in the public home absolute title", () => {
+    expect(PUBLIC_DEFAULT_TITLE).toContain("Multica");
+    expect(PUBLIC_DEFAULT_TITLE).not.toBe("Project workspace");
+  });
+
+  it("keeps a Multica suffix template for root-template public pages", () => {
+    // About/changelog/use-cases set a relative title like "About" and rely on
+    // the root metadata template for the brand suffix.
+    expect(PUBLIC_TITLE_TEMPLATE).toBe("%s | Multica");
+    expect(PUBLIC_TITLE_TEMPLATE.replace("%s", "About")).toBe("About | Multica");
+  });
 });
 
 describe("PageTitle", () => {
   it("renders a title element and syncs document.title on first paint", () => {
-    document.title = "Project workspace";
+    document.title = PUBLIC_DEFAULT_TITLE;
     const label = "SCA-286 fix(desktop): eliminate recurring Gemini…";
     render(<PageTitle title={label} />);
     expect(document.title).toBe(label);
   });
 
-  it("restores its title when another owner resets the layout default", async () => {
+  it("restores its title when another owner resets the public brand default", async () => {
     const label = "SCA-286 fix(desktop): eliminate recurring Gemini…";
     render(<PageTitle title={label} />);
 
-    document.title = "Project workspace";
+    document.title = PUBLIC_DEFAULT_TITLE;
 
     await waitFor(() => expect(document.title).toBe(label));
   });
