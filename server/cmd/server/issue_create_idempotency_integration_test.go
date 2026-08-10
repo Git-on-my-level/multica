@@ -147,6 +147,84 @@ func TestIssueCreateClientKeyReplaysAndRejectsChangedSemantics(t *testing.T) {
 	}
 }
 
+func TestIssueCreateClientKeyBindsInheritedProjectSemantics(t *testing.T) {
+	if testPool == nil || testServer == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	seed := fmt.Sprintf("inherited-project-%d", time.Now().UnixNano())
+	key := testClientKey(seed)
+
+	var firstProjectID, secondProjectID string
+	if err := testPool.QueryRow(ctx,
+		`INSERT INTO project (workspace_id, title) VALUES ($1, $2) RETURNING id`,
+		testWorkspaceID, "idempotency project one "+seed,
+	).Scan(&firstProjectID); err != nil {
+		t.Fatalf("create first project: %v", err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`INSERT INTO project (workspace_id, title) VALUES ($1, $2) RETURNING id`,
+		testWorkspaceID, "idempotency project two "+seed,
+	).Scan(&secondProjectID); err != nil {
+		t.Fatalf("create second project: %v", err)
+	}
+
+	parentResp, err := postIssueForWorkspace(testWorkspaceID, map[string]any{
+		"title": "idempotency parent " + seed, "project_id": firstProjectID,
+	})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	parent, err := decodeIdempotentIssueResponse(parentResp)
+	if err != nil || parentResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create parent status/error = %d/%v", parentResp.StatusCode, err)
+	}
+
+	childBody := map[string]any{
+		"client_key": key, "title": "idempotency child " + seed,
+		"parent_issue_id": parent.ID,
+	}
+	childResp, err := postIssueForWorkspace(testWorkspaceID, childBody)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	child, err := decodeIdempotentIssueResponse(childResp)
+	if err != nil || childResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create child status/error = %d/%v", childResp.StatusCode, err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1 AND workspace_id = $2`, child.ID, testWorkspaceID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue_create_idempotency WHERE workspace_id = $1 AND client_key_hash = $2`, testWorkspaceID, strings.TrimPrefix(key, "sha256:"))
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1 AND workspace_id = $2`, parent.ID, testWorkspaceID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM workspace_event_outbox WHERE workspace_id = $1 AND aggregate_id = ANY($2::uuid[])`, testWorkspaceID, []string{child.ID, parent.ID})
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM project WHERE id = ANY($1::uuid[]) AND workspace_id = $2`, []string{firstProjectID, secondProjectID}, testWorkspaceID)
+	})
+
+	var persistedProjectID string
+	if err := testPool.QueryRow(ctx, `SELECT project_id::text FROM issue WHERE id = $1`, child.ID).Scan(&persistedProjectID); err != nil {
+		t.Fatalf("read child project: %v", err)
+	}
+	if persistedProjectID != firstProjectID {
+		t.Fatalf("child project = %s, want inherited %s", persistedProjectID, firstProjectID)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET project_id = $1 WHERE id = $2 AND workspace_id = $3`, secondProjectID, parent.ID, testWorkspaceID); err != nil {
+		t.Fatalf("move parent project: %v", err)
+	}
+	replayResp, err := postIssueForWorkspace(testWorkspaceID, childBody)
+	if err != nil {
+		t.Fatalf("replay after inherited project changed: %v", err)
+	}
+	replay, err := decodeIdempotentIssueResponse(replayResp)
+	if err != nil {
+		t.Fatalf("decode inherited-project conflict: %v", err)
+	}
+	if replayResp.StatusCode != http.StatusConflict || replay.Code != "issue_client_key_conflict" {
+		t.Fatalf("changed inherited project status/code = %d/%q, want 409/issue_client_key_conflict", replayResp.StatusCode, replay.Code)
+	}
+}
+
 func TestIssueCreateClientKeyConcurrentRetryCreatesOneIssue(t *testing.T) {
 	if testPool == nil || testServer == nil {
 		t.Skip("database unavailable")
