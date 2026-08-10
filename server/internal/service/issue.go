@@ -220,10 +220,6 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			(p.AssigneeType.String == "agent" || p.AssigneeType.String == "squad") {
 			return IssueCreateResult{}, ErrIssueClientKeyAssignedDispatchUnsupported
 		}
-		semanticDigest, err = issueCreateSemanticDigest(p)
-		if err != nil {
-			return IssueCreateResult{}, fmt.Errorf("digest issue create semantics: %w", err)
-		}
 	}
 
 	tx, err := s.TxStarter.Begin(ctx)
@@ -233,7 +229,38 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 
+	// Resolve and validate parent / project before reserving a client key so
+	// the semantic digest reflects the effective project (including parent
+	// inheritance) that CreateIssue will persist.
+	projectID := p.ProjectID
+	if p.ParentIssueID.Valid {
+		parent, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+			ID:          p.ParentIssueID,
+			WorkspaceID: p.WorkspaceID,
+		})
+		if err != nil || !parent.ID.Valid {
+			return IssueCreateResult{}, ErrParentIssueNotFound
+		}
+		if !projectID.Valid {
+			projectID = parent.ProjectID
+		}
+	}
+	if projectID.Valid {
+		if _, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+			ID:          projectID,
+			WorkspaceID: p.WorkspaceID,
+		}); err != nil {
+			return IssueCreateResult{}, ErrProjectNotFound
+		}
+	}
+
 	if p.ClientKey != "" {
+		digestParams := p
+		digestParams.ProjectID = projectID
+		semanticDigest, err = issueCreateSemanticDigest(digestParams)
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("digest issue create semantics: %w", err)
+		}
 		reserved, err := qtx.ReserveIssueCreateClientKey(ctx, db.ReserveIssueCreateClientKeyParams{
 			WorkspaceID:    p.WorkspaceID,
 			ClientKeyHash:  clientKeyHash,
@@ -294,36 +321,6 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 				return IssueCreateResult{}, fmt.Errorf("commit issue client key replay: %w", err)
 			}
 			return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels, Reused: true}, nil
-		}
-	}
-
-	// Resolve and validate parent / project before reading from the
-	// duplicate guard so a forged parent or project ID is rejected
-	// before we touch the issue counter. Both checks scope by
-	// WorkspaceID — there is no path from this service to a row in a
-	// foreign workspace.
-	projectID := p.ProjectID
-	if p.ParentIssueID.Valid {
-		parent, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
-			ID:          p.ParentIssueID,
-			WorkspaceID: p.WorkspaceID,
-		})
-		if err != nil || !parent.ID.Valid {
-			return IssueCreateResult{}, ErrParentIssueNotFound
-		}
-		// Back-fill project from parent when the caller did not pin
-		// one explicitly. Matches the long-standing HTTP behavior: a
-		// sub-issue inherits its parent's project unless overridden.
-		if !projectID.Valid {
-			projectID = parent.ProjectID
-		}
-	}
-	if projectID.Valid {
-		if _, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
-			ID:          projectID,
-			WorkspaceID: p.WorkspaceID,
-		}); err != nil {
-			return IssueCreateResult{}, ErrProjectNotFound
 		}
 	}
 
