@@ -1,0 +1,11 @@
+DROP TRIGGER IF EXISTS capture_artifact_workspace_event_trigger ON attachment;
+DROP FUNCTION IF EXISTS capture_artifact_workspace_event();
+DROP TRIGGER IF EXISTS capture_run_workspace_event_trigger ON autopilot_run;
+DROP FUNCTION IF EXISTS capture_run_workspace_event();
+DROP TRIGGER IF EXISTS capture_task_workspace_event_trigger ON agent_task_queue;
+DROP FUNCTION IF EXISTS capture_task_workspace_event();
+DROP TRIGGER IF EXISTS capture_comment_workspace_event_trigger ON comment;
+DROP FUNCTION IF EXISTS capture_comment_workspace_event();
+DROP TRIGGER IF EXISTS capture_issue_workspace_event_trigger ON issue;
+DROP FUNCTION IF EXISTS capture_issue_workspace_event();
+DROP FUNCTION IF EXISTS append_workspace_event(UUID, TEXT, TEXT, TEXT, UUID, TEXT, UUID, JSONB, TIMESTAMPTZ);

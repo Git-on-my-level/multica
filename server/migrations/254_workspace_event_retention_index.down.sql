@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS workspace_event_outbox_retention_idx;

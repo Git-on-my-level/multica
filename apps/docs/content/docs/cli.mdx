@@ -92,6 +92,7 @@ multica issue search "login failure"
 
 # Create and update
 multica issue create --title "Fix login failure"
+multica issue create --title "Promoted task" --client-key sha256:<64-lowercase-hex>
 multica issue status MUL-123 in_progress
 multica issue assign MUL-123 --to "Backend Agent"
 
@@ -100,6 +101,21 @@ multica issue comment list MUL-123
 multica issue comment add MUL-123 --content "Check the regression tests first"
 multica issue runs MUL-123
 ```
+
+`--client-key` makes promotion retries authority-idempotent within the selected
+workspace. An exact retry returns the existing issue; reusing the key with a
+changed title, description, assignment, dates, labels, attachments, or other
+create semantics returns `409 issue_client_key_conflict`. Generate the key from
+a stable, non-secret promotion identity; Multica stores only its SHA-256 digest
+and a separate digest of the normalized create request, never the raw brief.
+The key remains consumed if the issue is later deleted, so a delayed retry
+cannot silently recreate intentionally removed work.
+
+Client-key creates that would immediately dispatch an agent or squad are
+rejected with `422 issue_client_key_assigned_dispatch_unsupported`. Issue
+creation and task enqueue are not one database transaction, so accepting that
+combination would leave a commit-to-enqueue crash window. Create unassigned, or
+create assigned in `backlog` and promote it separately.
 
 Read long descriptions or comments from stdin to avoid dealing with newlines and quoting:
 
@@ -167,6 +183,7 @@ See [Daemon and runtimes](/daemon-runtimes) for how it works and for custom prof
 | `label`, `property` | Manage workspace labels and custom properties |
 | `agent`, `skill`, `squad` | Manage agents, skills, and squads |
 | `autopilot` | Manage automations, triggers, and run history |
+| `event` | Replay or watch committed workspace events for automation |
 | `workspace` | Create, view, and switch workspaces, and invite members |
 | `repo` | Manage workspace repositories and check them out locally |
 | `daemon`, `runtime` | Start and stop the local daemon; view and manage runtimes |
@@ -192,6 +209,31 @@ multica agent list --output json
 ```
 
 Scripts should use JSON output rather than parsing the terminal-oriented tables. The output formats and pagination flags each command supports are defined by `multica <command> --help`.
+
+For automation that reacts to workspace changes, replay the committed event stream and persist the returned `next_cursor` only after processing the page:
+
+```bash
+multica event list --cursor 0 --limit 100
+multica event watch --cursor <last-processed-sequence>
+multica --profile staging --workspace-id <workspace-uuid> event watch --cursor <cursor>
+```
+
+`event watch` prints one compact JSON object per line and stays quiet when nothing changed. The cursor tracks a workspace-wide sequence. With `--type` filters, the returned cursor also binds the normalized filter set and the server rejects reuse with different filters. A `cursor_expired` (`410 Gone`) response means retained history no longer reaches that position; restart from the returned `oldest_cursor` and reconcile current aggregate state before continuing. Event payloads contain bounded routing/state metadata; fetch the aggregate through its normal API when full content is needed.
+
+Server operators can preview an explicit retention cutoff, then run bounded
+prefix deletion. Nothing is deleted unless both a positive retention duration
+and `--apply` are supplied:
+
+```bash
+cd server
+go run ./cmd/prune_workspace_events --retention 720h
+go run ./cmd/prune_workspace_events --retention 720h --batch-size 1000 --max-batches 100 --apply
+```
+
+Schedule the `--apply` form at the deployment layer if bounded retention is
+desired. Re-run when the JSON summary reports `has_more: true`. The pruner
+serializes with workspace appends and deletes only an age-eligible contiguous
+sequence prefix, preserving cursor/high-water invariants.
 
 ## Profiles and configuration
 
@@ -270,6 +312,8 @@ The tables below cover every current top-level command, grouped the way the CLI 
 | | `member list/add/set-role/remove` | Manage squad members | |
 | | `activity <issue-id> <outcome>` | Record a leader evaluation | |
 | `chat` | `history`, `thread [id]` | Read the external chat session an agent is currently handling | `--limit`, `--before` |
+| `event` | `list` | Read one bounded page from the durable workspace event stream | `--cursor`, `--limit`, `--type` (repeatable) |
+| | `watch` | Poll the stream and print one compact JSON event per line | `--cursor`, `--limit`, `--type` (repeatable), `--interval` |
 
 ### Runtime
 

@@ -2,9 +2,13 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -77,6 +81,10 @@ type IssueCreateParams struct {
 	// Stage groups this issue into an ordered barrier group under its parent
 	// (NULL = unstaged). See issue_child_done.go for the staged-barrier wake.
 	Stage pgtype.Int4
+	// ClientKey is an optional, caller-generated sha256:<64 lowercase hex>
+	// idempotency key. Its binding is workspace-scoped and committed in the
+	// same transaction as the issue row.
+	ClientKey string
 }
 
 // IssueCreateOpts groups optional knobs for IssueService.Create. Most
@@ -140,6 +148,24 @@ var ErrProjectNotFound = errors.New("project not found in this workspace")
 // label set. Callers translate this into their transport's 400.
 var ErrIssueLabelNotFound = errors.New("issue label not found in this workspace")
 
+// ErrIssueClientKeyConflict means this workspace already bound the supplied
+// client key to a create request with different semantic inputs.
+var ErrIssueClientKeyConflict = errors.New("issue client key already used with different semantics")
+
+// ErrIssueClientKeyTargetMissing means the key remains permanently consumed,
+// but its issue was later deleted. Retrying must not silently recreate it.
+var ErrIssueClientKeyTargetMissing = errors.New("issue client key target no longer exists")
+
+// ErrIssueClientKeyAssignedDispatchUnsupported prevents a client-key create
+// from claiming crash-safe promotion when the successful create would enqueue
+// an agent/squad task only after commit. Backlog assignments do not dispatch
+// and remain eligible.
+var ErrIssueClientKeyAssignedDispatchUnsupported = errors.New("issue client key does not support assigned creates that dispatch immediately")
+
+// ErrInvalidIssueClientKey means a non-empty key did not use the canonical
+// sha256:<64 lowercase hex> wire format.
+var ErrInvalidIssueClientKey = errors.New("invalid issue client key")
+
 // IssueCreateResult is the typed return from IssueService.Create.
 //
 //   - On the happy path: Issue is the new row, Attachments lists the
@@ -156,6 +182,9 @@ type IssueCreateResult struct {
 	// understood label_ids (see the create handler's compatibility contract).
 	Labels         []db.IssueLabel
 	DuplicateIssue *db.Issue
+	// Reused is true when ClientKey resolved an already-created issue. The
+	// caller must not interpret this as another create transition.
+	Reused bool
 }
 
 // Create runs the full issue-creation pipeline atomically end-to-end:
@@ -179,12 +208,94 @@ type IssueCreateResult struct {
 // Caller-owned validation is limited to transport-shaped checks: title
 // required, RFC3339 date format, assignee pair sanity.
 func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
+	clientKeyHash := ""
+	semanticDigest := ""
+	if p.ClientKey != "" {
+		var err error
+		clientKeyHash, err = util.ParseSHA256ClientKey(p.ClientKey)
+		if err != nil {
+			return IssueCreateResult{}, ErrInvalidIssueClientKey
+		}
+		if p.Status != "backlog" && p.AssigneeType.Valid &&
+			(p.AssigneeType.String == "agent" || p.AssigneeType.String == "squad") {
+			return IssueCreateResult{}, ErrIssueClientKeyAssignedDispatchUnsupported
+		}
+		semanticDigest, err = issueCreateSemanticDigest(p)
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("digest issue create semantics: %w", err)
+		}
+	}
+
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+
+	if p.ClientKey != "" {
+		reserved, err := qtx.ReserveIssueCreateClientKey(ctx, db.ReserveIssueCreateClientKeyParams{
+			WorkspaceID:    p.WorkspaceID,
+			ClientKeyHash:  clientKeyHash,
+			SemanticDigest: semanticDigest,
+		})
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("reserve issue client key: %w", err)
+		}
+		if reserved == 0 {
+			binding, err := qtx.GetIssueCreateClientKey(ctx, db.GetIssueCreateClientKeyParams{
+				WorkspaceID:   p.WorkspaceID,
+				ClientKeyHash: clientKeyHash,
+			})
+			if err != nil {
+				return IssueCreateResult{}, fmt.Errorf("read issue client key: %w", err)
+			}
+			if binding.SemanticDigest != semanticDigest {
+				return IssueCreateResult{}, ErrIssueClientKeyConflict
+			}
+			if !binding.IssueID.Valid {
+				return IssueCreateResult{}, fmt.Errorf("issue client key has no bound issue")
+			}
+			issue, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+				ID:          binding.IssueID,
+				WorkspaceID: p.WorkspaceID,
+			})
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return IssueCreateResult{}, ErrIssueClientKeyTargetMissing
+				}
+				return IssueCreateResult{}, fmt.Errorf("read issue client key target: %w", err)
+			}
+			// Complete a best-effort attachment link if the authority committed
+			// the issue but the original process crashed before its post-commit
+			// attachment step. LinkAttachmentsToIssue only updates unbound rows.
+			if len(p.AttachmentIDs) > 0 {
+				if err := qtx.LinkAttachmentsToIssue(ctx, db.LinkAttachmentsToIssueParams{
+					IssueID:     issue.ID,
+					WorkspaceID: issue.WorkspaceID,
+					Column3:     p.AttachmentIDs,
+				}); err != nil {
+					slog.Warn("retry attachment link failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
+				}
+			}
+			attachments, err := qtx.ListAttachmentsByIssue(ctx, db.ListAttachmentsByIssueParams{
+				IssueID: issue.ID, WorkspaceID: p.WorkspaceID,
+			})
+			if err != nil {
+				return IssueCreateResult{}, fmt.Errorf("list replayed issue attachments: %w", err)
+			}
+			labels, err := qtx.ListLabelsByIssue(ctx, db.ListLabelsByIssueParams{
+				IssueID: issue.ID, WorkspaceID: p.WorkspaceID,
+			})
+			if err != nil {
+				return IssueCreateResult{}, fmt.Errorf("list replayed issue labels: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return IssueCreateResult{}, fmt.Errorf("commit issue client key replay: %w", err)
+			}
+			return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels, Reused: true}, nil
+		}
+	}
 
 	// Resolve and validate parent / project before reading from the
 	// duplicate guard so a forged parent or project ID is rejected
@@ -315,6 +426,21 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		}
 	}
 
+	if clientKeyHash != "" {
+		bound, err := qtx.BindIssueCreateClientKey(ctx, db.BindIssueCreateClientKeyParams{
+			IssueID:        issue.ID,
+			WorkspaceID:    p.WorkspaceID,
+			ClientKeyHash:  clientKeyHash,
+			SemanticDigest: semanticDigest,
+		})
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("bind issue client key: %w", err)
+		}
+		if bound != 1 {
+			return IssueCreateResult{}, fmt.Errorf("bind issue client key: expected one reservation, updated %d", bound)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return IssueCreateResult{}, fmt.Errorf("commit: %w", err)
 	}
@@ -331,6 +457,87 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	s.maybeEnqueueOnAssign(ctx, issue, p.CreatorType, actorID)
 
 	return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels}, nil
+}
+
+// issueCreateSemanticDigest hashes the normalized authority inputs without
+// retaining any title, description, prompt, brief, or transcript in the
+// idempotency table. Slice order is normalized because label/attachment sets
+// are semantically unordered.
+func issueCreateSemanticDigest(p IssueCreateParams) (string, error) {
+	uuid := func(v pgtype.UUID) string {
+		if !v.Valid {
+			return ""
+		}
+		return util.UUIDToString(v)
+	}
+	text := func(v pgtype.Text) *string {
+		if !v.Valid {
+			return nil
+		}
+		value := v.String
+		return &value
+	}
+	date := func(v pgtype.Date) string {
+		if !v.Valid {
+			return ""
+		}
+		return v.Time.Format("2006-01-02")
+	}
+	int4 := func(v pgtype.Int4) int32 {
+		if !v.Valid {
+			return 0
+		}
+		return v.Int32
+	}
+	uuidSet := func(values []pgtype.UUID) []string {
+		out := make([]string, 0, len(values))
+		seen := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			if value.Valid {
+				id := util.UUIDToString(value)
+				if _, exists := seen[id]; !exists {
+					seen[id] = struct{}{}
+					out = append(out, id)
+				}
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	canonical := struct {
+		Version        int      `json:"v"`
+		Title          string   `json:"title"`
+		Description    *string  `json:"description"`
+		Status         string   `json:"status"`
+		Priority       string   `json:"priority"`
+		AssigneeType   *string  `json:"assignee_type"`
+		AssigneeID     string   `json:"assignee_id"`
+		CreatorType    string   `json:"creator_type"`
+		CreatorID      string   `json:"creator_id"`
+		ParentIssueID  string   `json:"parent_issue_id"`
+		ProjectID      string   `json:"project_id"`
+		StartDate      string   `json:"start_date"`
+		DueDate        string   `json:"due_date"`
+		OriginType     *string  `json:"origin_type"`
+		OriginID       string   `json:"origin_id"`
+		Stage          int32    `json:"stage"`
+		AttachmentIDs  []string `json:"attachment_ids"`
+		LabelIDs       []string `json:"label_ids"`
+		AllowDuplicate bool     `json:"allow_duplicate"`
+	}{
+		Version: 1, Title: p.Title, Description: text(p.Description), Status: p.Status, Priority: p.Priority,
+		AssigneeType: text(p.AssigneeType), AssigneeID: uuid(p.AssigneeID), CreatorType: p.CreatorType,
+		CreatorID: uuid(p.CreatorID), ParentIssueID: uuid(p.ParentIssueID), ProjectID: uuid(p.ProjectID),
+		StartDate: date(p.StartDate), DueDate: date(p.DueDate), OriginType: text(p.OriginType),
+		OriginID: uuid(p.OriginID), Stage: int4(p.Stage), AttachmentIDs: uuidSet(p.AttachmentIDs),
+		LabelIDs: uuidSet(p.LabelIDs), AllowDuplicate: p.AllowDuplicate,
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // validateIssueLabels checks that every requested label exists in the
