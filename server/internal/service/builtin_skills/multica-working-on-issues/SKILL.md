@@ -300,6 +300,21 @@ Parallel children — all start now:
 multica issue create --title "..." --parent <issue-id> --assignee <agent> --status todo
 ```
 
+For an external coordinator promoting durable work, supply a stable hash key:
+
+```bash
+multica --profile <profile> --workspace-id <uuid> issue create \
+  --title "..." --client-key sha256:<64-lowercase-hex>
+```
+
+An exact retry returns the same issue. Reusing the key with changed create
+semantics is a conflict. The authority stores only hashes, not the raw brief.
+Deleting the issue does not release the key for reuse.
+Client-key creates that immediately dispatch an agent or squad are rejected:
+issue commit and task enqueue are separate transactions, so that combination
+cannot honestly promise crash-safe dispatch. Create unassigned, or assign in
+`backlog` and promote separately.
+
 Strictly serial children — park later steps, promote one at a time:
 
 ```bash
@@ -380,6 +395,31 @@ multica issue status <child-id> done
 # correct for a true hard stop — immediate parent attention wake (does not close stage)
 multica issue status <child-id> blocked
 ```
+
+## Durable workspace event replay
+
+For an external coordinator that must observe committed issue work without
+depending on WebSocket delivery, use the workspace event stream:
+
+```bash
+multica event list --cursor 0 --limit 100
+multica event watch --cursor <last-processed-cursor>
+multica event watch --cursor 0 --type issue:updated --type task:completed
+multica --profile <profile> --workspace-id <uuid> event watch --cursor <cursor>
+```
+
+Persist `next_cursor` only after processing the returned page. A filtered
+cursor is bound to its exact normalized `--type` set; changing the set is a
+request error, not a silent skip. On `cursor_expired` (`410 Gone`), reconcile
+the current issue/task state, restart from `oldest_cursor`, and continue. Event
+payloads deliberately omit comment bodies, prompts, transcripts, task results,
+and artifact storage URLs; fetch the referenced aggregate when full content is
+needed.
+
+Retention is operator-configured, never implicit. The server-side
+`prune_workspace_events` command defaults to preview and requires both a
+positive `--retention` and `--apply` before deleting bounded contiguous-prefix
+batches. A `410` therefore has an explicit operational cause and recovery path.
 
 ## References
 

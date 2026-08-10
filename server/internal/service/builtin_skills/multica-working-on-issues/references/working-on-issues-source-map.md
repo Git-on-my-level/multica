@@ -228,6 +228,28 @@ comment-triggered runs otherwise must not change status unless asked.
 | Per-type value validation (self-correcting errors) | `server/internal/handler/property.go` (`validatePropertyValue`) |
 | API routes (`/api/properties`, PUT/DELETE `/api/issues/{id}/properties/{propertyId}`) | `server/cmd/server/router.go` |
 
+## Durable workspace event replay
+
+| Contract | Source |
+|---|---|
+| Event tables, including server-recorded retention time | `server/migrations/246_workspace_event_outbox.up.sql` |
+| Workspace cursor plus event ID/source/sequence uniqueness | `server/migrations/247_workspace_event_cursor_unique.up.sql`, `248_workspace_event_source_unique.up.sql`, `249_workspace_event_sequence_unique.up.sql`, `252_workspace_event_id_unique.up.sql` |
+| Transactional append and authoritative issue/comment/task/run/artifact triggers, installed only after prerequisite uniqueness | `server/migrations/253_workspace_event_capture.up.sql` |
+| Explicit bounded prefix pruning and retention index | `server/cmd/prune_workspace_events/main.go`, `server/pkg/db/queries/workspace_event.sql`, `server/migrations/254_workspace_event_retention_index.up.sql` |
+| Bounded replay query, exact type filtering, and retained bounds | `server/pkg/db/queries/workspace_event.sql` |
+| Authenticated member route, cursor/filter binding, and `cursor_expired` response | `server/cmd/server/router.go`, `server/internal/handler/workspace_event.go` |
+| `multica event list/watch` polling and JSONL output | `server/cmd/multica/cmd_event.go` |
+
+## Authority-owned issue-create idempotency
+
+| Contract | Source |
+|---|---|
+| Workspace-scoped hash binding without raw brief storage | `server/migrations/250_issue_create_idempotency.up.sql`, `251_issue_create_idempotency_unique.up.sql` |
+| Atomic reserve, semantic conflict, bind, and exact replay | `server/internal/service/issue.go`, `server/pkg/db/queries/issue_create_idempotency.sql` |
+| HTTP `client_key`, replay header, and stable conflict code | `server/internal/handler/issue.go` |
+| `multica issue create --client-key` | `server/cmd/multica/cmd_issue.go` |
+| Immediate agent/squad dispatch rejection for client-key creates | `server/internal/service/issue.go`, `server/internal/handler/issue.go` |
+
 ## Verification command
 
 Re-derive any line above before depending on it:

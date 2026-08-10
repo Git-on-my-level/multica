@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS issue_create_idempotency_workspace_key_uidx;

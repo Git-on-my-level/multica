@@ -2371,6 +2371,7 @@ func readRuntimeCLIVersion(metadata []byte) string {
 }
 
 type CreateIssueRequest struct {
+	ClientKey     string   `json:"client_key,omitempty"`
 	Title         string   `json:"title"`
 	Description   *string  `json:"description"`
 	Status        string   `json:"status"`
@@ -2412,6 +2413,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Title == "" {
 		writeError(w, http.StatusBadRequest, "title is required")
 		return
+	}
+	if req.ClientKey != "" {
+		if _, err := util.ParseSHA256ClientKey(req.ClientKey); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	workspaceID := h.resolveWorkspaceID(r)
@@ -2596,6 +2603,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := h.IssueService.Create(r.Context(), service.IssueCreateParams{
+		ClientKey:      req.ClientKey,
 		WorkspaceID:    wsUUID,
 		Title:          req.Title,
 		Description:    ptrToText(req.Description),
@@ -2642,6 +2650,31 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if errors.Is(err, service.ErrIssueClientKeyConflict) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "issue_client_key_conflict",
+			"error": "client_key was already used with different issue semantics",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyTargetMissing) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "issue_client_key_target_missing",
+			"error": "client_key is bound to an issue that no longer exists",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyAssignedDispatchUnsupported) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"code":  "issue_client_key_assigned_dispatch_unsupported",
+			"error": "client_key cannot be used with an agent or squad assignment that dispatches immediately; create unassigned or use backlog",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrInvalidIssueClientKey) {
+		writeError(w, http.StatusBadRequest, "client key must use sha256:<64 lowercase hex> format")
+		return
+	}
 	if errors.Is(err, service.ErrParentIssueNotFound) {
 		writeError(w, http.StatusBadRequest, "parent issue not found in this workspace")
 		return
@@ -2661,7 +2694,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issue := res.Issue
-	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
+	logMessage := "issue created"
+	if res.Reused {
+		logMessage = "issue create replayed"
+	}
+	slog.Info(logMessage, append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
@@ -2670,7 +2707,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// understood label_ids and skip its legacy post-create attach fallback.
 	labelResponses := labelsToResponse(res.Labels)
 	resp.Labels = &labelResponses
-	writeJSON(w, http.StatusCreated, resp)
+	statusCode := http.StatusCreated
+	if res.Reused {
+		statusCode = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, statusCode, resp)
 }
 
 type UpdateIssueRequest struct {

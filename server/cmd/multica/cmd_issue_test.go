@@ -437,6 +437,7 @@ func newIssueCreateTestCmd() *cobra.Command {
 	cmd.Flags().String("project", "", "")
 	cmd.Flags().String("due-date", "", "")
 	cmd.Flags().Bool("allow-duplicate", false, "")
+	cmd.Flags().String("client-key", "", "")
 	cmd.Flags().String("output", "json", "")
 	cmd.Flags().StringSlice("attachment", nil, "")
 	cmd.Flags().StringSlice("attachment-id", nil, "")
@@ -478,6 +479,43 @@ func TestRunIssueCreateSendsAllowDuplicate(t *testing.T) {
 	}
 	if got := body["allow_duplicate"]; got != true {
 		t.Fatalf("allow_duplicate = %#v, want true in request body", got)
+	}
+}
+
+func TestRunIssueCreateSendsClientKey(t *testing.T) {
+	const key = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "issue-1", "identifier": "MUL-1", "title": "Promoted", "status": "todo", "priority": "none",
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueCreateTestCmd()
+	_ = cmd.Flags().Set("title", "Promoted")
+	_ = cmd.Flags().Set("client-key", key)
+	if err := runIssueCreate(cmd, nil); err != nil {
+		t.Fatalf("runIssueCreate: %v", err)
+	}
+	if got := body["client_key"]; got != key {
+		t.Fatalf("client_key = %#v, want %q", got, key)
+	}
+}
+
+func TestRunIssueCreateRejectsMalformedClientKeyBeforeRequest(t *testing.T) {
+	cmd := newIssueCreateTestCmd()
+	_ = cmd.Flags().Set("title", "Promoted")
+	_ = cmd.Flags().Set("client-key", "sha256:not-a-digest")
+	err := runIssueCreate(cmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "64 lowercase hex") {
+		t.Fatalf("runIssueCreate error = %v, want client-key format error", err)
 	}
 }
 

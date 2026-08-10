@@ -643,6 +643,14 @@ type Issue struct {
 	Properties         []byte             `json:"properties"`
 }
 
+type IssueCreateIdempotency struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	ClientKeyHash  string             `json:"client_key_hash"`
+	SemanticDigest string             `json:"semantic_digest"`
+	IssueID        pgtype.UUID        `json:"issue_id"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`
@@ -1204,6 +1212,27 @@ type Workspace struct {
 	AvatarUrl    pgtype.Text        `json:"avatar_url"`
 	// When TRUE, an agent run that resolves to no precise accountable human (would be owner_fallback) is refused at enqueue instead of degrading to the agent owner (MUL-4302 §3.5). Default FALSE = owner_fallback. Never affects authorization (originator_user_id).
 	AttributionFailClosed bool `json:"attribution_fail_closed"`
+}
+
+type WorkspaceEventCursor struct {
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	LastSequence int64              `json:"last_sequence"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceEventOutbox struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Sequence      int64              `json:"sequence"`
+	SourceID      string             `json:"source_id"`
+	EventType     string             `json:"event_type"`
+	AggregateKind string             `json:"aggregate_kind"`
+	AggregateID   pgtype.UUID        `json:"aggregate_id"`
+	ActorType     pgtype.Text        `json:"actor_type"`
+	ActorID       pgtype.UUID        `json:"actor_id"`
+	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
+	RecordedAt    pgtype.Timestamptz `json:"recorded_at"`
+	Payload       []byte             `json:"payload"`
 }
 
 type WorkspaceInvitation struct {

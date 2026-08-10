@@ -804,11 +804,28 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 		return
 	}
-
 	// At this point workspaceMember has resolved → workspaceID is a valid UUID
 	// (the lookup would have errored otherwise), so reuse the resolved value.
 	if err := qtx.DeleteWorkspace(r.Context(), requester.WorkspaceID); err != nil {
 		slog.Warn("delete workspace failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
+		return
+	}
+	// These tables intentionally have no workspace FK/cascade. Delete them
+	// after the workspace row so cascaded issue/comment/task/artifact deletes
+	// cannot recreate durable events after an earlier sweep.
+	if err := qtx.DeleteWorkspaceEventsByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
+		slog.Warn("delete workspace durable events failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
+		return
+	}
+	if err := qtx.DeleteWorkspaceEventCursorByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
+		slog.Warn("delete workspace event cursor failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
+		return
+	}
+	if err := qtx.DeleteIssueCreateClientKeysByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
+		slog.Warn("delete workspace issue client keys failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 		return
 	}
