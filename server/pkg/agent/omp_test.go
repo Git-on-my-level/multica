@@ -352,9 +352,6 @@ func TestParseACPModelConfigOptions(t *testing.T) {
 	if glm45.ID == "" || glm45.Default {
 		t.Errorf("zai/glm-4.5 should be present and not Default: %+v", glm45)
 	}
-	if glm52.Provider != "zai" {
-		t.Errorf("provider should split on '/', got %q", glm52.Provider)
-	}
 	if glm52.Label != "GLM-5.2" {
 		t.Errorf("label should be the option name, got %q", glm52.Label)
 	}

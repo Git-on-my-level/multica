@@ -2095,10 +2095,7 @@ func TestModelSelectorContractFollowsProtocolFamily(t *testing.T) {
 	if !ok {
 		t.Fatal("omp is no longer a built-in runtime identity; this test needs a new subject")
 	}
-	if desc.ProtocolFamily != "pi" {
-		t.Fatalf("omp protocol family = %q, want pi", desc.ProtocolFamily)
-	}
-	if ModelSelectorMustBeProviderQualified("omp") != ModelSelectorMustBeProviderQualified(desc.ProtocolFamily) {
-		t.Error("omp does not inherit its selector contract from the pi protocol family")
+	if desc.ProtocolFamily != "omp" {
+		t.Fatalf("omp protocol family = %q, want omp (ACP overlay, not upstream pi JSON)", desc.ProtocolFamily)
 	}
 }

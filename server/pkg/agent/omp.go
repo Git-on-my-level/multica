@@ -73,9 +73,9 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		[]string{"acp", "--yolo"},
 		filterCustomArgs(opts.CustomArgs, ompBlockedArgs, b.cfg.Logger)...,
 	)
-	cmd := exec.CommandContext(runCtx, execPath, ompArgs...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, ompArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", ompArgs)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(ompArgs, trustAgentCommandPositional(0, "acp")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
