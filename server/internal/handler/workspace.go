@@ -1268,6 +1268,21 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspaceIssueRoots(ctx, requester.WorkspaceID) },
 		},
 		{
+			name: "delete fork event/handoff leftovers",
+			run: func() error {
+				if err := qtx.DeleteWorkspaceEventsByWorkspace(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.DeleteWorkspaceEventCursorByWorkspace(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.DeleteIssueCreateClientKeysByWorkspace(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				return qtx.DeleteWorkspacePRHandoffCandidates(ctx, requester.WorkspaceID)
+			},
+		},
+		{
 			// issue_status carries no foreign key by project rule, so its rows
 			// are swept explicitly. Placed after the issue deletes so no issue
 			// row outlives the catalog its status key resolves against.

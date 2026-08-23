@@ -875,6 +875,9 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			"branch", actualBranch,
 			"base", baseRef,
 		)
+		if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
+			return nil, err
+		}
 		return &WorktreeResult{Path: worktreePath, BranchName: actualBranch}, nil
 	}
 
@@ -914,6 +917,9 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			"branch", actualBranch,
 			"base", baseRef,
 		)
+		if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
+			return nil, err
+		}
 
 		return &WorktreeResult{
 			Path:       worktreePath,
@@ -955,6 +961,9 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 		"branch", actualBranch,
 		"base", baseRef,
 	)
+	if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
+		return nil, err
+	}
 
 	return &WorktreeResult{
 		Path:       worktreePath,

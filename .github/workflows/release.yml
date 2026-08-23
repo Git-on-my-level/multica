@@ -396,6 +396,10 @@ jobs:
   # not (yet) wired into CI.
   desktop:
     needs: release
+    # Fork overlay: do not auto-publish Desktop installers from Git-on-my-level
+    # tags. Linux/Windows desktop remains an upstream-cloud job; macOS stays
+    # human-gated via apps/desktop/MACOS_RELEASE.md.
+    if: github.repository_owner == 'multica-ai'
     strategy:
       fail-fast: false
       matrix:

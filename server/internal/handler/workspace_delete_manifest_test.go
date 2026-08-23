@@ -67,6 +67,8 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"github_pull_request_check_suite": workspaceDelete,
 	"inbox_item":                      workspaceDelete,
 	"issue":                           workspaceDelete,
+	"issue_create_idempotency":        workspaceDelete,
+	"issue_pr_handoff_candidate":      workspaceDelete,
 	"issue_view":                      workspaceDelete,
 	"issue_view_preference":           workspaceDelete,
 	"issue_dependency":                workspaceDelete,
@@ -124,6 +126,8 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"verification_code":               workspaceDeleteKeep,
 	"webhook_delivery":                workspaceDelete,
 	"workspace":                       workspaceDelete,
+	"workspace_event_cursor":          workspaceDelete,
+	"workspace_event_outbox":          workspaceDelete,
 	"workspace_invitation":            workspaceDelete,
 	"workspace_share_link":            workspaceDelete,
 }

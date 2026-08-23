@@ -199,7 +199,10 @@ func runtimeConfigPath(workDir, provider string) string {
 	// and delegate to the family's switch case. This avoids hardcoding
 	// "AGENTS.md" for every descriptor; a compatible runtime on Claude,
 	// CodeBuddy, or Qwen would otherwise write the wrong file.
-	if desc, ok := agent.BuiltinRuntimeByID(provider); ok {
+	//
+	// Fork overlay: OMP is both a builtin ID and an ACP protocol family.
+	// Recursing on ProtocolFamily == ID would overflow the stack.
+	if desc, ok := agent.BuiltinRuntimeByID(provider); ok && desc.ProtocolFamily != provider {
 		return runtimeConfigPath(workDir, desc.ProtocolFamily)
 	}
 	switch provider {
@@ -214,7 +217,7 @@ func runtimeConfigPath(workDir, provider string) string {
 		return filepath.Join(workDir, "CODEBUDDY.md")
 	case "qwen":
 		return filepath.Join(workDir, "QWEN.md")
-	case "codex", "copilot", "opencode", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwenpaw", "mcode", "dim":
+	case "codex", "copilot", "opencode", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwenpaw", "mcode", "dim", "omp":
 		return filepath.Join(workDir, "AGENTS.md")
 	default:
 		return ""
