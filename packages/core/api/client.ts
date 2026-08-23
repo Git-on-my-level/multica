@@ -4185,8 +4185,6 @@ export class ApiClient {
       raw,
       IssuePullRequestsResponseSchema,
       EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
-  IssuePullRequestResponseSchema,
-  EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
       { endpoint: "GET /api/issues/:id/pull-requests" },
     );
   }

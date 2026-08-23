@@ -772,6 +772,11 @@ export interface AppConfigResponse {
    * has no way to tell them apart, and only one of the two answers is safe. */
   local_worktree_supported?: boolean;
   server_version?: string;
+  /** Fork overlay: /api/config install/help URLs. Absent on upstream cloud. */
+  github_repo?: string;
+  github_branch?: string;
+  docs_base_url?: string;
+  changelog_url?: string;
 }
 
 // ---------------------------------------------------------------------------

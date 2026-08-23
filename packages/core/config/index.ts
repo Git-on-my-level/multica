@@ -32,6 +32,11 @@ interface ConfigState {
   // predate this signal are caught by the same net — indistinguishable from
   // here, and only one of the two answers is safe to guess.
   localWorktreeSupported: boolean;
+  // Fork overlay: /api/config install + docs URLs for Git-on-my-level.
+  githubRepo: string;
+  githubBranch: string;
+  docsBaseUrl: string;
+  changelogUrl: string;
   setCdnConfig: (config: { cdnDomain: string; cdnSigned?: boolean }) => void;
   setAuthConfig: (config: {
     allowSignup: boolean;
@@ -46,6 +51,14 @@ interface ConfigState {
   setFeatureFlags: (flags?: Record<string, boolean>) => void;
   setServerVersion: (version?: string) => void;
   setLocalWorktreeSupported: (supported?: boolean) => void;
+  setGithubConfig: (config: {
+    githubRepo?: string;
+    githubBranch?: string;
+  }) => void;
+  setDocsConfig: (config: {
+    docsBaseUrl?: string;
+    changelogUrl?: string;
+  }) => void;
 }
 
 export const configStore = createStore<ConfigState>((set) => ({
@@ -60,6 +73,10 @@ export const configStore = createStore<ConfigState>((set) => ({
   featureFlags: {},
   serverVersion: "",
   localWorktreeSupported: false,
+  githubRepo: "",
+  githubBranch: "",
+  docsBaseUrl: "",
+  changelogUrl: "",
   setCdnConfig: ({ cdnDomain, cdnSigned = false }) => set({ cdnDomain, cdnSigned }),
   setAuthConfig: ({
     allowSignup,
@@ -73,6 +90,10 @@ export const configStore = createStore<ConfigState>((set) => ({
   setServerVersion: (version = "") => set({ serverVersion: version }),
   setLocalWorktreeSupported: (supported = false) =>
     set({ localWorktreeSupported: supported === true }),
+  setGithubConfig: ({ githubRepo = "", githubBranch = "" }) =>
+    set({ githubRepo, githubBranch }),
+  setDocsConfig: ({ docsBaseUrl = "", changelogUrl = "" }) =>
+    set({ docsBaseUrl, changelogUrl }),
 }));
 
 export function useConfigStore(): ConfigState;
