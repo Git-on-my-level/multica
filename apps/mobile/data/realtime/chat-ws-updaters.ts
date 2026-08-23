@@ -205,52 +205,6 @@ export async function applyChatQuickActionsToCache(
   );
 }
 
-/**
- * Apply a `chat:quick_actions` supplement to the messages cache.
- *
- * The daemon generates quick actions in a background pass AFTER the turn
- * finishes, so they arrive on their own event well after `chat:done` already
- * invalidated + refetched the messages list (which came back with none). With
- * `staleTime: Infinity` nothing refetches again, so without this patch an
- * active mobile session would never render async-generated quick actions until
- * a manual pull-to-refresh or refocus.
- *
- * Patch the identified assistant message's `quick_actions` in place. The
- * payload's list is already server-validated, so — like web — this only
- * patches; no invalidate (mobile's cellular "patch over invalidate" rule). An
- * empty/missing list is terminal ("no suggestions this turn") and a no-op:
- * the message already renders no chips.
- *
- * Mirrors web's `applyChatQuickActionsToCache` in
- * packages/core/realtime/use-realtime-sync.ts. Mobile has a single flat
- * messages cache and no pending-placeholder marker, so it patches only that
- * one cache.
- */
-export async function applyChatQuickActionsToCache(
-  qc: QueryClient,
-  payload: ChatQuickActionsPayload,
-) {
-  const actions = payload.quick_actions ?? [];
-  if (actions.length === 0) return;
-  // chat:done's invalidate may still have a messages refetch in flight that
-  // read the assistant row BEFORE the daemon persisted these actions. Cancel it
-  // first so its actions-less response can't land after — and overwrite — the
-  // patch below. The messages query is staleTime: Infinity, so such an overwrite
-  // would never self-heal (MUL-5149 stale-refetch race). Cancel before
-  // setQueryData: cancelQueries reverts to the pre-fetch state, so patching
-  // first would be undone by the revert.
-  await qc.cancelQueries({
-    queryKey: chatKeys.messages(payload.chat_session_id),
-  });
-  qc.setQueryData<ChatMessage[]>(
-    chatKeys.messages(payload.chat_session_id),
-    (old) =>
-      old?.map((m) =>
-        m.id === payload.message_id ? { ...m, quick_actions: actions } : m,
-      ),
-  );
-}
-
 // =====================================================
 // Pending task (ChatPendingTask keyed by sessionId)
 // =====================================================
