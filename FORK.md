@@ -30,6 +30,12 @@ Current isolated overlays:
 | Linked-worktree repair | `server/internal/daemon/repocache/cache_fork.go` |
 | Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
+| Event tables without capture | `403–416` leftover tables; `418` drops leftover capture triggers |
+
+Leftover `workspace_event_*` tables are fine. Do **not** re-enable
+`415_workspace_event_capture` triggers: they take a
+`workspace_event_cursor` lock on every issue/task write and deadlock
+upstream FailTask/Rerun plus workspace-delete fence tests.
 
 After taking upstream during a sync:
 
