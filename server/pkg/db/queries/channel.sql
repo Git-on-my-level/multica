@@ -115,6 +115,47 @@ JOIN agent a ON a.id = ci.agent_id
 WHERE ci.channel_type = sqlc.arg('channel_type')
   AND ci.config ->> 'app_id' = sqlc.arg('app_id')::text;
 
+-- name: LockChannelInstallationAppIDSlot :exec
+-- Serializes everything an install does to one (channel_type, config->>'app_id')
+-- routing slot: read the current owner, decide, reclaim, upsert. Taken as the
+-- first statement of the install transaction and released by COMMIT/ROLLBACK,
+-- so the owner read below cannot go stale under a concurrent install or
+-- reconnect — a plain read-then-write leaves a TOCTOU window in which two
+-- callers both see "no live owner" and both go on to touch the slot.
+--
+-- Two-key form: the first key namespaces by channel so a feishu app_id and a
+-- wecom bot id that hash alike do not serialize against each other. hashtext
+-- collisions inside one channel only cost extra serialization, never
+-- correctness. pg_advisory_xact_lock (not pg_try_) so a second caller waits
+-- its turn rather than failing.
+SELECT pg_advisory_xact_lock(
+    hashtext(sqlc.arg('channel_type')::text),
+    hashtext(sqlc.arg('app_id')::text)
+);
+
+-- name: GetChannelInstallationSlotOwnerByAppID :one
+-- Everything the install path needs to classify the current holder of a
+-- (channel_type, config->>'app_id') slot BEFORE it acts on it, in one read.
+-- Distinct from GetChannelInstallationOwnerByAppID, which is the after-the-fact
+-- "name the conflict" read and INNER JOINs the agent away.
+--
+-- Here the joins are LEFT so an ORPHAN row survives the read: with no FKs
+-- (MUL-3515 §4) an installation outlives a deleted workspace or agent, and the
+-- caller has to tell "orphan, reclaimable" apart from "live owner, refuse".
+-- workspace_exists / agent_exists carry that; status and agent_archived_at
+-- carry the rest of ReclaimDeadChannelInstallationByAppID's own definition of
+-- dead, so the caller can predict what the reclaim would do without running it.
+-- pgx.ErrNoRows means the slot is free.
+SELECT ci.id, ci.workspace_id, ci.agent_id, ci.status,
+       a.archived_at AS agent_archived_at,
+       (a.id IS NOT NULL)::boolean AS agent_exists,
+       (w.id IS NOT NULL)::boolean AS workspace_exists
+FROM channel_installation ci
+LEFT JOIN agent a ON a.id = ci.agent_id
+LEFT JOIN workspace w ON w.id = ci.workspace_id
+WHERE ci.channel_type = sqlc.arg('channel_type')
+  AND ci.config ->> 'app_id' = sqlc.arg('app_id')::text;
+
 -- name: ReclaimDeadChannelInstallationByAppID :one
 -- Rebind cleanup gate. Frees the (channel_type, config->>'app_id') routing slot
 -- so a valid new agent can (re)bind a bot whose previous owner is DEAD, and, in
@@ -163,10 +204,30 @@ WITH dead AS (
       )
     RETURNING ci.id
 ),
+cleared_dingtalk_group_presence AS (
+    DELETE FROM dingtalk_group_presence WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_dingtalk_bot_identity AS (
+    DELETE FROM dingtalk_bot_identity WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_dingtalk_group_routes AS (
+    DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM dead)
+),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
     WHERE installation_id IN (SELECT id FROM dead)
     RETURNING chat_session_id
+),
+cleared_chat_contexts AS (
+    -- A revoked installation can still own preserved Chat history and an
+    -- in-flight task snapshot. Remove only generations whose Chat was already
+    -- cascade-deleted by an earlier orphan teardown.
+    DELETE FROM channel_chat_context_generation AS generation
+    WHERE generation.chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+      AND NOT EXISTS (
+          SELECT 1 FROM chat_session AS session
+          WHERE session.id = generation.chat_session_id
+      )
 ),
 cleared_outbound_cards AS (
     -- channel_outbound_card_message is keyed by chat_session_id (no installation_id,
@@ -197,24 +258,47 @@ detached_audit AS (
 )
 SELECT id FROM dead;
 
--- name: DeleteChannelInstallationsByArchivedRuntimeAgents :exec
+-- name: DeleteChannelInstallationsBySystemRuntimeAgents :exec
 -- Application-layer replacement for the (deliberately absent, MUL-3515 §4)
--- workspace/agent ON DELETE CASCADE: on runtime teardown, before the archived
+-- workspace/agent ON DELETE CASCADE: on runtime teardown, before the system
 -- agents are hard-deleted, remove every channel installation they own — plus all
 -- of each installation's dependent rows — so no orphaned installation keeps
 -- occupying its bot's (channel_type, app_id) routing slot after its agent is gone
--- (#4810). MUST run in the same tx as, and BEFORE, DeleteArchivedAgentsByRuntime.
--- Mirrors the agent hard-delete predicate (runtime_id, archived_at IS NOT NULL)
--- exactly.
-WITH doomed AS (
+-- (#4810). MUST run in the same tx as, and BEFORE, DeleteSystemAgentsByRuntime.
+-- Mirrors the agent hard-delete predicate (runtime_id, kind = 'system') exactly.
+--
+-- Scoped to kind = 'system' since MUL-5559: a user agent now survives its
+-- runtime's deletion as an unbound agent, so tearing down its installations
+-- here would take a working bot away from an agent that is still there.
+WITH system_agents AS (
+    SELECT system_agent.id FROM agent AS system_agent
+    WHERE system_agent.runtime_id = sqlc.arg('runtime_id') AND system_agent.kind = 'system'
+),
+doomed_sessions AS (
+    SELECT id FROM chat_session
+    WHERE agent_id IN (SELECT id FROM system_agents)
+),
+doomed AS (
     SELECT id FROM channel_installation
-    WHERE agent_id IN (
-        SELECT id FROM agent WHERE runtime_id = sqlc.arg('runtime_id') AND archived_at IS NOT NULL
-    )
+    WHERE agent_id IN (SELECT id FROM system_agents)
+),
+cleared_dingtalk_group_presence AS (
+    DELETE FROM dingtalk_group_presence WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_dingtalk_bot_identity AS (
+    DELETE FROM dingtalk_bot_identity WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_dingtalk_group_routes AS (
+    DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM doomed)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding WHERE installation_id IN (SELECT id FROM doomed)
     RETURNING chat_session_id
+),
+cleared_chat_contexts AS (
+    DELETE FROM channel_chat_context_generation
+    WHERE chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+       OR chat_session_id IN (SELECT id FROM doomed_sessions)
 ),
 cleared_outbound_cards AS (
     -- Reach channel_outbound_card_message (keyed by chat_session_id, no FK)
@@ -367,6 +451,25 @@ RETURNING *;
 SELECT * FROM channel_user_binding
 WHERE installation_id = $1 AND channel_user_id = $2;
 
+-- name: FindChannelBindingForMember :one
+-- Outbound notification lookup: given a Multica member and a channel_type,
+-- return the (installation, channel_user_id) that outbound push should
+-- target. The wecom smart-bot inbox-notification path uses this to decide
+-- whether to deliver via the bot at all — no row means "unbound member,
+-- fall back to the legacy path (TOF/RTX)".
+--
+-- If a member has bound multiple installations of the same channel_type in
+-- one workspace (multi-bot org), the most-recently-bound wins — matches
+-- FindReusableChannelUserBinding's tiebreak so the two lookups agree.
+SELECT b.* FROM channel_user_binding b
+JOIN channel_installation ci ON ci.id = b.installation_id
+WHERE b.workspace_id = sqlc.arg('workspace_id')
+  AND b.multica_user_id = sqlc.arg('multica_user_id')
+  AND b.channel_type = sqlc.arg('channel_type')
+  AND ci.status = 'active'
+ORDER BY b.bound_at DESC
+LIMIT 1;
+
 -- name: FindReusableChannelUserBinding :one
 -- Cross-installation account-link reuse (MUL-3911). When a platform user
 -- messages an installation they have NOT linked, but the SAME user id is already
@@ -421,12 +524,18 @@ WHERE installation_id = $1;
 -- is its own session. config carries any platform-specific outbound routing the
 -- key alone does not (e.g. Slack's real channel_id when the key is composite);
 -- it is opaque to the shared session service.
+WITH binding AS (
 INSERT INTO channel_chat_session_binding (
     chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config
 ) VALUES (
     $1, $2, $3, $4, $5, $6
 )
-RETURNING *;
+RETURNING *
+), generation AS (
+    INSERT INTO channel_chat_context_generation (chat_session_id, revision)
+    SELECT chat_session_id, context_revision FROM binding
+)
+SELECT * FROM binding;
 
 -- name: GetChannelChatSessionBinding :one
 -- Lookup-by-channel-chat: the inbound dispatcher finds the existing
@@ -443,6 +552,16 @@ SELECT * FROM channel_chat_session_binding
 WHERE chat_session_id = sqlc.arg('chat_session_id')
   AND channel_type = sqlc.arg('channel_type');
 
+-- name: GetChannelChatSessionBindingBySessionAny :one
+-- Channel-agnostic reverse lookup: which channel, if any, is behind this
+-- chat_session? UNIQUE (chat_session_id) guarantees at most one row, so a
+-- caller that only needs to READ the binding never has to name the channel it
+-- is hoping for — and therefore cannot go blind on a channel added later.
+-- The channel_type-scoped variant above stays for the outbound senders, which
+-- are per-platform by construction and must not deliver into a foreign one.
+SELECT * FROM channel_chat_session_binding
+WHERE chat_session_id = $1;
+
 -- name: UpdateChannelChatSessionBindingReplyTarget :exec
 -- Records the most recent inbound trigger message + thread so the decoupled
 -- outbound patcher can thread its reply back into the originating topic.
@@ -451,11 +570,128 @@ SET last_message_id = sqlc.narg('last_message_id'),
     last_thread_id  = sqlc.narg('last_thread_id')
 WHERE chat_session_id = $1;
 
+-- name: MarkChannelChatSessionPendingFresh :one
+-- Persists a channel `/new` intent until the next chat task is successfully
+-- created. RETURNING makes a missing binding an error instead of silently
+-- acknowledging a fresh start that was never stored.
+UPDATE channel_chat_session_binding
+SET pending_fresh = TRUE
+WHERE chat_session_id = $1
+RETURNING pending_fresh;
+
+-- name: LockChannelChatSessionPendingFresh :one
+-- EnqueueChatTask reads this under the same row lock and transaction that
+-- creates the task. A concurrent `/new` therefore lands either before this
+-- task and is consumed by it, or after this task and remains for the next one.
+SELECT pending_fresh FROM channel_chat_session_binding
+WHERE chat_session_id = $1
+FOR UPDATE;
+
+-- name: LockChannelChatSessionBindingForContext :one
+-- Context mutations acquire this row after chat_session and before any
+-- channel_chat_context_generation row. Keeping the statements separate makes
+-- the lock order explicit and identical for append, /new, and task enqueue.
+SELECT * FROM channel_chat_session_binding
+WHERE chat_session_id = $1
+FOR UPDATE;
+
+-- name: ClearChannelChatSessionPendingFresh :exec
+UPDATE channel_chat_session_binding
+SET pending_fresh = FALSE
+WHERE chat_session_id = $1;
+
+-- name: ClearChannelChatSessionPendingFreshForRevision :exec
+UPDATE channel_chat_session_binding
+SET pending_fresh = FALSE
+WHERE chat_session_id = @chat_session_id
+  AND context_revision = @revision;
+
+-- name: EnsureChannelChatContextGeneration :exec
+-- Rolling-deploy repair: an older server can create a binding after the schema
+-- migration but before every process is upgraded. Materialize its generation
+-- lazily before a new server attempts to lock it.
+INSERT INTO channel_chat_context_generation (
+    chat_session_id, revision
+)
+SELECT binding.chat_session_id, binding.context_revision
+FROM channel_chat_session_binding AS binding
+WHERE binding.chat_session_id = $1
+ON CONFLICT (chat_session_id, revision) DO NOTHING;
+
+-- name: AdvanceChannelChatContextGeneration :one
+-- Opens a new agent-visible context while retaining the same Multica Chat.
+-- The triggering platform message is the exclusive end of the old generation
+-- and, when it has a body, the inclusive start of the new one.
+WITH closed AS (
+    UPDATE channel_chat_context_generation AS generation
+    SET history_end_message_id = sqlc.narg('history_boundary_message_id')
+    WHERE generation.chat_session_id = @chat_session_id
+      AND generation.revision = @current_revision
+), advanced AS (
+    UPDATE channel_chat_session_binding AS binding
+    SET context_revision = binding.context_revision + 1,
+        pending_fresh = TRUE
+    WHERE binding.chat_session_id = @chat_session_id
+      AND binding.context_revision = @current_revision
+    RETURNING binding.*
+), opened AS (
+    INSERT INTO channel_chat_context_generation (
+        chat_session_id, revision, history_start_message_id,
+        history_boundary_pending, pending_fresh
+    )
+    SELECT chat_session_id, context_revision,
+           CASE WHEN @has_message_body::boolean THEN sqlc.narg('history_boundary_message_id') END,
+           NOT @has_message_body::boolean,
+           TRUE
+    FROM advanced
+    RETURNING *
+)
+SELECT * FROM opened;
+
+-- name: LockChannelChatContextGenerationByRevision :one
+SELECT * FROM channel_chat_context_generation
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision
+FOR UPDATE;
+
+-- name: ResolveChannelChatContextHistoryStart :exec
+UPDATE channel_chat_context_generation
+SET history_start_message_id = @history_start_message_id,
+    history_boundary_pending = FALSE
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision
+  AND history_boundary_pending;
+
+-- name: SetChannelChatContextInitiator :one
+-- Snapshots the latest authenticated sender whose durable input belongs to a
+-- generation. Crash recovery must use this identity rather than the sender of
+-- a later generation that happened to re-arm the lost debounce timer.
+UPDATE channel_chat_context_generation
+SET initiator_user_id = @initiator_user_id
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision
+RETURNING initiator_user_id;
+
+-- name: ClearChannelChatContextPendingFresh :exec
+UPDATE channel_chat_context_generation
+SET pending_fresh = FALSE
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision;
+
+-- name: GetChannelChatContextGeneration :one
+SELECT * FROM channel_chat_context_generation
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision;
+
 -- name: DeleteChannelChatSessionBindingBySession :exec
 -- Application-layer integrity (replaces the old chat_session-FK ON DELETE
 -- CASCADE): drop the binding when its chat_session is deleted.
-DELETE FROM channel_chat_session_binding
-WHERE chat_session_id = $1;
+WITH deleted_binding AS (
+    DELETE FROM channel_chat_session_binding AS binding
+    WHERE binding.chat_session_id = sqlc.arg('chat_session_id')
+)
+DELETE FROM channel_chat_context_generation AS generation
+WHERE generation.chat_session_id = sqlc.arg('chat_session_id');
 
 -- name: DeleteChannelChatSessionBindingsByInstallation :exec
 -- Retire every chat-session binding for an installation. Used when an
@@ -464,9 +700,12 @@ WHERE chat_session_id = $1;
 -- so reusing it would keep routing the conversation to the OLD agent. Dropping
 -- the bindings forces the next inbound message to create a fresh session under
 -- the new agent. The chat_session rows are preserved for history; only the
--- channel binding is removed.
-DELETE FROM channel_chat_session_binding
-WHERE installation_id = $1 AND channel_type = $2;
+-- channel binding is removed. Context generations belong to the preserved Chat,
+-- not to the retired binding: in-flight task history snapshots may still read
+-- them after this statement commits.
+DELETE FROM channel_chat_session_binding AS binding
+WHERE binding.installation_id = sqlc.arg('installation_id')
+  AND binding.channel_type = sqlc.arg('channel_type');
 
 -- =====================
 -- channel_inbound_message_dedup
@@ -524,7 +763,7 @@ WHERE received_at < $1;
 -- column — only routing / identity / drop_reason / timestamp.
 INSERT INTO channel_inbound_audit (
     installation_id, channel_type, channel_chat_id, event_type,
-    channel_event_id, channel_message_id, drop_reason
+    channel_event_id, channel_message_id, drop_reason, id
 ) VALUES (
     sqlc.narg('installation_id'),
     $1,
@@ -532,7 +771,8 @@ INSERT INTO channel_inbound_audit (
     $2,
     sqlc.narg('channel_event_id'),
     sqlc.narg('channel_message_id'),
-    $3
+    $3,
+    COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 );
 
 -- name: ListChannelInboundAuditByInstallation :many
@@ -608,6 +848,37 @@ INSERT INTO channel_binding_token (
     LEAST(sqlc.arg('expires_at')::timestamptz, now() + INTERVAL '15 minutes')
 )
 RETURNING *;
+
+-- name: FindLiveChannelBindingToken :one
+-- Mint guard: the newest token for this platform user that is still
+-- unconsumed, unexpired, and recent enough that the link already sitting in
+-- their chat is the one to point back at. Without it every message from an
+-- unbound user mints another row, so a user who keeps typing at a bot they
+-- have not linked yet writes one row per message. This narrows that to
+-- roughly one row per window; it is not a hard guarantee, since the caller
+-- runs this and the insert as two statements.
+--
+-- `mint_interval` is the caller's throttle window (see
+-- wecom.BindingTokenMintInterval). It is subtracted from now() rather than
+-- passed in as an absolute cutoff so the whole window is measured on the
+-- database clock: created_at is stamped by the column default, and comparing
+-- it against an application-side timestamp would let clock skew between the
+-- two stretch or shrink the window. The consumed_at / expires_at predicates
+-- keep an already-redeemed or stale token from suppressing a mint the user
+-- actually needs.
+--
+-- idx_channel_binding_token_installation covers the installation_id prefix;
+-- the rest is a filter over that installation's live tokens, which is a small
+-- set because nothing here outlives the 15-minute TTL.
+SELECT * FROM channel_binding_token
+WHERE installation_id = $1
+  AND channel_type = $2
+  AND channel_user_id = $3
+  AND consumed_at IS NULL
+  AND expires_at > now()
+  AND created_at >= now() - sqlc.arg('mint_interval')::interval
+ORDER BY created_at DESC
+LIMIT 1;
 
 -- name: ConsumeChannelBindingToken :one
 -- Atomic redemption: returns the row only if the hash exists, is

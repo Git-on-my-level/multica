@@ -12,7 +12,7 @@ import (
 )
 
 const findActiveDuplicateIssuesByTitle = `-- name: FindActiveDuplicateIssuesByTitle :many
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at FROM issue
 WHERE workspace_id = $1
   AND status NOT IN ('done', 'cancelled')
   AND lower(btrim(regexp_replace(title, '[[:space:]]+', ' ', 'g'))) = $2
@@ -60,6 +60,8 @@ func (q *Queries) FindActiveDuplicateIssuesByTitle(ctx context.Context, arg Find
 			&i.Metadata,
 			&i.Stage,
 			&i.Properties,
+			&i.Revision,
+			&i.LastActivityAt,
 		); err != nil {
 			return nil, err
 		}
@@ -72,7 +74,7 @@ func (q *Queries) FindActiveDuplicateIssuesByTitle(ctx context.Context, arg Find
 }
 
 const listOpenPullRequestsByRepository = `-- name: ListOpenPullRequestsByRepository :many
-SELECT id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files FROM github_pull_request
+SELECT id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, api_mergeable, api_merge_state_status, checks_rollup_state, snapshot_head_sha, snapshot_fetched_at FROM github_pull_request
 WHERE workspace_id = $1
   AND repo_owner = $2
   AND repo_name = $3
@@ -120,6 +122,11 @@ func (q *Queries) ListOpenPullRequestsByRepository(ctx context.Context, arg List
 			&i.Additions,
 			&i.Deletions,
 			&i.ChangedFiles,
+			&i.ApiMergeable,
+			&i.ApiMergeStateStatus,
+			&i.ChecksRollupState,
+			&i.SnapshotHeadSha,
+			&i.SnapshotFetchedAt,
 		); err != nil {
 			return nil, err
 		}

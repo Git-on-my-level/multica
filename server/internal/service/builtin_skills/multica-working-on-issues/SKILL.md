@@ -16,27 +16,6 @@ For building mention links, load `multica-mentioning` instead — not this skill
 Every contract below is traced to source in
 `references/working-on-issues-source-map.md`.
 
-## Read the coordination snapshot before mutating
-
-Use the ordinary read-only commands when ownership, duplicate work, or PR
-handoff is uncertain:
-
-```bash
-multica context --output json
-multica issue inspect <issue> --output json
-multica issue route --title "..." [--repo <github-clone-url>] [--project <id>] --output json
-multica issue url <issue>
-```
-
-`context` returns non-secret live workspace/project/resource/repository and
-routing-agent context. `inspect` is the server-owned point-in-time view of the
-issue, assignee, active/latest runs, native PRs, PR handoff, and safe-action
-signals. `route` is advisory only: its decisions (`safe_to_create`,
-`use_existing_issue`, `needs_project_selection`, or
-`blocked_by_active_owner`) never create, assign, or rerun anything. `issue url`
-is the authoritative human-facing web URL; do not assemble a public Multica
-domain by hand.
-
 ## PR linking and close intent are two distinct contracts
 
 The GitHub webhook runs two separate scans over an incoming PR. They are not the
@@ -117,12 +96,7 @@ stale).
 multica issue pull-requests <issue-id> --output json
 ```
 
-Returns `{"pull_requests": [...], "handoff": {...}}`. `handoff.state` is one of
-`missing`, `candidate_detected`, `awaiting_mirror`, `linked`,
-`invalid_external_pr`, or `multiple_candidates_needs_review`. A canonical
-agent-reported URL can remain `awaiting_mirror` until the connected GitHub App
-mirrors it; candidate detection alone never declares close intent or completes
-the issue. Each `pull_requests` element exposes:
+Returns `{"pull_requests": [...]}`. Each element exposes:
 
 - `number`, `html_url`, `title`
 - `state` — the PR lifecycle as a **single enum**, one of `merged`, `closed`,
@@ -153,48 +127,21 @@ not observe a routable issue key in the PR title/body/branch — or the only mat
 was a bare body mention, which links as `reference_only` and is hidden from this
 list (see the reference-only rule above).
 
-## Linking or unlinking a PR by hand
+## Metadata: durable custom state
 
-If the webhook scanner did not link a PR (e.g. the issue key is not in its
-title/body/branch, or you want close intent without editing the PR body), you
-can link it explicitly. Both reuse the same link row, `close_intent` flag, and
-close aggregate as the webhook path — there is no separate metadata-only link.
+Metadata is a free-form KV bag of durable issue state. Reading metadata is safe.
+Writing a metadata key is a state mutation and should be tied to an explicit
+task requirement to record that state for later readers or runs. Keys are
+whatever your workflow needs — the platform curates no vocabulary; pick short
+snake_case names and reuse them consistently within your workspace.
 
-```bash
-multica issue pull-requests link   <issue> --url <github-pr-url> [--close-intent]
-multica issue pull-requests unlink <issue> --url <github-pr-url>
-```
-
-The PR must already be mirrored in the issue's workspace (a connected GitHub App
-installation delivered it via webhook); an unmirrored PR returns 404. With
-`--close-intent`, linking an already-merged PR advances the issue to `done`
-under the native gate (no open/draft sibling, issue not already
-`done`/`cancelled`). Unlinking never reopens a `done`/`cancelled` issue.
-`pull-requests <id>` (no subcommand) still lists; `link`/`unlink` are
-subcommands.
-
-## Metadata: high-signal keys only
-
-Metadata is durable issue state. Reading metadata is safe. Writing a metadata key
-is a state mutation and should be tied to an explicit task requirement to record
-that state for later readers or runs.
-
-High-signal keys (reuse these names so queries stay consistent):
-
-- `pr_url`
-- `pr_number`
-- `pipeline_status`
-- `deploy_url`
-- `external_issue_url`
-- `waiting_on`
-- `blocked_reason`
-- `decision`
-
-Not metadata: logs, summaries, files touched, timestamps, attempt counts,
-investigation notes. Those belong in the result comment.
+Never store secrets, tokens, or API keys in metadata.
+Not metadata: logs or summaries; runtime bookkeeping such as timestamps,
+attempt counts, or agent IDs; or other single-run details such as
+files touched and investigation notes — those belong in the result comment.
 
 ```bash
-multica issue metadata set <issue-id> --key pr_url --value <url>
+multica issue metadata set <issue-id> --key <key> --value <value>
 multica issue metadata delete <issue-id> --key <stale-key>
 ```
 
@@ -204,9 +151,10 @@ string|number|bool` to force a type.
 ## Custom properties: typed workflow state
 
 Workspaces may define custom issue properties (Severity, Environment, QA
-Status, ...). Properties are the typed, user-visible sibling of metadata:
-values are validated against the definition (select options, date format,
-http(s) URL), visible in the issue sidebar, and addressed by name.
+Status, Reviewer, ...). Properties are the typed, user-visible sibling of
+metadata: values are validated against the definition (select options, date
+format, http(s) URL, member reference), visible in the issue sidebar, and
+addressed by name.
 
 - Read what exists before writing: `multica property list` shows the catalog;
   `multica issue property list <issue-id>` shows values set on the issue.
@@ -215,49 +163,63 @@ http(s) URL), visible in the issue sidebar, and addressed by name.
 ```bash
 multica issue property set <issue-id> --name Environment --value staging
 multica issue property set <issue-id> --name Platforms --value "iOS,Android"
+multica issue property set <issue-id> --name Reviewer --value Bohan
 multica issue property unset <issue-id> --name Environment
 ```
 
 - A validation error lists the legal options — fix the value and retry.
+- `actor` / `multi_actor` properties (Reviewer, Escalation contact, ...) hold
+  workspace members only. `--value` takes a member name, email, UUID, short id,
+  or an explicit `member:<uuid>`; `multi_actor` takes a comma-separated list
+  (duplicates dropped, order kept, max 20).
 - Definitions may include an optional catalog icon for visual identification;
   it does not change the property's type or value validation.
 - Agents cannot create or edit property definitions (owner/admin humans only).
   If a needed property does not exist, propose it in a comment instead.
 - Property vs metadata: if the value is workflow state a human should see and
   filter by, and a definition exists, prefer the property. Metadata stays the
-  free-form scratchpad for run state (`pr_url`, `waiting_on`, ...).
+  free-form bag for durable custom issue state.
 
 ## Status changes have server side effects
 
 A status change is not cosmetic — the server enqueues or skips agent work based
 on it. These are the contracts, not advice:
 
+A workspace may define custom statuses beyond the seven built-ins; when any
+exist, the runtime brief's Available Commands section lists this workspace's
+catalog. A custom status inherits its category's behavior in full, and each
+built-in key below is also the name of its category — so read these bullets as
+category rules. Two writes are literal-key exceptions, not category rules: the
+failed-task rollback below writes the literal `todo` key, and a merged PR with
+close intent writes the literal `done` key.
+
 - **`backlog`** parks an agent-assigned issue: the assignee is set but no task
   fires. Moving `backlog → todo` (or any non-done/non-cancelled status) enqueues
   the assigned agent then.
-- **`in_progress` / `in_review` on assignment runs** are agent-managed CLI
-  mutations, not `StartTask` / `CompleteTask` side effects. The assignment
-  runtime brief asks ordinary agents for `todo`/`backlog` → `in_progress` then
-  `in_review` when they have delivered. For **child/sub-issues under a parent**,
-  finishing as **`in_review` or `done`** both count as stage-terminal and can
-  wake the parent when the stage barrier closes — see *Child / sub-issue
-  completion* below. Squad leaders share the opening `in_progress` step on the
-  first assignment turn, keep the **parent** there while members/children work,
-  and only move the parent to `in_review` when a later re-trigger confirms the
-  overall goal / PR handoff is met.
-- **`in_review`** is a valid finish status for children (handoff/results ready)
-  **and** the usual PR/handoff status for the issue that owns a PR (parent or
-  solo implementer). On a child, entering `in_review` participates in the parent
-  stage barrier.
-- **`done`**, **`cancelled`**, and **`in_review`** are stage-terminal for parent
-  barriers. Entering any of these from a non-terminal status can close a stage
-  and wake the parent (system comment + assignee task) once every sibling in
-  that stage is stage-terminal. If a PR carries close intent (`Closes MUL-XXXX`),
-  merge can advance the linked issue to `done` — you do not also need to flip it
-  manually when that path applies.
-- **`blocked`** does **not** close a stage, but entering `blocked` **immediately
-  wakes the parent** with an attention comment (no barrier wait). Use it for a
-  true hard stop so the parent can intervene.
+- **`in_progress` / `in_review`** are agent-managed CLI mutations, not
+  `StartTask` / `CompleteTask` side effects. The runtime brief asks agents to
+  write the state the issue is in whenever their work changes it — not from
+  the trigger type or the run's lifecycle, and not gated on being the
+  assignee. Writes happen whenever the state changes, mid-turn included: a
+  turn that advances the issue's own ask sets `in_progress` as soon as that
+  is known, so the board shows the work while it runs; a blocker is recorded
+  when it is hit; and the turn must not exit with a stale value — delivered
+  the issue's own ask → `in_review`; work continues beyond the turn
+  (dispatched sub-issues, partial delivery) → `in_progress`; stuck →
+  `blocked`. A turn that produces none of the issue's own deliverable —
+  answering a question, consulting on work owned elsewhere — writes nothing
+  at any point. The kind of activity never decides this: research, design,
+  planning, and review all count as the work exactly when they are what the
+  issue asks for (a review-the-PR issue is being worked the moment reviewing
+  starts). Questions, discussion, or acknowledgements never move the status.
+  Squad leaders: dispatching members is not delivery — a dispatch turn
+  leaves the parent `in_progress`, and it moves to `in_review` only when a
+  later re-trigger confirms the overall goal is met.
+- **`in_review`** is an accepted issue status. Some workflows use it while a PR
+  is open and awaiting review; moving to it is an explicit mutation.
+- **`done`** on a child issue posts a system comment on its parent. If a PR
+  carries close intent (`Closes MUL-XXXX`), it advances the issue to `done`
+  itself on merge — you do not also need to flip it manually.
 - **`cancelled`** is a terminal, user-driven decision to close the issue. Like
   `done` it enqueues no new agent work, but it does **not** stop tasks already in
   flight — a run in progress keeps going (MUL-4465). To stop a running task,
@@ -266,27 +228,25 @@ on it. These are the contracts, not advice:
   `todo` when no active task / retry remains — that is the main server-owned
   status write on the agent-run path.
 
-### Child / sub-issue completion (prescriptive)
+## Claim ownership without duplicating a run
 
-When **this issue is a child** (has a parent) and its job is a unit of work the
-parent will synthesize or gate on:
+Assigning an active issue to an agent normally starts a run. When the work is
+already underway and the write only records ownership or progress, pass
+`--no-start` on every command in that flow — suppressing the assignment alone
+does not suppress a later status update:
 
-1. After the final comment with evidence/artifacts, set status to **`in_review`**
-   (handoff/results ready) or **`done`**. Either status is stage-terminal and
-   can wake the parent when the stage barrier closes.
-2. Prefer **`in_review`** when the parent still needs to synthesize or act on
-   your results; prefer **`done`** when the child unit is fully closed with
-   nothing left for the parent except optional bookkeeping.
-3. Use **`blocked`** when you cannot make further progress without external
-   input (missing auth, human decision, hard dependency). State the exact
-   blocker in the final comment. Entering `blocked` immediately wakes the
-   parent (attention path); it does **not** close the stage barrier.
-4. Use **`cancelled`** only if this unit of work is abandoned (also
-   stage-terminal).
+```bash
+multica issue assign <issue-id> --to-id <agent-id> --no-start
+multica issue update <issue-id> --assignee-id <agent-id> --no-start
+multica issue status <issue-id> in_progress --no-start
+```
 
-When **creating** sub-issues under a parent you own, put that completion contract
-in each child description before assign. Parent gates should treat child
-`in_review` or `done` as finished units.
+Before self-assigning, check the target issue's comment history for an existing
+claim and any `## Active sibling runs` block (its `run-messages` commands show
+work in flight). The server also suppresses a trusted self-assignment when the
+exact target `(issue, agent)` pair already has a non-terminal task, but it
+deliberately keeps same-agent handoffs to a fresh issue starting runs: cross-issue
+serial chains and triage batches rely on that.
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
@@ -299,21 +259,6 @@ Parallel children — all start now:
 ```bash
 multica issue create --title "..." --parent <issue-id> --assignee <agent> --status todo
 ```
-
-For an external coordinator promoting durable work, supply a stable hash key:
-
-```bash
-multica --profile <profile> --workspace-id <uuid> issue create \
-  --title "..." --client-key sha256:<64-lowercase-hex>
-```
-
-An exact retry returns the same issue. Reusing the key with changed create
-semantics is a conflict. The authority stores only hashes, not the raw brief.
-Deleting the issue does not release the key for reuse.
-Client-key creates that immediately dispatch an agent or squad are rejected:
-issue commit and task enqueue are separate transactions, so that combination
-cannot honestly promise crash-safe dispatch. Create unassigned, or assign in
-`backlog` and promote separately.
 
 Strictly serial children — park later steps, promote one at a time:
 
@@ -329,12 +274,10 @@ Creating every serial step as `todo` enqueues the whole chain at once.
 `--stage <N>` (N ≥ 1) groups sub-issues under the same parent into ordered
 stages. The parent assignee is woken **once, when a whole stage finishes** —
 i.e. every sub-issue in the lowest unfinished stage has reached a terminal
-status (`done`/`cancelled`/`in_review` — not `blocked`). A completion that does
-not close a stage is silent on the handoff path (no stage comment). A sibling
-set with **no** stages is one implicit stage, so the parent is woken once when
-the *last* sub-issue finishes — not on every child. Separately, a child entering
-**`blocked`** wakes the parent immediately for attention without closing the
-stage (see *Child / sub-issue completion* above).
+status (`done`/`cancelled`). A completion that does not close a stage is silent
+(no comment, no wake). A sibling set with **no** stages is one implicit stage,
+so the parent is woken once when the *last* sub-issue finishes — not on every
+child.
 
 Advancement is agent-driven: the server only detects the closed barrier and
 wakes the parent assignee, who then decides whether to promote the next stage's
@@ -355,6 +298,12 @@ When both Stage 1 sub-issues finish you (the parent assignee) are woken with a
 multica issue children <parent-id>             # sub-issues grouped by stage
 multica issue status <stage-2-child-id> todo   # promote when its deps are met
 ```
+
+`issue children --output json` reports per-stage `done` counts. A workspace may
+define custom statuses beyond the 7 built-ins; a custom status counts as done
+here when its category is `done` or `cancelled`, which is what `status_category`
+on each child carries. Read `status_category` rather than matching `status`
+against the built-in names.
 
 Read each sub-issue's description before promoting and only promote items whose
 stated dependencies are met; if a description conflicts with the parent's
@@ -382,44 +331,6 @@ multica issue create --title "Step 1" --parent <issue-id> --assignee <agent> --s
 multica issue create --title "Step 2" --parent <issue-id> --assignee <agent> --stage 2 --status backlog
 multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --stage 3 --status backlog
 ```
-
-Child finish status (stage barrier / parent wake):
-
-```text
-# correct — handoff/results ready; stage-terminal (wakes parent when barrier closes)
-multica issue status <child-id> in_review
-
-# correct — child unit fully closed; also stage-terminal
-multica issue status <child-id> done
-
-# correct for a true hard stop — immediate parent attention wake (does not close stage)
-multica issue status <child-id> blocked
-```
-
-## Durable workspace event replay
-
-For an external coordinator that must observe committed issue work without
-depending on WebSocket delivery, use the workspace event stream:
-
-```bash
-multica event list --cursor 0 --limit 100
-multica event watch --cursor <last-processed-cursor>
-multica event watch --cursor 0 --type issue:updated --type task:completed
-multica --profile <profile> --workspace-id <uuid> event watch --cursor <cursor>
-```
-
-Persist `next_cursor` only after processing the returned page. A filtered
-cursor is bound to its exact normalized `--type` set; changing the set is a
-request error, not a silent skip. On `cursor_expired` (`410 Gone`), reconcile
-the current issue/task state, restart from `oldest_cursor`, and continue. Event
-payloads deliberately omit comment bodies, prompts, transcripts, task results,
-and artifact storage URLs; fetch the referenced aggregate when full content is
-needed.
-
-Retention is operator-configured, never implicit. The server-side
-`prune_workspace_events` command defaults to preview and requires both a
-positive `--retention` and `--apply` before deleting bounded contiguous-prefix
-batches. A `410` therefore has an explicit operational cause and recovery path.
 
 ## References
 

@@ -1,23 +1,20 @@
 import { resolve } from "path";
-import { defineConfig } from "electron-vite";
+import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   main: {
-    // Bundle workspace packages into the main-process output. Externalizing
-    // them leaves raw `.ts` sources in node_modules, which Node 22 (Electron 39)
-    // refuses to type-strip at runtime (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING).
-    build: {
-      externalizeDeps: {
-        exclude: ["@multica/core"],
-      },
-    },
+    plugins: [externalizeDepsPlugin()],
   },
   preload: {
-    build: {
-      externalizeDeps: true,
-    },
+    // `@electron-toolkit/preload` must be bundled INTO the preload script:
+    // the renderer windows run with `sandbox: true`, and a sandboxed preload's
+    // `require` can only load `electron` plus a couple of node builtins — an
+    // externalized `require("@electron-toolkit/preload")` would throw and
+    // every contextBridge API would vanish. electron-vite emits preload as a
+    // single CJS bundle, which is exactly what the sandbox requires.
+    plugins: [externalizeDepsPlugin({ exclude: ["@electron-toolkit/preload"] })],
   },
   renderer: {
     server: {

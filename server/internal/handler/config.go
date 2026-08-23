@@ -38,8 +38,6 @@ type AppConfig struct {
 	DaemonAppURL    string `json:"daemon_app_url,omitempty"`
 	GithubRepo      string `json:"github_repo,omitempty"`
 	GithubBranch    string `json:"github_branch,omitempty"`
-	DocsBaseURL     string `json:"docs_base_url,omitempty"`
-	ChangelogURL    string `json:"changelog_url,omitempty"`
 
 	// VCSIntegrationAvailable mirrors the MULTICA_VCS_INTEGRATION_ENABLED
 	// deployment switch so the Settings UI can hide the whole self-hosted Git
@@ -63,6 +61,22 @@ type AppConfig struct {
 	// raw rules here: /api/config is public and may be called anonymously.
 	FeatureFlags map[string]bool `json:"feature_flags,omitempty"`
 
+	// LocalWorktreeSupported tells clients this server understands
+	// local_directory `execution_mode` and enforces the worktree capability
+	// gate when a resource is saved.
+	//
+	// Load-bearing for CLIENTS, not for this server. Releases before v0.4.25
+	// unmarshalled the ref into a struct without the field and re-marshalled
+	// it, so `execution_mode: "worktree"` was silently DROPPED and answered
+	// 201 — the resource then ran in_place, editing the working copy the user
+	// asked to isolate, with no gate anywhere to catch it. A new client cannot
+	// tell that from success, so it has to ask first, and absent has to read as
+	// "cannot honour it": every release that drops the field also omits this
+	// one. Releases between that fix and this signal do gate the save but say
+	// nothing, so they are treated the same way — the client cannot distinguish
+	// them, and only one of the two guesses is safe.
+	LocalWorktreeSupported bool `json:"local_worktree_supported"`
+
 	// ServerVersion is the running API build version, so self-hosted
 	// operators can confirm what's deployed and include it in bug reports.
 	// Only emitted on self-hosted deployments — omitted on the managed cloud,
@@ -77,6 +91,9 @@ type AppConfig struct {
 // to anonymous callers — never user- or tenant-scoped data.
 func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config := AppConfig{
+		// A property of this build, not of the deployment: if this code is
+		// running, the save gate is running with it.
+		LocalWorktreeSupported:    true,
 		AllowSignup:               os.Getenv("ALLOW_SIGNUP") != "false",
 		GoogleClientID:            os.Getenv("GOOGLE_CLIENT_ID"),
 		WorkspaceCreationDisabled: os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
@@ -87,8 +104,6 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config.CdnSigned = h.CFSigner != nil
 	config.DaemonServerURL, config.DaemonAppURL = daemonSetupURLsFromEnv()
 	config.GithubRepo, config.GithubBranch = githubConfigFromEnv()
-	config.DocsBaseURL = normalizePublicURL(os.Getenv("MULTICA_DOCS_BASE_URL"))
-	config.ChangelogURL = normalizePublicURL(os.Getenv("MULTICA_CHANGELOG_URL"))
 	config.VCSIntegrationAvailable = h.cfg.VCSIntegrationEnabled
 	config.FeatureFlags = featureflags.EvaluateFrontendPublicFlags(r.Context(), h.FeatureFlags)
 	// Only surface the build version on self-hosted deployments. The managed
@@ -112,25 +127,9 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, config)
 }
 
-func githubConfigFromEnv() (string, string) {
-	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
-	if !validGithubRepoSlug(repo) {
-		return "", ""
-	}
-	return repo, strings.TrimSpace(os.Getenv("MULTICA_GITHUB_BRANCH"))
-}
-
-func validGithubRepoSlug(raw string) bool {
-	if strings.Contains(raw, "://") {
-		return false
-	}
-	parts := strings.Split(raw, "/")
-	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
-}
-
 func daemonSetupURLsFromEnv() (string, string) {
 	serverURL := normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
-	appURL := ResolveFrontendAppURL()
+	appURL := resolveFrontendAppURL()
 	if appURL == "" {
 		return "", ""
 	}
@@ -144,11 +143,11 @@ func daemonSetupURLsFromEnv() (string, string) {
 	return serverURL, appURL
 }
 
-// ResolveFrontendAppURL returns the operator-configured frontend origin
+// resolveFrontendAppURL returns the operator-configured frontend origin
 // (MULTICA_APP_URL, falling back to FRONTEND_ORIGIN), normalized. Shared by
-// daemon setup, managed-cloud detection, and outbound web links so all
-// user-facing links read the same deployment setting.
-func ResolveFrontendAppURL() string {
+// the daemon-setup URLs and the managed-cloud detection so both read the same
+// signal.
+func resolveFrontendAppURL() string {
 	appURL := normalizePublicURL(os.Getenv("MULTICA_APP_URL"))
 	if appURL == "" {
 		appURL = normalizePublicURL(os.Getenv("FRONTEND_ORIGIN"))
@@ -179,7 +178,7 @@ func isOfficialCloudDaemonConfig(appURL string) bool {
 // server-version row, which only matters to self-hosted operators — is gated on
 // this.
 func isOfficialCloudDeployment() bool {
-	return isOfficialCloudDaemonConfig(ResolveFrontendAppURL())
+	return isOfficialCloudDaemonConfig(resolveFrontendAppURL())
 }
 
 func urlHostEquals(raw, want string) bool {
@@ -206,4 +205,22 @@ func canonicalURLHost(raw string) string {
 		host = u.Hostname()
 	}
 	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func githubConfigFromEnv() (string, string) {
+	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
+	if !validGithubRepoSlug(repo) {
+		return "", strings.TrimSpace(os.Getenv("MULTICA_GITHUB_BRANCH"))
+	}
+	return repo, strings.TrimSpace(os.Getenv("MULTICA_GITHUB_BRANCH"))
+}
+
+func validGithubRepoSlug(raw string) bool {
+	// owner/repo — keep this conservative; install/update URLs must not accept
+	// arbitrary strings that could break GitHub download paths.
+	if raw == "" || strings.Count(raw, "/") != 1 {
+		return false
+	}
+	owner, repo, _ := strings.Cut(raw, "/")
+	return owner != "" && repo != "" && !strings.ContainsAny(raw, " \t\n")
 }

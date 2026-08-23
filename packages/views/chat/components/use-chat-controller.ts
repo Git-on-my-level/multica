@@ -5,7 +5,6 @@ import {
   useInfiniteQuery,
   useQuery,
   useQueryClient,
-  type InfiniteData,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -14,7 +13,11 @@ import { agentListOptions, memberListOptions } from "@multica/core/workspace/que
 import { projectListOptions } from "@multica/core/projects/queries";
 import { canAssignAgent } from "@multica/views/issues/components";
 import { api, dispatchReasonCode } from "@multica/core/api";
-import { useAgentPresenceDetail, useWorkspaceAgentAvailability } from "@multica/core/agents";
+import {
+  isAgentRuntimeBound as hasAgentRuntime,
+  useAgentPresenceDetail,
+  useWorkspaceAgentAvailability,
+} from "@multica/core/agents";
 import {
   chatSessionsOptions,
   chatMessagesPageOptions,
@@ -30,15 +33,19 @@ import {
   useSetChatSessionArchived,
 } from "@multica/core/chat/mutations";
 import { useChatStore } from "@multica/core/chat";
-import { removeChatMessageFromCaches } from "@multica/core/realtime";
+import { upsertChatMessageToCaches } from "@multica/core/chat/message-cache";
+import {
+  enqueuePendingChatTask,
+  hideQueuedChatMessages,
+} from "@multica/core/chat/pending";
 import { useChatDraftRestore } from "./use-chat-draft-restore";
+import { useChatTaskActions } from "./use-chat-task-actions";
 import { useChatProjectContextSupport } from "./use-chat-project-context-support";
 import { createLogger } from "@multica/core/logger";
 import type {
   Agent,
   Attachment,
   ChatMessage,
-  ChatMessagesPage,
   ChatPendingTask,
 } from "@multica/core/types";
 import { useT } from "../../i18n";
@@ -146,39 +153,40 @@ export function hasInFlightPendingTask(
   const pending = qc.getQueryData<ChatPendingTask>(chatKeys.pendingTask(sessionId));
   return Boolean(pending?.task_id);
 }
-const CHAT_VIRTUOSO_INITIAL_FIRST_ITEM_INDEX = 1_000_000;
 
-function appendChatMessageToLatestPageCache(
+export function seedAcceptedPendingTask(
   qc: ReturnType<typeof useQueryClient>,
   sessionId: string,
-  message: ChatMessage,
+  task: {
+    task_id: string;
+    created_at: string;
+    message_id: string;
+    content: string;
+    supports_queue?: boolean;
+    queued?: boolean;
+  },
 ) {
-  qc.setQueryData<InfiniteData<ChatMessagesPage>>(
-    chatKeys.messagesPage(sessionId),
+  qc.setQueryData<ChatPendingTask>(
+    chatKeys.pendingTask(sessionId),
     (old) => {
-      if (!old) {
-        return {
-          pages: [{
-            messages: [message],
-            limit: 50,
-            has_more: false,
-            next_cursor: null,
-          }],
-          pageParams: [null],
-        };
+      const next = enqueuePendingChatTask(old, {
+        task_id: task.task_id,
+        status: "queued",
+        created_at: task.created_at,
+        message_id: task.message_id,
+        content: task.content,
+      }, task.queued);
+      if (task.supports_queue === true || old?.supports_queue === true) {
+        next.supports_queue = true;
       }
-      if (old.pages.some((page) => page.messages.some((m) => m.id === message.id))) {
-        return old;
-      }
-      return {
-        ...old,
-        pages: old.pages.map((page, index) =>
-          index === 0 ? { ...page, messages: [...page.messages, message] } : page,
-        ),
-      };
+      return next;
     },
   );
+  qc.invalidateQueries({ queryKey: chatKeys.pendingTask(sessionId) });
 }
+
+const CHAT_VIRTUOSO_INITIAL_FIRST_ITEM_INDEX = 1_000_000;
+
 
 /**
  * Layout-agnostic chat controller. Holds every piece of chat conversation
@@ -225,7 +233,14 @@ export function useChatController(opts?: { isActive?: boolean }) {
   } = useInfiniteQuery(chatMessagesPageOptions(activeSessionId ?? ""));
 
   const messagePages = activeSessionId ? rawMessagePages?.pages ?? [] : [];
-  const messages = [...messagePages].reverse().flatMap((page) => page.messages);
+  const allMessages = [...messagePages].reverse().flatMap((page) => page.messages);
+
+  const { data: pendingTask, isLoading: pendingTaskLoading } = useQuery(
+    pendingChatTaskOptions(activeSessionId ?? ""),
+  );
+  const showSkeleton =
+    !!activeSessionId && (messagesLoading || pendingTaskLoading);
+  const messages = hideQueuedChatMessages(allMessages, pendingTask);
   const olderMessageCount = messagePages
     .slice(1)
     .reduce((sum, page) => sum + page.messages.length, 0);
@@ -233,11 +248,6 @@ export function useChatController(opts?: { isActive?: boolean }) {
     messages.length > 0
       ? CHAT_VIRTUOSO_INITIAL_FIRST_ITEM_INDEX - olderMessageCount
       : 0;
-  const showSkeleton = !!activeSessionId && messagesLoading;
-
-  const { data: pendingTask } = useQuery(
-    pendingChatTaskOptions(activeSessionId ?? ""),
-  );
   const pendingTaskId = pendingTask?.task_id ?? null;
   const stopRequestedBeforeTaskRef = useRef(false);
   // Durable deferred-cancellation draft restores (#5219). The whole lifecycle —
@@ -252,6 +262,13 @@ export function useChatController(opts?: { isActive?: boolean }) {
   const appForeground = useAppForeground();
   const { restoreDraftRequest, enqueueLocalRestore, handleRestoreDraftApplied } =
     useChatDraftRestore(activeSessionId, isActive && appForeground);
+  const {
+    cancelChatTask,
+    handleEditQueuedTask,
+    handleRemoveQueuedTask,
+    handleClearQueuedTasks,
+    handleSendQueuedTaskNow,
+  } = useChatTaskActions(activeSessionId, enqueueLocalRestore);
   // Nonce handed to ChatInput to pull focus into the compose box when a new
   // chat starts. Bumped by handleNewChat / handleStartNewChat only, so
   // selecting an existing chat or a deep link never steals focus.
@@ -322,6 +339,17 @@ export function useChatController(opts?: { isActive?: boolean }) {
     availableAgents.find((a) => a.id === selectedAgentId) ??
     availableAgents[0] ??
     null;
+  const isAgentRuntimeBound = !!activeAgent && hasAgentRuntime(activeAgent);
+
+  // A session outlives the permission that created it. The agent can be flipped
+  // to personal, change owner, or drop this member from its allow-list, and the
+  // server then refuses every send with `invocation_not_allowed` while still
+  // serving the transcript (MUL-4525 — read uses the view gate, send re-runs the
+  // invoke gate). Judge the SESSION's agent, not just the picker list, so the
+  // composer goes read-only up front instead of after the user types
+  // (MUL-6380). Same rule the server enforces, via the shared predicate.
+  const isAgentAccessRevoked =
+    !!activeAgent && !canAssignAgent(activeAgent, user?.id, memberRole);
 
   const agentAvailability = useWorkspaceAgentAvailability();
   const noAgent = agentAvailability === "none";
@@ -430,55 +458,6 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // (MUL-5181 L2); surfaces only forward whether the affordance exists.
   const uploadEnabled = !!activeAgent;
 
-  const cancelChatTask = useCallback(
-    async (
-      taskId: string,
-      sessionId: string,
-      options: { restoreDraftToInput: boolean; source: string },
-    ) => {
-      apiLogger.info("cancelTask.start", {
-        taskId,
-        sessionId,
-        source: options.source,
-      });
-      qc.setQueryData(chatKeys.pendingTask(sessionId), {});
-
-      try {
-        const result = await api.cancelTaskById(taskId);
-        const restored = result.cancelled_chat_message;
-        if (restored?.restore_to_input) {
-          removeChatMessageFromCaches(qc, restored.chat_session_id, restored.message_id);
-          if (options.restoreDraftToInput && restored.chat_session_id === sessionId) {
-            enqueueLocalRestore({
-              id: restored.message_id,
-              content: restored.content,
-              attachments: restored.attachments,
-              sessionId: restored.chat_session_id,
-            });
-          }
-        }
-        qc.invalidateQueries({ queryKey: chatKeys.messages(sessionId) });
-        qc.invalidateQueries({ queryKey: chatKeys.messagesPage(sessionId) });
-        apiLogger.info("cancelTask.success", {
-          taskId,
-          sessionId,
-          restoredToInput: !!restored?.restore_to_input && options.restoreDraftToInput,
-        });
-        return result;
-      } catch (err) {
-        apiLogger.warn("cancelTask.error (task may have already finished)", {
-          taskId,
-          sessionId,
-          err,
-        });
-        qc.invalidateQueries({ queryKey: chatKeys.messages(sessionId) });
-        qc.invalidateQueries({ queryKey: chatKeys.messagesPage(sessionId) });
-        return null;
-      }
-    },
-    [qc, enqueueLocalRestore],
-  );
-
   const handleSend = useCallback(
     async (
       content: string,
@@ -500,6 +479,27 @@ export function useChatController(opts?: { isActive?: boolean }) {
         });
         return false;
       }
+      // Invoke permission was revoked while this session was open. The server
+      // would refuse with a 403 before persisting anything; not attempting the
+      // send keeps the draft and avoids a pointless roundtrip. The input is
+      // disabled in this state — this is the belt-and-braces guard.
+      if (isAgentAccessRevoked) {
+        apiLogger.warn("sendChatMessage skipped: invoke permission revoked", {
+          sessionId: activeSessionId,
+          agentId: activeAgent.id,
+        });
+        return false;
+      }
+      if (pendingTaskId && pendingTask?.supports_queue !== true) {
+        apiLogger.warn("sendChatMessage skipped: server does not support follow-up queues", {
+          sessionId: activeSessionId,
+        });
+        return false;
+      }
+      if (!isAgentRuntimeBound) {
+        toast.error(t(($) => $.input.runtime_required_toast));
+        return false;
+      }
 
       const finalContent = content;
       const isNewSession = !activeSessionId;
@@ -519,10 +519,13 @@ export function useChatController(opts?: { isActive?: boolean }) {
         apiLogger.error("sendChatMessage.ensureSession.error", err);
         // A revoked invoke permission blocks session create with a structured
         // 403 (MUL-4525) — name the cause instead of a generic failure.
+        const reason = dispatchReasonCode(err);
         toast.error(
-          dispatchReasonCode(err) === "invocation_not_allowed"
+          reason === "invocation_not_allowed"
             ? t(($) => $.input.send_blocked_toast)
-            : t(($) => $.input.send_failed_toast),
+            : reason === "agent_runtime_required"
+              ? t(($) => $.input.runtime_required_toast)
+              : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -539,19 +542,20 @@ export function useChatController(opts?: { isActive?: boolean }) {
       // the draft for retry (ChatInput never cleared it).
       let result;
       try {
-        result = await api.sendChatMessage(sessionId, finalContent, attachmentIds, {
-          quickActionsEnabled: useChatStore.getState().quickActionsEnabled,
-        });
+        result = await api.sendChatMessage(sessionId, finalContent, attachmentIds);
       } catch (err) {
         apiLogger.error("sendChatMessage.error", { sessionId, err });
         // Invoke permission can be revoked mid-session; the send is refused with
         // a structured 403 before anything persists (MUL-4525). Surface the
         // specific cause so the user knows it is a permission change, not a
         // transient failure they should retry.
+        const reason = dispatchReasonCode(err);
         toast.error(
-          dispatchReasonCode(err) === "invocation_not_allowed"
+          reason === "invocation_not_allowed"
             ? t(($) => $.input.send_blocked_toast)
-            : t(($) => $.input.send_failed_toast),
+            : reason === "agent_runtime_required"
+              ? t(($) => $.input.runtime_required_toast)
+              : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -577,15 +581,18 @@ export function useChatController(opts?: { isActive?: boolean }) {
         created_at: result.created_at,
         attachments: draftAttachments,
       };
-      appendChatMessageToLatestPageCache(qc, sessionId, sent);
-      qc.setQueryData<ChatMessage[]>(
-        chatKeys.messages(sessionId),
-        (old) => (old ? [...old, sent] : [sent]),
-      );
-      qc.setQueryData<ChatPendingTask>(chatKeys.pendingTask(sessionId), {
+      // Single door into the message caches (MUL-5711): idempotent by id, so
+      // this row and the chat:message echo of the same send converge in either
+      // arrival order, and this richer row (it carries the draft attachments)
+      // is never downgraded by the echo, which has no attachments field.
+      upsertChatMessageToCaches(qc, sessionId, sent, { seedIfMissing: true });
+      seedAcceptedPendingTask(qc, sessionId, {
         task_id: result.task_id,
-        status: "queued",
         created_at: result.created_at,
+        message_id: result.message_id,
+        content: finalContent,
+        supports_queue: result.supports_queue,
+        queued: result.queued,
       });
       // Cache primed → publish the new active session, but only if the user
       // hasn't navigated away mid-send. See isStillOnComposeTarget. commitInput
@@ -626,6 +633,10 @@ export function useChatController(opts?: { isActive?: boolean }) {
       activeSessionId,
       activeAgent,
       isAgentArchived,
+      isAgentAccessRevoked,
+      pendingTask,
+      pendingTaskId,
+      isAgentRuntimeBound,
       ensureSession,
       cancelChatTask,
       qc,
@@ -801,6 +812,8 @@ export function useChatController(opts?: { isActive?: boolean }) {
     currentSession,
     isSessionArchived,
     isAgentArchived,
+    isAgentAccessRevoked,
+    isAgentRuntimeBound,
     activeAgent,
     noAgent,
     availability,
@@ -822,6 +835,10 @@ export function useChatController(opts?: { isActive?: boolean }) {
     // actions
     handleSend,
     handleStop,
+    handleSendQueuedTaskNow,
+    handleEditQueuedTask,
+    handleRemoveQueuedTask,
+    handleClearQueuedTasks,
     uploadEnabled,
     handleNewChat,
     handleStartNewChat,

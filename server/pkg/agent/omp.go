@@ -73,9 +73,9 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		[]string{"acp", "--yolo"},
 		filterCustomArgs(opts.CustomArgs, ompBlockedArgs, b.cfg.Logger)...,
 	)
-	cmd := exec.CommandContext(runCtx, execPath, ompArgs...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, ompArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", ompArgs)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(ompArgs, trustAgentCommandPositional(0, "acp")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -206,7 +206,7 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		// Drop MCP entries whose remote transport the runtime didn't advertise
 		// in its initialize response. See hermes.go for why sending an
 		// unsupported transport tanks the whole session/new.
-		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "omp", b.cfg.Logger)
+		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "omp", b.cfg)
 
 		cwd := opts.Cwd
 		if cwd == "" {
@@ -383,12 +383,10 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		// token). Mirrors hermes/kimi/kiro/qoder/traecli.
 		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, finalOutput, providerErr)
 
-		c.usageMu.Lock()
-		u := c.usage
-		c.usageMu.Unlock()
+		u := c.accumulatedUsage()
 
 		var usageMap map[string]TokenUsage
-		if u.InputTokens > 0 || u.OutputTokens > 0 || u.CacheReadTokens > 0 || u.CacheWriteTokens > 0 {
+		if acpUsagePresent(u) {
 			model := effectiveModel
 			if model == "" {
 				model = "unknown"
@@ -407,4 +405,10 @@ func (b *ompBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func (b *ompBackend) applyBuiltinRuntimeOverrides(desc BuiltinRuntime) {
+	if desc.DefaultExecutable != "" && b.cfg.ExecutablePath == "" {
+		b.cfg.ExecutablePath = desc.DefaultExecutable
+	}
 }

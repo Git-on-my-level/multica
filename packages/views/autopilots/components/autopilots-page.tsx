@@ -165,7 +165,7 @@ const TEMPLATES: AutopilotTemplate[] = [
   },
   {
     id: "bug_triage",
-    prompt: `1. List all issues with status "triage" or "backlog" that have not been prioritized
+    prompt: `1. List all backlog issues that have not been prioritized
 2. For each issue, read the description and any attached logs or screenshots
 3. Assess severity (critical / high / medium / low) based on user impact and scope
 4. Set the priority field on the issue accordingly
@@ -251,7 +251,11 @@ function NameCell({ autopilot }: { autopilot: Autopilot }) {
           paused automation needs an inline signal. */}
       {autopilot.status === "paused" && (
         <span
-          title={t(($) => $.status.paused)}
+          title={
+            autopilot.pause_reason === "agent_runtime_required"
+              ? t(($) => $.status.paused_runtime_required)
+              : t(($) => $.status.paused)
+          }
           className="flex shrink-0 items-center text-amber-500"
         >
           <Pause className="size-3" />
@@ -894,7 +898,7 @@ export function AutopilotsPage() {
                       className={`cursor-pointer ${
                         selectedIds.has(autopilot.id) ? "bg-accent/30" : ""
                       }`}
-                      {...rowLink(wsPaths.autopilotDetail(autopilot.id))}
+                      {...rowLink(wsPaths.autopilotDetail(autopilot.id), autopilot.title)}
                     >
                       <CheckboxCell
                         checked={selectedIds.has(autopilot.id)}

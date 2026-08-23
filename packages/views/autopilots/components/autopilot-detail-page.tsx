@@ -4,7 +4,7 @@ import { useState } from "react";
 import {
   Zap, Play, Clock, Plus, Trash2, CheckCircle2, XCircle, Loader2, Pencil,
   Ban, ChevronDown, ChevronRight,
-  Webhook, RotateCw,
+  Webhook, RotateCw, Server,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { autopilotDetailOptions, autopilotRunsOptions, autopilotRunOptions } from "@multica/core/autopilots/queries";
@@ -18,7 +18,7 @@ import {
   useRotateAutopilotTriggerWebhookToken,
 } from "@multica/core/autopilots/mutations";
 import { buildAutopilotWebhookUrl } from "@multica/core/autopilots";
-import { api } from "@multica/core/api";
+import { api, clientErrorMessage, dispatchReasonCode } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useActorName } from "@multica/core/workspace/hooks";
@@ -69,6 +69,7 @@ import { WebhookPayloadPreview } from "./webhook-payload-preview";
 import { WebhookDeliveriesSection } from "./webhook-deliveries-section";
 import { ProjectIcon } from "../../projects/components/project-icon";
 import { useT } from "../../i18n";
+import { PageHeader } from "../../layout/page-header";
 
 // A run that already happened is an instant in the reader's day, so it reads in
 // the reader's zone (no timeZone passed). A run that is still to come belongs to
@@ -664,11 +665,11 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
   if (isLoading) {
     return (
       <div className="flex h-full flex-col">
-        <div className="flex h-12 shrink-0 items-center gap-2 border-b px-5">
+        <PageHeader>
           <Skeleton className="h-4 w-4" />
           <span className="text-muted-foreground">/</span>
           <Skeleton className="h-4 w-32" />
-        </div>
+        </PageHeader>
         <div className="flex-1 overflow-y-auto">
           <div className="max-w-4xl mx-auto p-6 space-y-8">
             <section className="space-y-4">
@@ -740,7 +741,15 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
         toast.error(message);
       }
     } catch (e: any) {
-      toast.error(e?.message || t(($) => $.detail.toast_trigger_failed));
+      const reason = dispatchReasonCode(e);
+      if (reason) {
+        toast.error(t(($) => $.detail[runNowBlockedKey(reason)]));
+        return;
+      }
+      // Only a 4xx message is written for the user; a 5xx one is internal
+      // server detail (MUL-6472), so an unclassified dispatch failure shows the
+      // localized generic sentence instead of the raw body.
+      toast.error(clientErrorMessage(e) || t(($) => $.detail.toast_trigger_failed));
     }
   };
 
@@ -824,6 +833,23 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
           ) : null
         }
       />
+
+      {autopilot.pause_reason === "agent_runtime_required" && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-caption text-amber-900 dark:text-amber-100">
+          <Server className="size-3.5 shrink-0" />
+          <span className="flex-1">
+            {t(($) => $.detail.paused_runtime_required)}
+          </span>
+          {autopilot.assignee_type === "agent" && (
+            <AppLink
+              href={`${wsPaths.agentDetail(autopilot.assignee_id)}?view=general`}
+              className="font-medium underline underline-offset-2"
+            >
+              {t(($) => $.detail.bind_runtime)}
+            </AppLink>
+          )}
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-4xl mx-auto p-6 space-y-8">

@@ -18,8 +18,6 @@ jobs:
     outputs:
       tag_name: ${{ steps.release_meta.outputs.tag_name }}
       is_stable: ${{ steps.release_meta.outputs.is_stable }}
-      ghcr_owner: ${{ steps.ghcr.outputs.owner }}
-      is_upstream: ${{ steps.meta.outputs.is_upstream }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,27 +45,17 @@ jobs:
             echo "is_stable=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Release metadata
-        id: meta
-        shell: bash
-        run: |
-          if [ "${GITHUB_REPOSITORY_OWNER}" = "multica-ai" ]; then
-            echo "is_upstream=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_upstream=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: GHCR image namespace
-        id: ghcr
-        shell: bash
-        # GHCR requires lowercase image namespaces; GitHub org names may be mixed-case.
-        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: server/go.mod
+          # Deliberately independent from the minimum patch in server/go.mod:
+          # releases follow the newest 1.26 patch available to setup-go.
+          go-version: "1.26.x"
+          check-latest: true
           cache-dependency-path: server/go.sum
+
+      - name: Record Go toolchain
+        run: go version
 
       - name: Verify Go test wrapper
         run: bash scripts/test-go.test.sh
@@ -75,11 +63,25 @@ jobs:
       - name: Run tests
         run: bash scripts/test-go.sh --race
 
-  # Publishes CLI archives to the GitHub Release for this repository.
-  # Upstream uses .goreleaser.yml (includes Homebrew tap). Forks use
-  # .goreleaser.fork.yml so they never touch multica-ai/homebrew-tap.
-  cli-release:
+      - name: Scan Go vulnerabilities
+        # Fail closed unless an administrator scopes the documented emergency
+        # override to this exact tag. See .github/RELEASING.md.
+        if: ${{ vars.ALLOW_VULN_BYPASS_FOR_TAG != github.ref_name }}
+        working-directory: server
+        run: go tool govulncheck ./...
+
+      - name: Record emergency vulnerability-scan bypass
+        if: ${{ vars.ALLOW_VULN_BYPASS_FOR_TAG == github.ref_name }}
+        run: echo "::warning::govulncheck was explicitly skipped for ${GITHUB_REF_NAME}; see .github/RELEASING.md"
+
+  release:
     needs: verify
+    # Only run on the canonical upstream repo. Forks don't have the
+    # HOMEBREW_TAP_GITHUB_TOKEN secret and should not be publishing to
+    # `multica-ai/homebrew-tap` anyway. Without this guard, every fork's
+    # tag push fails this job (401 against the upstream tap), which makes
+    # downstream CI go red without affecting the actual artifact pipeline.
+    if: github.repository_owner == 'multica-ai'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -90,11 +92,16 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: server/go.mod
+          # Deliberately independent from the minimum patch in server/go.mod:
+          # releases follow the newest 1.26 patch available to setup-go.
+          go-version: "1.26.x"
+          check-latest: true
           cache-dependency-path: server/go.sum
 
-      - name: Run GoReleaser (upstream)
-        if: needs.verify.outputs.is_upstream == 'true'
+      - name: Record Go toolchain
+        run: go version
+
+      - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
@@ -102,15 +109,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-
-      - name: Run GoReleaser (fork)
-        if: needs.verify.outputs.is_upstream != 'true'
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: "~> v2"
-          args: release --clean -f .goreleaser.fork.yml
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Multi-arch images are built natively per platform on dedicated runners
   # (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) and merged into a
@@ -140,7 +138,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-backend
+          images: ghcr.io/${{ github.repository_owner }}/multica-backend
           labels: |
             org.opencontainers.image.title=Multica Backend
             org.opencontainers.image.description=Multica self-hosted backend
@@ -169,7 +167,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.verify.outputs.tag_name }}
             COMMIT=${{ github.sha }}
-          outputs: type=image,name=ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-backend,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/multica-backend,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -206,7 +204,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-backend
+          images: ghcr.io/${{ github.repository_owner }}/multica-backend
           flavor: |
             latest=false
           tags: |
@@ -226,12 +224,12 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-backend@sha256:%s ' *)
+            $(printf 'ghcr.io/${{ github.repository_owner }}/multica-backend@sha256:%s ' *)
 
       - name: Inspect image
         run: |
           docker buildx imagetools inspect \
-            ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-backend:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/multica-backend:${{ steps.meta.outputs.version }}
 
   docker-web-build:
     needs: verify
@@ -257,7 +255,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-web
+          images: ghcr.io/${{ github.repository_owner }}/multica-web
           labels: |
             org.opencontainers.image.title=Multica Web
             org.opencontainers.image.description=Multica self-hosted web frontend
@@ -286,7 +284,7 @@ jobs:
           build-args: |
             REMOTE_API_URL=http://backend:8080
             NEXT_PUBLIC_APP_VERSION=${{ needs.verify.outputs.tag_name }}
-          outputs: type=image,name=ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-web,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/multica-web,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -323,7 +321,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-web
+          images: ghcr.io/${{ github.repository_owner }}/multica-web
           flavor: |
             latest=false
           tags: |
@@ -343,24 +341,23 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-web@sha256:%s ' *)
+            $(printf 'ghcr.io/${{ github.repository_owner }}/multica-web@sha256:%s ' *)
 
       - name: Inspect image
         run: |
           docker buildx imagetools inspect \
-            ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/multica-web:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/multica-web:${{ steps.meta.outputs.version }}
 
   helm-chart:
     needs: [verify, docker-backend-merge, docker-web-merge]
-    # Only the canonical upstream publishes the OCI Helm chart.
-    if: needs.verify.outputs.is_upstream == 'true'
+    if: github.repository_owner == 'multica-ai'
     runs-on: ubuntu-latest
     concurrency:
       group: release-helm-chart-${{ github.ref }}
       cancel-in-progress: true
     env:
       CHART_DIR: deploy/helm/multica
-      OCI_REGISTRY: oci://ghcr.io/${{ needs.verify.outputs.ghcr_owner }}/charts
+      OCI_REGISTRY: oci://ghcr.io/${{ github.repository_owner }}/charts
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -392,14 +389,17 @@ jobs:
       - name: Verify published chart
         run: helm show chart "$OCI_REGISTRY/multica" --version "$CHART_VERSION"
 
-  # Desktop installers upload to the GitHub Release created by cli-release.
-  # Publish owner/repo always come from github.repository so forks do not
-  # need a committed electron-builder.yml owner override.
+  # Build the Desktop installers for Linux and Windows and upload them to
+  # the GitHub Release that the `release` job above just published. macOS
+  # Desktop continues to ship via the manual `release-desktop` skill so it
+  # can be signed + notarized with Apple Developer credentials that are
+  # not (yet) wired into CI.
   desktop:
-    needs: [verify, cli-release]
-    # Fork tags release CLI archives and GHCR images only. Desktop releases
-    # are a deliberate local Developer ID + notarization operation on arm64.
-    if: needs.verify.outputs.is_upstream == 'true'
+    needs: release
+    # Fork overlay: do not auto-publish Desktop installers from Git-on-my-level
+    # tags. Linux/Windows desktop remains an upstream-cloud job; macOS stays
+    # human-gated via apps/desktop/MACOS_RELEASE.md.
+    if: github.repository_owner == 'multica-ai'
     strategy:
       fail-fast: false
       matrix:
@@ -422,8 +422,14 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: server/go.mod
+          # Deliberately independent from the minimum patch in server/go.mod:
+          # releases follow the newest 1.26 patch available to setup-go.
+          go-version: "1.26.x"
+          check-latest: true
           cache-dependency-path: server/go.sum
+
+      - name: Record Go toolchain
+        run: go version
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -441,59 +447,11 @@ jobs:
         working-directory: apps/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # electron-builder's GitHub publisher reads this:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # Disable code signing on Linux/Windows for now — the public
+          # release is unsigned for these platforms, the CLI carries the
+          # trust boundary. Set CSC_LINK in repo secrets to enable
+          # Windows signing later.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        shell: bash
-        run: >-
-          node scripts/package.mjs
-          --${{ matrix.target }} --x64 --arm64 --publish always
-          --config.publish.owner=${{ github.repository_owner }}
-          --config.publish.repo=${{ github.event.repository.name }}
-
-  # Fork Desktop publication is intentionally disabled. GitHub-hosted runners
-  # cannot use David's local Keychain identity, and an unsigned/ad-hoc macOS
-  # artifact must never be attached to a public fork tag.
-  desktop-mac:
-    needs: [verify, cli-release]
-    if: ${{ false }}
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: server/go.mod
-          cache-dependency-path: server/go.sum
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Package Desktop installers (mac)
-        working-directory: apps/desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This disabled job remains fail-closed as defense in depth.
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        shell: bash
-        # Never enable this job for a distributed build; use MACOS_RELEASE.md.
-        run: >-
-          node scripts/package.mjs
-          --mac --arm64 --publish always
-          --config.publish.owner=${{ github.repository_owner }}
-          --config.publish.repo=${{ github.event.repository.name }}
+        run: node scripts/package.mjs --${{ matrix.target }} --x64 --arm64 --publish always

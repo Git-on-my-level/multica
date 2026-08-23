@@ -1,7 +1,6 @@
 import { Instrument_Serif } from "next/font/google";
 import { LocaleProvider } from "@/features/landing/i18n";
 import { getRequestLocale } from "@/lib/request-locale";
-import { getServerGithubConfig } from "@/lib/github-config";
 
 // Instrument Serif is the landing display face and is Latin-only. The full
 // `--font-serif` stack (Instrument Serif + the per-locale CJK serif tail) is
@@ -15,32 +14,30 @@ const instrumentSerif = Instrument_Serif({
   variable: "--font-instrument-serif",
 });
 
-function buildJsonLd(githubWebUrl: string) {
-  return {
-    "@context": "https://schema.org",
-    "@graph": [
-      {
-        "@type": "Organization",
-        name: "Multica",
-        url: "https://www.multica.ai",
-        sameAs: [githubWebUrl],
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      name: "Multica",
+      url: "https://www.multica.ai",
+      sameAs: ["https://github.com/multica-ai/multica"],
+    },
+    {
+      "@type": "SoftwareApplication",
+      name: "Multica",
+      applicationCategory: "ProjectManagement",
+      operatingSystem: "Web",
+      description:
+        "Open-source project management platform that turns coding agents into real teammates.",
+      offers: {
+        "@type": "Offer",
+        price: "0",
+        priceCurrency: "USD",
       },
-      {
-        "@type": "SoftwareApplication",
-        name: "Multica",
-        applicationCategory: "ProjectManagement",
-        operatingSystem: "Web",
-        description:
-          "Open-source project management platform that turns coding agents into real teammates.",
-        offers: {
-          "@type": "Offer",
-          price: "0",
-          priceCurrency: "USD",
-        },
-      },
-    ],
-  };
-}
+    },
+  ],
+};
 
 export default async function LandingLayout({
   children,
@@ -48,7 +45,6 @@ export default async function LandingLayout({
   children: React.ReactNode;
 }) {
   const initialLocale = await getRequestLocale();
-  const jsonLd = buildJsonLd(getServerGithubConfig().webUrl);
 
   return (
     <>

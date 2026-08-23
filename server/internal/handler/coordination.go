@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -145,7 +146,7 @@ func (h *Handler) coordinationAssignee(r *http.Request, issue db.Issue) any {
 		if agent, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
 			ID: issue.AssigneeID, WorkspaceID: issue.WorkspaceID,
 		}); err == nil {
-			ready, reason, _ := service.AgentReadiness(r.Context(), h.Queries, agent)
+			ready, reason, _ := agentReadinessLegacy(r.Context(), h.Queries, agent)
 			return map[string]any{"type": "agent", "id": id, "name": agent.Name, "ready": ready, "reason": reason}
 		}
 	case "member":
@@ -353,7 +354,7 @@ func (h *Handler) RouteIssueCoordination(w http.ResponseWriter, r *http.Request)
 		if _, allowed := allowedAgents[id]; !allowed {
 			continue
 		}
-		ready, reason, _ := service.AgentReadiness(r.Context(), h.Queries, agent)
+		ready, reason, _ := agentReadinessLegacy(r.Context(), h.Queries, agent)
 		capacity := int(agent.MaxConcurrentTasks)
 		if capacity <= 0 {
 			capacity = 1
@@ -425,4 +426,16 @@ func (h *Handler) RouteIssueCoordination(w http.ResponseWriter, r *http.Request)
 		"candidate_agents":       candidateAgents,
 		"reasons":                reasons,
 	})
+}
+
+func agentReadinessLegacy(ctx context.Context, q *db.Queries, agent db.Agent) (bool, string, error) {
+	verdict, err := service.AgentReadiness(ctx, q, agent)
+	if err != nil {
+		return false, "", err
+	}
+	reason := verdict.Detail
+	if reason == "" && !verdict.Ready() {
+		reason = string(verdict.Reason)
+	}
+	return verdict.Ready(), reason, nil
 }
