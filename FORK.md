@@ -31,6 +31,7 @@ Current isolated overlays:
 | Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
 | Event tables without capture | `403–416` leftover tables; `418` drops leftover capture triggers |
+| Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
 
 Leftover `workspace_event_*` tables are fine. Do **not** re-enable
 `415_workspace_event_capture` triggers: they take a

@@ -322,6 +322,7 @@ var SupportedTypes = []string{
 	"mcode",
 	"dim",
 	"omp",
+	"devin",
 }
 
 // IsSupportedType reports whether agentType is in the SupportedTypes whitelist.
@@ -424,6 +425,8 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &mcodeBackend{cfg: cfg}, nil
 	case "omp":
 		return &ompBackend{cfg: cfg}, nil
+	case "devin":
+		return &devinBackend{cfg: cfg}, nil
 	default:
 		return nil, fmt.Errorf("unknown agent type: %q (supported: %s)", agentType, strings.Join(SupportedTypes, ", "))
 	}
@@ -469,6 +472,7 @@ var launchHeaders = map[string]string{
 	"qwenpaw":     "qwenpaw acp",
 	"dim":         "dim acp",
 	"omp":         "omp acp",
+	"devin":       "devin acp",
 	"mcode":       "mcode acp",
 }
 
