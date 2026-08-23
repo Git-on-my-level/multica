@@ -11,7 +11,7 @@ All configuration is done via environment variables. Copy `.env.example` as a st
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection string | `postgres://multica:multica@localhost:5432/multica?sslmode=disable` |
-| `JWT_SECRET` | **Must change from default.** Secret key for signing JWT tokens. Use a long random string. | `openssl rand -hex 32` |
+| `JWT_SECRET` | **Required — no safe default.** Secret key for signing JWT tokens. A production backend refuses to boot if this is empty or a known placeholder. Generate with `openssl rand -hex 32`. | `openssl rand -hex 32` |
 | `FRONTEND_ORIGIN` | URL where the frontend is served (used for CORS) | `https://app.example.com` |
 
 ### Database Pool Tuning (Optional)
@@ -86,7 +86,17 @@ Changes take effect after restarting the backend / compose stack. The web UI rea
 
 ### File Storage (Optional)
 
-For file uploads and attachments, configure S3 and (optionally) CloudFront:
+Uploads and attachments are written to local disk by default. Set `S3_BUCKET` to
+use S3-compatible object storage instead.
+
+#### Local disk (default)
+
+| Variable | Description |
+|----------|-------------|
+| `LOCAL_UPLOAD_DIR` | Directory attachments are written to (default: `./data/uploads`). The default is **relative to the backend's working directory** — `/app` in the bundled image, where the compose file mounts the `backend_uploads` volume. When running the binary manually it resolves against whatever directory you launched from, so set an absolute path; otherwise uploads land somewhere new each time the launch directory changes, and existing `attachment` rows point at files the server no longer looks for |
+| `LOCAL_UPLOAD_BASE_URL` | Optional absolute base for attachment URLs (e.g. `http://localhost:8080`). Leave empty to store `/uploads/...` paths that stay relative to the API origin |
+
+#### S3 / CloudFront
 
 | Variable | Description |
 |----------|-------------|
@@ -138,11 +148,53 @@ If the frontend and backend are served from different hostnames, `COOKIE_DOMAIN`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8080` | Backend server port |
+| `PORT` | `8080` | Backend port — the one to edit. It is the port the backend process listens on for a local/bare run, and the host port the Compose self-host stack publishes. In Compose the container always listens on `8080` internally, so changing this needs no rebuild. |
+| `BACKEND_PORT` | Value of `PORT` | Optional alias that overrides `PORT` for the backend. `API_PORT` and `SERVER_PORT` are further aliases; the **alias order** is `BACKEND_PORT` → `API_PORT` → `SERVER_PORT` → `PORT` → `8080`, and it is the same in `Makefile`, `scripts/local-env.sh` and `docker-compose.selfhost.yml`. Leave them unset unless the host port must differ from the port the process listens on. |
 | `METRICS_ADDR` | empty | Optional Prometheus metrics listener, for example `127.0.0.1:9090` |
-| `FRONTEND_PORT` | `3000` | Frontend port |
+| `FRONTEND_PORT` | `3000` | Frontend port. Host port in Compose; the container always listens on `3000` internally. |
 | `CORS_ALLOWED_ORIGINS` | Value of `FRONTEND_ORIGIN` | Comma-separated list of allowed origins. Governs **both** the HTTP CORS allowlist **and** the WebSocket `Origin` check. A browser origin that isn't listed here (and isn't `localhost`) has its real-time WebSocket upgrade rejected with `403`, so live updates stop working until a manual refresh. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+
+> **Which source wins depends on the entry point**, and only the alias order above
+> is shared. Docker Compose lets the calling environment outrank `.env`
+> (`PORT=9100 docker compose … up -d` publishes 9100). `make` is the other way
+> round: it `include`s the env file, so a value there outranks the same variable
+> from your environment, and a `make selfhost PORT=…` command-line assignment
+> outranks both. Editing the env file is therefore the one method that behaves
+> the same everywhere. None of this affects whether the reported port is correct:
+> `make selfhost` and both installers read the published port back from
+> `docker compose port`, so the health check and the printed URL always match
+> what Compose actually published.
+
+The web development server is one intentional exception to the generic `PORT`
+fallback: Next uses `PORT` for its own frontend listener before it evaluates the
+rewrite configuration. Its backend fallback therefore accepts
+`BACKEND_PORT` → `API_PORT` → `SERVER_PORT` → `8080`, while an explicit
+`REMOTE_API_URL` or `NEXT_PUBLIC_API_URL` still takes priority.
+
+### WeCom frame tracing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MULTICA_WECOM_TRACE` | empty (off) | `1` records every WeCom frame the backend reads and writes, including the first 120 runes of each message body. Anything else is off. |
+
+Turn it on for a debugging session and unset it when the session ends. Before
+you do:
+
+- **It is read at boot, so changing it needs a backend restart** — `docker compose -f docker-compose.selfhost.yml up -d backend`. There is no runtime toggle. While it is on, the backend logs a warning on every startup saying so.
+- **Anyone who can read the backend's logs can read the traced message text.** That is a wider audience than the WeCom chat it came from: your `docker logs` / journald / log shipper, and whoever administers them. The smart-bot secret is never read, and `token=` / `access_token=` / `code=` parameters are redacted out of message text — but user message content is not, and **an attachment's `Content-Disposition` and the filename read out of it are written verbatim**, up to 2048 runes and past the redactor. That line exists to show exactly how the storage backend encoded a name, and a redacted or truncated copy of it answers nothing; it also means an attachment's filename reaches your logs as sent.
+- **Retention is your log stack's, not the application's.** The backend writes to stderr and keeps nothing itself, so how long the traced text survives is whatever your Docker logging driver or shipper is set to. If that is "forever", decide about it before enabling rather than after.
+
+Each outbound frame produces two lines that share a `seq`: `dir=out` when it is
+about to be written, and `dir=out.done` with `ok=true` / `ok=false` once the
+socket has answered. `seq` is the frame's position in the write order, so the
+pair tells you what this backend sent and in which order; an attempt with no
+matching outcome is a write that never returned.
+
+`ok=true` means the frame reached the socket, not that WeCom accepted it. For
+the platform's verdict, match the frame's `req_id` against the `dir=in` line
+answering it and read that line's `errcode` — a frame can be written
+successfully and still be rejected there.
 
 ### CLI / Daemon
 
@@ -169,6 +221,7 @@ Agent-specific overrides:
 | `MULTICA_OPENCODE_MODEL` | Override the OpenCode model used |
 | `MULTICA_OPENCLAW_PATH` | Custom path to the `openclaw` binary |
 | `MULTICA_OPENCLAW_MODEL` | Override the OpenClaw model used |
+| `MULTICA_OPENCLAW_CLI_TIMEOUT` | Deadline for each `openclaw config ...` call during task preparation (default 30s; accepts `45s` or `45`). Raise it when the local CLI is slow to start; the daemon also reads it from `backends.openclaw.cli_timeout` in the CLI config |
 | `MULTICA_HERMES_PATH` | Custom path to the `hermes` binary |
 | `MULTICA_HERMES_MODEL` | Override the Hermes model used |
 | `MULTICA_PI_PATH` | Custom path to the `pi` binary |
@@ -180,7 +233,37 @@ Agent-specific overrides:
 
 ## Database Setup
 
-Multica requires PostgreSQL 17 with the pgvector extension.
+Multica requires PostgreSQL 17. It does **not** use pgvector — no migration
+declares a `vector` column or runs `CREATE EXTENSION vector`. The bundled image
+is named `pgvector/pgvector:pg17` for historical reasons only; a stock
+PostgreSQL 17 is sufficient.
+
+Migrations reference four extensions:
+
+| Extension | Migration | Required |
+| --- | --- | --- |
+| `pgcrypto` | `001_init` | **Yes** — a bare `CREATE EXTENSION`; the migration fails without it |
+| `pg_trgm` | `137_search_index_pg_trgm_extension` | **Yes** — same, and the search indexes depend on it |
+| `pg_bigm` | `032_issue_search_index` | No — wrapped in `DO ... EXCEPTION`, skipped with a `NOTICE` when unavailable |
+| `pg_cron` | `076_task_usage_pgcron_extension` | No — same; the usage rollup runs in-process instead, see [Usage Dashboard Rollup](#usage-dashboard-rollup) |
+
+`pgcrypto` and `pg_trgm` ship with every standard PostgreSQL 17 build
+(`postgresql-contrib` on Debian/Ubuntu, bundled in Homebrew's `postgresql@17`
+and in the official `postgres:17` image), so neither hard requirement needs a
+custom image.
+
+`pg_bigm` is optional and only affects **CJK search quality** — bigram indexes
+are far more selective than trigram ones for Chinese, Japanese, and Korean text.
+Search works without it: migrations 138–142 install portable `pg_trgm` fallback
+indexes covering every column the search handlers touch. Installing `pg_bigm`
+does require a custom image or a source build — the bundled
+`pgvector/pgvector:pg17` image does not ship it either.
+
+> Because `pg_bigm` and `pg_cron` are installed conditionally, a row in
+> `schema_migrations` proves the migration ran, not that its objects exist. Run
+> `SELECT extname FROM pg_extension` to see what a database actually has. To
+> recover a missing comment-content search index, follow
+> `server/cmd/migrate/README.md`.
 
 ### Using Docker Compose (Recommended)
 
@@ -188,10 +271,12 @@ The `docker-compose.selfhost.yml` includes PostgreSQL. No separate setup needed.
 
 ### Using Your Own PostgreSQL
 
-If you prefer to use an existing PostgreSQL instance, ensure the pgvector extension is available:
+If you prefer to use an existing PostgreSQL instance, confirm the migration role
+can create the two required extensions:
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
 
 Set `DATABASE_URL` in your `.env` and remove the `postgres` service from the compose file.
@@ -270,7 +355,7 @@ If you are upgrading from a binary that pre-dates MUL-2957 (or the auto-hook fai
 
 If you prefer to build and run services manually:
 
-**Prerequisites:** Go 1.26+, Node.js 20+, pnpm 10.28+, PostgreSQL 17 with pgvector.
+**Prerequisites:** Go 1.26.6, Node.js 22, pnpm 10.28.2, PostgreSQL 17 — a stock install is enough, see [Database Setup](#database-setup).
 
 ```bash
 # Start your PostgreSQL (or use: docker compose up -d postgres)
@@ -407,6 +492,10 @@ NEXT_PUBLIC_API_URL=https://api.example.com
 NEXT_PUBLIC_WS_URL=wss://api.example.com/ws
 ```
 
+> **`NEXT_PUBLIC_API_URL` and `REMOTE_API_URL` take the backend's origin — scheme + host (+ port) — and no path.** Write `https://api.example.com`, never `https://api.example.com/api`. The browser client appends its own prefixes, so a path is doubled: requests go to `/api/api/...` and every avatar, image and attachment resolves under `<your-path>/uploads/...`, which the backend does not serve — the app loads but data calls and images 404. A trailing `/api` is now stripped defensively, but any other path is kept, because a reverse proxy may legitimately mount the whole backend under a prefix.
+>
+> This bites on upgrade: before v0.4.10 `NEXT_PUBLIC_API_URL` was inert in the published images, so a wrong value sat in `.env` doing nothing. v0.4.10 wired it through, and the stale value took effect. If you upgraded and the UI loads but nothing else does, check this variable first, then recreate the frontend container (`docker compose ... up -d --force-recreate frontend`) so the new value is picked up.
+
 > **`COOKIE_DOMAIN` is required in this setup — omitting it breaks every write.** The web app authenticates with an HttpOnly `multica_auth` cookie plus a JS-readable `multica_csrf` cookie, and sends the CSRF value as an `X-CSRF-Token` header on every non-GET request. Both cookies are host-only unless `COOKIE_DOMAIN` is set, so a frontend on `app.example.com` cannot read a cookie issued by `api.example.com`. The header is then never sent and the backend rejects the request with `403 {"error":"CSRF validation failed"}` — while GET requests keep working, so the app renders but nothing can be created or edited.
 >
 > After changing `COOKIE_DOMAIN`, delete the existing `multica_auth` / `multica_csrf` cookies on **both** hosts and log in again. Stale host-only cookies otherwise sit alongside the new domain-scoped ones and the browser sends both.
@@ -433,10 +522,10 @@ COOKIE_DOMAIN=                       # empty: cookies are host-only on app.examp
 # Frontend
 NEXT_PUBLIC_API_URL=                 # empty: the client uses relative /api paths on the page origin
 NEXT_PUBLIC_WS_URL=                  # empty
-REMOTE_API_URL=http://backend:8080   # target the Next.js rewrites proxy /api, /auth and /uploads to
+REMOTE_API_URL=http://backend:8080   # target the Next.js rewrites proxy /v1, /api, /auth and /uploads to
 ```
 
-Serve everything from the single `app.example.com` vhost. HTTP works out of the box, because Next.js rewrites forward `/api`, `/auth` and `/uploads` to `REMOTE_API_URL`. WebSockets do **not** go through those rewrites, so add a `/ws` block to the frontend vhost that reaches the backend directly:
+Serve everything from the single `app.example.com` vhost. HTTP works out of the box, because Next.js rewrites forward `/v1`, `/api`, `/auth` and `/uploads` to `REMOTE_API_URL`. WebSockets do **not** go through those rewrites, so add a `/ws` block to the frontend vhost that reaches the backend directly:
 
 ```nginx
 # Add to the app.example.com server block above
@@ -472,7 +561,7 @@ docker compose -f docker-compose.selfhost.yml up -d
 
 ### WebSocket for LAN / Non-localhost Access
 
-HTTP requests (issues, comments, uploads) work on LAN out of the box — Next.js rewrites proxy `/api`, `/auth`, and `/uploads` to the backend. **WebSockets do not**: Next.js rewrites only forward HTTP requests, not the `Upgrade` handshake a WebSocket needs. If you open the app on `http://<lan-ip>:3000`, real-time features (chat streaming, live issue updates, notifications) will fail to connect until you do one of the following:
+HTTP requests (Plugin API, issues, comments, uploads) work on LAN out of the box — Next.js rewrites proxy `/v1`, `/api`, `/auth`, and `/uploads` to the backend. **WebSockets do not**: Next.js rewrites only forward HTTP requests, not the `Upgrade` handshake a WebSocket needs. If you open the app on `http://<lan-ip>:3000`, real-time features (chat streaming, live issue updates, notifications) will fail to connect until you do one of the following:
 
 1. **Put a reverse proxy in front of the stack (recommended).** Nginx or Caddy terminates the WebSocket upgrade and forwards it to the backend on port 8080. See the [Reverse Proxy](#reverse-proxy) section above — the Nginx example already includes a `location /ws { ... }` block with the correct `Upgrade` / `Connection` headers. Once a proxy is in place the browser connects directly through it, so no frontend rebuild is needed.
 
@@ -533,6 +622,34 @@ networking, allowlists, NetworkPolicy, or proxy authentication. If you bind
 `METRICS_ADDR=0.0.0.0:9090` inside a container, only publish that port to a
 trusted network, for example a host-local mapping such as
 `127.0.0.1:9090:9090`.
+
+## Go Runtime Profiling
+
+The backend exposes all standard Go pprof routes on the fixed loopback-only
+management listener `127.0.0.1:6060`, including CPU, heap, allocs, goroutine,
+block, mutex, threadcreate, symbol, and trace profiles:
+
+```bash
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+```
+
+The public API port does not serve `/debug/pprof/`. The listener address is not
+configurable and is never bound to a container or host network interface.
+Profiles can reveal process internals and some captures add CPU or memory
+pressure, so access should remain limited to operators on the same host or in
+the same container network namespace.
+
+A loopback listener inside a container belongs to that container's network
+namespace and is not reachable directly from the host. With the Compose stack,
+capture the profile inside the backend container and copy it out:
+
+```bash
+docker compose -f docker-compose.selfhost.yml exec backend \
+  wget -qO /tmp/heap.pprof http://127.0.0.1:6060/debug/pprof/heap
+docker compose -f docker-compose.selfhost.yml cp backend:/tmp/heap.pprof ./heap.pprof
+go tool pprof ./heap.pprof
+```
 
 ## Upgrading
 

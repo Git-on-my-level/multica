@@ -1,6 +1,13 @@
 "use client";
 
-import { ArrowUpRight, BookOpen, CircleHelp, History, MessageCircle } from "lucide-react";
+import {
+  ArrowUpRight,
+  BookOpen,
+  CircleHelp,
+  Download,
+  History,
+  MessageCircle,
+} from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -11,15 +18,32 @@ import {
   DropdownMenuTrigger,
 } from "@multica/ui/components/ui/dropdown-menu";
 import { useModalStore } from "@multica/core/modals";
-import { useGithubConfig } from "@multica/core/github/config";
 import { useConfigStore } from "@multica/core/config";
+import { isDesktopShell } from "../platform/local-directory";
 import { DISCORD_URL, DiscordIcon } from "./discord";
 import { useT } from "../i18n";
 
+const DOCS_URL = "https://multica.ai/docs";
+const CHANGELOG_URL = "https://multica.ai/changelog";
+// Absolute, including on self-hosted deployments: the installers we ship are
+// the same binaries either way, and the desktop client can point at a
+// self-hosted backend once installed. A self-host-relative /download would
+// only serve a copy of this page that still has to reach our release assets.
+const DOWNLOAD_URL = "https://multica.ai/download";
+
 export function HelpLauncher() {
   const { t } = useT("layout");
-  const { docsUrl, changelogUrl } = useGithubConfig();
   const serverVersion = useConfigStore((state) => state.serverVersion);
+  // Web-only: offering "download the desktop app" inside the desktop app is
+  // nonsense, and this sidebar is shared — apps/desktop renders the same
+  // AppSidebar as the web dashboard, so the entry has to be gated here.
+  //
+  // No `mounted` deferral (cf. browser-notification-setting.tsx): the desktop
+  // renderer is a locally-bundled SPA with no SSR pass, and on web
+  // `isDesktopShell()` is false both on the server and after hydration. The
+  // markup matches either way, so the link can ship in the SSR payload instead
+  // of popping in a frame late.
+  const desktop = isDesktopShell();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -33,11 +57,29 @@ export function HelpLauncher() {
         align="end"
         side="top"
         sideOffset={8}
-        className="min-w-40"
+        className="min-w-40 max-w-56"
       >
+        {!desktop && (
+          <>
+            <DropdownMenuItem
+              render={
+                <a
+                  href={DOWNLOAD_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                />
+              }
+            >
+              <Download className="h-3.5 w-3.5" />
+              {t(($) => $.help.download_desktop)}
+              <ArrowUpRight className="size-3 translate-y-px text-faint-foreground" />
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem
           render={
-            <a href={docsUrl} target="_blank" rel="noopener noreferrer" />
+            <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" />
           }
         >
           <BookOpen className="h-3.5 w-3.5" />
@@ -47,7 +89,7 @@ export function HelpLauncher() {
         <DropdownMenuItem
           render={
             <a
-              href={changelogUrl}
+              href={CHANGELOG_URL}
               target="_blank"
               rel="noopener noreferrer"
             />

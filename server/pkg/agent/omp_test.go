@@ -337,7 +337,7 @@ func TestParseACPModelConfigOptions(t *testing.T) {
 		`{"value":"zai/glm-5.2","name":"GLM-5.2"},` +
 		`{"value":"zai/glm-4.5","name":"GLM-4.5"}]},` +
 		`{"id":"thinking","category":"thought_level","currentValue":"high","options":[]}]}`)
-	models := parseACPModelConfigOptions(raw)
+	models := parseACPConfigOptionModels(raw)
 	if len(models) != 2 {
 		t.Fatalf("expected 2 models, got %d: %+v", len(models), models)
 	}
@@ -360,12 +360,12 @@ func TestParseACPModelConfigOptions(t *testing.T) {
 	}
 
 	// No model config option → nil (caller falls back to manual entry).
-	if got := parseACPModelConfigOptions(json.RawMessage(`{"sessionId":"s","configOptions":[{"id":"mode","category":"mode"}]}`)); got != nil {
+	if got := parseACPConfigOptionModels(json.RawMessage(`{"sessionId":"s","configOptions":[{"id":"mode","category":"mode"}]}`)); got != nil {
 		t.Errorf("expected nil when no model option, got %+v", got)
 	}
 	// omp's real session/new has no `models` block; this parser must not read
 	// one (that's the other ACP agents' shape, handled by parseACPSessionNewModels).
-	if got := parseACPModelConfigOptions(json.RawMessage(`{"models":{"availableModels":[{"modelId":"x"}]}}`)); got != nil {
+	if got := parseACPConfigOptionModels(json.RawMessage(`{"models":{"availableModels":[{"modelId":"x"}]}}`)); got != nil {
 		t.Errorf("expected nil for models-block-only payload, got %+v", got)
 	}
 }
