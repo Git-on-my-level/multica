@@ -226,6 +226,36 @@ func (q *Queries) GetIssuePullRequestCloseAggregate(ctx context.Context, issueID
 	return i, err
 }
 
+const getIssuePullRequestLink = `-- name: GetIssuePullRequestLink :one
+SELECT issue_id, pull_request_id, linked_by_type, linked_by_id, linked_at, close_intent, reference_only FROM issue_pull_request
+WHERE issue_id = $1 AND pull_request_id = $2
+`
+
+type GetIssuePullRequestLinkParams struct {
+	IssueID       pgtype.UUID `json:"issue_id"`
+	PullRequestID pgtype.UUID `json:"pull_request_id"`
+}
+
+// Returns the link row for one (issue, PR) pair, or no rows when unlinked.
+// The webhook mirror path uses this to avoid regressing a member-authored
+// manual link (a routine synchronize/edited push must not flip reference_only
+// to true and hide the PR, nor clobber a manual close_intent); the manual
+// unlink path uses it to distinguish "PR not mirrored" from "not linked".
+func (q *Queries) GetIssuePullRequestLink(ctx context.Context, arg GetIssuePullRequestLinkParams) (IssuePullRequest, error) {
+	row := q.db.QueryRow(ctx, getIssuePullRequestLink, arg.IssueID, arg.PullRequestID)
+	var i IssuePullRequest
+	err := row.Scan(
+		&i.IssueID,
+		&i.PullRequestID,
+		&i.LinkedByType,
+		&i.LinkedByID,
+		&i.LinkedAt,
+		&i.CloseIntent,
+		&i.ReferenceOnly,
+	)
+	return i, err
+}
+
 const getIssueReviewHeadSha = `-- name: GetIssueReviewHeadSha :one
 SELECT head_sha FROM (
     SELECT pr.head_sha AS head_sha, pr.state AS state, pr.pr_updated_at AS pr_updated_at
@@ -292,6 +322,10 @@ INSERT INTO issue_pull_request (
     $1, $2, $4, $5, $3, $6
 )
 ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
+    -- A member's manual link is authoritative even when the webhook had
+    -- already created this row. Without this promotion, the following
+    -- webhook still sees a system-owned row and can undo the member's
+    -- close_intent/reference_only choices.
     linked_by_type = CASE
         WHEN EXCLUDED.linked_by_type = 'member' THEN EXCLUDED.linked_by_type
         ELSE issue_pull_request.linked_by_type
@@ -614,32 +648,6 @@ func (q *Queries) UnlinkIssueFromPullRequest(ctx context.Context, arg UnlinkIssu
 	_, err := q.db.Exec(ctx, unlinkIssueFromPullRequest, arg.IssueID, arg.PullRequestID)
 	return err
 }
-
-const getIssuePullRequestLink = `-- name: GetIssuePullRequestLink :one
-SELECT issue_id, pull_request_id, linked_by_type, linked_by_id, linked_at, close_intent, reference_only FROM issue_pull_request
-WHERE issue_id = $1 AND pull_request_id = $2
-`
-
-type GetIssuePullRequestLinkParams struct {
-	IssueID       pgtype.UUID `json:"issue_id"`
-	PullRequestID pgtype.UUID `json:"pull_request_id"`
-}
-
-func (q *Queries) GetIssuePullRequestLink(ctx context.Context, arg GetIssuePullRequestLinkParams) (IssuePullRequest, error) {
-	row := q.db.QueryRow(ctx, getIssuePullRequestLink, arg.IssueID, arg.PullRequestID)
-	var i IssuePullRequest
-	err := row.Scan(
-		&i.IssueID,
-		&i.PullRequestID,
-		&i.LinkedByType,
-		&i.LinkedByID,
-		&i.LinkedAt,
-		&i.CloseIntent,
-		&i.ReferenceOnly,
-	)
-	return i, err
-}
-
 
 const updateGitHubInstallationAccountByInstallationID = `-- name: UpdateGitHubInstallationAccountByInstallationID :many
 UPDATE github_installation

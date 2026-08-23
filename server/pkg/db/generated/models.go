@@ -745,6 +745,14 @@ type Issue struct {
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
 }
 
+type IssueCreateIdempotency struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	ClientKeyHash  string             `json:"client_key_hash"`
+	SemanticDigest string             `json:"semantic_digest"`
+	IssueID        pgtype.UUID        `json:"issue_id"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`
@@ -761,6 +769,20 @@ type IssueLabel struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 	ResourceType string             `json:"resource_type"`
 	Description  string             `json:"description"`
+}
+
+type IssuePrHandoffCandidate struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	TaskID      pgtype.UUID        `json:"task_id"`
+	Url         string             `json:"url"`
+	RepoOwner   string             `json:"repo_owner"`
+	RepoName    string             `json:"repo_name"`
+	PrNumber    int32              `json:"pr_number"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type IssueProperty struct {
@@ -1441,6 +1463,27 @@ type Workspace struct {
 	AttributionFailClosed bool `json:"attribution_fail_closed"`
 }
 
+type WorkspaceEventCursor struct {
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	LastSequence int64              `json:"last_sequence"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceEventOutbox struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Sequence      int64              `json:"sequence"`
+	SourceID      string             `json:"source_id"`
+	EventType     string             `json:"event_type"`
+	AggregateKind string             `json:"aggregate_kind"`
+	AggregateID   pgtype.UUID        `json:"aggregate_id"`
+	ActorType     pgtype.Text        `json:"actor_type"`
+	ActorID       pgtype.UUID        `json:"actor_id"`
+	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
+	RecordedAt    pgtype.Timestamptz `json:"recorded_at"`
+	Payload       []byte             `json:"payload"`
+}
+
 type WorkspaceInvitation struct {
 	ID            pgtype.UUID        `json:"id"`
 	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
@@ -1475,49 +1518,4 @@ type WorkspaceShareLink struct {
 	UseCount    int32              `json:"use_count"`
 	IsActive    bool               `json:"is_active"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-}
-
-// Fork overlay types (sqlc models from origin/main). Upstream models.go
-// dropped these because the matching query files are fork-only.
-type IssueCreateIdempotency struct {
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	ClientKeyHash  string             `json:"client_key_hash"`
-	SemanticDigest string             `json:"semantic_digest"`
-	IssueID        pgtype.UUID        `json:"issue_id"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-}
-
-type IssuePrHandoffCandidate struct {
-	ID          pgtype.UUID        `json:"id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	TaskID      pgtype.UUID        `json:"task_id"`
-	Url         string             `json:"url"`
-	RepoOwner   string             `json:"repo_owner"`
-	RepoName    string             `json:"repo_name"`
-	PrNumber    int32              `json:"pr_number"`
-	State       string             `json:"state"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-}
-
-type WorkspaceEventOutbox struct {
-	ID            pgtype.UUID        `json:"id"`
-	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
-	Sequence      int64              `json:"sequence"`
-	SourceID      string             `json:"source_id"`
-	EventType     string             `json:"event_type"`
-	AggregateKind string             `json:"aggregate_kind"`
-	AggregateID   pgtype.UUID        `json:"aggregate_id"`
-	ActorType     pgtype.Text        `json:"actor_type"`
-	ActorID       pgtype.UUID        `json:"actor_id"`
-	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
-	RecordedAt    pgtype.Timestamptz `json:"recorded_at"`
-	Payload       []byte             `json:"payload"`
-}
-
-type WorkspaceEventCursor struct {
-	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
-	LastSequence int64              `json:"last_sequence"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }

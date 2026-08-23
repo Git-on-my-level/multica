@@ -129,20 +129,6 @@ export {
   findQuickActionTemplateToken,
 } from "./quick-action";
 export type {
-  QuickAction,
-  QuickActionVisibility,
-  QuickActionAssigneeType,
-  QuickActionStatus,
-  CreateQuickActionRequest,
-  UpdateQuickActionRequest,
-  ListQuickActionsResponse,
-} from "./quick-action";
-export {
-  QUICK_ACTION_SIDEBAR_LIMIT,
-  QUICK_ACTION_TEMPLATE_TOKEN_RE,
-  findQuickActionTemplateToken,
-} from "./quick-action";
-export type {
   TimelineEntry,
   AssigneeFrequencyEntry,
 } from "./activity";
