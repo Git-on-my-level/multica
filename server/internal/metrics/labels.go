@@ -154,6 +154,7 @@ var (
 		"multica_agent": "multica_agent",
 		"openclaw":      "openclaw",
 		"omp":           "omp",
+		"devin":         "devin",
 		"opencode":      "opencode",
 		"deveco":        "deveco",
 		"pi":            "pi",

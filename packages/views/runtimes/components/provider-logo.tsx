@@ -371,6 +371,8 @@ export function ProviderLogo({
       return <PiLogo className={className} />;
     case "omp":
       return <PiLogo className={className} />;
+    case "devin":
+      return <KiroLogo className={className} />;
     case "copilot":
       return <CopilotLogo className={className} />;
     case "cursor":
