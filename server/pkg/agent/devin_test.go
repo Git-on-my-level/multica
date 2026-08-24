@@ -200,4 +200,8 @@ func TestParseDevinModels(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].Label != "Opus" {
 		t.Fatalf("array form: %+v err %v", got, err)
 	}
+	got, err = parseDevinModels([]byte(`{"families":[{"slug":"kimi-k3","variants":[{"model_uid":"kimi-k3-high","label":"Kimi K3 High"}]}]}`))
+	if err != nil || len(got) != 1 || got[0].ID != "kimi-k3-high" || got[0].Provider != "kimi-k3" {
+		t.Fatalf("families form: %+v err %v", got, err)
+	}
 }

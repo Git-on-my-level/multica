@@ -500,6 +500,41 @@ func parseDevinModels(data []byte) ([]Model, error) {
 		Label    string `json:"label"`
 		Provider string `json:"provider"`
 		Model    string `json:"model"`
+		ModelUID string `json:"model_uid"`
+	}
+	var families struct {
+		Families []struct {
+			Slug     string  `json:"slug"`
+			Variants []entry `json:"variants"`
+		} `json:"families"`
+	}
+	if err := json.Unmarshal(data, &families); err == nil && len(families.Families) > 0 {
+		out := make([]Model, 0, 64)
+		seen := map[string]bool{}
+		for _, fam := range families.Families {
+			provider := strings.TrimSpace(fam.Slug)
+			for _, e := range fam.Variants {
+				id := strings.TrimSpace(e.ModelUID)
+				if id == "" {
+					id = strings.TrimSpace(e.ID)
+				}
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				label := strings.TrimSpace(e.Label)
+				if label == "" {
+					label = strings.TrimSpace(e.Name)
+				}
+				if label == "" {
+					label = id
+				}
+				out = append(out, Model{ID: id, Label: label, Provider: provider})
+			}
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
 	}
 	var models []entry
 	var wrapper struct {
@@ -514,6 +549,9 @@ func parseDevinModels(data []byte) ([]Model, error) {
 	seen := map[string]bool{}
 	for _, e := range models {
 		id := strings.TrimSpace(e.ID)
+		if id == "" {
+			id = strings.TrimSpace(e.ModelUID)
+		}
 		if id == "" {
 			id = strings.TrimSpace(e.Model)
 		}
