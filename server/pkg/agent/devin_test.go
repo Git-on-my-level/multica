@@ -168,6 +168,45 @@ func TestDevinBlockedArgsFiltering(t *testing.T) {
 	}
 }
 
+func TestDevinPassesModelFlag(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "argv.txt")
+	fakePath := filepath.Join(tempDir, "devin")
+	writeTestExecutable(t, fakePath, []byte(fakeDevinACPScript()))
+
+	backend, err := New("devin", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"DEVIN_ARGS_FILE": argsFile},
+	})
+	if err != nil {
+		t.Fatalf("new devin backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "task", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "swe-1.7-lightning",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	<-session.Result
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	got := strings.Join(strings.Split(strings.TrimSpace(string(raw)), "\n"), " ")
+	if got != "acp --model swe-1.7-lightning" {
+		t.Fatalf("argv = %q, want acp --model swe-1.7-lightning", got)
+	}
+}
+
 func TestSelectDevinAuthMethod(t *testing.T) {
 	t.Parallel()
 	if got, err := selectDevinAuthMethod(nil, false); err != nil || got != "" {

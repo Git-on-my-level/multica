@@ -28,6 +28,7 @@ var devinBlockedArgs = map[string]blockedArgMode{
 	"--print":           blockedStandalone,
 	"--mode":            blockedWithValue,
 	"--output-format":   blockedWithValue,
+	"--model":           blockedWithValue,
 }
 
 // devinBackend implements Backend by spawning `devin acp` and communicating
@@ -68,10 +69,11 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	timeout := opts.Timeout
 	runCtx, cancel := runContext(ctx, timeout)
 
-	devinArgs := append(
-		[]string{"acp"},
-		filterCustomArgs(opts.CustomArgs, devinBlockedArgs, b.cfg.Logger)...,
-	)
+	devinArgs := []string{"acp"}
+	if model := strings.TrimSpace(opts.Model); model != "" {
+		devinArgs = append(devinArgs, "--model", model)
+	}
+	devinArgs = append(devinArgs, filterCustomArgs(opts.CustomArgs, devinBlockedArgs, b.cfg.Logger)...)
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, devinArgs...)
 	hideAgentWindow(cmd)
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(devinArgs, trustAgentCommandPositional(0, "acp")))
@@ -284,48 +286,15 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("omp session created", "session_id", sessionID)
+		b.cfg.Logger.Info("devin session created", "session_id", sessionID)
 		// Surface the session id on the message bus immediately so the daemon
 		// can PinTaskSession mid-flight. Without this, a daemon restart during
-		// a long OMP turn loses the resume pointer (Devin never emits a later
-		// system/status event carrying sessionId the way Claude/Codex do).
+		// a long Devin turn loses the resume pointer.
 		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 
-		if opts.Model != "" {
-			// OMP exposes the model selector as a session config option, not
-			// via session/set_model (which it rejects as "Unknown ACP ext
-			// method"). Switch the model with session/set_config_option; the
-			// value is a model id from the configOptions catalog (e.g.
-			// "zai/glm-5.2"). Verified against omp acp 16.x.
-			if _, err := c.request(runCtx, "session/set_config_option", map[string]any{
-				"sessionId": sessionID,
-				"configId":  "model",
-				"value":     opts.Model,
-			}); err != nil {
-				b.cfg.Logger.Warn("omp set_config_option failed", "error", err, "requested_model", opts.Model)
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("omp could not switch to model %q: %v", opts.Model, err)
-				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
-					// On a resumed session with a model override, the dead
-					// session surfaces here instead of at session/prompt.
-					// Same fix as the prompt path below: clear the id so the
-					// daemon's resume-failure fallback retries fresh.
-					b.cfg.Logger.Warn("resumed session not found at set_config_option time; clearing session id so the daemon retries fresh",
-						"backend", "devin",
-						"session_id", sessionID,
-					)
-					sessionID = ""
-				}
-				resCh <- Result{
-					Status:     finalStatus,
-					Error:      finalError,
-					DurationMs: time.Since(startTime).Milliseconds(),
-					SessionID:  sessionID,
-				}
-				return
-			}
-			b.cfg.Logger.Info("omp session model set", "model", opts.Model)
-		}
+		// Model is set at launch via `devin acp --model`. Live CLI 3000.5.20
+		// accepts that flag on the acp subcommand. Do not use OMP's
+		// session/set_config_option.
 
 		userText := prompt
 		if opts.SystemPrompt != "" {
@@ -342,7 +311,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		if err != nil {
 			if runCtx.Err() == context.DeadlineExceeded {
 				finalStatus = "timeout"
-				finalError = fmt.Sprintf("omp timed out after %s", timeout)
+				finalError = fmt.Sprintf("devin timed out after %s", timeout)
 			} else if runCtx.Err() == context.Canceled {
 				finalStatus = "aborted"
 				finalError = "execution cancelled"
@@ -368,7 +337,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			case pr := <-promptDone:
 				if pr.stopReason == "cancelled" {
 					finalStatus = "aborted"
-					finalError = "omp cancelled the prompt"
+					finalError = "devin cancelled the prompt"
 				}
 				c.usageMu.Lock()
 				c.usage.InputTokens += pr.usage.InputTokens
@@ -381,7 +350,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		duration := time.Since(startTime)
-		b.cfg.Logger.Info("omp finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
+		b.cfg.Logger.Info("devin finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
 		stdin.Close()
 		cancel()
