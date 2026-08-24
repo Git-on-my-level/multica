@@ -110,10 +110,11 @@ var BuiltinRuntimes = []BuiltinRuntime{
 		EnvPrefix:         "MULTICA_DEVIN",
 		DisplayName:       "Devin",
 		SkillsDir:         ".devin/skills",
-		UserSkillsDir:     ".devin/skills",
+		UserSkillsDir:     ".config/devin/skills",
 		LaunchHeader:      "devin acp",
 		DefaultExecutable: "devin",
 		ProviderLabel:     "devin",
+		ModelDiscovery:    discoverDevinModels,
 	},
 }
 

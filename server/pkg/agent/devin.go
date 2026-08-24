@@ -3,9 +3,11 @@ package agent
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,13 +15,9 @@ import (
 )
 
 // devinBlockedArgs are flags hardcoded by the daemon that must not be overridden
-// by user-configured custom_args. `acp` is the protocol subcommand that drives
-// the ACP JSON-RPC transport; `--yolo`/`--auto-approve`/`--approval-mode` are
-// daemon-owned so headless ACP always runs in bypass-permissions mode (Devin
-// otherwise gates bash/edit/delete/move behind an ACP client permission
-// prompt); `-p`/`--print`, `--mode` (e.g. `--mode rpc`), and `--output-format`
-// would switch the binary out of ACP into a different transport and break the
-// daemon↔OMP communication contract.
+// by user-configured custom_args. `acp` is the protocol subcommand. Devin ACP
+// does not take a root `--permission-mode`; auto-approve via ACP
+// session/request_permission. `-p`/`--print` would leave ACP stdio.
 var devinBlockedArgs = map[string]blockedArgMode{
 	"acp":               blockedStandalone,
 	"--yolo":            blockedStandalone,
@@ -209,18 +207,36 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		// unsupported transport tanks the whole session/new.
 		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "devin", b.cfg)
 
+		// When initialize advertises authMethods, the ACP host must send
+		// authenticate before session/new. Desktop-spawned `devin acp` ignores
+		// local `devin auth` and waits for this. Standalone often advertises
+		// nothing (empty = skip).
+		if methodID, authErr := selectDevinAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(cmd.Env, "WINDSURF_API_KEY")); authErr != nil {
+			finalStatus = "failed"
+			finalError = fmt.Sprintf("devin authentication setup failed: %v", authErr)
+			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+			return
+		} else if methodID != "" {
+			authParams := map[string]any{"methodId": methodID}
+			if methodID == devinAuthMethodWindsurfAPIKey {
+				authParams["_meta"] = map[string]any{"headless": true}
+			}
+			if _, err := c.request(runCtx, "authenticate", authParams); err != nil {
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("devin authenticate (%s) failed: %v — run `devin auth login` or set WINDSURF_API_KEY", methodID, err)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				return
+			}
+			b.cfg.Logger.Info("devin authenticated", "method", methodID)
+		}
+
 		cwd := opts.Cwd
 		if cwd == "" {
 			cwd = "."
 		}
 
 		if opts.ResumeSessionID != "" {
-			// OMP advertises loadSession, so resume goes through the standard
-			// ACP session/load (same path as Kiro/Traecli). Apply the same
-			// defensive id resolution hermes/kimi/kiro use: if OMP echoes a
-			// different sessionId, prefer it (the canonical id the backend is
-			// committed to) so a silent state reset doesn't pin us to a dead
-			// id.
+			// Devin advertises loadSession; resume uses ACP session/load.
 			result, err := c.request(runCtx, "session/load", map[string]any{
 				"cwd":        cwd,
 				"sessionId":  opts.ResumeSessionID,
@@ -258,7 +274,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			sessionID = extractACPSessionID(result)
 			if sessionID == "" {
 				finalStatus = "failed"
-				finalError = "omp session/new returned no session ID"
+				finalError = "devin session/new returned no session ID"
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
@@ -412,4 +428,107 @@ func (b *devinBackend) applyBuiltinRuntimeOverrides(desc BuiltinRuntime) {
 	if desc.DefaultExecutable != "" && b.cfg.ExecutablePath == "" {
 		b.cfg.ExecutablePath = desc.DefaultExecutable
 	}
+}
+
+const (
+	devinAuthMethodWindsurfAPIKey = "windsurf-api-key"
+)
+
+// selectDevinAuthMethod picks an ACP authenticate method advertised by
+// initialize. Empty methods means skip (standalone `devin acp` often uses
+// local `devin auth` without an explicit handshake).
+func selectDevinAuthMethod(methods []string, haveWindsurfKey bool) (string, error) {
+	if len(methods) == 0 {
+		return "", nil
+	}
+	offered := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		if m = strings.TrimSpace(m); m != "" {
+			offered[m] = true
+		}
+	}
+	if haveWindsurfKey && offered[devinAuthMethodWindsurfAPIKey] {
+		return devinAuthMethodWindsurfAPIKey, nil
+	}
+	for _, candidate := range []string{"devin-cli", "cached-login", "local", "login"} {
+		if offered[candidate] {
+			return candidate, nil
+		}
+	}
+	// Standalone `devin acp` advertises interactive browser login. Multica
+	// cannot complete that from a daemon; skip the handshake and rely on
+	// stored `devin auth` / WINDSURF_API_KEY. session/new fails closed if
+	// neither is present.
+	if offered["devin-browser"] && !offered[devinAuthMethodWindsurfAPIKey] {
+		return "", nil
+	}
+	if offered[devinAuthMethodWindsurfAPIKey] {
+		return "", fmt.Errorf("devin acp advertised only windsurf-api-key; set WINDSURF_API_KEY or run `devin auth login`")
+	}
+	advertised := make([]string, 0, len(offered))
+	for method := range offered {
+		advertised = append(advertised, method)
+	}
+	sort.Strings(advertised)
+	return "", fmt.Errorf("devin acp advertised unsupported auth methods %q", advertised)
+}
+
+// discoverDevinModels runs `devin models list --format json`.
+// Unknown/empty output degrades to an empty catalog (manual entry).
+func discoverDevinModels(ctx context.Context, runtimeCmd Command) ([]Model, error) {
+	if runtimeCmd.Path == "" {
+		runtimeCmd.Path = "devin"
+	}
+	if _, err := exec.LookPath(runtimeCmd.Path); err != nil {
+		return []Model{}, nil
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := runtimeCmd.exec(runCtx, "models", "list", "--format", "json")
+	hideAgentWindow(cmd)
+	stdout, err := cmd.Output()
+	if err != nil || len(stdout) == 0 {
+		return []Model{}, nil
+	}
+	return parseDevinModels(stdout)
+}
+
+func parseDevinModels(data []byte) ([]Model, error) {
+	type entry struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Label    string `json:"label"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	}
+	var models []entry
+	var wrapper struct {
+		Models []entry `json:"models"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Models) > 0 {
+		models = wrapper.Models
+	} else if err := json.Unmarshal(data, &models); err != nil {
+		return []Model{}, nil
+	}
+	out := make([]Model, 0, len(models))
+	seen := map[string]bool{}
+	for _, e := range models {
+		id := strings.TrimSpace(e.ID)
+		if id == "" {
+			id = strings.TrimSpace(e.Model)
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		label := strings.TrimSpace(e.Name)
+		if label == "" {
+			label = strings.TrimSpace(e.Label)
+		}
+		if label == "" {
+			label = id
+		}
+		out = append(out, Model{ID: id, Label: label, Provider: strings.TrimSpace(e.Provider)})
+	}
+	return out, nil
 }
