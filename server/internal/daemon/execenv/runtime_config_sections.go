@@ -698,6 +698,8 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	}
 	b.WriteString("5. Before exiting, confirm the status still matches where things actually stand, then pin or clear a metadata key via `multica issue metadata set`/`delete` only if it clears the bar in `## Issue Metadata`. Most runs write no metadata — that is the expected outcome, not a gap. When in doubt, do not write.\n\n")
 
+	b.WriteString("**PR identifier contract.** If work on this issue creates or updates a pull request, read the issue `identifier` from the `multica issue get` response and include it in the PR title, body, or branch. Prefer the link-only title form `IDENTIFIER: <summary>`. This establishes association only: do not add `Closes`, `Fixes`, or `Resolves` solely to satisfy this contract; use an explicit closing keyword only when merge-close intent is authorized.\n\n")
+
 	b.WriteString("**Issue status — write the state the issue is in, whenever it changes** (skip any status call your Agent Identity forbids)\n\n")
 	b.WriteString("Status reflects the state the ISSUE is in, not your run's lifecycle — keep it true at every point in the turn, not only at checkpoints: write the new value the moment your work changes it, mid-turn included. Write only when the new value differs from the current one, whoever the assignee is:\n\n")
 	b.WriteString("- You delivered what the issue itself asks for and it awaits acceptance → `in_review`. Delivering an issue assigned to you — including a sub-issue in a chain or stage — always lands here; stage barriers and parent notifications depend on that signal. `done` stays human.\n")

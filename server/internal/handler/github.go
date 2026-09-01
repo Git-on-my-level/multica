@@ -1734,7 +1734,7 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 	// are a "new side-effect" and must be gated by the workspace's auto-link
 	// flag (which itself short-circuits when the master `github_enabled`
 	// switch is off).
-	linkedIssueIDs := make([]string, 0)
+	linkedIssueIDs := h.linkAwaitingHandoffsForPR(ctx, wsID, pr)
 	if h.workspaceAutoLinkPRsEnabled(ctx, wsID) {
 		idents := extractIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
 		// closingIdents is the subset of identifiers that this PR explicitly
