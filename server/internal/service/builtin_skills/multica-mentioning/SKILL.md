@@ -32,6 +32,15 @@ So the link target is a real entity UUID (or `all`), never a display name. The
 label between the brackets is free text — that is where the human-readable name
 goes.
 
+One `mention://` form deliberately sits OUTSIDE this parser:
+`[Label](mention://project/<uuid>)`. `project` is absent from the type group
+above, so the backend never parses it and it can enqueue nothing — it is a
+render-only link every client makes navigable (a chip on web and desktop, an
+ordinary link that opens the project on tap on mobile). That is the whole point:
+a project reference should never be able to start a run. Use it freely to point
+at a project (see the multica-projects-and-resources skill); everything else in
+this document is about the four types (plus `all`) the parser does recognize.
+
 ## Step 1 — look up the UUID with `--output json`
 
 A name is not a UUID. Look the UUID up first, from the matching list command:
@@ -157,6 +166,17 @@ read. Read that array after posting — it is the only place any of this shows u
   nothing about being able to mention it. (The `canEnqueueSquadLeader` wrapper
   is the squad assignment/promote path, not this one; the child-done wake is
   ungated — see the multica-squads skill.)
+
+A chain that crosses issues keeps its human (MUL-6490). The A2A gate judges the
+human at the top of your chain, and that human travels on the comment you write:
+the comment records the run that authored it, so the run it wakes inherits your
+originator. This holds when you comment on a DIFFERENT issue than the one you are
+running on — the ordinary "create issue Y, then coordinate there" flow — so a
+delegation that works on your own issue keeps working on the issue you just
+created. It does not go the other way: nothing ever substitutes a different human
+(your agent's owner, or the target issue's originator), so if your chain has no
+human at its top, member-scoped allow-lists stay closed no matter which issue you
+move to.
 
 One nuance for automation (MUL-4857): when an UNATTRIBUTED autopilot run (a
 schedule/webhook dispatch has no human originator, so the A2A gate has no human

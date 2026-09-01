@@ -333,7 +333,7 @@ describe("shouldDisableMacNotarize", () => {
 });
 
 describe("fork Desktop release policy", () => {
-  it("keeps fork tag workflows from publishing Desktop artifacts", () => {
+  it("keeps macOS Desktop signing human-gated on this fork", () => {
     const repoRoot = [process.cwd(), resolve(process.cwd(), "..", "..")].find(
       (candidate) => existsSync(resolve(candidate, ".github", "workflows", "release.yml")),
     );
@@ -344,13 +344,13 @@ describe("fork Desktop release policy", () => {
     );
     const macGuide = readFileSync(resolve(repoRoot, "apps", "desktop", "MACOS_RELEASE.md"), "utf-8");
 
-    expect(workflow).toMatch(/desktop:\n\s+needs: \[verify, cli-release\]\n[\s\S]*?if: needs\.verify\.outputs\.is_upstream == 'true'/);
-    expect(workflow).toMatch(/desktop-mac:[\s\S]*?if: \$\{\{ false \}\}/);
+    // Keep upstream's Linux/Windows desktop job; do not let CI publish
+    // signed macOS artifacts from this fork.
+    expect(workflow).toMatch(/desktop:\n\s+needs: release/);
+    expect(workflow).not.toMatch(/matrix\.target == 'mac'/);
     expect(macGuide).toContain("human-gated on the designated arm64 Mac");
     expect(macGuide).toContain("release:macos-arm64");
     expect(macGuide).toContain('APPLE_KEYCHAIN_PROFILE="multica-notary"');
-    expect(macGuide).toContain("ZIP, and ZIP blockmap");
-    expect(macGuide).toContain("--publish always");
     expect(macGuide).toContain("never runs from\nGitHub Actions");
   });
 });

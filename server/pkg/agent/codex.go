@@ -31,11 +31,6 @@ import (
 // share the `-c` flag with legitimate non-MCP overrides like `-c model=…`.
 var codexBlockedArgs = map[string]blockedArgMode{
 	"--listen": blockedWithValue, // stdio:// transport for daemon communication
-	// These flags belong to the interactive `codex` command, not its
-	// app-server subcommand. Passing either makes app-server exit before the
-	// JSON-RPC handshake.
-	"--yolo": blockedStandalone,
-	"--dangerously-bypass-approvals-and-sandbox": blockedStandalone,
 }
 
 const (
@@ -113,6 +108,9 @@ func codexProcessWaitDelay() time.Duration {
 }
 
 type codexStderrClassification struct {
+	// modelRefreshFailure is the broad catalog failure bucket. It includes the
+	// narrower modelRefreshTimeout bucket, so the two counts are not additive.
+	modelRefreshFailure int
 	modelRefreshTimeout int
 	mcpInitTransport    int
 	bareTimeout         int
@@ -124,6 +122,7 @@ type codexStderrClassification struct {
 func classifyCodexStartupStderr(stderr string, timedOut bool) codexStderrClassification {
 	lower := strings.ToLower(sanitizeCodexDiagnostic(stderr))
 	classification := codexStderrClassification{
+		modelRefreshFailure: strings.Count(lower, codexModelCatalogRefreshFailureSignal),
 		modelRefreshTimeout: strings.Count(lower, codexModelCatalogRefreshTimeoutSignal),
 	}
 	for _, line := range strings.Split(lower, "\n") {
@@ -132,7 +131,10 @@ func classifyCodexStartupStderr(stderr string, timedOut bool) codexStderrClassif
 			classification.mcpInitTransport++
 		}
 	}
-	if timedOut && classification.modelRefreshTimeout == 0 && classification.mcpInitTransport == 0 {
+	// Any catalog refresh failure now owns the timeout classification, not only
+	// the narrower child-process timeout signal. This intentionally makes the
+	// existing bare-timeout bucket stricter across daemon versions.
+	if timedOut && classification.modelRefreshFailure == 0 && classification.mcpInitTransport == 0 {
 		classification.bareTimeout = 1
 	}
 	return classification
@@ -149,6 +151,38 @@ const CodexFirstTurnNoProgressMarker = "codex app-server no progress timeout"
 // CodexHandshakeTimeoutMarker identifies a Codex app-server startup RPC that
 // did not answer within the bounded handshake window.
 const CodexHandshakeTimeoutMarker = "codex app-server handshake timeout"
+
+// codexResumeMarker and codexLineOverflowMarker are the two halves of the
+// error text a resume-overflow produces: the method that failed (written by
+// startOrResumeThread) and bufio's own ErrTooLong wording, which reaches the
+// string through the reader goroutine.
+const (
+	codexResumeMarker       = "thread/resume failed"
+	codexLineOverflowMarker = "token too long"
+)
+
+// CodexResumeOverflowError reports whether an agent error string is the
+// resume-overflow failure — the thread/resume response did not fit in our
+// stdout line buffer, so the thread cannot be handed to us at all.
+//
+// This lives next to the code that writes both halves of the text so the two
+// cannot drift apart, and it is exported because the daemon has only the error
+// STRING at report time: by then the typed bufio.ErrTooLong that
+// isCodexResumeOverflow matches in-process is long gone. Both markers are
+// required — "thread/resume failed" alone covers ordinary rejections that a
+// plain retry handles, and "token too long" alone would also match an overflow
+// on some other RPC, where dropping the session pointer cures nothing.
+//
+// The session behind such a failure is unusable for resume until it shrinks,
+// which it never does — codex rollouts are append-only. Callers use this to
+// stop handing the same oversized thread to the next task (MUL-5722).
+func CodexResumeOverflowError(errText string) bool {
+	if errText == "" {
+		return false
+	}
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, codexResumeMarker) && strings.Contains(lower, codexLineOverflowMarker)
+}
 
 // codexModelCatalogRefreshFailureSignal matches the Codex models-manager error
 // emitted when the model catalog could not be refreshed. Codex reports several
@@ -179,6 +213,47 @@ type codexTimeoutDiagnostic struct {
 	CodexVersion string
 }
 
+// codexFirstItemWaitObservation records the interval from turn/started to the
+// first semantic progress or terminal outcome. start is called by the stdout
+// reader before it publishes status:running, while finish is called by the
+// lifecycle goroutine; the mutex keeps the cross-goroutine timestamp precise
+// without changing the watchdog's existing channel-driven semantics.
+type codexFirstItemWaitObservation struct {
+	mu         sync.Mutex
+	startedAt  time.Time
+	finishedAt time.Time
+	outcome    string
+	stderr     codexStderrClassification
+}
+
+func (o *codexFirstItemWaitObservation) start(now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.startedAt.IsZero() {
+		o.startedAt = now
+	}
+}
+
+func (o *codexFirstItemWaitObservation) finish(now time.Time, outcome string, stderr codexStderrClassification) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.startedAt.IsZero() || o.outcome != "" {
+		return
+	}
+	o.finishedAt = now
+	o.outcome = outcome
+	o.stderr = stderr
+}
+
+func (o *codexFirstItemWaitObservation) snapshot() (time.Duration, string, codexStderrClassification, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.startedAt.IsZero() || o.finishedAt.IsZero() || o.outcome == "" {
+		return 0, "", codexStderrClassification{}, false
+	}
+	return o.finishedAt.Sub(o.startedAt), o.outcome, o.stderr, true
+}
+
 // codexBackend implements Backend by spawning `codex app-server --listen stdio://`
 // and communicating via JSON-RPC 2.0 over stdin/stdout.
 type codexBackend struct {
@@ -192,26 +267,6 @@ func buildCodexArgs(opts ExecOptions, logger *slog.Logger) []string {
 		launchArgs = enforceCodexFastMode(launchArgs, logger)
 	}
 	return append(args, launchArgs...)
-}
-
-// ValidateCodexAppServerArgs rejects known interactive-Codex flags before a
-// task is started. Normalization remains a defensive second boundary for old
-// persisted records and daemon-wide defaults, but silently filtering a saved
-// agent setting is not an acceptable substitute for telling its owner that it
-// cannot be used with the app-server protocol.
-func ValidateCodexAppServerArgs(args []string) error {
-	for _, raw := range args {
-		arg := unshellQuoteArg(raw)
-		flag := arg
-		if idx := strings.IndexByte(flag, '='); idx > 0 {
-			flag = flag[:idx]
-		}
-		switch flag {
-		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
-			return fmt.Errorf("codex app-server does not accept CLI-only argument %q; configure permissions through Multica instead", flag)
-		}
-	}
-	return nil
 }
 
 // NormalizeCodexLaunchArgs returns the user-supplied Codex args (extra then
@@ -263,6 +318,21 @@ func NormalizeCodexLaunchArgs(extraArgs, customArgs []string, mcpConfig json.Raw
 // catalog-owned `priority` tier. Future service tiers must not accidentally
 // inherit Fast mode semantics.
 func enforceCodexFastMode(args []string, logger *slog.Logger) []string {
+	return append(stripCodexFastModeConflicts(args, logger), "--enable", codexFastModeFeature)
+}
+
+// stripCodexFastModeConflicts removes the lower-priority overrides that would
+// defeat an explicit priority tier, without appending the managed enable.
+//
+// Split out of enforceCodexFastMode because the enable belongs exactly once, on
+// the final managed args, while the removal has to reach every argv region the
+// user can write into — including a custom runtime profile's launch prefix.
+// Prefix-first does not protect this setting: `--disable fast_mode` beats
+// `--enable fast_mode` regardless of argv order, and a `-c
+// features.fast_mode=false` beats config.toml from any position. Leaving the
+// prefix unfiltered would let a profile override the tier the agent explicitly
+// selected, inverting the precedence this package promises (GH #7046).
+func stripCodexFastModeConflicts(args []string, logger *slog.Logger) []string {
 	args = filterCodexConfigOverrides(
 		args,
 		codexManagedFastModeConfigKeyRe,
@@ -297,7 +367,7 @@ func enforceCodexFastMode(args []string, logger *slog.Logger) []string {
 		}
 		filtered = append(filtered, arg)
 	}
-	return append(filtered, "--enable", codexFastModeFeature)
+	return filtered
 }
 
 // hasManagedCodexMcpConfig reports whether the agent's mcp_config field is
@@ -839,7 +909,8 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				// thread may hold the submitted input or an unfinished turn.
 				// Resuming it again could duplicate that input; start a fresh
 				// thread instead and keep ResumeExpected so codexTurnInput
-				// prepends the continuity notice about the lost context.
+				// prepends the caller's continuity notice about the lost
+				// context.
 				if attemptOpts.ResumeSessionID != "" {
 					b.cfg.Logger.Warn("codex retry dropping resume pointer after model catalog refresh failure",
 						"prior_thread_id", attemptOpts.ResumeSessionID,
@@ -887,10 +958,10 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// `mcp_servers.<id>.env` is allowed to carry secrets (Codex docs:
 	// https://developers.openai.com/codex/mcp#configure-with-configtoml)
 	// and our UI already treats mcp_config as a redacted-for-non-admins
-	// field. Process argv ends up in OS-level `ps` listings and is also
-	// echoed into the daemon's `agent command` log line below, so any
-	// inline env-bearing TOML would defeat the redaction. Writing through
-	// config.toml at 0o600 keeps the secret values out of argv and logs.
+	// field. Process argv ends up in OS-level `ps` listings; daemon command
+	// logs redact values, but log redaction cannot protect the process list.
+	// Writing through config.toml at 0o600 keeps the secret values out of argv
+	// entirely.
 	codexHome := strings.TrimSpace(b.cfg.Env["CODEX_HOME"])
 	if codexHome != "" {
 		if err := ensureCodexMcpConfig(filepath.Join(codexHome, "config.toml"), opts.McpConfig, b.cfg.Logger); err != nil {
@@ -912,15 +983,39 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("codex: mcp_config is set but CODEX_HOME env var is not configured; cannot apply managed MCP")
 	}
 
+	// A custom runtime profile's fixed_args reach codex as the launch prefix.
+	// Being first does not protect the daemon's managed config from them: a
+	// `-c key=value` override wins over the task-local config.toml from any
+	// argv position, so the prefix needs the same two removals ExtraArgs and
+	// CustomArgs get below.
+	runtimeCmd := b.cfg.commandAt(execPath)
 	if codexHome != "" {
 		// The daemon owns shell_environment_policy in the task-local config.
 		// Codex -c/--config overrides are last-wins, so remove user-provided
 		// root or profile policy overrides before building the final argv.
 		opts.ExtraArgs = filterCodexShellEnvConfigOverrides(opts.ExtraArgs, b.cfg.Logger)
 		opts.CustomArgs = filterCodexShellEnvConfigOverrides(opts.CustomArgs, b.cfg.Logger)
+		runtimeCmd = runtimeCmd.withFilteredPrefix(func(prefix []string) []string {
+			return filterCodexShellEnvConfigOverrides(prefix, b.cfg.Logger)
+		})
+	}
+	if hasManagedCodexMcpConfig(opts.McpConfig) {
+		// Mirrors NormalizeCodexLaunchArgs, which applies this to ExtraArgs and
+		// CustomArgs once an agent has a managed mcp_config.
+		runtimeCmd = runtimeCmd.withFilteredPrefix(func(prefix []string) []string {
+			return filterCodexCustomConfigOverrides(prefix, b.cfg.Logger)
+		})
+	}
+	if opts.ServiceTier == codexFastServiceTier {
+		// Mirrors enforceCodexFastMode, which buildCodexArgs applies to the
+		// managed args. The enable itself is appended there, once; the prefix
+		// only needs the conflicting disable/config overrides removed.
+		runtimeCmd = runtimeCmd.withFilteredPrefix(func(prefix []string) []string {
+			return stripCodexFastModeConflicts(prefix, b.cfg.Logger)
+		})
 	}
 	codexArgs := buildCodexArgs(opts, b.cfg.Logger)
-	cmd := exec.CommandContext(runCtx, execPath, codexArgs...)
+	cmd := runtimeCmd.exec(runCtx, codexArgs...)
 	hideAgentWindow(cmd)
 	// Run codex in its own process group so a cancel-on-stuck cleanup
 	// reaches the whole tree — the codex Node wrapper plus the native
@@ -938,7 +1033,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// still backstops cmd.Wait() if the kill leaves an open pipe.
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
-			signalProcessGroup(cmd.Process, syscall.SIGKILL)
+			signalProcessGroup(cmd, syscall.SIGKILL)
 		}
 		return nil
 	}
@@ -946,7 +1041,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// open pipe held by a grandchild) can't hang cmd.Wait() forever. Matches
 	// the other long-lived backends (claude, copilot, cursor, …).
 	cmd.WaitDelay = codexProcessWaitDelay()
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", codexArgs)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(codexArgs, trustAgentCommandPositional(0, "app-server")))
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -967,7 +1062,14 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	stderrBuf := newStderrTail(io.Discard, codexStderrTailBytes)
 	cmd.Stderr = stderrBuf
 
-	if err := cmd.Start(); err != nil {
+	// Start and take ownership of the process tree in one step. On Windows the
+	// child is created suspended and placed in a Job Object before it runs, so
+	// the cleanup below reaches the Node wrapper, the native app-server, and the
+	// sandbox helpers underneath them rather than just the direct child. On Unix
+	// the process group configured above already covers that and this is a plain
+	// Start. Ownership that cannot be taken is logged, not fatal; a child that
+	// cannot be resumed is killed and reported here.
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start codex: %w", err)
 	}
@@ -1000,6 +1102,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	var finalAnswer, lastAgentMessage string
 	var semanticObserved atomic.Bool
 	turnNotificationGate := &codexTurnNotificationGate{}
+	firstItemWait := &codexFirstItemWaitObservation{}
 
 	// turnDone is set before starting the reader goroutine so there is no
 	// race between the lifecycle goroutine writing and the reader reading.
@@ -1029,9 +1132,13 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				lastAgentMessage = msg.Content
 				outputMu.Unlock()
 			}
+			activity := describeCodexSemanticActivity(msg)
+			if activity == "status:running" {
+				firstItemWait.start(time.Now())
+			}
 			trySend(msgCh, msg)
-			trySendString(semanticActivityCh, describeCodexSemanticActivity(msg))
-			if describeCodexSemanticActivity(msg) != "" {
+			trySendString(semanticActivityCh, activity)
+			if activity != "" {
 				semanticObserved.Store(true)
 			}
 		},
@@ -1057,8 +1164,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+		scanner := newAgentStreamScanner(stdout)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -1067,7 +1173,12 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			c.handleLine(line)
 		}
 		if err := scanner.Err(); err != nil {
-			c.markProcessExited(fmt.Errorf("%w: %v", errCodexProcessExited, err))
+			// %w on BOTH: callers match errCodexProcessExited to decide the
+			// process is gone, and bufio.ErrTooLong to tell "we could not read
+			// the response" apart from "codex died". startOrResumeThread needs
+			// that distinction to report an oversized resume as a rejected
+			// resume rather than a crash (MUL-5722).
+			c.markProcessExited(fmt.Errorf("%w: %w", errCodexProcessExited, err))
 			return
 		}
 		c.markProcessExited(errCodexProcessExited)
@@ -1191,7 +1302,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			// Wait returning with a ProcessState is the os/exec reap boundary.
 			// On Unix, ProcessState.Exited reports false for a process terminated
 			// by SIGKILL even though Wait successfully reaped it.
-			cleanupConfirmed = waitReturned && cmd.ProcessState != nil && waitProcessGroupGone(cmd.Process, grace)
+			cleanupConfirmed = waitReturned && cmd.ProcessState != nil && waitProcessGroupGone(cmd, grace)
 			if codexCleanupConfirmationOverride.Load() < 0 {
 				cleanupConfirmed = false
 			}
@@ -1209,6 +1320,12 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				"stderr_bytes", stderrBuf.TotalBytes(),
 				"stderr_truncated", stderrBuf.TotalBytes() > codexStderrTailBytes,
 			)
+			// The tree has been reaped and observed; drop ownership. This is
+			// the only safe point to do so on Windows, where releasing kills
+			// whatever is still inside the job — which is precisely what should
+			// happen to anything that outlived the reap above. waitOnce makes it
+			// exactly-once per launch attempt.
+			releaseProcessGroup(cmd)
 		})
 	}
 
@@ -1248,7 +1365,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				// A timed-out initialize may still complete after the host gives up.
 				// Kill the whole process group before waiting so a leader that exits
 				// on stdin EOF cannot leave detached-stdio descendants behind.
-				signalProcessGroup(cmd.Process, syscall.SIGKILL)
+				signalProcessGroup(cmd, syscall.SIGKILL)
 			}
 			drainAndWait() // flush os/exec stderr goroutine before sampling Tail
 			finalStatus = "failed"
@@ -1287,7 +1404,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				// A timed-out thread/start has an uncertain provider outcome. Kill
 				// the whole process group before waiting so a leader that exits on
 				// EOF cannot leave detached-stdio descendants behind.
-				signalProcessGroup(cmd.Process, syscall.SIGKILL)
+				signalProcessGroup(cmd, syscall.SIGKILL)
 			}
 			drainAndWait() // flush os/exec stderr goroutine before sampling Tail
 			finalStatus = "failed"
@@ -1309,12 +1426,18 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 					"reaped", cleanupConfirmed,
 					"retry_safe", false,
 					"retry_attempted", false,
+					"stderr_model_refresh_failure_count", classification.modelRefreshFailure,
 					"stderr_model_refresh_timeout_count", classification.modelRefreshTimeout,
 					"stderr_mcp_init_transport_count", classification.mcpInitTransport,
 					"stderr_bare_timeout_count", classification.bareTimeout,
 				)
 			}
-			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+			resCh <- Result{
+				Status:         finalStatus,
+				Error:          finalError,
+				DurationMs:     time.Since(startTime).Milliseconds(),
+				ResumeRejected: isCodexResumeOverflow(opts, err),
+			}
 			return
 		}
 		c.threadID = threadID
@@ -1327,13 +1450,17 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// 3. Send turn and wait for completion. When a resume was expected but we
 		// ended up on a fresh thread (the live thread/resume RPC was rejected — a
 		// corrupt/incompatible rollout, server-side thread GC, schema drift — or a
-		// transport failure forced a fresh retry), prepend a continuity notice so
-		// the agent tells the user the prior conversation could not be restored.
-		// The daemon's pre-flight gates only catch cases detectable before launch;
+		// transport failure forced a fresh retry), prepend the caller's continuity
+		// notice so the agent does not assume continuity it no longer has. The
+		// daemon's pre-flight gates only catch cases detectable before launch;
 		// this covers the ones only the live resume reveals (MUL-4424).
+		//
+		// Whether that notice asks the agent to tell the USER is the caller's
+		// call, not ours: it depends on whether this surface's conversation is
+		// still readable, which this package cannot see (MUL-5722).
 		turnParams := map[string]any{
 			"threadId": threadID,
-			"input":    codexTurnInput(prompt, opts.ResumeExpected, resumed),
+			"input":    codexTurnInput(prompt, opts.ResumeExpected, resumed, opts.ResumeContinuityNotice),
 		}
 		// Per-turn reasoning override. Mirrors the per-thread injection in
 		// startOrResumeThread; keeping both in sync is enforced by the
@@ -1345,10 +1472,18 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		waitingForTurn := true
 		var timeoutDiagnostic codexTimeoutDiagnostic
 		var processExitErr error
+		finishFirstItemWait := func(outcome string) {
+			firstItemWait.finish(
+				time.Now(),
+				outcome,
+				classifyCodexStartupStderr(stderrBuf.Tail(), strings.HasSuffix(outcome, "_timeout")),
+			)
+		}
 		finishTurn := func(aborted bool) {
 			waitingForTurn = false
 			switch {
 			case aborted:
+				finishFirstItemWait("turn_aborted")
 				finalStatus = "aborted"
 				if errMsg := c.getTurnError(); errMsg != "" {
 					finalError = errMsg
@@ -1357,8 +1492,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				}
 			default:
 				if errMsg := c.getTurnError(); errMsg != "" {
+					finishFirstItemWait("turn_failed")
 					finalStatus = "failed"
 					finalError = errMsg
+				} else {
+					finishFirstItemWait("turn_completed")
 				}
 			}
 		}
@@ -1382,7 +1520,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		semanticTimer := time.NewTimer(semanticInactivityTimeout)
 		defer semanticTimer.Stop()
 
-		firstTurnNoProgressTimeout := codexFirstTurnNoProgressTimeout(semanticInactivityTimeout)
+		firstTurnNoProgressTimeout := codexFirstTurnNoProgressTimeout(semanticInactivityTimeout, opts.FirstTurnNoProgressTimeout)
 		var firstTurnNoProgressTimer *time.Timer
 		var firstTurnNoProgressTimerC <-chan time.Time
 		firstTurnStarted := false
@@ -1399,9 +1537,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		finishRunContextDone := func() {
 			waitingForTurn = false
 			if runCtx.Err() == context.DeadlineExceeded {
+				finishFirstItemWait("execution_timeout")
 				finalStatus = "timeout"
 				finalError = fmt.Sprintf("codex timed out after %s", timeout)
 			} else {
+				finishFirstItemWait("cancelled")
 				finalStatus = "aborted"
 				finalError = "execution cancelled"
 			}
@@ -1416,14 +1556,21 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				resetTimer(semanticTimer, semanticInactivityTimeout)
 				if activity == "status:running" && !firstTurnStarted {
 					firstTurnStarted = true
+					firstItemWait.start(time.Now())
 					firstTurnNoProgressTimer = time.NewTimer(firstTurnNoProgressTimeout)
 					firstTurnNoProgressTimerC = firstTurnNoProgressTimer.C
 				} else if firstTurnStarted && !firstTurnProgressObserved && isCodexFirstTurnProgressActivity(activity) {
 					firstTurnProgressObserved = true
+					if activity == "error:terminal" {
+						finishFirstItemWait("turn_failed")
+					} else {
+						finishFirstItemWait("progress")
+					}
 					stopFirstTurnNoProgressTimer()
 				}
 			case <-firstTurnNoProgressTimerC:
 				waitingForTurn = false
+				finishFirstItemWait("no_progress_timeout")
 				finalStatus = "timeout"
 				timeoutDiagnostic = codexTimeoutDiagnostic{
 					Kind:         codexTimeoutFirstTurnNoProgress,
@@ -1442,6 +1589,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				)
 			case <-semanticTimer.C:
 				waitingForTurn = false
+				finishFirstItemWait("semantic_inactivity_timeout")
 				finalStatus = "timeout"
 				timeoutDiagnostic = codexTimeoutDiagnostic{
 					Kind:         codexTimeoutSemanticInactivity,
@@ -1470,6 +1618,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 						finishRunContextDone()
 					} else {
 						waitingForTurn = false
+						finishFirstItemWait("process_exit")
 						finalStatus = "failed"
 						processExitErr = c.getProcessErr()
 						if processExitErr == nil {
@@ -1496,7 +1645,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 		stderrTail := sanitizeCodexDiagnostic(stderrBuf.Tail())
 		if timeoutDiagnostic.Kind != codexTimeoutNone {
-			timeoutDiagnostic.CodexVersion = detectCodexVersionForDiagnostics(context.Background(), execPath, cmd.Env, b.cfg.Logger)
+			timeoutDiagnostic.CodexVersion = detectCodexVersionForDiagnostics(context.Background(), b.cfg.commandAt(execPath), cmd.Env, b.cfg.Logger)
 			finalError = buildCodexTimeoutDiagnosticError(timeoutDiagnostic, stderrTail)
 		}
 
@@ -1517,6 +1666,53 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				"thread_id", threadID,
 				"attempt", attempt,
 			)
+		}
+
+		if waitLatency, outcome, classification, ok := firstItemWait.snapshot(); ok {
+			if waitLatency < 0 {
+				waitLatency = 0
+			}
+			// On timeout, cmd.Wait is the synchronization point that guarantees
+			// the stderr copy goroutine has drained. Reclassify from the complete
+			// bounded tail so a last-moment catalog/MCP signal is not reported as
+			// a bare timeout. Successful waits keep the snapshot taken at first
+			// progress so later turn stderr cannot pollute first-item telemetry.
+			if strings.HasSuffix(outcome, "_timeout") {
+				classification = classifyCodexStartupStderr(stderrTail, true)
+			}
+			fields := []any{
+				"phase", "first_item_wait",
+				"task_id", b.cfg.TaskID,
+				"runtime_id", b.cfg.RuntimeID,
+				"pid", cmd.Process.Pid,
+				"attempt", attempt,
+				"active_launches", activeLaunches,
+				"method", "turn/start",
+				"thread_id", threadID,
+				"turn_id", c.turnID,
+				"outcome", outcome,
+				"latency", waitLatency.Round(time.Millisecond).String(),
+				"latency_ms", waitLatency.Milliseconds(),
+				"timeout", firstTurnNoProgressTimeout.String(),
+				"semantic_inactivity_timeout", semanticInactivityTimeout.String(),
+				"codex_version", codexVersion,
+				"daemon_version", b.cfg.DaemonVersion,
+				"cleanup_confirmed", cleanupConfirmed,
+				"reaped", cleanupConfirmed,
+				// retry_safe describes the terminal attempt, not the measured wait
+				// interval. Successful samples therefore report false by design.
+				"retry_safe", startupRefreshRetrySafe,
+				"stderr_model_refresh_failure_count", classification.modelRefreshFailure,
+				"stderr_model_refresh_timeout_count", classification.modelRefreshTimeout,
+				"stderr_mcp_init_transport_count", classification.mcpInitTransport,
+				"stderr_bare_timeout_count", classification.bareTimeout,
+			}
+			switch outcome {
+			case "progress", "turn_completed":
+				b.cfg.Logger.Info("codex lifecycle", fields...)
+			default:
+				b.cfg.Logger.Warn("codex lifecycle", fields...)
+			}
 		}
 
 		outputMu.Lock()
@@ -1566,23 +1762,26 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-// codexResumeUnavailableNotice is prepended to the first turn's input when a
-// resume was expected but Codex ended up on a fresh thread. It mirrors the
-// daemon brief's Session Continuity Notice so the disclosure is identical
-// whether the loss is detected pre-launch (daemon gate) or only by the live
-// thread/resume RPC (MUL-4424).
-const codexResumeUnavailableNotice = "[System notice] You were expected to continue an earlier conversation, but restoring that session failed and this is a fresh thread with no memory of the previous turns. Rebuild context from the issue/thread, and when you reply, tell the user up front (one short sentence) that the previous conversation context could not be restored and this is a new session.\n\n"
+// The continuity notice this backend prepends is supplied by the caller via
+// ExecOptions.ResumeContinuityNotice rather than written here. It used to be a
+// constant in this file that mirrored the daemon's, which meant two hand-kept
+// copies of the same paragraph and no way for this package to know which
+// surface it was running on — the wording is only correct if you know whether
+// the conversation is still readable (MUL-5722).
 
 // codexTurnInput builds the input content for the first turn/start. When a
 // resume was expected (resumeExpected) but the backend landed on a fresh thread
-// (!resumed), it prepends codexResumeUnavailableNotice so the user learns the
-// prior context was lost instead of the run silently continuing as new. The
-// notice is folded into the same text block as the prompt to stay within the
-// single-text-block turn input Codex already accepts.
-func codexTurnInput(prompt string, resumeExpected, resumed bool) []map[string]any {
+// (!resumed), it prepends the caller's continuity notice so the run does not
+// silently continue as new. The notice is folded into the same text block as
+// the prompt to stay within the single-text-block turn input Codex accepts.
+//
+// An empty notice means the caller has already disclosed the loss in the prompt
+// itself, so this must add nothing — that is the whole guard against a turn
+// carrying the same paragraph twice.
+func codexTurnInput(prompt string, resumeExpected, resumed bool, notice string) []map[string]any {
 	text := prompt
 	if resumeExpected && !resumed {
-		text = codexResumeUnavailableNotice + prompt
+		text = notice + prompt
 	}
 	return []map[string]any{{"type": "text", "text": text}}
 }
@@ -1770,7 +1969,30 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func codexFirstTurnNoProgressTimeout(semanticInactivityTimeout time.Duration) time.Duration {
+// codexFirstTurnNoProgressTimeout resolves the first-turn watchdog ceiling:
+// how long the first turn may stay silent after turn/started before that one
+// watchdog fails it. This is only the first-turn timer's own duration — NOT
+// the effective first-item wait. The semantic-inactivity timer is armed
+// concurrently (the same first status:running resets it and starts this one),
+// so the real wait is min(this, semanticInactivityTimeout, execution timeout).
+// Raising the override above the semantic timeout therefore does not extend the
+// wait unless the semantic timeout is raised too; LoadConfig warns when it does
+// not. See the run loop's competing-timer select for the interaction.
+//
+// An explicit configured override (MULTICA_CODEX_FIRST_TURN_TIMEOUT) is honored
+// as-is, upward included: an operator whose app-server is legitimately slow to
+// its first event (a heavy MCP boot, a cold model catalog) can lift this ceiling
+// past the default that the semantic-inactivity timeout alone can never raise
+// (GH #3262 / #5959).
+//
+// With no override the behaviour is byte-identical to before: the default
+// ceiling, which the configured semantic-inactivity timeout can only ever
+// shrink, never raise. The `* 4 / 5` cannot overflow here because that branch
+// only runs when 0 < semanticInactivityTimeout <= defaultCodexFirstTurnNoProgressTimeout.
+func codexFirstTurnNoProgressTimeout(semanticInactivityTimeout, configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
 	if semanticInactivityTimeout <= 0 || semanticInactivityTimeout > defaultCodexFirstTurnNoProgressTimeout {
 		return defaultCodexFirstTurnNoProgressTimeout
 	}
@@ -1839,11 +2061,11 @@ func appendCodexKnownStderrHint(msg, stderrTail string) string {
 	return msg
 }
 
-func detectCodexVersionForDiagnostics(ctx context.Context, execPath string, env []string, logger *slog.Logger) string {
+func detectCodexVersionForDiagnostics(ctx context.Context, runtimeCmd Command, env []string, logger *slog.Logger) string {
 	versionCtx, cancel := context.WithTimeout(ctx, codexVersionDiagnosticTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(versionCtx, execPath, "--version")
+	cmd := runtimeCmd.exec(versionCtx, "--version")
 	cmd.Env = env
 	data, err := cmd.Output()
 	if err != nil {
@@ -2231,6 +2453,29 @@ func (c *codexClient) getProcessErr() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.processErr
+}
+
+// isCodexResumeOverflow reports whether a failed startOrResumeThread failed
+// because the thread/resume RESPONSE did not fit in our stdout line buffer.
+//
+// Codex serializes the entire thread into that single response, so a long
+// enough thread overflows agentStreamMaxLineBytes and the reader goroutine
+// dies with bufio.ErrTooLong. Every other transport error means codex is
+// gone; this one means codex is fine and we cannot read it. The distinction
+// is what makes it a resume REJECTION: the thread cannot be handed to us at
+// all, so only starting over can cure it — exactly what Result.ResumeRejected
+// documents, and the evidence shouldRetryWithFreshSession looks for first.
+//
+// Recovery has to go through the daemon rather than a local thread/start
+// fallback. By the time we get here the reader goroutine has exited and codex
+// is blocked writing the rest of the oversized line into a pipe nobody drains,
+// so this process can no longer answer any RPC. The daemon's fresh-session
+// retry re-execs codex, which is the only way back (MUL-5722).
+//
+// Requires ResumeSessionID: an overflow on a thread/start response is a
+// different failure and nothing about the session pointer would fix it.
+func isCodexResumeOverflow(opts ExecOptions, err error) bool {
+	return opts.ResumeSessionID != "" && errors.Is(err, bufio.ErrTooLong)
 }
 
 func isCodexTransportError(err error) bool {
@@ -2702,6 +2947,50 @@ func codexPatchResultOutput(status string, changes []any, stdout, stderr string)
 	return strings.Join(segments, "\n")
 }
 
+// codexMCPToolInput keeps the remote server visible in the transcript while
+// preserving the provider-native argument shape under a stable key. Redact at
+// the adapter boundary as well as in the daemon: other Message consumers must
+// not have to know that an MCP invocation can carry credentials or private
+// query text in deeply nested arguments.
+func codexMCPToolInput(item map[string]any) map[string]any {
+	input := make(map[string]any, 2)
+	if server, _ := item["server"].(string); strings.TrimSpace(server) != "" {
+		input["server"] = server
+	}
+	if arguments, ok := item["arguments"]; ok {
+		input["arguments"] = arguments
+	}
+	return redact.InputMap(input)
+}
+
+func codexMCPToolName(item map[string]any) string {
+	if tool, _ := item["tool"].(string); strings.TrimSpace(tool) != "" {
+		return tool
+	}
+	return "mcp_tool"
+}
+
+// codexMCPToolResultOutput deliberately excludes result.content and
+// structuredContent. Those values can be large and may contain private data;
+// the Agent Log needs an auditable outcome, not a second copy of the provider
+// payload that Codex already consumed.
+func codexMCPToolResultOutput(item map[string]any) string {
+	status, _ := item["status"].(string)
+	status = codexNormalizePatchStatus(status)
+	if status == "" {
+		status = "completed"
+	}
+
+	segments := []string{status}
+	if durationMS := codexInt64(item, "durationMs", "duration_ms"); durationMS > 0 {
+		segments = append(segments, fmt.Sprintf("duration: %d ms", durationMS))
+	}
+	if errMessage := extractNestedString(item, "error", "message"); strings.TrimSpace(errMessage) != "" {
+		segments = append(segments, "error: "+sanitizeCodexDiagnostic(errMessage))
+	}
+	return strings.Join(segments, "\n")
+}
+
 func codexPatchHeadline(status string, fileCount int) string {
 	switch {
 	case status == "" && fileCount == 0:
@@ -2966,6 +3255,28 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 				Tool:   "patch_apply",
 				CallID: itemID,
 				Output: codexPatchResultOutput(codexNormalizePatchStatus(status), changes, "", ""),
+			})
+		}
+
+	case method == "item/started" && itemType == "mcpToolCall":
+		if c.onMessage != nil {
+			c.onMessage(Message{
+				Type:   MessageToolUse,
+				Tool:   codexMCPToolName(item),
+				CallID: itemID,
+				Input:  codexMCPToolInput(item),
+			})
+		}
+
+	case method == "item/completed" && itemType == "mcpToolCall":
+		status, _ := item["status"].(string)
+		if c.onMessage != nil {
+			c.onMessage(Message{
+				Type:   MessageToolResult,
+				Tool:   codexMCPToolName(item),
+				CallID: itemID,
+				Output: codexMCPToolResultOutput(item),
+				Status: codexNormalizePatchStatus(status),
 			})
 		}
 

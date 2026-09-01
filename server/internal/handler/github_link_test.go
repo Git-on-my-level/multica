@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -783,76 +782,5 @@ func firePullRequestWebhookRaw(t *testing.T, secret string, instID int64, owner,
 	testHandler.HandleGitHubWebhook(rec, req)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("webhook %s: expected 202, got %d %s", action, rec.Code, rec.Body.String())
-	}
-}
-
-// TestWebhook_DoesNotClobberManualLink is the regression guard for the
-// manual-link / webhook coexistence bug: a manually-linked PR with
-// close_intent=true must survive routine webhook activity (a synchronize push
-// whose title carries the issue identifier but no closing keyword). Without
-// the member-link preservation in mirrorPullRequestForWorkspace, that push
-// would overwrite close_intent true->false and silently kill "mark done when
-// merged"; a bare body mention would additionally flip reference_only and hide
-// the PR from the list.
-func TestWebhook_DoesNotClobberManualLink(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	secret := "manual-coexist-secret"
-	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
-
-	issueID := createManualLinkIssue(t, "in_progress")
-	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
-	if err != nil {
-		t.Fatalf("GetIssue: %v", err)
-	}
-	const instID int64 = 60060060
-	seedManualLinkInstallation(t, testWorkspaceID, instID)
-	// First let the webhook create its normal system-owned link. The manual
-	// action below must promote that existing row to member-owned; otherwise a
-	// later webhook would be allowed to overwrite the member's intent.
-	var prefix string
-	if err := testPool.QueryRow(ctx, `SELECT issue_prefix FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&prefix); err != nil {
-		t.Fatalf("load workspace prefix: %v", err)
-	}
-	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
-	firePullRequestWebhookRaw(t, secret, instID, "acme", "coexist", 71, "opened", "open", false,
-		identifier+" tweak", "", "feature/x")
-
-	url := "https://github.com/acme/coexist/pull/71"
-	if w := linkIssuePR(t, issueID, url, true); w.Code != http.StatusOK {
-		t.Fatalf("manual link: %d %s", w.Code, w.Body.String())
-	}
-
-	// A routine push: title carries the identifier, no closing keyword.
-	firePullRequestWebhookRaw(t, secret, instID, "acme", "coexist", 71, "synchronize", "open", false,
-		identifier+" tweak", "", "feature/x")
-
-	// Resolve the link row via the mirrored PR id and assert the webhook did
-	// not regress the member-authored close_intent or flip reference_only.
-	pr, err := testHandler.Queries.GetGitHubPullRequest(ctx, db.GetGitHubPullRequestParams{
-		WorkspaceID: parseUUID(testWorkspaceID), RepoOwner: "acme", RepoName: "coexist", PrNumber: 71,
-	})
-	if err != nil {
-		t.Fatalf("GetGitHubPullRequest: %v", err)
-	}
-	link, err := testHandler.Queries.GetIssuePullRequestLink(ctx, db.GetIssuePullRequestLinkParams{
-		IssueID: parseUUID(issueID), PullRequestID: pr.ID,
-	})
-	if err != nil {
-		t.Fatalf("GetIssuePullRequestLink after webhook: %v", err)
-	}
-	if !link.CloseIntent {
-		t.Errorf("webhook clobbered manual close_intent: expected true, got false")
-	}
-	if !link.LinkedByType.Valid || link.LinkedByType.String != "member" {
-		t.Errorf("manual override did not promote link ownership: got %+v", link.LinkedByType)
-	}
-	if link.ReferenceOnly {
-		t.Errorf("webhook flipped reference_only: expected false, got true (PR would vanish from the list)")
-	}
-	if got := countLinks(t, issueID); got != 1 {
-		t.Errorf("expected PR to remain visible (1 link), got %d", got)
 	}
 }

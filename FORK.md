@@ -16,6 +16,38 @@ This is a fork-only operational contract. Preserve it when merging upstream.
 - Migration collision registrations, fork self-host/Tailnet defaults, and
   `.goreleaser.fork.yml` for CLI releases without upstream Homebrew publishing.
 
+## Overlay isolation (keep syncs cheap)
+
+Put fork-only behavior in `*_fork.go` / dedicated files. Do **not** patch
+upstream hot files (`daemon.go`, `client.go`, `cache.go`, generated
+`models.go`) unless there is no other option.
+
+Current isolated overlays:
+
+| Contract | Overlay |
+| --- | --- |
+| OMP ACP backend | `server/pkg/agent/omp.go` + `BuiltinRuntimes` ProtocolFamily `omp` |
+| Linked-worktree repair | `server/internal/daemon/repocache/cache_fork.go` |
+| Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
+| Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
+| Event tables without capture | `403–416` leftover tables; `418` drops leftover capture triggers |
+| Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
+
+Leftover `workspace_event_*` tables are fine. Do **not** re-enable
+`415_workspace_event_capture` triggers: they take a
+`workspace_event_cursor` lock on every issue/task write and deadlock
+upstream FailTask/Rerun plus workspace-delete fence tests.
+
+After taking upstream during a sync:
+
+1. Delete fork files that upstream superseded (example: daemon-side
+   `chat_suggest.go` — MUL-5573 moved generation server-side).
+2. Delete leftover tests that import files upstream deleted.
+3. Run `make sqlc` and commit the generated diff. Do not hand-edit
+   `server/pkg/db/generated/models.go`.
+4. Renumber any fork migration prefix that collides with a new upstream
+   prefix above 148. Make the new `.up.sql` idempotent.
+
 ## Safe upstream sync
 
 Fetch branch heads only. Fork and upstream reuse semver tag names for different

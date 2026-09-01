@@ -46,7 +46,6 @@ spec:
             - name: NEXT_PUBLIC_WS_URL
               value: {{ .Values.frontend.config.publicWsUrl | quote }}
             {{- end }}
-
             - name: MULTICA_GITHUB_REPO
               value: {{ .Values.backend.config.githubRepo | quote }}
           resources:

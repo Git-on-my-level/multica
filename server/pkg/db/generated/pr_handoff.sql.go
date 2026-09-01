@@ -32,7 +32,7 @@ func (q *Queries) DeleteWorkspacePRHandoffCandidates(ctx context.Context, worksp
 }
 
 const getIssueForPRHandoff = `-- name: GetIssueForPRHandoff :one
-SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties FROM issue i
+SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at FROM issue i
 JOIN workspace w ON w.id = i.workspace_id
 WHERE i.id = $1
 FOR KEY SHARE OF w, i
@@ -68,6 +68,8 @@ func (q *Queries) GetIssueForPRHandoff(ctx context.Context, id pgtype.UUID) (Iss
 		&i.Metadata,
 		&i.Stage,
 		&i.Properties,
+		&i.Revision,
+		&i.LastActivityAt,
 	)
 	return i, err
 }
@@ -127,9 +129,6 @@ func (q *Queries) ListAwaitingPRHandoffCandidates(ctx context.Context, arg ListA
 }
 
 const listLatestIssuePRHandoffCandidates = `-- name: ListLatestIssuePRHandoffCandidates :many
--- A later completed follow-up with no candidate must not erase the last
--- reported handoff. A later task that does report candidates supersedes the
--- prior task as one source-bound candidate group.
 WITH latest_candidate_task AS (
     SELECT t.id AS task_id
     FROM agent_task_queue t
@@ -150,6 +149,9 @@ WHERE c.issue_id = $1
 ORDER BY c.created_at ASC, c.url ASC
 `
 
+// A later completed follow-up with no candidate must not erase the last
+// reported handoff. A later task that does report candidates supersedes the
+// prior task as one source-bound candidate group.
 func (q *Queries) ListLatestIssuePRHandoffCandidates(ctx context.Context, issueID pgtype.UUID) ([]IssuePrHandoffCandidate, error) {
 	rows, err := q.db.Query(ctx, listLatestIssuePRHandoffCandidates, issueID)
 	if err != nil {
