@@ -28,10 +28,12 @@ var issueURLCmd = &cobra.Command{
 }
 
 var issueInspectCmd = &cobra.Command{
-	Use:   "inspect <issue>",
-	Short: "Inspect issue ownership, runs, PR handoff, and safe actions",
-	Args:  exactArgs(1),
-	RunE:  runIssueInspect,
+	Use: "inspect <issue>",
+	// view is a compatibility alias: agents keep inventing `issue view`.
+	Aliases: []string{"view"},
+	Short:   "Inspect issue ownership, runs, PR handoff, and safe actions",
+	Args:    exactArgs(1),
+	RunE:    runIssueInspect,
 }
 
 var issueRouteCmd = &cobra.Command{

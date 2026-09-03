@@ -97,6 +97,23 @@ func TestRunIssueURLRejectsWorkspaceWithoutSlug(t *testing.T) {
 	}
 }
 
+func TestIssueViewIsInspectAlias(t *testing.T) {
+	view, _, err := issueCmd.Find([]string{"view"})
+	if err != nil {
+		t.Fatalf("expected issue view alias to exist: %v", err)
+	}
+	inspect, _, err := issueCmd.Find([]string{"inspect"})
+	if err != nil {
+		t.Fatalf("expected issue inspect command to exist: %v", err)
+	}
+	if view != inspect {
+		t.Fatalf("issue view resolved to %q, want the inspect command", view.Name())
+	}
+	if inspect.Flags().Lookup("output") == nil {
+		t.Fatal("inspect/view missing --output flag")
+	}
+}
+
 func TestRunIssueInspectReturnsServerOwnedSnapshot(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
