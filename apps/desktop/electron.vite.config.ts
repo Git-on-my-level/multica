@@ -5,7 +5,11 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    // Workspace packages ship TypeScript. If electron-vite externalizes
+    // @multica/core, the packaged main process require()s raw .ts under
+    // node_modules and Electron 39/Node 22 throws
+    // ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING on launch.
+    plugins: [externalizeDepsPlugin({ exclude: ["@multica/core"] })],
   },
   preload: {
     // `@electron-toolkit/preload` must be bundled INTO the preload script:
