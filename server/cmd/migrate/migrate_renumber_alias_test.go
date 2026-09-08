@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,20 @@ const (
 )
 
 func TestRenumberAliasesExactVerifiedSet(t *testing.T) {
+	// Independently pinned to the historical fork files and ledger, not generated
+	// from the implementation alias list. A changed SQL file must lose its alias.
+	want := []renamedMigrationAlias{
+		{"247_workspace_event_cursor_unique", "409_workspace_event_cursor_unique", "a6ea4600216659dfcaa2d8d701b4e69f8c396fdfcd11d537d8de16cd2e3e4a9d"},
+		{"248_workspace_event_source_unique", "410_workspace_event_source_unique", "f5fa8b2ba96ebea059c3dc007cd170bc23e99c22bf73c5f97eaa3e9d43427623"},
+		{"249_workspace_event_sequence_unique", "411_workspace_event_sequence_unique", "584e47e30ae4b07b6dc1b0e26c098b0092bccc6cdbc1e83ce9247446c2ffded0"},
+		{"251_issue_create_idempotency_unique", "413_issue_create_idempotency_unique", "8f5d5a62c72f45ad32832bfd6404cfb711b1dbdf12fe7794a4245bb8914cc295"},
+		{"252_workspace_event_id_unique", "414_workspace_event_id_unique", "532c618369df8c090098c91f3a404d67347c9ec7a8a365512c710ebcf98d7c7f"},
+		{"253_workspace_event_capture", "415_workspace_event_capture", "dbe9716f42581c61bc6d89de5bf39e024a21a84a4d68163263ac15f81bc5c06c"},
+		{"254_workspace_event_retention_index", "416_workspace_event_retention_index", "82a5c7de4eab067d7c853bdcc3257ecd2d6cce2b56da63afb92833aec335b1b5"},
+	}
+	if !reflect.DeepEqual(fleetRenumberAliases, want) {
+		t.Fatalf("alias mapping differs from verified historical names and hashes: got %+v, want %+v", fleetRenumberAliases, want)
+	}
 	if len(fleetRenumberAliases) != 7 {
 		t.Fatalf("fleetRenumberAliases len = %d, want 7", len(fleetRenumberAliases))
 	}
@@ -210,6 +225,42 @@ func TestRenumberAliasesDownUpAfterNormalizationRebuilds(t *testing.T) {
 		assertMigrationVersionRecorded(t, f.ctx, f.pool, f.schema, alias.OldVersion, false)
 		assertMigrationVersionRecorded(t, f.ctx, f.pool, f.schema, alias.NewVersion, true)
 	}
+}
+
+func TestRenumberAliasesMixedHistoryPreservesAlreadyRenamedRows(t *testing.T) {
+	f := newRenumberFixture(t)
+	stamps, cursorOID := prepareAppliedOldAliases(t, f)
+	// Model a previous partial rollout: six current ledger names and one old.
+	for _, alias := range fleetRenumberAliases[:6] {
+		if _, err := f.pool.Exec(f.ctx, "UPDATE "+f.tableSQL+" SET version = $1 WHERE version = $2", alias.NewVersion, alias.OldVersion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runMigrations(f.ctx, f.pool, f.upOpts(t, aliasUpFiles(t))); err != nil {
+		t.Fatalf("normalize mixed history: %v", err)
+	}
+	assertAliasLedgerNormalized(t, f, stamps)
+	assertUnrelatedLegacyPreserved(t, f)
+	if got := indexOID(t, f, cursorUniqueIndex); got != cursorOID {
+		t.Fatalf("mixed history recreated index: got %d, want %d", got, cursorOID)
+	}
+}
+
+func TestRenumberAliasesLaterUpdateFailureRollsBackEarlierUpdates(t *testing.T) {
+	f := newRenumberFixture(t)
+	stamps := seedOldAliasesAndUnrelated(t, f)
+	// The seventh UPDATE fails after the first six have executed. This checks
+	// actual transaction rollback, independently of preflight validation.
+	if _, err := f.pool.Exec(f.ctx, "ALTER TABLE "+f.tableSQL+" ADD CONSTRAINT reject_last_alias CHECK (version <> '416_workspace_event_retention_index')"); err != nil {
+		t.Fatal(err)
+	}
+	err := runMigrations(f.ctx, f.pool, f.upOpts(t, aliasUpFiles(t)))
+	if err == nil || !strings.Contains(err.Error(), "reject_last_alias") {
+		t.Fatalf("want later UPDATE constraint failure, got %v", err)
+	}
+	assertOldAliasRowsUntouched(t, f, stamps)
+	assertNewAliasRows(t, f, nil)
+	assertUnrelatedLegacyPreserved(t, f)
 }
 
 func TestRenumberAliasesDoesNotNormalizeOnDown(t *testing.T) {
