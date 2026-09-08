@@ -697,6 +697,13 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		return fmt.Errorf("create migrations table: %w", err)
 	}
 
+	// Merge af021d45b renumbered seven already-applied fork migrations.
+	// Rewrite those ledger aliases to the current names before EXISTS
+	// checks so up does not replay identical DDL. See fleetRenumberAliases.
+	if err := normalizeRenumberedMigrationLedger(ctx, conn, opts, tableIdent); err != nil {
+		return err
+	}
+
 	existsSQL := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE version = $1)", tableIdent)
 	insertSQL := fmt.Sprintf("INSERT INTO %s (version) VALUES ($1)", tableIdent)
 	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE version = $1", tableIdent)
