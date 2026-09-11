@@ -175,12 +175,17 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}()
 
 	go func() {
-		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
 		defer func() {
 			stdin.Close()
+			// Cancellation must be reachable before Wait. A child that
+			// ignores EOF on stdin and only exits on context cancel would
+			// otherwise block Wait forever, leaving the deferred cancel
+			// unreachable and the run stuck.
+			cancel()
 			_ = cmd.Wait()
+			releaseProcessGroup(cmd)
 		}()
 
 		startTime := time.Now()

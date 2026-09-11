@@ -215,6 +215,66 @@ func TestDevinPassesModelFlag(t *testing.T) {
 	}
 }
 
+// fakeDevinIgnoresEOFScript answers initialize with an error, then keeps the
+// process alive after stdin closes — the shape that deadlocked the old
+// stdin.Close → Wait cleanup, where the deferred cancel sat behind a Wait
+// that only the cancel could unblock.
+func fakeDevinIgnoresEOFScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"boot failure"}}\n' "$id"
+      break
+      ;;
+  esac
+done
+# Outlive the closed stdin: only context cancellation (SIGKILL) ends this.
+exec sleep 60
+`
+}
+
+// TestDevinCleanupKillsChildThatIgnoresStdinEOF is the regression for the
+// defer-ordering deadlock: an early handshake failure used to run
+// stdin.Close → cmd.Wait → cancel, so a child that ignored EOF kept Wait
+// blocked forever and the cancellation was never reached. The fixed order
+// cancels before Wait, so the channels must close promptly even though the
+// fake child is still alive at that point.
+func TestDevinCleanupKillsChildThatIgnoresStdinEOF(t *testing.T) {
+	t.Parallel()
+	fakePath := filepath.Join(t.TempDir(), "devin")
+	writeTestExecutable(t, fakePath, []byte(fakeDevinIgnoresEOFScript()))
+
+	backend, err := New("devin", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new devin backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "task", ExecOptions{Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range session.Messages {
+		}
+	}()
+
+	result := <-session.Result
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed (error=%q)", result.Status, result.Error)
+	}
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session.Messages stayed open after failure — Wait() blocked on a child that ignores stdin EOF")
+	}
+}
+
 // runDevinResume drives Execute with a recorded session id and returns the
 // terminal Result. The fake devin's behaviour is selected through env vars.
 func runDevinResume(t *testing.T, env map[string]string) Result {
