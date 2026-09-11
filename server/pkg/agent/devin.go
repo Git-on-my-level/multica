@@ -187,6 +187,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		finalStatus := "completed"
 		var finalError string
 		var sessionID string
+		var resumeRejected bool
 		effectiveModel := strings.TrimSpace(opts.Model)
 
 		initResult, err := c.request(runCtx, "initialize", map[string]any{
@@ -245,9 +246,13 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				"mcpServers": mcpServers,
 			})
 			if err != nil {
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("devin session/load failed: %v", err)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				// A runtime that refuses the recorded id has to say so here:
+				// without ResumeRejected the daemon reads the bare failure as
+				// "checked, not a rejection", keeps the pointer and replays the
+				// same dead session on every later turn (GH #8116).
+				finalStatus, finalError, resumeRejected = classifyACPResumeFailure(
+					runCtx, "devin", "session/load", err, timeout, b.cfg.Logger)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
 				return
 			}
 			var changed bool
@@ -322,14 +327,15 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					// See the hermes backend: the runtime may echo the
 					// requested id back from session/load even when the
 					// session is gone, so the stale id only fails here, at
-					// prompt time. Empty SessionID lets the daemon's
-					// resume-failure fallback retry fresh and store the
-					// replacement id.
+					// prompt time. Empty SessionID plus ResumeRejected lets
+					// the daemon's resume-failure fallback retry fresh and
+					// store the replacement id.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "devin",
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
 				}
 			}
 		} else {
@@ -381,12 +387,13 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     finalOutput,
-			Error:      finalError,
-			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
-			Usage:      usageMap,
+			Status:         finalStatus,
+			Output:         finalOutput,
+			Error:          finalError,
+			DurationMs:     duration.Milliseconds(),
+			SessionID:      sessionID,
+			ResumeRejected: resumeRejected,
+			Usage:          usageMap,
 		}
 	}()
 

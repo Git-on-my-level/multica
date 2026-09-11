@@ -64,9 +64,17 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_devin","models":{"currentModelId":"kimi-k2.5"}}}\n' "$id"
       ;;
     *'"method":"session/load"'*)
+      if [ -n "$DEVIN_LOAD_NOT_FOUND" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Session not found: ses_gone"}}\n' "$id"
+        exit 0
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_loaded"}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
+      if [ -n "$DEVIN_PROMPT_NOT_FOUND" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Session not found: ses_loaded"}}\n' "$id"
+        exit 0
+      fi
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_devin","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pong"}}}}\n'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       exit 0
@@ -204,6 +212,86 @@ func TestDevinPassesModelFlag(t *testing.T) {
 	got := strings.Join(strings.Split(strings.TrimSpace(string(raw)), "\n"), " ")
 	if got != "acp --model swe-1.7-lightning" {
 		t.Fatalf("argv = %q, want acp --model swe-1.7-lightning", got)
+	}
+}
+
+// runDevinResume drives Execute with a recorded session id and returns the
+// terminal Result. The fake devin's behaviour is selected through env vars.
+func runDevinResume(t *testing.T, env map[string]string) Result {
+	t.Helper()
+	fakePath := filepath.Join(t.TempDir(), "devin")
+	writeTestExecutable(t, fakePath, []byte(fakeDevinACPScript()))
+
+	backend, err := New("devin", Config{ExecutablePath: fakePath, Logger: slog.Default(), Env: env})
+	if err != nil {
+		t.Fatalf("new devin backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "continue", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_gone",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	return <-session.Result
+}
+
+// TestDevinResumeRejectedAtLoad covers the resume-not-found path: session/load
+// fails with a session-not-found error and the backend must report
+// ResumeRejected=true so the daemon retries from a fresh session instead of
+// replaying the dead id on every later turn.
+func TestDevinResumeRejectedAtLoad(t *testing.T) {
+	t.Parallel()
+	result := runDevinResume(t, map[string]string{"DEVIN_LOAD_NOT_FOUND": "1"})
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed (error=%q)", result.Status, result.Error)
+	}
+	if !result.ResumeRejected {
+		t.Fatalf("ResumeRejected = false, want true on session/load not found (error=%q)", result.Error)
+	}
+	if result.SessionID != "" {
+		t.Fatalf("SessionID = %q, want empty so the daemon does not keep the dead pointer", result.SessionID)
+	}
+}
+
+// TestDevinResumeRejectedAtPrompt covers the prompt-time variant: session/load
+// echoes the requested id back even though the session is gone, so the stale
+// id only fails at session/prompt. The backend must clear SessionID and set
+// ResumeRejected=true for the daemon's fresh-session retry.
+func TestDevinResumeRejectedAtPrompt(t *testing.T) {
+	t.Parallel()
+	result := runDevinResume(t, map[string]string{"DEVIN_PROMPT_NOT_FOUND": "1"})
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed (error=%q)", result.Status, result.Error)
+	}
+	if !result.ResumeRejected {
+		t.Fatalf("ResumeRejected = false, want true on prompt-time session not found (error=%q)", result.Error)
+	}
+	if result.SessionID != "" {
+		t.Fatalf("SessionID = %q, want empty so the daemon does not keep the dead pointer", result.SessionID)
+	}
+}
+
+// TestDevinResumeNotRejectedOnSuccess pins the negative: a resume that lands
+// must not flag ResumeRejected, or the daemon would fork a live conversation.
+func TestDevinResumeNotRejectedOnSuccess(t *testing.T) {
+	t.Parallel()
+	result := runDevinResume(t, nil)
+	if result.Status != "completed" {
+		t.Fatalf("status = %q, want completed (error=%q)", result.Status, result.Error)
+	}
+	if result.ResumeRejected {
+		t.Fatal("ResumeRejected = true on a successful resume, want false")
+	}
+	if result.SessionID != "ses_loaded" {
+		t.Fatalf("SessionID = %q, want ses_loaded", result.SessionID)
 	}
 }
 
