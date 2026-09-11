@@ -4,6 +4,8 @@ import codeartsLogo from "./codearts-logo.svg";
 import qwenLogo from "./qwen-logo.svg";
 import reasonixLogo from "./reasonix-logo.svg";
 import dimLogo from "./dim-logo.png";
+import devinLogo from "./devin-logo.png";
+import devinLogoDark from "./devin-logo-dark.png";
 
 // Next.js exposes static imports as objects while Vite exposes URL strings.
 // Normalize both shapes here so shared provider logos work in web and desktop.
@@ -354,6 +356,23 @@ function DimLogo({ className }: { className: string }) {
   return <img src={staticAssetSrc(dimLogo)} alt="" aria-hidden className={className} />;
 }
 
+// Devin (Cognition) — official hexagon mark from docs.devin.ai brand assets
+// (mintcdn.com/cognitionai logo/devin.png + devin-light.png). The mark is a
+// flat single-colour glyph, so the pair is shipped as the black and white
+// variants and swapped by theme, following the dark:hidden / dark:block
+// pattern in composio-toolkit-logo.
+const devinLogoSrc = staticAssetSrc(devinLogo);
+const devinLogoDarkSrc = staticAssetSrc(devinLogoDark);
+
+function DevinLogo({ className }: { className: string }) {
+  return (
+    <>
+      <img src={devinLogoSrc} alt="Devin" className={`${className} dark:hidden`} />
+      <img src={devinLogoDarkSrc} alt="Devin" className={`${className} hidden dark:block`} />
+    </>
+  );
+}
+
 // ZeroClaw — no official brand asset has been sourced for this runtime yet
 // (multica-ai/multica#1543), so this is a deliberately simple placeholder
 // mark (three claw-scratch strokes) rather than a claimed "official" logo.
@@ -403,7 +422,7 @@ export function ProviderLogo({
     case "pi":
       return <PiLogo className={className} />;
     case "devin":
-      return <KiroLogo className={className} />;
+      return <DevinLogo className={className} />;
     case "omp":
       return <PiLogo className={className} />;
     case "copilot":
