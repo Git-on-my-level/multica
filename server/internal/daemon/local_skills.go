@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -86,6 +87,26 @@ const (
 	localSkillRootPlugin = "plugin"
 )
 
+// localSkillGOOS is the platform used for skill-root resolution, lifted to a
+// package var so tests can exercise the Windows %APPDATA% branches on any
+// host (same pattern as browserMcpGOOS in pkg/agent).
+var localSkillGOOS = runtime.GOOS
+
+// resolveBuiltinUserSkillsDir turns a builtin runtime's UserSkillsDir /
+// UserSkillsDirWindows descriptor fields into an absolute path. On Windows a
+// descriptor that declares UserSkillsDirWindows resolves against %APPDATA%
+// (falling back to <home>\AppData\Roaming when the variable is unset); every
+// other case is the $HOME-relative path.
+func resolveBuiltinUserSkillsDir(home string, desc agent.BuiltinRuntime) string {
+	if localSkillGOOS == "windows" && desc.UserSkillsDirWindows != "" {
+		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+			return filepath.Join(appData, desc.UserSkillsDirWindows)
+		}
+		return filepath.Join(home, "AppData", "Roaming", desc.UserSkillsDirWindows)
+	}
+	return filepath.Join(home, desc.UserSkillsDir)
+}
+
 // localSkillRootsForProvider returns the ordered user-level skill roots
 // scanned for each runtime/provider. The slice is in priority order:
 //
@@ -134,7 +155,7 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 	// common construction below so universal roots, merging, and fallback
 	// import all still apply — same as every protocol-family provider.
 	if desc, ok := agent.BuiltinRuntimeByID(provider); ok {
-		providerRoot = filepath.Join(home, desc.UserSkillsDir)
+		providerRoot = resolveBuiltinUserSkillsDir(home, desc)
 	} else {
 		switch provider {
 		case "claude":

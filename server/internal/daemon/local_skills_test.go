@@ -120,6 +120,84 @@ func TestListRuntimeLocalSkills_Mcode(t *testing.T) {
 	}
 }
 
+func TestListRuntimeLocalSkills_Devin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeTestLocalSkill(t, filepath.Join(home, ".config", "devin", "skills"), "devin-review", map[string]string{
+		"SKILL.md": "---\nname: Devin Review\ndescription: Review code with Devin\n---\n",
+	})
+
+	skills, supported, err := listRuntimeLocalSkills("devin")
+	if err != nil {
+		t.Fatalf("listRuntimeLocalSkills: %v", err)
+	}
+	if !supported || len(skills) != 1 {
+		t.Fatalf("supported=%v skills=%#v", supported, skills)
+	}
+	if skills[0].Key != "devin-review" {
+		t.Fatalf("key = %q, want devin-review", skills[0].Key)
+	}
+}
+
+// TestListRuntimeLocalSkills_DevinWindowsUsesAppData pins the Windows
+// resolution: Devin CLI stores user-level skills under
+// %APPDATA%\devin\skills, so on Windows the XDG-style
+// ~/.config/devin/skills must not be scanned.
+func TestListRuntimeLocalSkills_DevinWindowsUsesAppData(t *testing.T) {
+	home := t.TempDir()
+	appData := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", appData)
+	oldGOOS := localSkillGOOS
+	localSkillGOOS = "windows"
+	defer func() { localSkillGOOS = oldGOOS }()
+
+	writeTestLocalSkill(t, filepath.Join(appData, "devin", "skills"), "devin-review", map[string]string{
+		"SKILL.md": "---\nname: Devin Review\ndescription: Review code with Devin\n---\n",
+	})
+	// The XDG path is not a Devin discovery root on Windows — a skill there
+	// must not surface.
+	writeTestLocalSkill(t, filepath.Join(home, ".config", "devin", "skills"), "xdg-only", map[string]string{
+		"SKILL.md": "---\nname: XDG Only\ndescription: Should not appear on Windows\n---\n",
+	})
+
+	skills, supported, err := listRuntimeLocalSkills("devin")
+	if err != nil {
+		t.Fatalf("listRuntimeLocalSkills: %v", err)
+	}
+	if !supported {
+		t.Fatal("devin should be supported")
+	}
+	if len(skills) != 1 || skills[0].Key != "devin-review" {
+		t.Fatalf("expected only the %%APPDATA%% skill, got %#v", skills)
+	}
+}
+
+// TestListRuntimeLocalSkills_DevinWindowsAppDataUnset covers the fallback:
+// when %APPDATA% is unset on Windows the root resolves under
+// <home>\AppData\Roaming\devin\skills.
+func TestListRuntimeLocalSkills_DevinWindowsAppDataUnset(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", "")
+	oldGOOS := localSkillGOOS
+	localSkillGOOS = "windows"
+	defer func() { localSkillGOOS = oldGOOS }()
+
+	writeTestLocalSkill(t, filepath.Join(home, "AppData", "Roaming", "devin", "skills"), "devin-review", map[string]string{
+		"SKILL.md": "---\nname: Devin Review\ndescription: Review code with Devin\n---\n",
+	})
+
+	skills, supported, err := listRuntimeLocalSkills("devin")
+	if err != nil {
+		t.Fatalf("listRuntimeLocalSkills: %v", err)
+	}
+	if !supported || len(skills) != 1 || skills[0].Key != "devin-review" {
+		t.Fatalf("expected the AppData\\Roaming fallback skill, got supported=%v skills=%#v", supported, skills)
+	}
+}
+
 // TestListRuntimeLocalSkills_Codebuddy is the regression guard for a bug
 // where CodeBuddy was treated as a drop-in alias for Claude and local
 // (user-level) skills were discovered from ~/.claude/skills. CodeBuddy Code
