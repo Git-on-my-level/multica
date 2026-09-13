@@ -34,7 +34,21 @@ const (
 )
 
 var (
-	taskWakeupPongWait          = 60 * time.Second
+	// taskWakeupPongWait bounds how long the wakeup websocket may stay
+	// receive-silent (no heartbeat ack, ping, or pong) before the read pump
+	// declares it dead and tears it down. 30s = two missed keepalive round
+	// trips at the 15s cadence below, so a half-open path — where writes
+	// silently buffer for minutes before surfacing broken pipe / 1006 — is
+	// detected in seconds-to-tens-of-seconds instead (SCA-471). Must stay
+	// ≥ 2× taskWakeupPingPeriod. Var so tests can shrink it.
+	taskWakeupPongWait = 30 * time.Second
+	// taskWakeupPingPeriod is how often the daemon sends a WebSocket PING on
+	// the wakeup connection. The server's gorilla default ping handler
+	// replies with a PONG, giving the read deadline above a steady inbound
+	// keepalive even when application traffic (heartbeat acks) pauses — e.g.
+	// a runtime set temporarily empty, or a slow claim RPC in flight. Var so
+	// tests can shrink it; keep ≤ ½ × taskWakeupPongWait.
+	taskWakeupPingPeriod        = 15 * time.Second
 	taskWakeupWriteWait         = 10 * time.Second
 	taskWakeupBackoffResetAfter = 10 * time.Second
 )
@@ -257,25 +271,48 @@ func (d *Daemon) runTaskWakeupConnection(ctx context.Context, runtimeIDs []strin
 
 // runWSWriter funnels writes from the heartbeat sender (and any future
 // daemon-initiated message) into a single goroutine. gorilla/websocket
-// requires that all WriteMessage calls happen from the same goroutine.
+// requires that all WriteMessage calls happen from the same goroutine. The
+// same loop also emits the keepalive PINGs (SCA-471): a failed PING write
+// gets the same teardown as a failed data write, and the PONG the server
+// sends back is what keeps the read pump's deadline — and therefore
+// half-open detection — on a seconds-scale clock.
 func (d *Daemon) runWSWriter(conn *websocket.Conn, writes <-chan *wsOutbound, done chan<- struct{}) {
 	defer close(done)
-	for item := range writes {
-		// Skip frames whose RPC caller already gave up: delivering them after a
-		// fallback would double-claim (MUL-4257). beginWrite also marks the
-		// frame sent so a racing cancel() can no longer reclaim it.
-		if !item.beginWrite() {
-			continue
-		}
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := conn.WriteMessage(websocket.TextMessage, item.data); err != nil {
-			d.logger.Debug("task wakeup websocket write failed", "error", err)
-			conn.Close()
-			// Drain remaining frames so the producers don't block forever
-			// while waiting for runTaskWakeupConnection to close the channel.
-			for range writes {
+	pingTicker := time.NewTicker(taskWakeupPingPeriod)
+	defer pingTicker.Stop()
+	for {
+		select {
+		case item, ok := <-writes:
+			if !ok {
+				return
 			}
-			return
+			// Skip frames whose RPC caller already gave up: delivering them after a
+			// fallback would double-claim (MUL-4257). beginWrite also marks the
+			// frame sent so a racing cancel() can no longer reclaim it.
+			if !item.beginWrite() {
+				continue
+			}
+			conn.SetWriteDeadline(time.Now().Add(taskWakeupWriteWait))
+			if err := conn.WriteMessage(websocket.TextMessage, item.data); err != nil {
+				d.logger.Debug("task wakeup websocket write failed", "error", err)
+				conn.Close()
+				// Drain remaining frames so the producers don't block forever
+				// while waiting for runTaskWakeupConnection to close the channel.
+				for range writes {
+				}
+				return
+			}
+		case <-pingTicker.C:
+			// WriteControl is concurrency-safe with all other methods, but
+			// keeping it in the writer goroutine preserves the single-writer
+			// discipline and reuses this loop's teardown path.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(taskWakeupWriteWait)); err != nil {
+				d.logger.Debug("task wakeup websocket ping failed", "error", err)
+				conn.Close()
+				for range writes {
+				}
+				return
+			}
 		}
 	}
 }
@@ -382,6 +419,10 @@ func (d *Daemon) readTaskWakeupMessagesForConnection(conn *websocket.Conn, taskW
 		if err != nil {
 			return err
 		}
+		// Any inbound frame — data, ping, or pong — is receive liveness for
+		// the half-open guard; record it before dispatching so a handler
+		// stall cannot un-record evidence already delivered by the socket.
+		d.recordWSReceive()
 		if err := d.extendTaskWakeupReadDeadline(conn); err != nil {
 			return err
 		}
@@ -455,9 +496,11 @@ func (d *Daemon) configureTaskWakeupReadLiveness(conn *websocket.Conn) {
 		d.logger.Debug("task wakeup websocket read deadline failed", "error", err)
 	}
 	conn.SetPongHandler(func(string) error {
+		d.recordWSReceive()
 		return d.extendTaskWakeupReadDeadline(conn)
 	})
 	conn.SetPingHandler(func(appData string) error {
+		d.recordWSReceive()
 		if err := d.extendTaskWakeupReadDeadline(conn); err != nil {
 			return err
 		}
