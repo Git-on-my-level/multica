@@ -253,6 +253,7 @@ function InstructionsStep({ onClose }: { onClose: () => void }) {
             n={1}
             label={t(($) => $.connect.step1_label)}
             cmd={cliInstallCommand}
+            copyAria={t(($) => $.connect.copy_aria)}
           />
 
           <div>
