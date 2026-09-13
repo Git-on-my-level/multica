@@ -345,12 +345,12 @@ function TriggerRow({ trigger, autopilotId, canWrite }: { trigger: AutopilotTrig
             <span className="text-caption text-muted-foreground">({trigger.label})</span>
           )}
           {!trigger.enabled && (
-            <span className="text-caption bg-muted px-1.5 py-0.5 rounded">
+            <span className="text-caption bg-muted px-1.5 py-0.5 rounded-xs">
               {t(($) => $.trigger_row.disabled_badge)}
             </span>
           )}
           {isApi && (
-            <span className="text-caption bg-muted px-1.5 py-0.5 rounded">
+            <span className="text-caption bg-muted px-1.5 py-0.5 rounded-xs">
               {t(($) => $.trigger_row.deprecated_badge)}
             </span>
           )}
@@ -898,28 +898,30 @@ export function AutopilotDetailPage({ autopilotId }: { autopilotId: string }) {
                   {t(($) => $.execution_mode[autopilot.execution_mode as AutopilotExecutionMode])}
                 </div>
               </div>
-              {autopilot.execution_mode === "create_issue" && (
-                <div>
-                  <label className="text-caption text-muted-foreground">{t(($) => $.detail.field_project)}</label>
-                  <div className="mt-1 min-w-0">
-                    {!autopilot.project_id ? (
-                      <span className="text-muted-foreground">{t(($) => $.detail.no_project)}</span>
-                    ) : projectLoading ? (
-                      <Skeleton className="h-5 w-32" />
-                    ) : project ? (
-                      <AppLink
-                        href={wsPaths.projectDetail(project.id)}
-                        className="inline-flex max-w-full items-center gap-1.5 text-foreground hover:underline"
-                      >
-                        <ProjectIcon project={project} size="md" />
-                        <span className="truncate">{project.title}</span>
-                      </AppLink>
-                    ) : (
-                      <span className="text-muted-foreground">{t(($) => $.detail.project_unavailable)}</span>
-                    )}
-                  </div>
+              {/* Shown for BOTH output modes (MUL-6681): a run_only autopilot's
+                  project decides its execution environment (repository /
+                  local_directory, and therefore worktree isolation), so an
+                  operator debugging a run needs to see it here. */}
+              <div>
+                <label className="text-caption text-muted-foreground">{t(($) => $.detail.field_project)}</label>
+                <div className="mt-1 min-w-0">
+                  {!autopilot.project_id ? (
+                    <span className="text-muted-foreground">{t(($) => $.detail.no_project)}</span>
+                  ) : projectLoading ? (
+                    <Skeleton className="h-5 w-32" />
+                  ) : project ? (
+                    <AppLink
+                      href={wsPaths.projectDetail(project.id)}
+                      className="inline-flex max-w-full items-center gap-1.5 text-foreground hover:underline"
+                    >
+                      <ProjectIcon project={project} size="md" />
+                      <span className="truncate">{project.title}</span>
+                    </AppLink>
+                  ) : (
+                    <span className="text-muted-foreground">{t(($) => $.detail.project_unavailable)}</span>
+                  )}
                 </div>
-              )}
+              </div>
               {autopilot.execution_mode === "create_issue" && (
                 <div className="col-span-2">
                   <label className="text-caption text-muted-foreground">

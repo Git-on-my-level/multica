@@ -1004,10 +1004,7 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"pull_requests": out})
 }
 
-// broadcastPRSnapshotApplied is the ghsnapshot pipeline's onApplied callback:
-// once an API snapshot is written to a PR row, re-broadcast the PR so every
-// open issue detail page re-queries its PR list and picks up the fresh CI /
-// mergeability state. Runs on a background pipeline goroutine.
+// linkPullRequestRequest is the body for POST /api/issues/{id}/pull-requests/link.
 type linkPullRequestRequest struct {
 	URL         string `json:"url"`
 	CloseIntent bool   `json:"close_intent"`
@@ -1075,7 +1072,6 @@ func (h *Handler) LinkPullRequestToIssue(w http.ResponseWriter, r *http.Request)
 		IssueID:             issue.ID,
 		PullRequestID:       pr.ID,
 		CloseIntent:         req.CloseIntent,
-		ReferenceOnly:       false,
 		PreserveCloseIntent: false,
 		LinkedByType:        strToText("member"),
 		LinkedByID:          linkedByID,
@@ -1734,12 +1730,13 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 	// are a "new side-effect" and must be gated by the workspace's auto-link
 	// flag (which itself short-circuits when the master `github_enabled`
 	// switch is off).
+	// Fork overlay: promote PR-handoff completion candidates (the completing
+	// agent explicitly reported this PR URL) regardless of the auto-link flag.
 	linkedIssueIDs := h.linkAwaitingHandoffsForPR(ctx, wsID, pr)
 	if h.workspaceAutoLinkPRsEnabled(ctx, wsID) {
 		idents := extractIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
 		// closingIdents is the subset of identifiers that this PR explicitly
-		// declared via a closing keyword ("Closes/Fixes/Resolves MUL-X").
-		// Linking still happens for every mention (idents above), but the
+		// declared via a closing keyword ("Closes/Fixes/Resolves MUL-X"). The
 		// link row's close_intent column — and therefore whether the
 		// auto-advance gate eventually fires — is only set for keyword-
 		// declared identifiers. Bare title prefixes and branch-name
@@ -1748,20 +1745,25 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 		for _, c := range extractClosingIdentifiers(p.PullRequest.Title, p.PullRequest.Body) {
 			closingIdents[c] = struct{}{}
 		}
-		// qualifyingIdents are the identifiers that genuinely tie this PR to an
-		// issue: a title prefix, a branch-name reference, or a body closing
-		// keyword. Any identifier that is linked but NOT in this set was matched
-		// only by a bare mention in the PR body ("Related MUL-1", "Follow up in
-		// MUL-1"). Those links are still recorded (auto-link stays generous so
-		// close_intent can be tracked across edits) but are flagged
-		// reference_only and hidden from the issue's PR list — a passing mention
-		// should not surface the PR as a working PR for that issue (MUL-3739).
-		qualifyingIdents := map[string]struct{}{}
+		// claimedIdents are the identifiers this PR actually claims: a title
+		// prefix, a branch-name reference, or a body closing keyword. An
+		// identifier matched only by a bare mention in the body ("Related
+		// MUL-1", "Follow up in MUL-1") is not a claim — a passing mention must
+		// not surface the PR as a working PR for that issue (MUL-3739) — so it
+		// gets no link row at all, and drops one an earlier claim had created.
+		//
+		// MUL-3739 used to write that row anyway and flag it reference_only,
+		// hidden from every read path. A hidden row had no reader, and once the
+		// PR went terminal the preserve gate froze the flag, so adding a closing
+		// keyword to a merged PR's body could never surface it — the one
+		// recovery action a user can take was the one that could not work
+		// (MUL-7072).
+		claimedIdents := map[string]struct{}{}
 		for _, id := range extractIdentifiers(p.PullRequest.Title, p.PullRequest.Head.Ref) {
-			qualifyingIdents[id] = struct{}{}
+			claimedIdents[id] = struct{}{}
 		}
 		for c := range closingIdents {
-			qualifyingIdents[c] = struct{}{}
+			claimedIdents[c] = struct{}{}
 		}
 		// close_intent should follow the PR title/body while the PR is still
 		// editable before its terminal close event. Once GitHub has delivered
@@ -1784,6 +1786,27 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 			if !ok {
 				continue
 			}
+			if _, claimed := claimedIdents[id]; !claimed {
+				// A passing mention. Never links; while the PR is still
+				// editable it also drops a link an earlier claim created, so
+				// the list follows the live parse. Once the PR is terminal the
+				// same preserve rule that freezes close_intent applies: a
+				// post-merge edit must not unlink a PR that did the work.
+				if preserveCloseIntent {
+					continue
+				}
+				if err := h.Queries.UnlinkIssueFromPullRequest(ctx, db.UnlinkIssueFromPullRequestParams{
+					IssueID:       issue.ID,
+					PullRequestID: pr.ID,
+				}); err != nil {
+					slog.Warn("github: unlink failed", "err", err)
+					continue
+				}
+				// Dropping a link can be what lets the issue advance, so the
+				// gate below still re-evaluates it.
+				reevalIssues = append(reevalIssues, issue)
+				continue
+			}
 			_, declared := closingIdents[id]
 			if declared && !closePolicy.permits(id, workspaceID) {
 				// The delivery-wide scan did not prove this workspace is the one
@@ -1794,13 +1817,10 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 				declared = false
 			}
 			closeIntent := declared && !preserveCloseIntent
-			_, qualifies := qualifyingIdents[id]
-			referenceOnly := !qualifies
 			if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
 				IssueID:             issue.ID,
 				PullRequestID:       pr.ID,
 				CloseIntent:         closeIntent,
-				ReferenceOnly:       referenceOnly,
 				PreserveCloseIntent: preserveCloseIntent,
 				LinkedByType:        strToText("system"),
 				LinkedByID:          pgtype.UUID{},
@@ -1827,9 +1847,12 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 		// silently auto-closing the issue — if nothing carrying closing
 		// intent was ever delivered, the user should decide manually.
 		if state == "merged" || state == "closed" {
+			// All linked issues belong to this workspace. Resolve custom statuses
+			// once per delivery; built-in statuses still need no catalog read.
+			resolver := issuestatus.NewResolver(wsID)
 			for _, issue := range reevalIssues {
 				// A custom terminal status counts as terminal here. (MUL-6243)
-				if s := issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status); s == "done" || s == "cancelled" {
+				if s := resolver.Effective(ctx, h.issueStatusCatalog(), issue.Status); s == "done" || s == "cancelled" {
 					continue
 				}
 				// Combined across providers: an issue may also carry a still-open
@@ -2109,6 +2132,8 @@ func strPtrOrNil(s string) *string {
 	return &v
 }
 
+// reevaluateIssueCloseGate re-runs the native PR-close gate for an issue after
+// a manual link change. Returns true when the issue advanced to done.
 func (h *Handler) reevaluateIssueCloseGate(ctx context.Context, issue db.Issue, workspaceID string) bool {
 	if issue.Status == "done" || issue.Status == "cancelled" {
 		return false
@@ -2154,9 +2179,3 @@ func parseCanonicalGitHubPRURL(raw string) (owner, repo string, number int32, ok
 	}
 	return ref.Owner, ref.Repo, ref.Number, true
 }
-
-// linkAwaitingHandoffsForPR promotes completion candidates only after the
-// canonical PR has been mirrored in this workspace. It is independent of the
-// title/body auto-link preference: the completing agent explicitly reported
-// this URL. Close intent remains false and is preserved when a member-authored
-// link already exists.

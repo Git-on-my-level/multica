@@ -1,6 +1,5 @@
 import { queryOptions } from "@tanstack/react-query";
 import { api } from "../api";
-import { githubConfigFromStore } from "../github/config";
 
 export const runtimeKeys = {
   all: (wsId: string) => ["runtimes", wsId] as const,
@@ -58,25 +57,5 @@ export function runtimeListOptions(wsId: string, owner?: "me", wsSlug?: string) 
   return queryOptions({
     queryKey: owner === "me" ? runtimeKeys.listMine(wsId) : runtimeKeys.list(wsId),
     queryFn: () => api.listRuntimes({ workspace_id: wsId, owner }, wsSlug),
-  });
-}
-
-export function latestCliVersionOptions() {
-  const config = githubConfigFromStore();
-  return queryOptions({
-    queryKey: ["runtimes", "latest-version", config.repo] as const,
-    queryFn: async (): Promise<string | null> => {
-      try {
-        const response = await fetch(config.releasesLatestApiUrl, {
-          headers: { Accept: "application/vnd.github+json" },
-        });
-        if (!response.ok) return null;
-        const data = await response.json() as { tag_name?: unknown };
-        return typeof data.tag_name === "string" ? data.tag_name : null;
-      } catch {
-        return null;
-      }
-    },
-    staleTime: 10 * 60 * 1000,
   });
 }

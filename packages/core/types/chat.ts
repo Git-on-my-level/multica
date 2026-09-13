@@ -66,49 +66,6 @@ export interface ChatQuickActionsFailureState {
   at: number;
 }
 
-/**
- * A concise follow-up offered by an assistant reply. `label` is rendered in
- * the UI while `prompt` is the full text sent back to the agent. At most one
- * action should be primary; clients still render safely if an older or future
- * server sends more than one.
- */
-export interface ChatQuickAction {
-  label: string;
-  prompt: string;
-  primary?: boolean;
-}
-
-/**
- * Client-only marker (never persisted, never fetched) that the identified
- * turn's quick-actions supplement is still in flight — drives the pill
- * skeleton between chat:done and chat:quick_actions.
- */
-export interface ChatQuickActionsPendingState {
-  message_id: string;
-  task_id: string;
-  /**
-   * Absolute epoch-ms deadline after which a client gives up waiting for the
-   * chat:quick_actions supplement and clears this marker. Stored on the marker
-   * (not as a component timer) so switching chat surfaces — which unmounts and
-   * remounts the timeout hook — resumes the SAME deadline instead of re-arming
-   * a fresh window each time (MUL-5149 review).
-   */
-  expires_at: number;
-}
-
-/**
- * Client-only signal (never persisted, never fetched) that an explicit refresh's
- * background regeneration FAILED — the daemon suggestion pass never completed, so
- * the turn's pills are unchanged. Set by the realtime layer off a failed
- * chat:quick_actions and consumed once by a view to toast "couldn't refresh"
- * before clearing itself. `at` is a per-event nonce so a second failure re-fires
- * even when the message_id repeats (MUL-5149 review).
- */
-export interface ChatQuickActionsFailureState {
-  message_id: string;
-  at: number;
-}
-
 /** Preview of a session's most recent message, for the IM-style list. */
 export interface ChatLastMessage {
   content: string;
@@ -118,6 +75,12 @@ export interface ChatLastMessage {
   failure_reason?: string | null;
   /** "message" (default) or "no_response". Optional for older servers. */
   message_kind?: ChatMessageKind;
+}
+
+export interface ChatChannelSource {
+  channel_type: string;
+  installation_id: string;
+  route_revision: number;
 }
 
 export interface ChatSession {
@@ -141,6 +104,11 @@ export interface ChatSession {
   /** True when the user has pinned this chat to the top of the list.
    *  Optional so older clients / non-list payloads stay valid. */
   pinned?: boolean;
+  /** Present for Chats created by an external Channel. Historical Chats keep
+   *  their source even after a newer route generation becomes current. */
+  channel_source?: ChatChannelSource;
+  /** Absent for first-party Chats. */
+  is_current_channel_route?: boolean;
   created_at: string;
   updated_at: string;
 }

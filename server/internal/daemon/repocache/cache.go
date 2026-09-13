@@ -61,15 +61,21 @@ var agentGitExcludePatterns = []string{
 	"AGENTS.md",
 	".claude",
 	".opencode",
+	".codeartsdoer",
 	".deveco",
 	"CODEBUDDY.md",
 	".codebuddy",
+	".pi",
+	".omp",
 }
 
 const repoCacheGitTimeout = 10 * time.Minute
 
 func newGitCommand(args ...string) *exec.Cmd {
 	cmd := exec.Command("git", args...)
+	// A daemon can outlive the checkout it was launched from. Run Git from the
+	// filesystem root instead of inheriting a cwd that may have been deleted.
+	cmd.Dir = filepath.VolumeName(os.TempDir()) + string(os.PathSeparator)
 	cmd.Env = gitEnv()
 	return cmd
 }
@@ -730,18 +736,44 @@ type WorktreeParams struct {
 	// listed as a writable root — on Linux (multica-ai/multica#2925) and on the
 	// Windows native sandbox (multica-ai/multica#6449).
 	IsolatedGitMetadata bool
+	// Fresh discards what an existing checkout at the target path holds —
+	// uncommitted changes, untracked files, its branch position — and starts
+	// over on a new branch from the base ref. It deletes no branch holding
+	// unpushed commits. Without it, an existing checkout that holds work or is
+	// already on this task's branch is kept as it is.
+	Fresh bool
 }
 
 // WorktreeResult describes a successfully created worktree.
 type WorktreeResult struct {
 	Path       string `json:"path"`        // absolute path to the worktree
-	BranchName string `json:"branch_name"` // git branch created for this worktree
+	BranchName string `json:"branch_name"` // branch checked out; empty for a kept checkout on a detached HEAD
+	// Kept is set when an existing checkout was left exactly as it was — not
+	// reset, cleaned, switched, or pruned — and only its remote refs were
+	// fetched. It names why: KeptTaskBranch or KeptLocalWork.
+	Kept string `json:"kept,omitempty"`
+	// UncommittedFiles and UnpushedCommits describe a kept checkout: the paths
+	// `git status` reports, untracked files included, and the commits on HEAD
+	// that no remote-tracking ref reaches.
+	UncommittedFiles int `json:"uncommitted_files,omitempty"`
+	UnpushedCommits  int `json:"unpushed_commits,omitempty"`
 }
 
+// Reasons CreateWorktree keeps an existing checkout, reported in
+// WorktreeResult.Kept.
+const (
+	// KeptTaskBranch: the checkout is already on this task's branch, so the
+	// checkout was already done.
+	KeptTaskBranch = "task_branch"
+	// KeptLocalWork: the checkout holds uncommitted changes, untracked files,
+	// or unpushed commits that moving it to a new branch would lose.
+	KeptLocalWork = "local_work"
+)
+
 // CreateWorktree looks up the bare cache for a repo, fetches latest, and creates
-// a git worktree in the agent's working directory. If a worktree already exists
-// at the target path (reused environment), it updates the existing worktree to
-// the latest remote default branch instead of failing.
+// a git worktree in the agent's working directory. If a checkout already exists
+// at the target path (reused environment), updateExistingCheckoutContext
+// decides what happens to it.
 func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	return c.CreateWorktreeContext(context.Background(), params)
 }
@@ -841,13 +873,14 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	// that omits the mode hint. This also makes provider transitions on a reused
 	// workdir backward compatible.
 	if params.IsolatedGitMetadata || isIsolatedCheckoutContext(ctx, worktreePath) {
-		actualBranch, err := c.createOrUpdateIsolatedCheckoutContext(
+		result, err := c.createOrUpdateIsolatedCheckoutContext(
 			ctx,
 			barePath,
 			params.RepoURL,
 			worktreePath,
 			branchName,
 			baseRef,
+			params.Fresh,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("create isolated checkout: %w", err)
@@ -856,35 +889,19 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 		for _, pattern := range agentGitExcludePatterns {
 			_ = excludeFromGitContext(ctx, worktreePath, pattern)
 		}
-		if params.CoAuthoredByEnabled {
-			if err := installCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
-			}
-		} else {
-			if err := removeCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-				c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
-			}
-		}
+		c.applyCoAuthoredBySettingContext(ctx, worktreePath, params)
 		if err := ctx.Err(); err != nil {
 			return nil, context.Cause(ctx)
 		}
 
-		c.logger.Info("repo checkout: isolated checkout ready",
-			"url", params.RepoURL,
-			"path", worktreePath,
-			"branch", actualBranch,
-			"base", baseRef,
-		)
-		if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
-			return nil, err
-		}
-		return &WorktreeResult{Path: worktreePath, BranchName: actualBranch}, nil
+		c.logCheckoutReady("repo checkout: isolated checkout ready", params.RepoURL, baseRef, result)
+		return result, nil
 	}
 
 	// If worktree already exists (reused environment from a prior task),
-	// update it to the latest remote code instead of creating a new one.
+	// reuse it instead of creating a new one.
 	if isGitWorktree(worktreePath) {
-		actualBranch, err := updateExistingWorktreeContext(ctx, worktreePath, branchName, baseRef)
+		result, err := updateExistingCheckoutContext(ctx, worktreePath, branchName, baseRef, params.Fresh)
 		if err != nil {
 			return nil, fmt.Errorf("update existing worktree: %w", err)
 		}
@@ -893,38 +910,18 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			_ = excludeFromGitContext(ctx, worktreePath, pattern)
 		}
 
-		// Install or remove the Co-authored-by hook based on the workspace
+		// Reconcile the Co-authored-by hook and the workspace's recorded
 		// setting. The hook lives in the bare repo's shared hooks dir, so we
 		// must actively remove it when disabled — otherwise a previously
 		// installed hook keeps appending the trailer to every commit even
 		// after the user toggles the setting off.
-		if params.CoAuthoredByEnabled {
-			if err := installCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
-			}
-		} else {
-			if err := removeCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-				c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
-			}
-		}
+		c.applyCoAuthoredBySettingContext(ctx, worktreePath, params)
 		if err := ctx.Err(); err != nil {
 			return nil, context.Cause(ctx)
 		}
 
-		c.logger.Info("repo checkout: existing worktree updated",
-			"url", params.RepoURL,
-			"path", worktreePath,
-			"branch", actualBranch,
-			"base", baseRef,
-		)
-		if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
-			return nil, err
-		}
-
-		return &WorktreeResult{
-			Path:       worktreePath,
-			BranchName: actualBranch,
-		}, nil
+		c.logCheckoutReady("repo checkout: existing worktree updated", params.RepoURL, baseRef, result)
+		return result, nil
 	}
 
 	// Create a new worktree. createWorktree may rename the branch to avoid
@@ -939,18 +936,10 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 		_ = excludeFromGitContext(ctx, worktreePath, pattern)
 	}
 
-	// Install or remove the Co-authored-by hook based on the workspace
-	// setting. See the existing-worktree branch above for why removal is
-	// required when the setting is disabled.
-	if params.CoAuthoredByEnabled {
-		if err := installCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-			c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
-		}
-	} else {
-		if err := removeCoAuthoredByHookContext(ctx, worktreePath); err != nil {
-			c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
-		}
-	}
+	// Reconcile the Co-authored-by hook and the workspace's recorded setting.
+	// See the existing-worktree branch above for why removal is required when
+	// the setting is disabled.
+	c.applyCoAuthoredBySettingContext(ctx, worktreePath, params)
 	if err := ctx.Err(); err != nil {
 		return nil, context.Cause(ctx)
 	}
@@ -961,14 +950,34 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 		"branch", actualBranch,
 		"base", baseRef,
 	)
-	if err := ensureLinkedWorktreeUsable(worktreePath); err != nil {
-		return nil, err
-	}
 
 	return &WorktreeResult{
 		Path:       worktreePath,
 		BranchName: actualBranch,
 	}, nil
+}
+
+// logCheckoutReady logs how CreateWorktree left an existing or isolated
+// checkout, naming a kept one as such so the log never reads as if its work
+// had moved to baseRef.
+func (c *Cache) logCheckoutReady(msg, repoURL, baseRef string, result *WorktreeResult) {
+	if result.Kept != "" {
+		c.logger.Info("repo checkout: existing checkout kept",
+			"url", repoURL,
+			"path", result.Path,
+			"branch", result.BranchName,
+			"reason", result.Kept,
+			"uncommitted_files", result.UncommittedFiles,
+			"unpushed_commits", result.UnpushedCommits,
+		)
+		return
+	}
+	c.logger.Info(msg,
+		"url", repoURL,
+		"path", result.Path,
+		"branch", result.BranchName,
+		"base", baseRef,
+	)
 }
 
 const (
@@ -984,58 +993,82 @@ const (
 // The temporary cache remote is then replaced with the real repository URL so
 // an agent's normal fetch / push commands still target GitHub rather than the
 // daemon-owned bare cache.
-func (c *Cache) createOrUpdateIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef string) (string, error) {
-	return c.createOrUpdateIsolatedCheckoutContext(context.Background(), barePath, repoURL, checkoutPath, branchName, baseRef)
+func (c *Cache) createOrUpdateIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef string, fresh bool) (*WorktreeResult, error) {
+	return c.createOrUpdateIsolatedCheckoutContext(context.Background(), barePath, repoURL, checkoutPath, branchName, baseRef, fresh)
 }
 
-func (c *Cache) createOrUpdateIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, checkoutPath, branchName, baseRef string) (string, error) {
+func (c *Cache) createOrUpdateIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, checkoutPath, branchName, baseRef string, fresh bool) (*WorktreeResult, error) {
 	baseCommit, err := resolveCommitContext(ctx, barePath, baseRef)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if isIsolatedCheckoutContext(ctx, checkoutPath) {
 		if err := setIsolatedCheckoutOriginContext(ctx, checkoutPath, repoURL); err != nil {
-			return "", err
+			return nil, err
 		}
 		// Idempotent, and required for a workdir that was first created while
 		// the cache was still a full clone: without it, a checkout backed by a
 		// blobless cache resolves missing blobs to nothing instead of fetching.
 		if isPartialCloneContext(ctx, barePath) {
 			if err := configurePromisorRemoteContext(ctx, checkoutPath); err != nil {
-				return "", err
+				return nil, err
 			}
 		}
+		// Refresh the remote refs before inspecting the checkout: a kept
+		// checkout still gets them, and they decide which commits are unpushed.
 		if err := syncIsolatedCheckoutRefsContext(ctx, barePath, checkoutPath, baseRef); err != nil {
-			return "", err
+			return nil, err
 		}
-		actualBranch, err := updateExistingWorktreeContext(ctx, checkoutPath, branchName, baseCommit)
-		if err != nil {
-			return "", err
+		result, err := updateExistingCheckoutContext(ctx, checkoutPath, branchName, baseCommit, fresh)
+		if err != nil || result.Kept != "" {
+			return result, err
 		}
 		// Drop earlier tasks' agent/* heads so a reused workdir doesn't grow a
 		// new local branch on every checkout. Non-fatal: leftover branches are
 		// harmless clutter and must never fail the checkout.
-		if err := deleteStaleAgentBranchesContext(ctx, checkoutPath, actualBranch); err != nil {
+		if err := deleteStaleAgentBranchesContext(ctx, checkoutPath, result.BranchName); err != nil {
 			c.logger.Warn("repo checkout: prune stale branches failed (non-fatal)", "error", err)
 		}
-		return actualBranch, nil
+		return result, nil
 	}
 	// A daemon upgrade can resume a pre-fix Codex workdir that still has a
 	// linked worktree. Remove it through Git (so the shared admin record is
 	// cleaned too), then recreate the same checkout path with local metadata.
+	// Removing it deletes its working tree, so one keepReason claims stays a
+	// linked worktree until the caller asks for fresh. Even then its branch
+	// comes along when it holds unpushed commits: fresh discards the working
+	// tree, not commits, and left in the shared cache the branch would be
+	// out of the agent's reach and dropped by the next GC.
+	var carryBranch string
 	if isGitWorktree(checkoutPath) {
+		state, err := inspectCheckoutContext(ctx, checkoutPath)
+		if err != nil {
+			return nil, err
+		}
+		if !fresh {
+			if state.Kept = keepReason(state, branchName); state.Kept != "" {
+				return state, nil
+			}
+		}
+		if state.BranchName != "" && state.UnpushedCommits > 0 {
+			carryBranch = state.BranchName
+		}
 		if err := removeLinkedWorktreeContext(ctx, barePath, checkoutPath); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	if _, err := os.Stat(checkoutPath); err == nil {
-		return "", fmt.Errorf("checkout path already exists and is not a Multica isolated checkout: %s", checkoutPath)
+		return nil, fmt.Errorf("checkout path already exists and is not a Multica isolated checkout: %s", checkoutPath)
 	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("stat checkout path: %w", err)
+		return nil, fmt.Errorf("stat checkout path: %w", err)
 	}
 
-	return createIsolatedCheckoutContext(ctx, barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit)
+	actualBranch, err := createIsolatedCheckoutContext(ctx, barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit, carryBranch)
+	if err != nil {
+		return nil, err
+	}
+	return &WorktreeResult{Path: checkoutPath, BranchName: actualBranch}, nil
 }
 
 func removeLinkedWorktree(barePath, checkoutPath string) error {
@@ -1097,11 +1130,14 @@ func localCloneArgs(goos, barePath, checkoutPath string) []string {
 	return append(args, "--origin", isolatedCacheRemoteName, barePath, checkoutPath)
 }
 
-func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit string) (_ string, retErr error) {
-	return createIsolatedCheckoutContext(context.Background(), barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit)
+// createIsolatedCheckout seeds a new isolated checkout from the cache. A
+// non-empty carryBranch names a cache branch to import as a local branch of
+// the same name — the branch of the linked worktree this checkout replaces.
+func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit, carryBranch string) (_ string, retErr error) {
+	return createIsolatedCheckoutContext(context.Background(), barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit, carryBranch)
 }
 
-func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit string) (_ string, retErr error) {
+func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, checkoutPath, branchName, baseRef, baseCommit, carryBranch string) (_ string, retErr error) {
 	if out, err := runGitCombinedOutputContext(
 		ctx,
 		localCloneArgs(runtime.GOOS, barePath, checkoutPath)...,
@@ -1136,6 +1172,14 @@ func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, check
 			return "", err
 		}
 	}
+	// A shallow bare cache can have a freshly fetched base commit reachable
+	// only from refs/remotes/origin/* while its copied refs/heads/* remain
+	// stale. Git ignores --local for a shallow source and the initial clone can
+	// therefore omit baseCommit even though it exists in the cache. Import the
+	// cache refs and selected base before trying to check it out.
+	if err := syncIsolatedCheckoutRefsContext(ctx, barePath, checkoutPath, baseRef); err != nil {
+		return "", err
+	}
 
 	if out, err := runGitCombinedOutputContext(ctx, "-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
 		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
@@ -1143,8 +1187,14 @@ func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, check
 	if err := deleteAllLocalBranchesContext(ctx, checkoutPath); err != nil {
 		return "", err
 	}
-	if err := syncIsolatedCheckoutRefsContext(ctx, barePath, checkoutPath, baseRef); err != nil {
-		return "", err
+	// Import the carried branch before creating the task branch, so a carried
+	// branch with the task branch's own name moves the new one to a
+	// timestamped name instead of being overwritten.
+	if carryBranch != "" {
+		ref := "refs/heads/" + carryBranch
+		if out, err := runGitCombinedOutputContext(ctx, "-C", checkoutPath, "fetch", "--no-tags", barePath, ref+":"+ref); err != nil {
+			return "", fmt.Errorf("carry branch %s: %s: %w", carryBranch, strings.TrimSpace(string(out)), err)
+		}
 	}
 	if out, err := runGitCombinedOutputContext(ctx, "-C", checkoutPath, "config", isolatedCheckoutConfigKey, isolatedCheckoutConfigValue); err != nil {
 		return "", fmt.Errorf("mark isolated checkout: %s: %w", strings.TrimSpace(string(out)), err)
@@ -1272,32 +1322,53 @@ func deleteAllLocalBranches(repoPath string) error {
 }
 
 func deleteAllLocalBranchesContext(ctx context.Context, repoPath string) error {
-	return deleteLocalBranchesUnderContext(ctx, repoPath, "refs/heads/", "")
+	return deleteLocalBranchesUnderContext(ctx, repoPath, "refs/heads/", nil)
 }
 
 // deleteStaleAgentBranches prunes branches left by earlier Multica tasks while
-// preserving the current task branch and every user-created local branch.
+// preserving the current task branch, every user-created local branch, and
+// every agent branch holding commits no remote-tracking ref reaches. In an
+// isolated checkout that branch is the only copy of those commits; deleting it
+// would leave them to the reflog (MUL-7284).
 func deleteStaleAgentBranches(repoPath, keepBranch string) error {
 	return deleteStaleAgentBranchesContext(context.Background(), repoPath, keepBranch)
 }
 
 func deleteStaleAgentBranchesContext(ctx context.Context, repoPath, keepBranch string) error {
-	return deleteLocalBranchesUnderContext(ctx, repoPath, "refs/heads/agent/", "refs/heads/"+keepBranch)
+	keepRef := "refs/heads/" + keepBranch
+	return deleteLocalBranchesUnderContext(ctx, repoPath, "refs/heads/agent/", func(ref string) (bool, error) {
+		if ref == keepRef {
+			return true, nil
+		}
+		unpushed, err := countUnpushedCommitsContext(ctx, repoPath, ref)
+		return unpushed > 0, err
+	})
 }
 
-func deleteLocalBranchesUnder(repoPath, namespace, keepRef string) error {
-	return deleteLocalBranchesUnderContext(context.Background(), repoPath, namespace, keepRef)
+// deleteLocalBranchesUnder deletes every branch under namespace that keep does
+// not claim. A nil keep deletes them all.
+func deleteLocalBranchesUnder(repoPath, namespace string, keep func(ref string) (bool, error)) error {
+	return deleteLocalBranchesUnderContext(context.Background(), repoPath, namespace, keep)
 }
 
-func deleteLocalBranchesUnderContext(ctx context.Context, repoPath, namespace, keepRef string) error {
+func deleteLocalBranchesUnderContext(ctx context.Context, repoPath, namespace string, keep func(ref string) (bool, error)) error {
 	out, err := runGitOutputContext(ctx, "-C", repoPath, "for-each-ref", "--format=%(refname)", namespace)
 	if err != nil {
 		return fmt.Errorf("list local branches: %w", err)
 	}
 	for _, ref := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		ref = strings.TrimSpace(ref)
-		if ref == "" || ref == keepRef {
+		if ref == "" {
 			continue
+		}
+		if keep != nil {
+			kept, err := keep(ref)
+			if err != nil {
+				return err
+			}
+			if kept {
+				continue
+			}
 		}
 		if out, err := runGitCombinedOutputContext(ctx, "-C", repoPath, "update-ref", "-d", ref); err != nil {
 			return fmt.Errorf("delete local branch %s: %s: %w", ref, strings.TrimSpace(string(out)), err)
@@ -1420,10 +1491,112 @@ func isGitWorktree(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// updateExistingCheckoutContext handles a checkout CreateWorktree finds already
+// in place. Re-running checkout must never silently lose work (MUL-7284), and
+// a reused workdir reaches here within one task (a repeated checkout), in a
+// follow-up turn, and from a fresh session that has no memory of the directory.
+// So unless fresh is set, a checkout keepReason claims is left exactly as it
+// is. Only one with nothing to lose — or any, when fresh is set — is moved to a
+// new branch from baseRef. The caller fetches beforehand, so a kept checkout
+// still has current remote refs.
+func updateExistingCheckoutContext(ctx context.Context, path, branchName, baseRef string, fresh bool) (*WorktreeResult, error) {
+	if !fresh {
+		state, err := inspectCheckoutContext(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if state.Kept = keepReason(state, branchName); state.Kept != "" {
+			return state, nil
+		}
+	}
+	actualBranch, err := updateExistingWorktreeContext(ctx, path, branchName, baseRef)
+	if err != nil {
+		return nil, err
+	}
+	return &WorktreeResult{Path: path, BranchName: actualBranch}, nil
+}
+
+// keepReason says why an existing checkout must be left as it is, or returns
+// "" when moving it to a new branch loses nothing. It is kept when it is
+// already on this task's branch — the checkout was already done — or when it
+// holds uncommitted changes, untracked files, or unpushed commits.
+func keepReason(state *WorktreeResult, branchName string) string {
+	switch {
+	case isTaskBranch(state.BranchName, branchName):
+		return KeptTaskBranch
+	case state.UncommittedFiles > 0 || state.UnpushedCommits > 0:
+		return KeptLocalWork
+	default:
+		return ""
+	}
+}
+
+// inspectCheckoutContext describes what an existing checkout holds: its branch
+// (empty on a detached HEAD), the paths `git status` reports, untracked files
+// included, and the commits on HEAD that no remote-tracking ref reaches.
+func inspectCheckoutContext(ctx context.Context, path string) (*WorktreeResult, error) {
+	result := &WorktreeResult{Path: path}
+	// symbolic-ref fails on a detached HEAD, which leaves BranchName empty.
+	if out, err := runGitOutputContext(ctx, "-C", path, "symbolic-ref", "--quiet", "HEAD"); err == nil {
+		result.BranchName = strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/heads/")
+	}
+	// Untracked files are counted one by one because `git clean -fd` would
+	// delete each of them. Ignored files are not: nothing here deletes them.
+	out, err := runGitOutputContext(ctx, "-C", path, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return nil, fmt.Errorf("inspect existing checkout %s: git status: %w", path, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line != "" {
+			result.UncommittedFiles++
+		}
+	}
+	if result.UnpushedCommits, err = countUnpushedCommitsContext(ctx, path, "HEAD"); err != nil {
+		return nil, fmt.Errorf("inspect existing checkout %s: %w", path, err)
+	}
+	return result, nil
+}
+
+// countUnpushedCommitsContext counts the commits reachable from ref that no
+// remote-tracking ref reaches: work whose only copy is this repository.
+func countUnpushedCommitsContext(ctx context.Context, repoPath, ref string) (int, error) {
+	out, err := runGitOutputContext(ctx, "-C", repoPath, "rev-list", "--count", ref, "--not", "--remotes")
+	if err != nil {
+		return 0, fmt.Errorf("count unpushed commits on %s: %w", ref, err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("count unpushed commits on %s: %w", ref, err)
+	}
+	return count, nil
+}
+
+// isTaskBranch reports whether branch is the one CreateWorktree gives the task
+// that owns branchName: that name itself, or the timestamp-suffixed name a
+// branch collision retry picks (see updateExistingWorktree).
+func isTaskBranch(branch, branchName string) bool {
+	if branch == branchName {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(branch, branchName+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // updateExistingWorktree resets the worktree to a clean state and checks out a
-// new branch from the default branch. The caller is responsible for fetching
-// the bare cache beforehand (worktrees share the same object store).
-// Returns the actual branch name used (may differ from input on collision).
+// new branch from the default branch, discarding uncommitted changes and
+// untracked files. Callers go through updateExistingCheckoutContext, which
+// reaches it only when that loses nothing or the caller asked for fresh. The
+// caller is responsible for fetching the bare cache beforehand (worktrees share
+// the same object store). Returns the actual branch name used (may differ from
+// input on collision).
 func updateExistingWorktree(worktreePath, branchName, baseRef string) (string, error) {
 	return updateExistingWorktreeContext(context.Background(), worktreePath, branchName, baseRef)
 }
@@ -1604,9 +1777,253 @@ var daemonInstalledHookSignatures = []string{
 	"# Installed by the Multica daemon.",
 }
 
-// prepareCommitMsgHook is the prepare-commit-msg hook script that appends a
-// Co-authored-by trailer for the Multica Agent to every commit message.
-const prepareCommitMsgHook = `#!/bin/sh
+// coAuthoredByStateFile records the workspace's current Co-authored-by setting
+// for hooks that are already on disk. It lives beside the workspace's bare
+// caches (`<root>/<workspace-id>/`) and is rewritten every time the daemon
+// learns the setting, so a checkout made before the toggle was flipped still
+// commits under the current value. Without it the decision would be frozen
+// into the hook file at checkout time (MUL-6921).
+const (
+	coAuthoredByStateFile     = ".multica_co_authored_by"
+	coAuthoredByStateEnabled  = "1"
+	coAuthoredByStateDisabled = "0"
+)
+
+// CoAuthoredByStatePath returns the file the prepare-commit-msg hook consults
+// at commit time for a workspace. Empty when the workspace is unknown, which
+// installs a hook with no gate — the pre-MUL-6921 behavior.
+func (c *Cache) CoAuthoredByStatePath(workspaceID string) string {
+	if workspaceID == "" {
+		return ""
+	}
+	return filepath.Join(c.root, workspaceID, coAuthoredByStateFile)
+}
+
+// WriteCoAuthoredByState publishes the workspace's current setting to every
+// prepare-commit-msg hook the daemon has installed for it, including hooks in
+// checkouts this call knows nothing about. The daemon calls it whenever it
+// refreshes workspace settings, which is what makes the toggle apply without
+// waiting for the repo to be checked out again.
+//
+// The write is atomic (temp file + rename) so a hook running concurrently
+// reads either the old value or the new one, never a half-written file.
+func (c *Cache) WriteCoAuthoredByState(workspaceID string, enabled bool) error {
+	path := c.CoAuthoredByStatePath(workspaceID)
+	if path == "" {
+		return nil
+	}
+	value := coAuthoredByStateDisabled
+	if enabled {
+		value = coAuthoredByStateEnabled
+	}
+	if current, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(current)) == value {
+		// Already published. The daemon republishes on every workspace sync so
+		// the file survives cache GC and daemon restarts; skipping the rewrite
+		// keeps that cheap.
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create workspace cache dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, coAuthoredByStateFile+".*")
+	if err != nil {
+		return fmt.Errorf("create co-authored-by state temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(value + "\n"); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write co-authored-by state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("write co-authored-by state: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("publish co-authored-by state: %w", err)
+	}
+	return nil
+}
+
+// applyCoAuthoredBySettingContext reconciles this checkout's hook file with the
+// workspace setting.
+//
+// It deliberately does NOT publish the state file. params.CoAuthoredByEnabled
+// is a snapshot the handler took before fetch and lock waits, so a checkout can
+// finish long after the value it captured stopped being true; writing that
+// snapshot to the workspace-wide state file would let a slow checkout resurrect
+// a trailer the user has since turned off. The daemon is the only publisher —
+// it holds the ordering between settings updates — and this reads what the
+// daemon published, falling back to the snapshot only when nothing has been
+// published yet (a cache driven without a daemon, or a state file removed under
+// us).
+func (c *Cache) applyCoAuthoredBySettingContext(ctx context.Context, worktreePath string, params WorktreeParams) {
+	enabled := params.CoAuthoredByEnabled
+	if published, ok := c.readCoAuthoredByState(params.WorkspaceID); ok {
+		enabled = published
+	}
+	if enabled {
+		if err := installCoAuthoredByHookContext(ctx, worktreePath, c.CoAuthoredByStatePath(params.WorkspaceID)); err != nil {
+			c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+		}
+		return
+	}
+	if err := removeCoAuthoredByHookContext(ctx, worktreePath); err != nil {
+		c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+	}
+}
+
+// readCoAuthoredByState reports the setting the daemon last published for a
+// workspace. ok is false when nothing has been published — the caller decides
+// what "unknown" means for it.
+func (c *Cache) readCoAuthoredByState(workspaceID string) (enabled, ok bool) {
+	path := c.CoAuthoredByStatePath(workspaceID)
+	if path == "" {
+		return false, false
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	switch strings.TrimSpace(string(contents)) {
+	case coAuthoredByStateEnabled:
+		return true, true
+	case coAuthoredByStateDisabled:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// ReconcileCoAuthoredByHooks brings the hooks in a workspace's bare caches in
+// line with enabled, without waiting for those repos to be checked out again.
+//
+// This is the migration path for hooks installed by earlier daemon versions:
+// they predate the state file and read nothing at commit time, so publishing a
+// new value cannot reach them. Enabled rewrites them to the current gated
+// script (a later toggle-off then applies at commit time); disabled deletes
+// them. Hooks the daemon does not own are never touched.
+//
+// Only bare caches are enumerable here — the cache root is all this type
+// knows. Isolated checkouts keep their hook inside a task workdir; the daemon
+// finds those and reconciles them one at a time through
+// ReconcileCoAuthoredByHookInCheckout.
+func (c *Cache) ReconcileCoAuthoredByHooks(workspaceID string, enabled bool) error {
+	if workspaceID == "" {
+		return nil
+	}
+	wsDir := filepath.Join(c.root, workspaceID)
+	entries, err := os.ReadDir(wsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read workspace cache dir: %w", err)
+	}
+
+	var firstErr error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		barePath := filepath.Join(wsDir, entry.Name())
+		if !isBareRepo(barePath) {
+			continue
+		}
+		if err := c.reconcileHookAt(filepath.Join(barePath, "hooks"), workspaceID, enabled); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ReconcileCoAuthoredByHookInCheckout applies the workspace setting to a single
+// checkout that owns its git metadata — an isolated checkout, whose .git lives
+// in the task workdir instead of the shared bare cache and is therefore
+// invisible to ReconcileCoAuthoredByHooks. The daemon knows where those
+// workdirs are and calls this for each one it finds.
+//
+// A linked worktree has a .git FILE pointing at the bare cache; it is skipped
+// here because its hook is reconciled through the bare cache instead.
+func (c *Cache) ReconcileCoAuthoredByHookInCheckout(checkoutPath, workspaceID string, enabled bool) error {
+	if checkoutPath == "" || workspaceID == "" {
+		return nil
+	}
+	gitDir := filepath.Join(checkoutPath, ".git")
+	info, err := os.Stat(gitDir)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	return c.reconcileHookAt(filepath.Join(gitDir, "hooks"), workspaceID, enabled)
+}
+
+// reconcileHookAt applies the workspace setting to one hooks directory. It
+// leaves a hook the daemon did not install alone, and never creates a hooks
+// directory it did not find.
+func (c *Cache) reconcileHookAt(hooksDir, workspaceID string, enabled bool) error {
+	hookPath := filepath.Join(hooksDir, "prepare-commit-msg")
+	current, err := os.ReadFile(hookPath)
+	switch {
+	case err == nil && !isDaemonInstalledHook(current):
+		return nil // user or third-party hook: not ours to reconcile
+	case err != nil && !os.IsNotExist(err):
+		return fmt.Errorf("read prepare-commit-msg hook: %w", err)
+	}
+	exists := err == nil
+
+	if !enabled {
+		if !exists {
+			return nil
+		}
+		if err := os.Remove(hookPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove prepare-commit-msg hook: %w", err)
+		}
+		return nil
+	}
+
+	want := prepareCommitMsgHook(c.CoAuthoredByStatePath(workspaceID))
+	if exists && string(current) == want {
+		return nil
+	}
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		return fmt.Errorf("create hooks dir: %w", err)
+	}
+	if err := writeHookFile(hookPath, want); err != nil {
+		return fmt.Errorf("write prepare-commit-msg hook: %w", err)
+	}
+	return nil
+}
+
+// prepareCommitMsgHook builds the prepare-commit-msg hook script that appends
+// a Co-authored-by trailer for the Multica Agent to every commit message.
+//
+// The script re-reads statePath on every commit instead of trusting its own
+// presence on disk: the hook is installed in the git common directory and
+// outlives the checkout that created it, so a workspace toggled off after the
+// checkout must still stop the trailer at the very next commit — including
+// commits the daemon never sees, and `git commit --no-verify`, which bypasses
+// pre-commit and commit-msg but not prepare-commit-msg.
+//
+// A missing or unreadable state file keeps the trailer: the hook only exists
+// because a checkout ran with the setting enabled, so "no state recorded" must
+// mean the same thing it meant before the state file existed.
+func prepareCommitMsgHook(statePath string) string {
+	var gate string
+	if statePath != "" {
+		gate = fmt.Sprintf(`# Current workspace setting, refreshed by the daemon. "0" means the
+# Co-authored-by toggle is off — leave the message alone.
+STATE_FILE=%s
+if [ -f "$STATE_FILE" ]; then
+  case "$(cat "$STATE_FILE" 2>/dev/null)" in
+    0) exit 0 ;;
+  esac
+fi
+
+`, shellSingleQuoted(filepath.ToSlash(statePath)))
+	}
+	return `#!/bin/sh
 # multica:prepare-commit-msg:co-authored-by
 # Multica: add Co-authored-by trailer for the Multica Agent.
 # Installed by the Multica daemon. Do not edit — it will be overwritten.
@@ -1619,7 +2036,7 @@ case "$COMMIT_SOURCE" in
   merge|squash) exit 0 ;;
 esac
 
-TRAILER="Co-authored-by: multica-agent <github@multica.ai>"
+` + gate + `TRAILER="Co-authored-by: multica-agent <github@multica.ai>"
 
 # Don't add if already present.
 if grep -qF "$TRAILER" "$COMMIT_MSG_FILE"; then
@@ -1629,16 +2046,26 @@ fi
 # Use git interpret-trailers for proper formatting.
 git interpret-trailers --in-place --trailer "$TRAILER" "$COMMIT_MSG_FILE"
 `
+}
+
+// shellSingleQuoted renders s as a POSIX shell single-quoted literal so a path
+// with spaces or shell metacharacters survives being embedded in the hook.
+func shellSingleQuoted(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 // installCoAuthoredByHook installs a prepare-commit-msg git hook that appends
 // a Co-authored-by trailer for the Multica Agent. The hook is installed in the
 // git common directory (the bare repo for worktrees) so it applies to all
 // worktrees created from this cache.
-func installCoAuthoredByHook(worktreePath string) error {
-	return installCoAuthoredByHookContext(context.Background(), worktreePath)
+//
+// statePath is the file the hook re-reads on every commit to decide whether
+// the trailer is still wanted; pass "" to install an ungated hook.
+func installCoAuthoredByHook(worktreePath, statePath string) error {
+	return installCoAuthoredByHookContext(context.Background(), worktreePath, statePath)
 }
 
-func installCoAuthoredByHookContext(ctx context.Context, worktreePath string) error {
+func installCoAuthoredByHookContext(ctx context.Context, worktreePath, statePath string) error {
 	out, err := runGitOutputContext(ctx, "-C", worktreePath, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return fmt.Errorf("resolve git common dir: %w", err)
@@ -1654,8 +2081,38 @@ func installCoAuthoredByHookContext(ctx context.Context, worktreePath string) er
 	}
 
 	hookPath := filepath.Join(hooksDir, "prepare-commit-msg")
-	if err := os.WriteFile(hookPath, []byte(prepareCommitMsgHook), 0o755); err != nil {
+	if err := writeHookFile(hookPath, prepareCommitMsgHook(statePath)); err != nil {
 		return fmt.Errorf("write prepare-commit-msg hook: %w", err)
+	}
+	return nil
+}
+
+// writeHookFile publishes a hook script by rename. A plain truncate-and-write
+// would be visible to a commit running at that moment as a half-written
+// script, and this path rewrites hooks in repos with checkouts live on them.
+func writeHookFile(hookPath, contents string) error {
+	dir := filepath.Dir(hookPath)
+	tmp, err := os.CreateTemp(dir, ".multica-hook-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(contents); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, hookPath); err != nil {
+		os.Remove(tmpName)
+		return err
 	}
 	return nil
 }

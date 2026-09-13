@@ -429,7 +429,7 @@ func (h *Handler) RouteIssueCoordination(w http.ResponseWriter, r *http.Request)
 }
 
 func agentReadinessLegacy(ctx context.Context, q *db.Queries, agent db.Agent) (bool, string, error) {
-	verdict, err := service.AgentReadiness(ctx, q, agent)
+	verdict, err := service.AgentReadiness(ctx, service.RuntimeLookup{Queries: q}, agent)
 	if err != nil {
 		return false, "", err
 	}

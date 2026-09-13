@@ -73,7 +73,7 @@ import {
   AgentListToolbar,
   countActiveFilterDimensions,
 } from "./agent-list-toolbar";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 import { matchesPinyin } from "../../editor/extensions/pinyin-match";
 
 // Column template — single source of truth for header, rows, and skeletons.
@@ -399,7 +399,7 @@ function NameCell({ row }: { row: AgentListRow }) {
             </Tooltip>
           )}
           {isOwnedByMe && (
-            <span className="shrink-0 rounded bg-muted px-1 text-micro font-medium text-muted-foreground">
+            <span className="shrink-0 rounded-xs bg-muted px-1 text-micro font-medium text-muted-foreground">
               {t(($) => $.row.you)}
             </span>
           )}
@@ -768,6 +768,7 @@ function LoadingSkeleton() {
 
 export function AgentsPage(_props: AgentsPageProps = {}) {
   const { t } = useT("agents");
+  const locale = useLocale();
   const wsId = useWorkspaceId();
   const paths = useWorkspacePaths();
   const navigation = useNavigation();
@@ -1140,7 +1141,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                       )}
                       {isColVisible("runs") ? (
                         <ListGridCell className="hidden justify-end font-mono text-caption tabular-nums text-muted-foreground @2xl:flex">
-                          {row.runCount.toLocaleString()}
+                          {row.runCount.toLocaleString(locale)}
                         </ListGridCell>
                       ) : (
                         <ListGridCell className="hidden px-0 @2xl:flex" />
@@ -1158,7 +1159,7 @@ export function AgentsPage(_props: AgentsPageProps = {}) {
                         <ListGridCell className="hidden whitespace-nowrap text-caption tabular-nums text-muted-foreground @2xl:flex">
                           {new Date(
                             row.agent.created_at,
-                          ).toLocaleDateString()}
+                          ).toLocaleDateString(locale)}
                         </ListGridCell>
                       ) : (
                         <ListGridCell className="hidden px-0 @2xl:flex" />

@@ -36,7 +36,7 @@ import { api } from "@multica/core/api";
 import type { TelegramInstallation } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { openExternal } from "../../platform";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 
 // TelegramTab is the workspace settings panel for Telegram bot installations,
 // mirroring SlackTab: listing is member-visible; the disconnect action is
@@ -106,7 +106,7 @@ export function TelegramTab() {
             <p className="text-body font-medium">{t(($) => $.telegram.not_enabled_title)}</p>
             <p className="text-caption text-muted-foreground">
               {t(($) => $.telegram.not_enabled_description_prefix)}{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-micro">
+              <code className="rounded-xs bg-muted px-1 py-0.5 text-micro">
                 MULTICA_TELEGRAM_SECRET_KEY
               </code>{" "}
               {t(($) => $.telegram.not_enabled_description_suffix)}{" "}
@@ -186,6 +186,7 @@ function InstallationRow({
   onDisconnect: () => void;
 }) {
   const { t } = useT("settings");
+  const locale = useLocale();
   const { getAgentName } = useActorName();
   const isActive = installation.status === "active";
   const agentName = getAgentName(installation.agent_id);
@@ -208,14 +209,14 @@ function InstallationRow({
               </span>
             ) : null}
             {!isActive && (
-              <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
+              <span className="ml-2 rounded-xs bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
                 {t(($) => $.telegram.revoked_badge)}
               </span>
             )}
           </p>
           <p className="text-micro text-muted-foreground">
             {t(($) => $.telegram.installed_at_label, {
-              when: new Date(installation.installed_at).toLocaleString(),
+              when: new Date(installation.installed_at).toLocaleString(locale),
             })}
           </p>
         </div>
@@ -388,6 +389,8 @@ export function TelegramAgentBindButton({
               type="password"
               value={botToken}
               onChange={(e) => setBotToken(e.target.value)}
+              // Telegram token shape: a format hint, not copy.
+              // eslint-disable-next-line no-restricted-syntax
               placeholder="123456789:AA…"
               autoComplete="off"
               spellCheck={false}

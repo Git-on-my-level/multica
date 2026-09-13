@@ -119,7 +119,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("reasonix stderr pipe: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start reasonix: %w", err)
 	}
@@ -235,6 +235,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		defer func() {
 			stdin.Close()
 			_ = cmd.Wait()
+			releaseProcessGroup(cmd)
 		}()
 
 		startTime := time.Now()
@@ -355,7 +356,9 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			}); err != nil {
 				b.cfg.Logger.Warn("reasonix set_session_model failed", "error", err, "requested_model", opts.Model)
 				finalStatus, finalError = reasonixRequestFailure(runCtx, timeout, fmt.Sprintf("reasonix could not switch to model %q: %v", opts.Model, err))
-				if finalStatus == "failed" && opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
+				if setupFailureWithholdsSessionID(opts) {
+					sessionID = ""
+				} else if finalStatus == "failed" && isACPSessionNotFound(err) {
 					// On a resumed session with a model override, the dead
 					// session surfaces here instead of at session/prompt.
 					// Same fix as the prompt path below: clear the id so

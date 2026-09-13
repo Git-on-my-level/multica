@@ -20,12 +20,47 @@ const (
 	// unblocked, which let exactly such a daemon through (MUL-5707). A daemon
 	// that implements the mode says so; one that does not, cannot.
 	DaemonCapabilityLocalWorktreeV1 = "local-worktree-v1"
+	// DaemonCapabilitySourceContextQuickCreateV1 advertises support for the
+	// two-section quick-create prompt that keeps a new instruction separate
+	// from immutable historical source context.
+	DaemonCapabilitySourceContextQuickCreateV1 = "source_context_quick_create_v1"
 
 	// DaemonCapabilityRPCV1 advertises that the daemon can carry
 	// request/response RPCs over the WebSocket control connection (MUL-4257).
 	// Gated so only daemons+servers that both support it route claim over WS;
 	// everyone else keeps using the HTTP claim endpoint.
 	DaemonCapabilityRPCV1 = "rpc-v1"
+	// DaemonCapabilityClaimPollHintsV1 advertises that the daemon understands
+	// the batch-claim response's safety-poll metadata. The server only performs
+	// the extra deferred-task lookup for clients that opt in, and an older
+	// server's missing fields make a newer daemon retain its short fallback.
+	DaemonCapabilityClaimPollHintsV1 = "claim-poll-hints-v1"
+
+	// DaemonCapabilityPlatformSkillV1 advertises that the daemon's runtime
+	// brief names the merged `multica-platform` skill instead of the
+	// per-domain built-ins it replaced (MUL-6986).
+	//
+	// The brief is assembled by the daemon, so a backend upgrade does not
+	// rewrite it: a daemon released before that merge still tells the agent to
+	// "read the `multica-working-on-issues` skill", a name this server no
+	// longer ships. Without this gate the pointer dangles and the agent is left
+	// hunting for a skill that is not installed. When it is absent the server
+	// ships a redirect stub under the old name; when it is present it ships
+	// nothing extra, so the stub retires itself as daemons update.
+	DaemonCapabilityPlatformSkillV1 = "platform-skill-v1"
+
+	// DaemonCapabilityCheckoutKeepsWorkV1 advertises that the daemon's
+	// `multica repo checkout` keeps an existing checkout that holds work
+	// (uncommitted changes, untracked files, unpushed commits) instead of
+	// resetting it (MUL-7284).
+	//
+	// The server hands an automatic retry that must start a fresh session its
+	// parent's workdir only when this is present (MUL-7034). That session has no
+	// memory of the work in the directory and will fetch its repositories again.
+	// An older daemon's checkout resets an existing checkout and deletes that
+	// work, so such a daemon keeps getting a fresh directory and the parent's
+	// stays untouched on disk.
+	DaemonCapabilityCheckoutKeepsWorkV1 = "checkout-keeps-work-v1"
 
 	// AppCapabilityChatDraftRestoreV1 is advertised (X-Client-Capabilities) by
 	// app clients that understand the durable draft-restore recovery path:
@@ -113,7 +148,9 @@ type WorkspacesChangedPayload struct{}
 // heartbeat, which claims whatever is queued) — so an unknown value from a
 // newer server stays safe on an older daemon.
 const (
-	PendingWorkKindModelList = "model_list"
+	PendingWorkKindModelList        = "model_list"
+	PendingWorkKindLocalSkills      = "local_skills"
+	PendingWorkKindLocalSkillImport = "local_skill_import"
 )
 
 // PendingWorkPayload is sent from server to daemon as a wakeup hint when a
@@ -140,12 +177,6 @@ type TaskCompletedPayload struct {
 	TaskID string `json:"task_id"`
 	PRURL  string `json:"pr_url,omitempty"`
 	Output string `json:"output,omitempty"`
-	// QuickActionsPending declares that this daemon will follow up with a
-	// quick-actions supplement for this chat turn (the suggestion pass runs
-	// in the background after this callback). Per-turn capability signal:
-	// absent on non-chat tasks, skipped turns, and older daemons — so a
-	// false/missing flag means clients must not wait for suggestions.
-	QuickActionsPending bool `json:"quick_actions_pending,omitempty"`
 }
 
 // ChatQuickActionsPayload supplements one completed chat turn with the
@@ -168,15 +199,20 @@ type ChatQuickActionsPayload struct {
 
 // TaskMessagePayload represents a single agent execution message (tool call, text, etc.)
 type TaskMessagePayload struct {
-	TaskID    string         `json:"task_id"`
-	IssueID   string         `json:"issue_id,omitempty"`
-	Seq       int            `json:"seq"`
-	Type      string         `json:"type"`              // "text", "tool_use", "tool_result", "error"
-	Tool      string         `json:"tool,omitempty"`    // tool name for tool_use/tool_result
-	Content   string         `json:"content,omitempty"` // text content
-	Input     map[string]any `json:"input,omitempty"`   // tool input (tool_use only)
-	Output    string         `json:"output,omitempty"`  // tool output (tool_result only)
-	CreatedAt string         `json:"created_at,omitempty"`
+	TaskID  string         `json:"task_id"`
+	IssueID string         `json:"issue_id,omitempty"`
+	Seq     int            `json:"seq"`
+	Type    string         `json:"type"`              // "text", "tool_use", "tool_result", "error"
+	Tool    string         `json:"tool,omitempty"`    // tool name for tool_use/tool_result
+	Content string         `json:"content,omitempty"` // text content
+	Input   map[string]any `json:"input,omitempty"`   // tool input (tool_use only)
+	Output  string         `json:"output,omitempty"`  // tool output (tool_result only)
+	// OutputTruncated reports whether Output is the whole tool output that ran
+	// (tool_result only). Tri-state: omitted means no daemon ever measured this
+	// record — historical rows and older installed daemons — which clients must
+	// present as unknown rather than as complete.
+	OutputTruncated *bool  `json:"output_truncated,omitempty"`
+	CreatedAt       string `json:"created_at,omitempty"`
 }
 
 // DaemonRegisterPayload is sent from daemon to server on connection.
@@ -295,6 +331,22 @@ type ChatCancelFinalizedPayload struct {
 // Fires to other devices so their unread counts stay in sync.
 type ChatSessionReadPayload struct {
 	ChatSessionID string `json:"chat_session_id"`
+}
+
+type ChatSessionCreatedPayload struct {
+	WorkspaceID           string                   `json:"workspace_id"`
+	ChatSessionID         string                   `json:"chat_session_id"`
+	AgentID               string                   `json:"agent_id"`
+	CreatorID             string                   `json:"creator_id"`
+	Title                 string                   `json:"title"`
+	ChannelSource         ChatSessionChannelSource `json:"channel_source"`
+	IsCurrentChannelRoute bool                     `json:"is_current_channel_route"`
+}
+
+type ChatSessionChannelSource struct {
+	ChannelType    string `json:"channel_type"`
+	InstallationID string `json:"installation_id"`
+	RouteRevision  int64  `json:"route_revision"`
 }
 
 // ChatSessionDeletedPayload is broadcast when a chat session is hard-deleted

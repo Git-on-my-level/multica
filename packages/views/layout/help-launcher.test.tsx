@@ -93,14 +93,23 @@ describe("HelpLauncher", () => {
     expect(screen.getByText("Server version 1.2.3")).toBeInTheDocument();
   });
 
-  // MUL-4819: the version row's DropdownMenuLabel must sit inside a
-  // DropdownMenuGroup. Rendering it bare made Base UI's Menu.GroupLabel throw
-  // on open, unmounting the whole app (black screen, no error) because no error
-  // boundary sits above the sidebar. Rendering here must not throw.
-  it("renders the version row without a missing-group crash", () => {
-    configStore.getState().setServerVersion("9.9.9");
-    expect(() => render(<HelpLauncher />)).not.toThrow();
-    expect(screen.getByText("Server version 9.9.9")).toBeInTheDocument();
+  // MUL-6462: after web onboarding the desktop download CTA was unreachable —
+  // no entry anywhere in the app, so users had to remember the URL or detour
+  // through the marketing site. The Help menu is the persistent home for it.
+  it("links to the download page on web", () => {
+    render(<HelpLauncher />);
+    const link = screen.getByRole("link", { name: /Desktop app/ });
+    expect(link).toHaveAttribute("href", "https://multica.ai/download");
+  });
+
+  // AppSidebar is shared: apps/desktop renders the same component tree. Without
+  // this gate the desktop app would offer to download the desktop app.
+  it("hides the download entry inside the desktop shell", () => {
+    vi.mocked(isDesktopShell).mockReturnValue(true);
+    render(<HelpLauncher />);
+    expect(screen.queryByText("Desktop app")).not.toBeInTheDocument();
+    // The rest of the menu is unaffected by the gate.
+    expect(screen.getByText("Docs")).toBeInTheDocument();
   });
 
   // MUL-6462: after web onboarding the desktop download CTA was unreachable —

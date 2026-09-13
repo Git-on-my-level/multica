@@ -36,8 +36,6 @@ type AppConfig struct {
 	// with the operator's own domains instead of Multica Cloud defaults.
 	DaemonServerURL string `json:"daemon_server_url,omitempty"`
 	DaemonAppURL    string `json:"daemon_app_url,omitempty"`
-	GithubRepo      string `json:"github_repo,omitempty"`
-	GithubBranch    string `json:"github_branch,omitempty"`
 
 	// VCSIntegrationAvailable mirrors the MULTICA_VCS_INTEGRATION_ENABLED
 	// deployment switch so the Settings UI can hide the whole self-hosted Git
@@ -77,12 +75,30 @@ type AppConfig struct {
 	// them, and only one of the two guesses is safe.
 	LocalWorktreeSupported bool `json:"local_worktree_supported"`
 
+	// AgentConversationStartersSupported tells independently deployed clients
+	// that agent create/update persists conversation_starters. Older handlers
+	// ignored the unknown JSON field and still returned success, so clients
+	// must fail closed when this declaration is absent.
+	AgentConversationStartersSupported bool `json:"agent_conversation_starters_supported"`
+
+	// CommentDeleteKeepRepliesSupported tells clients that deleting a comment
+	// removes only that comment and keeps its replies (#8296), and that
+	// DELETE /api/comments/{id}/keep-replies exists. Older servers deleted the
+	// replies too and omit this, so clients must promise nothing about
+	// replies unless it is declared.
+	CommentDeleteKeepRepliesSupported bool `json:"comment_delete_keep_replies_supported"`
+
 	// ServerVersion is the running API build version, so self-hosted
 	// operators can confirm what's deployed and include it in bug reports.
 	// Only emitted on self-hosted deployments — omitted on the managed cloud,
 	// which is continuously deployed so its users can't act on the version —
 	// and empty for dev builds that aren't stamped via -X main.version.
 	ServerVersion string `json:"server_version,omitempty"`
+	// GithubRepo / GithubBranch carry the fork install-source override
+	// (MULTICA_GITHUB_REPO / MULTICA_GITHUB_BRANCH) so a Git-on-my-level
+	// deployment's clients install CLIs from the fork, not multica-ai.
+	GithubRepo   string `json:"github_repo,omitempty"`
+	GithubBranch string `json:"github_branch,omitempty"`
 }
 
 // GetConfig is mounted on the public (unauthenticated) route group because
@@ -93,17 +109,19 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config := AppConfig{
 		// A property of this build, not of the deployment: if this code is
 		// running, the save gate is running with it.
-		LocalWorktreeSupported:    true,
-		AllowSignup:               os.Getenv("ALLOW_SIGNUP") != "false",
-		GoogleClientID:            os.Getenv("GOOGLE_CLIENT_ID"),
-		WorkspaceCreationDisabled: os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
+		LocalWorktreeSupported:             true,
+		AgentConversationStartersSupported: true,
+		CommentDeleteKeepRepliesSupported:  true,
+		AllowSignup:                        os.Getenv("ALLOW_SIGNUP") != "false",
+		GoogleClientID:                     os.Getenv("GOOGLE_CLIENT_ID"),
+		WorkspaceCreationDisabled:          os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
 	}
+	config.GithubRepo, config.GithubBranch = githubConfigFromEnv()
 	if h.Storage != nil {
 		config.CdnDomain = h.Storage.CdnDomain()
 	}
 	config.CdnSigned = h.CFSigner != nil
 	config.DaemonServerURL, config.DaemonAppURL = daemonSetupURLsFromEnv()
-	config.GithubRepo, config.GithubBranch = githubConfigFromEnv()
 	config.VCSIntegrationAvailable = h.cfg.VCSIntegrationEnabled
 	config.FeatureFlags = featureflags.EvaluateFrontendPublicFlags(r.Context(), h.FeatureFlags)
 	// Only surface the build version on self-hosted deployments. The managed
@@ -128,7 +146,10 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func daemonSetupURLsFromEnv() (string, string) {
-	serverURL := normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
+	serverURL := normalizePublicURL(os.Getenv("MULTICA_DAEMON_SERVER_URL"))
+	if serverURL == "" {
+		serverURL = normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
+	}
 	appURL := resolveFrontendAppURL()
 	if appURL == "" {
 		return "", ""
@@ -207,6 +228,8 @@ func canonicalURLHost(raw string) string {
 	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
+// githubConfigFromEnv reads the fork install-source overrides. Empty values
+// fall back to the client's built-in multica-ai defaults.
 func githubConfigFromEnv() (string, string) {
 	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
 	if !validGithubRepoSlug(repo) {

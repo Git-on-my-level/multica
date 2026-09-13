@@ -1,9 +1,78 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAuthStore } from "../auth";
+import { configStore } from "../config";
+import type { StorageAdapter, User } from "../types";
 import { ApiClient, ApiError, CHAT_DRAFT_RESTORE_CAPABILITY, clientErrorMessage } from "./client";
 import { EMPTY_PLUGIN_PACKAGE_LIST, EMPTY_PLUGIN_PREVIEW, EMPTY_PLUGIN_SURFACE_LAUNCH } from "./schemas";
 
 afterEach(() => {
+  configStore.getState().setAgentConversationStartersSupported(false);
   vi.unstubAllGlobals();
+});
+
+describe("ApiClient agent conversation-starter compatibility", () => {
+  const prompt = {
+    label: "Review a PR",
+    prompt: "Review the open pull request.",
+  };
+
+  it("rejects create writes before an older backend can drop them", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+
+    await expect(
+      client.createAgent({
+        name: "Reviewer",
+        runtime_id: "runtime-1",
+        conversation_starters: [prompt],
+      }),
+    ).rejects.toThrow(/server version does not support agent conversation starters/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects update writes before an older backend can drop them", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+
+    await expect(
+      client.updateAgent("agent-1", { conversation_starters: [prompt] }),
+    ).rejects.toThrow(/server version does not support agent conversation starters/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows declared-capability create and update writes through", async () => {
+    configStore.getState().setAgentConversationStartersSupported(true);
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ id: "agent-1" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    await client.createAgent({
+      name: "Reviewer",
+      runtime_id: "runtime-1",
+      conversation_starters: [prompt],
+    });
+    await client.updateAgent("agent-1", {
+      conversation_starters: [prompt],
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      name: "Reviewer",
+      runtime_id: "runtime-1",
+      conversation_starters: [prompt],
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      conversation_starters: [prompt],
+    });
+  });
 });
 
 describe("ApiClient edit guards", () => {
@@ -773,6 +842,60 @@ describe("ApiClient notification preferences", () => {
   });
 });
 
+describe("ApiClient Inbox response schemas", () => {
+  const legacyRow = {
+    id: "inbox-1",
+    workspace_id: "ws-1",
+    recipient_type: "member",
+    recipient_id: "member-1",
+    type: "new_comment",
+    severity: "info",
+    issue_id: "issue-1",
+    title: "Legacy Inbox row",
+    body: null,
+    read: false,
+    archived: false,
+    created_at: "2026-08-24T00:00:00Z",
+  };
+
+  it("schema-parses the main Inbox and preserves omitted legacy projections", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify([legacyRow]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const result = await new ApiClient("https://api.example.test").listInbox();
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).not.toHaveProperty("issue_status");
+    expect(result[0]).not.toHaveProperty("issue_priority");
+  });
+
+  it("falls back safely when the main Inbox projection is wrong-typed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify([{ ...legacyRow, issue_priority: 3 }]),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      ),
+    );
+
+    await expect(
+      new ApiClient("https://api.example.test").listInbox(),
+    ).resolves.toEqual([]);
+  });
+});
+
 describe("ApiClient", () => {
   it("preserves HTTP status on failed requests", async () => {
     vi.stubGlobal(
@@ -949,6 +1072,42 @@ describe("ApiClient", () => {
     expect(tasks[1]?.usage).toBeUndefined();
     expect(tasks[2]?.usage?.[0]?.input_tokens).toBe(31_000);
     expect(tasks[2]?.usage?.[0]?.output_tokens).toBe(0);
+  });
+
+  it("keeps agent detail task history on the lightweight endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { id: "task-1", status: "completed", created_at: "2026-08-27T03:00:00Z" },
+          { id: "task-2", status: "completed", created_at: "2026-08-27T02:00:00Z" },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    const tasks = await client.listAgentTasks("agent-1");
+
+    expect(tasks.map((task) => task.id)).toEqual(["task-1", "task-2"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/api/agents/agent-1/tasks",
+    );
+  });
+
+  it("falls back to an empty agent task history for a malformed response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ tasks: "not-an-array" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.listAgentTasks("agent-1")).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("uses the expected HTTP contract for autopilot endpoints", async () => {
@@ -1997,6 +2156,19 @@ describe("ApiClient model discovery response schema", () => {
     expect(result.cached_at).toBe("2026-07-29T00:00:00Z");
   });
 
+  it("requests a live model list when force refresh is selected", async () => {
+    stubJSON(completed);
+
+    await new ApiClient("https://api.example.test").initiateListModels("rt-1", {
+      force: true,
+    });
+
+    expect(vi.mocked(fetch).mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/api/runtimes/rt-1/models?force=true",
+    );
+    expect(vi.mocked(fetch).mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
+  });
+
   // The picker drives a state machine off `status`, so a malformed body must
   // become an explicit failure — not a fabricated empty catalog, and not an
   // endless "discovering models" spinner.
@@ -2374,6 +2546,101 @@ describe("ApiClient workspace MCP servers", () => {
   });
 });
 
+describe("importSkillArchive", () => {
+  it("POSTs multipart form data without a JSON content-type", async () => {
+    const skill = {
+      id: "skill-1",
+      workspace_id: "ws-1",
+      name: "review-helper",
+      description: "Reviews code",
+      content: "# Review",
+      config: {},
+      files: [],
+      created_by: "user-1",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "created", skill }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File(["pk"], "review-helper.skill", { type: "application/zip" });
+    const result = await new ApiClient("https://api.example.test").importSkillArchive(
+      file,
+      "fail",
+    );
+
+    expect(result.id).toBe("skill-1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.example.test/api/skills/import");
+    expect(init?.method).toBe("POST");
+    const headers = init?.headers as Record<string, string>;
+    expect(headers["Content-Type"]).toBeUndefined();
+    const body = init?.body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    expect(body.get("on_conflict")).toBe("fail");
+    const uploaded = body.get("file");
+    expect(uploaded).toBeInstanceOf(File);
+    expect((uploaded as File).name).toBe("review-helper.skill");
+  });
+
+  it("falls back to Import failed when the archive envelope is malformed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ not_a_status: true, skill: 42 }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File(["pk"], "review-helper.skill");
+    await expect(
+      new ApiClient("https://api.example.test").importSkillArchive(file),
+    ).rejects.toThrow(/import failed/i);
+  });
+
+  it("keeps the server reason for a status this client does not know", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ status: "quarantined", reason: "pending review" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File(["pk"], "review-helper.skill");
+    await expect(
+      new ApiClient("https://api.example.test").importSkillArchive(file),
+    ).rejects.toThrow("pending review");
+  });
+
+  it("throws the structured reason on a name conflict", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          status: "conflict",
+          reason: "a skill with this name already exists",
+        }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const file = new File(["pk"], "review-helper.skill");
+    await expect(
+      new ApiClient("https://api.example.test").importSkillArchive(file),
+    ).rejects.toMatchObject({
+      message: "a skill with this name already exists",
+      status: 409,
+    });
+  });
+});
+
 describe("clientErrorMessage", () => {
   it("returns a 4xx message, which handlers write for the user", () => {
     expect(clientErrorMessage(new ApiError("autopilot is not active", 400, "Bad Request")))
@@ -2396,5 +2663,61 @@ describe("clientErrorMessage", () => {
   it("withholds a transport failure, whose message says nothing actionable", () => {
     expect(clientErrorMessage(new TypeError("Failed to fetch"))).toBeUndefined();
     expect(clientErrorMessage(undefined)).toBeUndefined();
+  });
+});
+
+// The wiring this exercises is the one CoreProvider installs: the client's
+// 401 hook drives the auth store's session teardown. Before MUL-7028 the hook
+// only dropped the stored token, so the shell stayed mounted with a live
+// `user` and every following request came back "missing authorization" with
+// no way for the user to get to the login page.
+describe("ApiClient session expiry", () => {
+  function makeStorage(
+    initial: Record<string, string> = {},
+  ): StorageAdapter {
+    const values = { ...initial };
+    return {
+      getItem: (key) => values[key] ?? null,
+      setItem: (key, value) => {
+        values[key] = value;
+      },
+      removeItem: (key) => {
+        delete values[key];
+      },
+    };
+  }
+
+  it("ends the session when the server rejects the credential mid-flight", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "missing authorization" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    const storage = makeStorage({ multica_token: "live-token" });
+    // The client is constructed before the store it notifies, exactly as
+    // CoreProvider's initCore does; the hook only ever runs from a request.
+    const session: { store?: ReturnType<typeof createAuthStore> } = {};
+    const client = new ApiClient("https://api.example.test", {
+      onUnauthorized: () => session.store?.getState().sessionExpired(),
+    });
+    const store = createAuthStore({ api: client, storage });
+    session.store = store;
+    store.setState({
+      user: { id: "u1", email: "a@example.com" } as User,
+      isLoading: false,
+      status: "authenticated",
+    });
+    client.setToken("live-token");
+
+    await expect(client.listProjects()).rejects.toBeInstanceOf(ApiError);
+
+    expect(store.getState().user).toBeNull();
+    expect(store.getState().status).toBe("unauthenticated");
+    expect(store.getState().expired).toBe(true);
+    expect(storage.getItem("multica_token")).toBeNull();
   });
 });

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,9 +17,12 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/database"
+	"github.com/multica-ai/multica/server/internal/dbreader"
 	"github.com/multica-ai/multica/server/internal/dbstartup"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/profiling"
@@ -36,14 +40,34 @@ var (
 	commit  = "unknown"
 )
 
-func newNamedRedisClient(base *redis.Options, suffix string) *redis.Client {
+func newNamedRedisClient(base *redis.UniversalOptions, suffix string) redis.UniversalClient {
 	opts := *base
 	if envBool("REDIS_DISABLE_CLIENT_NAME", false) {
 		opts.ClientName = ""
 	} else {
 		opts.ClientName = redisClientName(opts.ClientName, suffix)
 	}
-	return redis.NewClient(&opts)
+	return redis.NewUniversalClient(&opts)
+}
+
+// newClaimRedisClient is a named client that honours its callers' context
+// deadlines.
+//
+// go-redis discards them by default (Options.ContextTimeoutEnabled): a command
+// is bounded by the socket timeout instead, so a caller's deadline reaches the
+// wire only as a suggestion. That is the right default for the relay's own
+// publish traffic, where nobody is holding a stopwatch, and the wrong one for
+// the WeCom claim store, whose callers spend budgets they have promised to
+// keep — DedupeStore.ClaimBudget is what sizes the dispatcher's outcome grace,
+// and a shutdown drain gives its whole sequence of round trips one DrainBudget.
+//
+// Hence a dedicated client rather than the flag on the shared relay client:
+// setting it there would change the timeout behaviour of every publish that
+// runs through it, which is a far wider blast radius than this store needs.
+func newClaimRedisClient(base *redis.UniversalOptions, suffix string) redis.UniversalClient {
+	opts := *base
+	opts.ContextTimeoutEnabled = true
+	return newNamedRedisClient(&opts, suffix)
 }
 
 func redisClientName(existing, suffix string) string {
@@ -56,21 +80,7 @@ func redisClientName(existing, suffix string) string {
 	return "multica-api:" + suffix
 }
 
-func channelLeaseRedisURLFromEnv() string {
-	if dedicated := strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_REDIS_URL")); dedicated != "" {
-		return dedicated
-	}
-	return strings.TrimSpace(os.Getenv("REDIS_URL"))
-}
-
-func realtimeRelayRedisURLFromEnv() string {
-	if dedicated := strings.TrimSpace(os.Getenv("REALTIME_RELAY_REDIS_URL")); dedicated != "" {
-		return dedicated
-	}
-	return strings.TrimSpace(os.Getenv("REDIS_URL"))
-}
-
-func closeRedisClient(label string, client *redis.Client) {
+func closeRedisClient(label string, client redis.UniversalClient) {
 	if client == nil {
 		return
 	}
@@ -110,6 +120,13 @@ func realtimeRelayModeFromEnv() string {
 		slog.Warn("invalid env var, using default", "name", "REALTIME_RELAY_MODE", "value", raw, "default", defaultMode)
 		return defaultMode
 	}
+}
+
+func validateRealtimeRelayMode(mode string, clusterMode bool) error {
+	if clusterMode && mode != "sharded" {
+		return fmt.Errorf("REALTIME_RELAY_MODE=%s is incompatible with REDIS_CLUSTER_MODE=true; use sharded mode", mode)
+	}
+	return nil
 }
 
 func envPositiveInt(name string, def int) int {
@@ -269,9 +286,25 @@ func jwtSecretBootError(jwtSecret, appEnv string) error {
 	return auth.ValidateJWTSecret(jwtSecret)
 }
 
+// newMainHTTPServer builds the public HTTP server with the production timeout
+// defaults. These values are load-bearing safety settings, not cosmetic tuning,
+// so they live in one helper that main() and the config regression test share.
+//
+// Bound header reads to stop Slowloris; IdleTimeout is looser than the
+// metrics/profiling servers' 30s for keep-alive-heavy CLI and daemon clients.
+// ReadTimeout and WriteTimeout are deliberately left zero so WebSocket upgrades
+// (/ws, /api/daemon/ws) on this listener aren't killed mid-connection.
+func newMainHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func main() {
 	logger.Init()
-
 	// Warn about missing configuration
 	if err := jwtSecretBootError(os.Getenv("JWT_SECRET"), os.Getenv("APP_ENV")); err != nil {
 		slog.Error(
@@ -348,66 +381,124 @@ func main() {
 	}
 	stopStartup()
 	slog.Info("connected to database")
-	logPoolConfig(pool)
-	ctx := context.Background()
+	logPoolConfig("primary", pool)
+
+	// The replica is an optional capacity optimization, never a startup
+	// dependency. Invalid configuration preserves primary-only behavior. New
+	// replica connections are validated as read-only by the pool configuration,
+	// while request-driven fallback and a passive circuit breaker handle runtime
+	// failures without background SQL.
+	var replicaPool *pgxpool.Pool
+	if replicaURL := strings.TrimSpace(os.Getenv("DATABASE_REPLICA_URL")); replicaURL != "" {
+		replicaPool, err = newReplicaDBPool(context.Background(), replicaURL, startupSettings.ConnectTimeout)
+		if err != nil {
+			slog.Warn("database replica configuration is invalid; using primary for reads", "error", err)
+			replicaPool = nil
+		} else {
+			defer replicaPool.Close()
+			logPoolConfig("replica", replicaPool)
+		}
+	}
 
 	bus := events.New()
 	hub := realtime.NewHub()
 	go hub.Run()
 	daemonHub := daemonws.NewHub()
-	var daemonWakeup service.TaskWakeupNotifier = daemonHub
+	var daemonWakeup interface {
+		service.TaskWakeupNotifier
+		handler.RuntimeGoneNotifier
+	} = daemonHub
+	// Nil unless a Redis relay is running: without one there is only one
+	// replica, and it both publishes the completion and holds the socket.
+	var wecomRelay WecomRelay
+	// Built here rather than in the router because the relay's shard readers
+	// start before the router exists, and a deliverer registered after they
+	// start would miss the replay window they open with. The registry is a
+	// bare map with no dependencies, so it can be minted this early and handed
+	// down.
+	wecomSenders := wecom.NewSendersRegistry()
+	var wecomRelayOutbound *wecom.RelayOutbound
 
 	// MUL-1138: when REDIS_URL is set, route fanout through a Redis relay so
 	// multiple API nodes can deliver each other's events. Without it the hub
 	// is the sole broadcaster and the server stays single-node (legacy).
 	// Runtime local-skill stores and realtime relay traffic use separate Redis
 	// clients so blocking stream consumers cannot starve request-path Redis
-	// operations. Channel leases are initialized separately below so production
-	// can point them at a dedicated no-eviction Redis instance.
+	// operations. Channel leases are initialized separately below from the same
+	// global Redis configuration.
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	var broadcaster realtime.Broadcaster = hub
-	var storeRedis *redis.Client
-	var channelLeaseRedis *redis.Client
-	var relayWriteRedis *redis.Client
-	var relayReadRedis *redis.Client
-	var shardedReadRedis *redis.Client
-	var legacyReadRedis *redis.Client
+	var storeRedis redis.UniversalClient
+	var storeRedisPoolSize int
+	var channelLeaseRedis redis.UniversalClient
+	var relayWriteRedis redis.UniversalClient
+	var wecomClaimRedis redis.UniversalClient
+	var relayReadRedis redis.UniversalClient
+	var shardedReadRedis redis.UniversalClient
+	var legacyReadRedis redis.UniversalClient
 	var relay realtime.ManagedRelay
+	// stopRelay halts the relay readers and drains the WeCom dispatcher. It is
+	// called from the shutdown BODY, before the channel supervisor is torn
+	// down — the dispatcher's drain sends over the sockets the supervisor
+	// owns, and each supervised connection clears its sender on exit, so a
+	// drain that runs after that teardown finds ownsSocket false for every
+	// installation and discards everything it was built to save. The defer
+	// keeps a second call (idempotent via the Once) for the early-return
+	// paths that never reach the body's shutdown sequence.
+	var stopRelayOnce sync.Once
+	stopRelay := func() {
+		stopRelayOnce.Do(func() {
+			if relay != nil {
+				relay.Stop()
+			}
+			relayCancel()
+			if relay != nil {
+				relay.Wait()
+			}
+			// Join the dispatcher BEFORE its Redis clients go away, or the
+			// drain races the teardown it depends on.
+			wecomRelayOutbound.Wait()
+		})
+	}
 	defer func() {
-		if relay != nil {
-			relay.Stop()
-		}
-		relayCancel()
-		if relay != nil {
-			relay.Wait()
-		}
+		stopRelay()
 		closeRedisClient("realtime-read-legacy", legacyReadRedis)
 		closeRedisClient("realtime-read-sharded", shardedReadRedis)
 		closeRedisClient("realtime-read", relayReadRedis)
+		closeRedisClient("wecom-claim", wecomClaimRedis)
 		closeRedisClient("realtime-write", relayWriteRedis)
 		closeRedisClient("channel-lease", channelLeaseRedis)
 		closeRedisClient("store", storeRedis)
 	}()
 	sharedRedisURL := strings.TrimSpace(os.Getenv("REDIS_URL"))
-	relayRedisURL := realtimeRelayRedisURLFromEnv()
-	if (sharedRedisURL != "" || relayRedisURL != "") && envBool("REDIS_DISABLE_CLIENT_NAME", false) {
+	redisClusterMode := envBool("REDIS_CLUSTER_MODE", false)
+	// Main parses shared options instead of using database.NewRedisClient so it
+	// can create separate role-specific pools. Request-path clients must also
+	// survive a transient startup outage; relay and lease components own their
+	// existing bounded readiness probes and failure policies.
+	if sharedRedisURL != "" && envBool("REDIS_DISABLE_CLIENT_NAME", false) {
 		slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
 	}
 	if sharedRedisURL != "" {
-		if opts, err := redis.ParseURL(sharedRedisURL); err != nil {
+		if opts, err := database.NewRedisOptions(database.RedisConfig{URL: sharedRedisURL, ClusterMode: redisClusterMode}); err != nil {
 			slog.Error("invalid REDIS_URL — request-path Redis features disabled", "error", err)
 		} else {
 			storeRedis = newNamedRedisClient(opts, "store")
+			storeRedisPoolSize = opts.PoolSize
 		}
 	}
-	if relayRedisURL != "" {
-		opts, err := redis.ParseURL(relayRedisURL)
+	if sharedRedisURL != "" {
+		opts, err := database.NewRedisOptions(database.RedisConfig{URL: sharedRedisURL, ClusterMode: redisClusterMode})
 		if err != nil {
-			slog.Error("invalid realtime relay Redis URL — falling back to in-memory hub", "error", err)
+			slog.Error("invalid REDIS_URL — realtime relay falling back to in-memory hub", "error", err)
 		} else {
+			relayMode := realtimeRelayModeFromEnv()
+			if err := validateRealtimeRelayMode(relayMode, redisClusterMode); err != nil {
+				slog.Error("invalid realtime relay configuration", "error", err)
+				os.Exit(1)
+			}
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
 
-			relayMode := realtimeRelayModeFromEnv()
 			relayConfig := shardedRelayConfigFromEnv()
 			switch relayMode {
 			case "legacy":
@@ -419,6 +510,7 @@ func main() {
 				legacyReadRedis = newNamedRedisClient(opts, "realtime-read-legacy")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, shardedReadRedis, relayConfig)
 				sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				wecomRelay = sharded
 				legacy := realtime.NewRedisRelayWithClientsAndConfig(hub, relayWriteRedis, legacyReadRedis, relayConfig.RetentionConfig())
 				relay = realtime.NewMirroredRelay(sharded, legacy)
 				daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
@@ -426,20 +518,40 @@ func main() {
 				relayReadRedis = newNamedRedisClient(opts, "realtime-read")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, relayReadRedis, relayConfig)
 				sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				wecomRelay = sharded
 				relay = sharded
 				daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
 			}
+			if wecomRelay != nil {
+				// LeaseSettle comes from the supervisor's own knob rather than
+				// from a constant here: the re-offer chain exists to outlast a
+				// lease move, and how long that takes is the supervisor's poll
+				// interval, which a deployment can tune.
+				leaseSettle, err := channelLeasePollInterval()
+				if err != nil {
+					slog.Warn("wecom relay: unreadable lease poll interval, using the dispatcher default",
+						"error", err)
+					leaseSettle = 0
+				}
+				wecomClaimRedis = newClaimRedisClient(opts, "wecom-claim")
+				wecomRelayOutbound = wecom.NewRelayOutbound(wecomRelay,
+					wecom.NewRedisDedupe(wecomClaimRedis, 0, slog.Default()),
+					wecom.RelayConfig{
+						ReplayGrace: relayConfig.ReplayGrace,
+						LeaseSettle: leaseSettle,
+					}, slog.Default())
+				wecomRelay.SetWecomOutboundDeliverer(wecomRelayOutbound)
+				wecomRelayOutbound.Start(relayCtx)
+			}
+			// Every deliverer is registered by this point. The shard readers
+			// open on a replay window, so anything registered after Start
+			// silently misses it.
 			relay.Start(relayCtx)
 			broadcaster = realtime.NewDualWriteBroadcaster(hub, relay)
-			storePoolSize := 0
-			if storeRedis != nil {
-				storePoolSize = storeRedis.Options().PoolSize
-			}
 			slog.Info(
 				"realtime: Redis relay enabled",
 				"node_id", relay.NodeID(),
 				"mode", relayMode,
-				"dedicated_instance", strings.TrimSpace(os.Getenv("REALTIME_RELAY_REDIS_URL")) != "",
 				"shards", relayConfig.Shards,
 				"stream_max_len", relayConfig.StreamMaxLen,
 				"replay_grace", relayConfig.ReplayGrace.String(),
@@ -448,19 +560,18 @@ func main() {
 				"stream_ttl_enabled", relayConfig.StreamTTLEnabled,
 				"xread_count", relayConfig.ReadCount,
 				"xread_block", relayConfig.ReadBlock.String(),
-				"store_pool_size", storePoolSize,
+				"store_pool_size", storeRedisPoolSize,
 				"realtime_write_pool_size", opts.PoolSize,
 				"realtime_read_pool_size", opts.PoolSize,
 			)
 		}
 	} else {
-		slog.Info("realtime: REDIS_URL and REALTIME_RELAY_REDIS_URL are unset — using in-memory hub (single-node mode)")
+		slog.Info("realtime: REDIS_URL is unset — using in-memory hub (single-node mode)")
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
-		leaseRedisURL := channelLeaseRedisURLFromEnv()
-		if leaseRedisURL == "" {
-			slog.Error("channel leases: CHANNEL_WS_LEASE_REDIS_URL and REDIS_URL are unset")
-		} else if opts, err := redis.ParseURL(leaseRedisURL); err != nil {
+		if sharedRedisURL == "" {
+			slog.Error("channel leases: REDIS_URL is unset")
+		} else if opts, err := database.NewRedisOptions(database.RedisConfig{URL: sharedRedisURL, ClusterMode: redisClusterMode}); err != nil {
 			slog.Error("channel leases: invalid Redis URL; supervisor will fail closed", "error", err)
 		} else {
 			channelLeaseRedis = newNamedRedisClient(opts, "channel-lease")
@@ -484,40 +595,25 @@ func main() {
 	var metricsServer *http.Server
 	var httpMetrics *obsmetrics.HTTPMetrics
 	var businessMetrics *obsmetrics.BusinessMetrics
-	var samplerPool *pgxpool.Pool
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
 	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	var wecomMetrics *obsmetrics.WecomMetrics
+	var dbRoutingMetrics *obsmetrics.DBRoutingMetrics
 	if metricsConfig.Enabled() {
-		// Build a dedicated tiny pool for the BusinessSamplerCollector
-		// so a stalled scrape can never starve business traffic. If the
-		// pool fails to construct we log and continue without the
-		// sampler — the rest of /metrics is still useful.
-		var err error
-		samplerPool, err = newSamplerDBPool(ctx, dbURL)
-		if err != nil {
-			slog.Warn("metrics: failed to build sampler pgxpool; sampler disabled", "error", err)
-			samplerPool = nil
-		}
-
 		metricsRegistry := obsmetrics.NewRegistry(obsmetrics.RegistryOptions{
-			Pool:     pool,
-			Realtime: realtime.M,
-			DaemonWS: daemonws.M,
-			Version:  version,
-			Commit:   commit,
-			BusinessSampler: func() *obsmetrics.BusinessSamplerOptions {
-				if samplerPool == nil {
-					return nil
-				}
-				return &obsmetrics.BusinessSamplerOptions{Pool: samplerPool}
-			}(),
+			Pool:        pool,
+			ReplicaPool: replicaPool,
+			Realtime:    realtime.M,
+			DaemonWS:    daemonws.M,
+			Version:     version,
+			Commit:      commit,
 		})
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
 		channelMediaMetrics = metricsRegistry.ChannelMedia
 		channelLeaseMetrics = metricsRegistry.ChannelLease
 		wecomMetrics = metricsRegistry.Wecom
+		dbRoutingMetrics = metricsRegistry.DBRouting
 		// Forward inbound daemon WS frames into the per-kind counter so
 		// dashboards can split heartbeat / unknown / invalid traffic.
 		if daemonHub != nil {
@@ -531,15 +627,11 @@ func main() {
 			)
 		}
 	}
-	if samplerPool != nil {
-		defer samplerPool.Close()
-	}
-
 	// Construct the BatchedHeartbeatScheduler before the router so it can
 	// be injected into the Handler. The Run goroutine starts below
 	// alongside the sweeper, and Stop is called explicitly during graceful
 	// shutdown so any pending bumps are flushed before we exit.
-	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
+	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval, daemonWakeup)
 
 	// Validate the LLM retry budget before the router exists: an operator who
 	// typed a value we cannot honor should see the boot stop, the same way a
@@ -548,6 +640,10 @@ func main() {
 	if err != nil {
 		slog.Error("invalid MULTICA_LLM_MAX_RETRIES", "error", err)
 		os.Exit(1)
+	}
+	var readRecorder dbreader.Recorder
+	if dbRoutingMetrics != nil {
+		readRecorder = dbRoutingMetrics
 	}
 
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
@@ -558,15 +654,27 @@ func main() {
 		WecomMetrics:        wecomMetrics,
 		DaemonHub:           daemonHub,
 		DaemonWakeup:        daemonWakeup,
+		WecomSenders:        wecomSenders,
+		WecomRelayOutbound:  wecomRelayOutbound,
 		FeatureFlags:        flags,
 		HeartbeatScheduler:  heartbeatScheduler,
 		LLMMaxRetries:       llmMaxRetries,
 	})
-
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+	var replicaQueries *db.Queries
+	if replicaPool != nil {
+		replicaQueries = db.New(replicaPool)
 	}
+	// Reuse the handler's primary Queries handle so replica routing does not
+	// create a second wrapper around the same primary pool.
+	h.ReadSelector = dbreader.New(h.Queries, replicaQueries, readRecorder)
+	h.PRRefresh.SetReadSelector(h.ReadSelector)
+
+	// Reconciled race recoveries in the batched scheduler reuse the same
+	// daemon:register refresh the sync transition path publishes. Wired before
+	// the scheduler's Run goroutine starts so the field write is race-free.
+	heartbeatScheduler.RecoveryNotifier = h
+
+	srv := newMainHTTPServer(":"+port, r)
 	profilingServer := profiling.NewServer()
 
 	// Start background workers.
@@ -598,20 +706,32 @@ func main() {
 		)
 		runtimeReconnectGrace = minimumRuntimeReconnectGrace
 	}
-	// MULTICA_TASK_QUEUED_TTL lets self-hosted deployments that legitimately
-	// hold queued work behind long-running tasks — e.g. a runtime with low
-	// task concurrency — raise the built-in 2h queued expiry without losing
-	// work to queued_expired failures.
-	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus, runtimeReconnectGrace,
-		envDuration("MULTICA_TASK_QUEUED_TTL", defaultTaskQueuedTTL))
+	// Queued work now expires on the same runtime-liveness signal as in-flight
+	// work, so there is no separate queue TTL to tune: a busy runtime keeps its
+	// backlog, and a departed one retires everything it owned at once.
+	go runRuntimeSweeper(sweepCtx, queries, liveness, taskSvc, bus, runtimeReconnectGrace)
+	go runDelegatedFailureRecoverySweeper(sweepCtx, taskSvc)
+	// Seven-day runtime retention does not share the 30-second liveness tick:
+	// its bounded transactions run independently once per hour, so a slow GC
+	// round cannot delay offline detection or task recovery.
+	go runRuntimeGCSweeper(sweepCtx, pool, queries, taskSvc.Metrics, h)
+	// Source-context cleanup is object-store work, so it gets its own goroutine
+	// instead of a slot in the runtime sweep tick.
+	go runSourceContextSweeper(sweepCtx, taskSvc)
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	if autopilotSvc.QuotaEnabled() {
 		go runAutopilotQuotaReconciler(autopilotCtx, autopilotSvc)
 	}
-	go runDBStatsLogger(sweepCtx, pool)
+	go runDBStatsLogger(sweepCtx, "primary", pool)
+	if replicaPool != nil {
+		go runDBStatsLogger(sweepCtx, "replica", replicaPool)
+	}
 	if h.WebhookDeliveryWorker != nil {
 		go h.WebhookDeliveryWorker.Run(sweepCtx)
+	}
+	if h.SeatCapacityWorker != nil {
+		go h.SeatCapacityWorker.Run(sweepCtx)
 	}
 	if h.TelegramOutbound != nil {
 		h.TelegramOutbound.Start(sweepCtx)
@@ -708,69 +828,78 @@ func main() {
 	signal.Stop(quit)
 
 	slog.Info("shutting down server")
-	autopilotCancel()
 
-	// Order matters: drain in-flight HTTP first so any heartbeat handlers
-	// finish calling Schedule() before we stop the scheduler. Otherwise a
-	// late heartbeat could enqueue a pending ID after Run has already
-	// drained and exited, and Stop() would not flush it.
-	apiShutdownCtx, apiShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := srv.Shutdown(apiShutdownCtx); err != nil {
-		apiShutdownCancel()
-		slog.Error("server forced to shutdown", "error", err)
-		os.Exit(1)
-	}
-	apiShutdownCancel()
-
-	// HTTP is fully drained — safe to stop the sweeper and flush the
-	// final batch of queued heartbeat bumps.
-	sweepCancel()
-	heartbeatScheduler.Stop()
-	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
-		slog.Warn("webhook delivery worker did not exit within shutdown timeout")
-	}
-	if h.TelegramOutbound != nil && !h.TelegramOutbound.WaitWithTimeout(5*time.Second) {
-		slog.Warn("telegram outbound workers did not exit within shutdown timeout")
-	}
-
-	// Join the channel supervisor's per-installation goroutines so the
-	// lease renewer can issue a final release before process exit;
-	// otherwise the next replica would have to wait the full LeaseTTL
-	// before picking up the installation on the other side of the
-	// redeploy. The wait is bounded — if a supervisor is wedged (DB
-	// pool stalled, a connector ignoring ctx, etc.) the fallback is the
-	// natural LeaseTTL expiry on the other side, which is strictly better
-	// than holding shutdown open forever. Then drain the Feishu runtime:
-	// the supervisors have stopped delivering inbound events, so flush the
-	// debounced run triggers and join any in-flight outbound replies
-	// (each bounded by ReplyTimeout) so a binding card / offline notice is
-	// not lost on shutdown.
-	if h.ChannelSupervisor != nil {
-		if !h.ChannelSupervisor.WaitWithTimeout(h.ChannelSupervisor.ShutdownTimeout()) {
-			slog.Warn("channel supervisor: connections did not exit within shutdown timeout; proceeding",
-				"timeout", h.ChannelSupervisor.ShutdownTimeout().String(),
-			)
-		}
-		if h.ChannelRouter != nil {
+	// The order below is the contract, and shutdown.go is where it is stated
+	// and pinned. The one that is not self-evident: the WeCom dispatcher must
+	// be drained BEFORE sweepCancel, not merely before the supervisor is
+	// joined — cancelling the sweeper context is already what makes every
+	// supervised connection clear its sender, and a drain past that point
+	// finds no socket to deliver over.
+	shutdownSequence{
+		StopAutopilot: autopilotCancel,
+		DrainHTTP: func() {
+			apiShutdownCtx, apiShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := srv.Shutdown(apiShutdownCtx); err != nil {
+				apiShutdownCancel()
+				slog.Error("server forced to shutdown", "error", err)
+				os.Exit(1)
+			}
+			apiShutdownCancel()
+		},
+		StopOutboundRelay: stopRelay,
+		CancelWorkers:     sweepCancel,
+		StopHeartbeats:    heartbeatScheduler.Stop,
+		JoinWebhookWorker: func() {
+			if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
+				slog.Warn("webhook delivery worker did not exit within shutdown timeout")
+			}
+		},
+		JoinTelegram: func() {
+			if h.TelegramOutbound != nil && !h.TelegramOutbound.WaitWithTimeout(5*time.Second) {
+				slog.Warn("telegram outbound workers did not exit within shutdown timeout")
+			}
+		},
+		// Joined so the lease renewer can issue a final release before exit;
+		// otherwise the next replica waits out the whole LeaseTTL on the far
+		// side of a redeploy. Bounded: a wedged supervisor falls back to the
+		// natural expiry rather than holding shutdown open.
+		JoinChannelSupervisor: func() {
+			if h.ChannelSupervisor == nil {
+				return
+			}
+			if !h.ChannelSupervisor.WaitWithTimeout(h.ChannelSupervisor.ShutdownTimeout()) {
+				slog.Warn("channel supervisor: connections did not exit within shutdown timeout; proceeding",
+					"timeout", h.ChannelSupervisor.ShutdownTimeout().String(),
+				)
+			}
+		},
+		DrainChannelRouter: func() {
+			if h.ChannelSupervisor == nil || h.ChannelRouter == nil {
+				return
+			}
 			drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			if !h.ChannelRouter.Drain(drainCtx) {
 				slog.Warn("channel router: drain deadline reached; deferred media fallback remains durable")
 			}
 			drainCancel()
-		}
-	}
-
-	if metricsServer != nil {
-		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := metricsServer.Shutdown(metricsShutdownCtx); err != nil {
-			slog.Error("metrics server forced to shutdown", "error", err)
-		}
-		metricsShutdownCancel()
-	}
-	profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
-		slog.Error("pprof server forced to shutdown", "error", err)
-	}
-	profilingShutdownCancel()
+		},
+		StopMetricsServer: func() {
+			if metricsServer == nil {
+				return
+			}
+			metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := metricsServer.Shutdown(metricsShutdownCtx); err != nil {
+				slog.Error("metrics server forced to shutdown", "error", err)
+			}
+			metricsShutdownCancel()
+		},
+		StopProfiling: func() {
+			profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
+				slog.Error("pprof server forced to shutdown", "error", err)
+			}
+			profilingShutdownCancel()
+		},
+	}.run()
 	slog.Info("server stopped")
 }

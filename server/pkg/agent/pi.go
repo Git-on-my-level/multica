@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -226,6 +227,16 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	if err := ensurePiSessionFile(sessionPath); err != nil {
 		return nil, fmt.Errorf("%s session file: %w", label, err)
 	}
+	sessionLock, locked, err := tryLockPiSessionFile(sessionPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s session lock: %w", label, err)
+	}
+	if !locked {
+		if opts.ResumeSessionID != "" {
+			return piSessionBusyResult(label, sessionPath), nil
+		}
+		return nil, fmt.Errorf("%s session file %q is already in use", label, sessionPath)
+	}
 
 	runCtx, cancel := runContext(ctx, timeout)
 
@@ -241,6 +252,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		releasePiSessionFileLock(sessionLock)
 		cancel()
 		return nil, fmt.Errorf("%s stdout pipe: %w", label, err)
 	}
@@ -251,15 +263,21 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	// Pi has been observed to wait indefinitely when stdin never reaches EOF.
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		releasePiSessionFileLock(sessionLock)
 		cancel()
 		return nil, fmt.Errorf("%s stdin pipe: %w", label, err)
 	}
 	var closeStdinOnce sync.Once
 	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
-	cmd.Stderr = newLogWriter(b.cfg.Logger, "["+label+":stderr] ")
+	// Watch stderr as well as log it. When Pi refuses a resume it exits before
+	// emitting a single JSON event, so stderr is the only place the reason
+	// exists and Result.ResumeRejected has nothing else to be built from.
+	stderrWatch := newPiStderrWatcher(newLogWriter(b.cfg.Logger, "["+label+":stderr] "))
+	cmd.Stderr = stderrWatch
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		closeStdin()
+		releasePiSessionFileLock(sessionLock)
 		cancel()
 		return nil, fmt.Errorf("start %s: %w", label, err)
 	}
@@ -289,6 +307,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	}()
 
 	go func() {
+		defer func() { releasePiSessionFileLock(sessionLock) }()
 		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
@@ -415,6 +434,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		}
 
 		waitErr := cmd.Wait()
+		releaseProcessGroup(cmd)
 		duration := time.Since(startTime)
 
 		// Wait closes the process pipes, so a prompt write still blocked when the
@@ -429,7 +449,20 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 			finalError = "execution cancelled"
 		} else if waitErr != nil && finalStatus == "completed" {
 			finalStatus = "failed"
-			finalError = fmt.Sprintf("%s exited with error: %v", label, waitErr)
+			// Prefer the turn's provider message over the process exit code.
+			// Pi (and pi-print-clean-exit) exits 1 after stopReason=error, so
+			// Wait() wins this branch and used to drop lastTurnError. The
+			// classifier then saw only "exit status 1" and filed the run as
+			// non-retryable process_failure — even when the turn was a
+			// transient LiteLLM/OpenAI "Connection error." / "Request timed
+			// out." Keep the exit status as a suffix so a genuine crash is
+			// still visible (same shape as the OpenCode empty-step+exit
+			// composite).
+			if lastTurnError != "" {
+				finalError = fmt.Sprintf("%s; %s exited with error: %v", lastTurnError, label, waitErr)
+			} else {
+				finalError = fmt.Sprintf("%s exited with error: %v", label, waitErr)
+			}
 		} else if writeErr != nil && finalStatus == "completed" {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("%s prompt write failed: %v", label, writeErr)
@@ -443,6 +476,12 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 		b.cfg.Logger.Info(label+" finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
+		// Publish the terminal result only after the transcript is available to
+		// a follow-up run. The result channel is buffered, so relying on a defer
+		// would let the receiver race ahead and spuriously treat the session as
+		// still busy after Pi had already exited.
+		releasePiSessionFileLock(sessionLock)
+		sessionLock = nil
 		resCh <- Result{
 			Status:     finalStatus,
 			Output:     output.String(),
@@ -450,10 +489,86 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 			DurationMs: duration.Milliseconds(),
 			SessionID:  sessionPath,
 			Usage:      usage,
+			// Only a run that asked to resume can have had a resume refused.
+			// On a cold run the phrase cannot appear anyway, but stating the
+			// precondition keeps this honest against Result.ResumeRejected's
+			// contract rather than relying on Pi never saying it.
+			ResumeRejected: opts.ResumeSessionID != "" && stderrWatch.resumeRefused(),
 		}
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func piSessionBusyResult(label, sessionPath string) *Session {
+	msgCh := make(chan Message)
+	close(msgCh)
+	resCh := make(chan Result, 1)
+	resCh <- Result{
+		Status:                  "failed",
+		Error:                   fmt.Sprintf("%s session file %q is already in use by another execution", label, sessionPath),
+		ResumeRejectedTransient: true,
+	}
+	close(resCh)
+	return &Session{Messages: msgCh, Result: resCh}
+}
+
+// piResumeRefusedMarker is Pi's message when a resumed transcript names a
+// working directory that no longer exists. Pi re-anchors a resumed run to the
+// cwd recorded in the session header; when that directory is gone it prints
+// this to stderr and exits 1 immediately, before any JSON event, any tool call
+// and any output (GH #8082).
+//
+// The daemon's resume gate already declines to hand Pi such a session, so in
+// normal operation this never fires. It is the second layer, and its reach is
+// exactly this one refusal arriving on a run the gate let through: the
+// directory disappearing between the gate's check and Pi's, a header the
+// gate's bounded scan did not reach or could not parse, or a Pi-family runtime
+// the gate does not model as refusing. It is a single phrase match, so it does
+// NOT generalise to some other refusal Pi might grow later.
+//
+// Without it such a run fails as a generic non-retryable process_failure and
+// the same stale pointer is served again on the next claim — the permanent
+// loop #8082 reported.
+const piResumeRefusedMarker = "Stored session working directory does not exist"
+
+// piStderrTailLimit bounds the retained stderr tail. The marker arrives in a
+// single write at startup, so this only has to be large enough that a partial
+// flush cannot split it apart.
+const piStderrTailLimit = 8 << 10
+
+// piStderrWatcher tees Pi's stderr to the debug log while retaining a bounded
+// tail to test for a resume refusal. Writes arrive from the child process
+// goroutine and resumeRefused is read from the result goroutine after Wait, so
+// the buffer is mutex-guarded rather than relying on that ordering.
+type piStderrWatcher struct {
+	log io.Writer
+
+	mu   sync.Mutex
+	tail []byte
+}
+
+func newPiStderrWatcher(log io.Writer) *piStderrWatcher {
+	return &piStderrWatcher{log: log}
+}
+
+func (w *piStderrWatcher) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.tail = append(w.tail, p...)
+	if len(w.tail) > piStderrTailLimit {
+		w.tail = w.tail[len(w.tail)-piStderrTailLimit:]
+	}
+	w.mu.Unlock()
+	// Never fail the child's stderr write on a logging problem: a short write
+	// here makes Pi's own writer error out mid-run.
+	_, _ = w.log.Write(p)
+	return len(p), nil
+}
+
+func (w *piStderrWatcher) resumeRefused() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return bytes.Contains(w.tail, []byte(piResumeRefusedMarker))
 }
 
 // ── Pi event types ──

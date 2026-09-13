@@ -26,6 +26,7 @@ import type {
   CreateProjectRequest,
   CreateProjectResourceRequest,
   InboxItem,
+  InboxWorkspaceUnread,
   Issue,
   IssueLabelsResponse,
   Label,
@@ -57,8 +58,11 @@ import type {
   UpdateProjectRequest,
   User,
   Workspace,
+  WorkspaceSubscriptionSummary,
 } from "@multica/core/types";
 import {
+  AppConfigSchema,
+  EMPTY_APP_CONFIG,
   EMPTY_LIST_ISSUE_STATUSES_RESPONSE,
   EMPTY_LIST_ISSUES_RESPONSE,
   EMPTY_TIMELINE_ENTRIES,
@@ -66,7 +70,9 @@ import {
   ListIssuesResponseSchema,
   ListIssueStatusesResponseSchema,
   TimelineEntriesSchema,
+  WorkspaceSubscriptionSummarySchema,
 } from "@multica/core/api/schemas";
+import type { AppConfigResponse } from "@multica/core/api/schemas";
 import {
   ActiveTasksResponseSchema,
   AgentListSchema,
@@ -87,6 +93,7 @@ import {
   EMPTY_CHAT_SESSION_LIST,
   EMPTY_COMMENT,
   EMPTY_INBOX_LIST,
+  EMPTY_INBOX_UNREAD_SUMMARY,
   EMPTY_ISSUE_FALLBACK,
   EMPTY_LIST_LABELS_RESPONSE,
   EMPTY_LIST_PROJECT_RESOURCES_RESPONSE,
@@ -102,6 +109,7 @@ import {
   EMPTY_USER,
   EMPTY_WORKSPACE_LIST,
   InboxListSchema,
+  InboxUnreadSummarySchema,
   NotificationPreferenceResponseSchema,
   ListLabelsResponseSchema,
   ListProjectResourcesResponseSchema,
@@ -389,6 +397,26 @@ class ApiClient {
     );
   }
 
+  async getConfig(opts?: { signal?: AbortSignal }): Promise<AppConfigResponse> {
+    return this.fetchValidated<AppConfigResponse>(
+      "/api/config",
+      AppConfigSchema,
+      EMPTY_APP_CONFIG,
+      { ...opts, endpoint: "getConfig" },
+    );
+  }
+
+  async getWorkspaceSubscriptionSummary(opts?: {
+    signal?: AbortSignal;
+  }): Promise<WorkspaceSubscriptionSummary | null> {
+    return this.fetchValidated<WorkspaceSubscriptionSummary | null>(
+      "/api/cloud-subscriptions/summary",
+      WorkspaceSubscriptionSummarySchema,
+      null,
+      { ...opts, endpoint: "getWorkspaceSubscriptionSummary" },
+    );
+  }
+
   // PATCH /api/me — name, avatar_url, language. Server returns the updated
   // user; we parse so a partial drift doesn't bleed into the auth store.
   async updateMe(data: UpdateMeRequest): Promise<User> {
@@ -452,6 +480,25 @@ class ApiClient {
     return parseWithFallback(raw, InboxListSchema, EMPTY_INBOX_LIST, {
       endpoint: "listInbox",
     });
+  }
+
+  /**
+   * Cross-workspace unread inbox counts, one entry per workspace with unread
+   * items. Backs the inbox tab badge — see lib/unread-counts.ts for why the
+   * badge reads this instead of counting `listInbox()` locally.
+   */
+  async getInboxUnreadSummary(opts?: {
+    signal?: AbortSignal;
+  }): Promise<InboxWorkspaceUnread[]> {
+    const raw = await this.fetch<unknown>("/api/inbox/unread-summary", {
+      signal: opts?.signal,
+    });
+    return parseWithFallback(
+      raw,
+      InboxUnreadSummarySchema,
+      EMPTY_INBOX_UNREAD_SUMMARY,
+      { endpoint: "getInboxUnreadSummary" },
+    );
   }
 
   async markInboxRead(id: string): Promise<InboxItem> {
@@ -739,9 +786,19 @@ class ApiClient {
   }
 
   // DELETE /api/comments/:id — 204 No Content on success; this.fetch
-  // already short-circuits 204 → undefined.
-  async deleteComment(commentId: string): Promise<void> {
-    await this.fetch<void>(`/api/comments/${commentId}`, { method: "DELETE" });
+  // already short-circuits 204 → undefined. `keepReplies` calls the route
+  // only servers that keep a deleted comment's replies expose (#8296): if the
+  // request reaches an older server it fails instead of deleting the replies
+  // too. Pass it only when the server declared
+  // `comment_delete_keep_replies_supported`. Mirrors packages/core/api/client.ts.
+  async deleteComment(
+    commentId: string,
+    opts: { keepReplies?: boolean } = {},
+  ): Promise<void> {
+    const path = opts.keepReplies === true
+      ? `/api/comments/${commentId}/keep-replies`
+      : `/api/comments/${commentId}`;
+    await this.fetch<void>(path, { method: "DELETE" });
   }
 
   // POST /api/comments/:id/resolve — marks the thread root resolved; only

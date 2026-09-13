@@ -77,6 +77,7 @@ vi.mock("@multica/core/auth", () => ({
 }));
 
 vi.mock("../../i18n", () => ({
+  useLocale: () => "en",
   // TableView also reads `i18n.language` for its date formatting.
   useT: () => ({ t: mockTranslate, i18n: { language: "en" } }),
   useTimeAgo: () => () => "now",
@@ -565,7 +566,7 @@ describe("IssueSurface — table pagination ownership", () => {
       "pt-sort-transition",
     );
     const listIssueTableRows = vi.fn((request: IssueTableRowsRequest) =>
-      request.query.sort.field === "position"
+      request.query.sort.field === "created_at"
         ? Promise.resolve({
             query_fingerprint: "sha256:initial-sort",
             group_key: null,

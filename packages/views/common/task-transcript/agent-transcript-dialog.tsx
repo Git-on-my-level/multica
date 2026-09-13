@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, forwardRef } from "react";
+import { useWorkspaceId } from "@multica/core/hooks";
+import { useTraceIssueLabels } from "./use-trace-issue-labels";
 import { Virtuoso, type VirtuosoHandle, type Components } from "react-virtuoso";
 import {
   Bot,
@@ -42,7 +44,7 @@ import {
 } from "@multica/ui/components/ui/dropdown-menu";
 import { ActorAvatar } from "../actor-avatar";
 import { AttributionBadge } from "../../issues/components/attribution-badge";
-import { cancelReasonLabel } from "../../agents/components/tabs/task-failure";
+import { cancellationActorLabel, cancelReasonLabel, failureReasonLabel } from "../../agents/components/tabs/task-failure";
 import { RichContent } from "../../rich-content";
 import { api } from "@multica/core/api";
 import {
@@ -56,11 +58,11 @@ import { runtimeDisplayName, providerDisplayName } from "@multica/core/runtimes"
 import { useCustomPricingStore } from "@multica/core/runtimes/custom-pricing-store";
 import { redactSecrets } from "./redact";
 import {
-  createNewestFirstFollow,
+  createLiveEndFollow,
   FOLLOW_EDGE_THRESHOLD,
   LINE_SCROLL_PX,
 } from "./transcript-follow";
-import type { TimelineItem } from "./build-timeline";
+import { isOutputTruncated, type TimelineItem } from "./build-timeline";
 import {
   buildLanes,
   buildSteps,
@@ -68,7 +70,6 @@ import {
   isCallStep,
   isGroupRow,
   rowCalls,
-  shouldShowTimeline,
   toolKindTotals,
   type TraceCallStep,
   type TraceGroupRow,
@@ -95,7 +96,7 @@ import {
   ToolDetailSurface,
 } from "./detail-surfaces";
 import { languageForPath } from "./diff-highlight";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 import {
   formatTokens,
   formatUsd,
@@ -116,6 +117,16 @@ interface AgentTranscriptDialogProps {
   items: TimelineItem[];
   agentName: string;
   isLive?: boolean;
+  /**
+   * Whether focus returns to the trigger when the dialog closes. Pass `true`
+   * only for a keyboard open, where the reader has no other way back. After a
+   * pointer open, returning focus is what leaves the trigger wearing a focus
+   * ring and its tooltip once Esc closes the log — and, on the hover-revealed
+   * comment action row, holds the whole row visible with the pointer long gone.
+   */
+  finalFocus?: boolean;
+  /** Loading/error content while the caller retrieves the transcript. */
+  contentState?: React.ReactNode;
   /**
    * Optional content rendered between the header chips and the event list.
    * Used by autopilot run rows to surface the inbound webhook trigger
@@ -142,6 +153,8 @@ function formatElapsedMs(ms: number): string {
 
 /** A step's own duration, in the compact form the right column carries. */
 function formatStepDuration(ms: number): string {
+  if (ms <= 0) return "—";
+  if (ms < 100) return "<0.1s";
   if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
   const minutes = Math.floor(ms / 60_000);
@@ -159,8 +172,8 @@ function formatOffset(ms: number): string {
   return `+${hours}:${String(minutes % 60).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function formatRunTime(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
+function formatRunTime(iso: string, locale: string): string {
+  return new Date(iso).toLocaleString(locale, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -233,7 +246,7 @@ function RunDetailRow({
         type="button"
         onClick={onCopy}
         title={copyTitle}
-        className="group -mx-1 grid w-[calc(100%+0.5rem)] grid-cols-[4.5rem_minmax(0,1fr)] items-start gap-3 rounded px-1 py-0.5 text-left transition-colors hover:bg-accent/60"
+        className="group -mx-1 grid w-[calc(100%+0.5rem)] grid-cols-[4.5rem_minmax(0,1fr)] items-start gap-3 rounded-xs px-1 py-0.5 text-left transition-colors hover:bg-accent/60"
       >
         <span className="text-muted-foreground">{label}</span>
         <span className="flex min-w-0 items-start gap-1.5">
@@ -304,9 +317,13 @@ export function AgentTranscriptDialog({
   items,
   agentName,
   isLive = false,
+  finalFocus = false,
   headerSlot,
+  contentState,
 }: AgentTranscriptDialogProps) {
   const { t } = useT("agents");
+  const locale = useLocale();
+  const formatText = useTraceIssueLabels(useWorkspaceId(), task.issue_id, items, open);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(() => new Set());
   const [query, setQuery] = useState("");
@@ -333,7 +350,7 @@ export function AgentTranscriptDialog({
   // controller (see transcript-follow.ts for the model); this component only
   // wires DOM events to it. A stable instance, never re-rendered by scroll
   // traffic.
-  const followCtl = useMemo(() => createNewestFirstFollow(), []);
+  const followCtl = useMemo(() => createLiveEndFollow(), []);
   const detachScrollerRef = useRef<(() => void) | null>(null);
 
   const handleScrollerRef = useCallback(
@@ -341,30 +358,55 @@ export function AgentTranscriptDialog({
       detachScrollerRef.current?.();
       detachScrollerRef.current = null;
       if (!(el instanceof HTMLElement)) return;
+      let inputFrame: number | null = null;
+      const stageInput = (delta: number) => {
+        followCtl.input(delta);
+        if (inputFrame !== null) cancelAnimationFrame(inputFrame);
+        inputFrame = requestAnimationFrame(() => {
+          inputFrame = null;
+          followCtl.endInputFrame();
+        });
+      };
       const onWheel = (e: WheelEvent) => {
         const scale =
           e.deltaMode === 1 ? LINE_SCROLL_PX : e.deltaMode === 2 ? el.clientHeight : 1;
-        followCtl.input(e.deltaY * scale);
+        stageInput(e.deltaY * scale);
       };
+      let touchId: number | null = null;
       let lastTouchY: number | null = null;
+      const trackedTouch = (touches: TouchList) =>
+        Array.from(touches).find((touch) => touch.identifier === touchId);
       const onTouchStart = (e: TouchEvent) => {
-        lastTouchY = e.touches[0]?.clientY ?? null;
+        if (touchId !== null) return;
+        const touch = e.changedTouches[0] ?? e.touches[0];
+        if (!touch) return;
+        touchId = touch.identifier;
+        lastTouchY = touch.clientY;
+        followCtl.touchStart();
       };
       const onTouchMove = (e: TouchEvent) => {
-        const y = e.touches[0]?.clientY;
-        if (y === undefined) return;
+        const touch = trackedTouch(e.touches);
+        if (!touch) return;
         // Finger moving up scrolls the content down (away from the live end).
-        if (lastTouchY !== null) followCtl.input(lastTouchY - y);
-        lastTouchY = y;
+        if (lastTouchY !== null) stageInput(lastTouchY - touch.clientY);
+        lastTouchY = touch.clientY;
+      };
+      const onTouchEnd = (e: TouchEvent) => {
+        if (touchId === null || trackedTouch(e.touches)) return;
+        touchId = null;
+        lastTouchY = null;
+        followCtl.touchEnd();
       };
       const onKeyDown = (e: KeyboardEvent) => {
         // Only keys aimed at the scroller itself; Space/arrows bubbling from
         // row controls are not scroll intent.
         if (e.target !== el) return;
-        if (e.key === "ArrowDown") followCtl.input(LINE_SCROLL_PX);
-        else if (e.key === "ArrowUp") followCtl.input(-LINE_SCROLL_PX);
-        else if (e.key === "PageDown" || e.key === " ") followCtl.input(el.clientHeight);
-        else if (e.key === "PageUp") followCtl.input(-el.clientHeight);
+        if (e.key === "ArrowDown") stageInput(LINE_SCROLL_PX);
+        else if (e.key === "ArrowUp") stageInput(-LINE_SCROLL_PX);
+        else if (e.key === "PageDown") stageInput(el.clientHeight);
+        // Shift+Space pages up — toward this list's live end.
+        else if (e.key === " ") stageInput(e.shiftKey ? -el.clientHeight : el.clientHeight);
+        else if (e.key === "PageUp") stageInput(-el.clientHeight);
         else if (e.key === "End") followCtl.disengage();
       };
       // Scrollbar drags hit the scroller element itself; clicks on row
@@ -388,14 +430,20 @@ export function AgentTranscriptDialog({
       el.addEventListener("wheel", onWheel, { passive: true });
       el.addEventListener("touchstart", onTouchStart, { passive: true });
       el.addEventListener("touchmove", onTouchMove, { passive: true });
+      el.addEventListener("touchend", onTouchEnd, { passive: true });
+      el.addEventListener("touchcancel", onTouchEnd, { passive: true });
       el.addEventListener("keydown", onKeyDown);
       el.addEventListener("mousedown", onPointerDown);
       window.addEventListener("mouseup", onPointerUp, { capture: true });
       el.addEventListener("scroll", onScroll, { passive: true });
       detachScrollerRef.current = () => {
+        if (inputFrame !== null) cancelAnimationFrame(inputFrame);
+        followCtl.endInputFrame();
         el.removeEventListener("wheel", onWheel);
         el.removeEventListener("touchstart", onTouchStart);
         el.removeEventListener("touchmove", onTouchMove);
+        el.removeEventListener("touchend", onTouchEnd);
+        el.removeEventListener("touchcancel", onTouchEnd);
         el.removeEventListener("keydown", onKeyDown);
         el.removeEventListener("mousedown", onPointerDown);
         window.removeEventListener("mouseup", onPointerUp, { capture: true });
@@ -403,6 +451,7 @@ export function AgentTranscriptDialog({
         // The scroller can detach mid-drag (listEpoch remount); a stuck
         // held-mouse flag would suppress enforcement forever.
         followCtl.pointerUp();
+        followCtl.touchEnd();
       };
     },
     [followCtl],
@@ -461,10 +510,13 @@ export function AgentTranscriptDialog({
     if (activeFilterSet.size === 0 && trimmedQuery.length === 0) return steps;
     return steps.filter((step) => {
       if (activeFilterSet.size > 0 && !activeFilterSet.has(stepFilterKey(step))) return false;
-      if (trimmedQuery.length > 0 && !stepHaystack(step).includes(trimmedQuery)) return false;
+      if (trimmedQuery.length > 0) {
+        const raw = stepHaystack(step);
+        if (!raw.includes(trimmedQuery) && !formatText(raw).toLowerCase().includes(trimmedQuery)) return false;
+      }
       return true;
     });
-  }, [steps, activeFilterSet, trimmedQuery]);
+  }, [steps, activeFilterSet, trimmedQuery, formatText]);
 
   // Grouping runs on what the reader is looking at: filtering breaks adjacency,
   // and a group that spans a hidden step would be a lie about what ran.
@@ -490,9 +542,6 @@ export function AgentTranscriptDialog({
   const runEnd = task.completed_at ?? lastStamp;
 
   const lanes = useMemo(() => buildLanes(steps, runStart, runEnd), [steps, runStart, runEnd]);
-  // A short run's timeline says less than the durations already on each row,
-  // so it does not render at all.
-  const showTimeline = shouldShowTimeline(steps, lanes);
   const toolKinds = useMemo(() => toolKindTotals(steps), [steps]);
   const outcome = useMemo(() => buildRunOutcome(steps), [steps]);
 
@@ -715,14 +764,21 @@ export function AgentTranscriptDialog({
         // A server-cancelled run (worktree claim gate, preserved-work
         // delivery) carries a persisted reason the user must act on; surface
         // it on the badge instead of a bare "Cancelled". User-initiated
-        // cancels have no reason and keep the plain label.
-        const cancelReason = cancelReasonLabel(task);
+        // cancels have no reason, but carry actor provenance when it was
+        // recorded. The title contains only this localized status — never the
+        // raw `task.error`, which is operator prose reserved for Run details.
+        const cancelReason = cancelReasonLabel(task, t);
+        const cancelledBy = cancellationActorLabel(task, t);
+        const cancelStatus = cancelReason
+          ? `${cancelledBy ?? t(($) => $.transcript.status_cancelled)} · ${cancelReason}`
+          : cancelledBy ?? t(($) => $.transcript.status_cancelled);
         return (
-          <span className={cn(base, "bg-muted text-muted-foreground")} title={task.error ?? undefined}>
-            <XCircle className="h-3 w-3" />
-            {cancelReason
-              ? `${t(($) => $.transcript.status_cancelled)} · ${cancelReason}`
-              : t(($) => $.transcript.status_cancelled)}
+          <span
+            className={cn(base, "min-w-0 max-w-[45%] bg-muted text-muted-foreground")}
+            title={cancelStatus}
+          >
+            <XCircle className="h-3 w-3 shrink-0" />
+            <span className="truncate">{cancelStatus}</span>
           </span>
         );
       }
@@ -765,16 +821,16 @@ export function AgentTranscriptDialog({
           ? t(($) => $.transcript.trigger_chat)
           : task.kind === "quick_create"
             ? t(($) => $.transcript.trigger_quick_create)
-            : task.kind === "direct" || task.handoff_note
+            : task.kind === "direct"
               ? t(($) => $.transcript.trigger_direct)
               : t(($) => $.transcript.trigger_initial);
 
   // Diagnostic detail for the ⓘ popover: everything a reader needs only when
   // debugging this specific run, kept off the always-visible surface.
   const providerLabel = runtimeInfo?.provider ? transcriptProviderLabel(runtimeInfo.provider) : null;
-  const createdLabel = task.created_at ? formatRunTime(task.created_at) : null;
-  const startedLabel = task.started_at ? formatRunTime(task.started_at) : null;
-  const completedLabel = task.completed_at ? formatRunTime(task.completed_at) : null;
+  const createdLabel = task.created_at ? formatRunTime(task.created_at, locale) : null;
+  const startedLabel = task.started_at ? formatRunTime(task.started_at, locale) : null;
+  const completedLabel = task.completed_at ? formatRunTime(task.completed_at, locale) : null;
   const hasTriggeredBy = !!task.attribution?.initiator;
   // This run's own spend. Present on transcripts opened from the issue
   // execution log (the endpoint that hydrates usage); absent elsewhere, where
@@ -785,10 +841,23 @@ export function AgentTranscriptDialog({
   // this figure, same as on the other usage surfaces.
   useCustomPricingStore((s) => s.pricings);
   const usage = summarizeTaskUsage(task.usage);
+  // Two separate things, deliberately not one string (#7411):
+  //   • `reasonLabel` — the localized reason, derived from the stable
+  //     `failure_reason` enum. This is the user-facing explanation.
+  //   • `task.error` — the raw diagnostic the server/daemon persisted, in
+  //     English, for classification and logs. Kept readable (it is how you
+  //     find "which worktree holds my preserved work" and "which machine
+  //     needs upgrading") but labelled as a technical detail rather than
+  //     presented as the reason, and never merged into the localized text.
+  const reasonLabel =
+    task.status === "failed"
+      ? failureReasonLabel(task.failure_reason, t)
+      : cancelReasonLabel(task, t);
   const hasRunDetails =
     !!runtimeInfo ||
     !!workdirCopyTarget?.relativePath ||
     !!task.branch_name ||
+    !!reasonLabel ||
     !!task.error ||
     !!createdLabel ||
     !!startedLabel ||
@@ -800,6 +869,7 @@ export function AgentTranscriptDialog({
       <DialogContent
         className="!max-w-5xl !w-[calc(100vw-4rem)] !max-h-[calc(100vh-4rem)] !h-[calc(100vh-4rem)] flex flex-col !p-0 !gap-0 overflow-hidden"
         showCloseButton={false}
+        finalFocus={finalFocus}
       >
         <DialogTitle className="sr-only">{t(($) => $.transcript.dialog_title)}</DialogTitle>
 
@@ -936,14 +1006,13 @@ export function AgentTranscriptDialog({
                           copyTitle={t(($) => $.transcript.copy_branch)}
                         />
                       )}
-                      {/* The full persisted error, for failed AND
-                          server-cancelled runs — this is where "which
-                          worktree holds my preserved work" and "which
-                          machine needs upgrading" are actually readable. */}
-                      {task.error && (
+                      {/* The localized reason, from the stable
+                          `failure_reason` enum — this is the explanation, and
+                          it reads in the user's language. */}
+                      {reasonLabel && (
                         <RunDetailRow
                           label={t(($) => $.transcript.details_reason)}
-                          value={task.error}
+                          value={reasonLabel}
                         />
                       )}
                       {createdLabel && (
@@ -954,6 +1023,23 @@ export function AgentTranscriptDialog({
                       )}
                       {completedLabel && (
                         <RunDetailRow label={t(($) => $.transcript.details_completed)} value={completedLabel} />
+                      )}
+                      {/* The raw persisted diagnostic, last and behind its own
+                          divider. It is English prose written by the server
+                          and daemon for logs and classification, so it is
+                          labelled "Technical details" — a translated heading
+                          over untranslated content — rather than shown as the
+                          run's reason (#7411). Still the place where "which
+                          worktree holds my preserved work" is readable. */}
+                      {task.error && (
+                        <>
+                          <div className="my-2 h-px bg-border" />
+                          <RunDetailRow
+                            label={t(($) => $.transcript.details_diagnostics)}
+                            value={task.error}
+                            mono
+                          />
+                        </>
                       )}
                       {usage && (
                         <>
@@ -1005,7 +1091,7 @@ export function AgentTranscriptDialog({
         <RunOutcomeRow outcome={outcome} branch={task.branch_name} />
 
         {/* ── Where the time went ────────────────────────────────────── */}
-        {showTimeline && lanes && (
+        {lanes && (
           <RunTimeline
             lanes={lanes}
             toolKinds={toolKinds}
@@ -1132,7 +1218,7 @@ export function AgentTranscriptDialog({
         {/* ── Steps, and the inspector when one is selected ───────────── */}
         <div className="flex min-h-0 flex-1">
           <div className="flex min-w-0 flex-1 flex-col">
-            {displayRows.length === 0 ? (
+            {contentState ? <div className="flex h-full items-center justify-center p-4">{contentState}</div> : displayRows.length === 0 ? (
               <div className="flex h-full items-center justify-center text-body text-muted-foreground">
                 {isAntigravityLiveEmpty ? (
                   <div className="flex max-w-md items-center gap-2 px-4 text-center">
@@ -1172,13 +1258,14 @@ export function AgentTranscriptDialog({
                 }
                 atBottomThreshold={FOLLOW_EDGE_THRESHOLD}
                 atTopThreshold={FOLLOW_EDGE_THRESHOLD}
-                atTopStateChange={(atTop) => followCtl.onAtTopChange(atTop)}
+                atTopStateChange={(atTop) => followCtl.onAtEdgeChange(atTop)}
                 scrollerRef={handleScrollerRef}
                 computeItemKey={(_, row) => row.seq}
                 components={LIST_COMPONENTS}
                 itemContent={(_, row) => (
                   <TranscriptRow
                     row={row}
+                    formatText={formatText}
                     runStartMs={runStartMs}
                     isLive={isLive}
                     selectedSeq={selectedSeq}
@@ -1290,6 +1377,7 @@ function RunOutcomeRow({
 // ─── Rows ───────────────────────────────────────────────────────────────────
 
 interface TranscriptRowProps {
+  formatText: (text: string) => string;
   row: TraceRow;
   runStartMs?: number;
   isLive: boolean;
@@ -1308,12 +1396,13 @@ function TranscriptRow(props: TranscriptRowProps) {
 
 /** The offset column: where in the run this happened. */
 function OffsetCell({ startedAt, runStartMs }: { startedAt?: string; runStartMs?: number }) {
+  const locale = useLocale();
   const at = timeMs(startedAt);
   const label = at !== undefined && runStartMs !== undefined ? formatOffset(at - runStartMs) : "";
   return (
     <span
       className="w-11 shrink-0 pt-0.5 text-right font-mono text-micro tabular-nums text-faint-foreground"
-      title={startedAt ? new Date(startedAt).toLocaleString() : undefined}
+      title={startedAt ? new Date(startedAt).toLocaleString(locale) : undefined}
     >
       {label}
     </span>
@@ -1332,8 +1421,28 @@ function DurationCell({ ms, pending }: { ms?: number; pending?: boolean }) {
   }
   if (ms === undefined) return <span className="w-12 shrink-0" />;
   return (
-    <span className="w-12 shrink-0 pt-0.5 text-right font-mono text-micro tabular-nums text-faint-foreground">
-      {formatStepDuration(ms)}
+    <StepDuration
+      ms={ms}
+      unknownLabel={t(($) => $.transcript.step_duration_unknown)}
+      className="w-12 shrink-0 pt-0.5 text-right font-mono text-micro tabular-nums text-faint-foreground"
+    />
+  );
+}
+
+function StepDuration({
+  ms,
+  unknownLabel,
+  className,
+}: {
+  ms: number;
+  unknownLabel: string;
+  className?: string;
+}) {
+  const unknown = ms <= 0;
+  return (
+    <span className={className} title={unknown ? unknownLabel : undefined}>
+      <span aria-hidden={unknown || undefined}>{formatStepDuration(ms)}</span>
+      {unknown && <span className="sr-only">{unknownLabel}</span>}
     </span>
   );
 }
@@ -1378,6 +1487,7 @@ function ProseRow({ row, runStartMs }: TranscriptRowProps & { row: TraceMessageS
  *  click away in the inspector. */
 function StepRow({
   row,
+  formatText,
   runStartMs,
   isLive,
   selectedSeq,
@@ -1386,10 +1496,11 @@ function StepRow({
   const { t } = useT("agents");
   const summaryLabels = useMemo<TraceSummaryLabels>(
     () => ({
+      formatText,
       morePaths: (path, extraCount) =>
         t(($) => $.transcript.patch_summary_more, { path, extra: extraCount }),
     }),
-    [t],
+    [t, formatText],
   );
 
   const call = isCallStep(row) ? row : null;
@@ -1456,6 +1567,7 @@ function StepRow({
 /** Consecutive same-tool calls, folded to one line until asked. */
 function GroupRow({
   row,
+  formatText,
   runStartMs,
   selectedSeq,
   expanded,
@@ -1465,10 +1577,11 @@ function GroupRow({
   const { t } = useT("agents");
   const summaryLabels = useMemo<TraceSummaryLabels>(
     () => ({
+      formatText,
       morePaths: (path, extraCount) =>
         t(($) => $.transcript.patch_summary_more, { path, extra: extraCount }),
     }),
-    [t],
+    [t, formatText],
   );
 
   return (
@@ -1509,16 +1622,22 @@ function GroupRow({
               type="button"
               onClick={() => onSelect(step.seq)}
               className={cn(
-                "flex w-full items-baseline gap-2 rounded px-2 py-1 text-left text-micro transition-colors",
+                "flex w-full items-baseline gap-2 rounded-xs px-2 py-1 text-left text-micro transition-colors",
                 selectedSeq === step.seq ? "bg-brand/10" : "hover:bg-accent/40",
               )}
             >
               <span className="truncate font-mono text-muted-foreground">
                 {callSummary(step, summaryLabels) || step.tool}
               </span>
-              <span className="ml-auto shrink-0 font-mono tabular-nums text-faint-foreground">
-                {step.durationMs === undefined ? "" : formatStepDuration(step.durationMs)}
-              </span>
+              {step.durationMs === undefined ? (
+                <span className="ml-auto shrink-0" />
+              ) : (
+                <StepDuration
+                  ms={step.durationMs}
+                  unknownLabel={t(($) => $.transcript.step_duration_unknown)}
+                  className="ml-auto shrink-0 font-mono tabular-nums text-faint-foreground"
+                />
+              )}
             </button>
           ))}
         </div>
@@ -1541,7 +1660,7 @@ function callSummary(step: TraceCallStep, labels: TraceSummaryLabels): string {
   }
   if (!step.result) return "";
   if (readImageResult(step.result.output)) return "";
-  return traceEventSummary({ type: "tool_result", output: step.result.output });
+  return traceEventSummary({ type: "tool_result", output: step.result.output }, labels);
 }
 
 function firstLineOf(value: string | undefined): string {
@@ -1605,7 +1724,11 @@ function StepInspector({
           {call?.durationMs !== undefined && (
             <>
               <FactDot />
-              <span className="font-mono tabular-nums">{formatStepDuration(call.durationMs)}</span>
+              <StepDuration
+                ms={call.durationMs}
+                unknownLabel={t(($) => $.transcript.step_duration_unknown)}
+                className="font-mono tabular-nums"
+              />
             </>
           )}
         </span>
@@ -1665,10 +1788,17 @@ function InspectorSection({ label, children }: { label: string; children: React.
 }
 
 /** One payload, rendered as what it is. */
-function StepBody({ item }: { item: TimelineItem }) {
+/** Pre-existing render ceiling for a body with no server-side budget. */
+const DISPLAY_CLIP_CHARS = 8000;
+
+export function StepBody({ item }: { item: TimelineItem }) {
   const { t } = useT("agents");
   const detail = useMemo(() => traceEventDetail(item), [item]);
   const image = useMemo(() => readImageResult(item.output), [item.output]);
+  // Stated where the output actually ends, for a reader who has just reached
+  // the bottom and is wondering whether that was all of it. A header badge said
+  // the same thing louder, before anyone had asked the question.
+  const note = isOutputTruncated(item) ? t(($) => $.transcript.output_truncated_note) : undefined;
 
   // A screenshot is a picture, not a 200KB base64 string in a <pre>.
   if (image) {
@@ -1682,6 +1812,7 @@ function StepBody({ item }: { item: TimelineItem }) {
         <figcaption className="pt-1 text-micro text-faint-foreground">
           {t(($) => $.transcript.image_result)} · {formatBytes(base64ByteLength(image.base64))}
         </figcaption>
+        {note && <span className="block pt-1 text-micro text-faint-foreground">{note}</span>}
       </figure>
     );
   }
@@ -1692,15 +1823,27 @@ function StepBody({ item }: { item: TimelineItem }) {
     case "patch":
       return <PatchDetailSurface files={detail.files} truncated={detail.truncated} />;
     case "file":
-      return (
-        <FileWriteSurface text={detail.text} lineCount={detail.lineCount} path={detail.path} />
-      );
+      return <FileWriteSurface text={detail.text} lineCount={detail.lineCount} path={detail.path} />;
     default: {
       const text = detail.text;
+      // A stored tool result is already capped at 8192 bytes by the daemon, so
+      // clipping it again could only shave a couple of hundred more characters
+      // — under a note that already reports the same loss. Tool input has no
+      // server-side budget and keeps the clip at its existing length; nothing
+      // about how long an input renders is this change's business.
+      const clip = item.type === "tool_result" ? null : DISPLAY_CLIP_CHARS;
       const clipped =
-        text.length > 8000 ? `${redactSecrets(text.slice(0, 8000))}\n... (truncated)` : redactSecrets(text);
+        clip !== null && text.length > clip
+          ? `${redactSecrets(text.slice(0, clip))}\n${t(($) => $.transcript.display_clipped)}`
+          : redactSecrets(text);
       const path = item.type === "tool_use" ? readPathFromInput(item.input) : undefined;
-      return <ToolDetailSurface text={clipped} language={path ? languageForPath(path) : undefined} />;
+      return (
+        <ToolDetailSurface
+          text={clipped}
+          language={path ? languageForPath(path) : undefined}
+          note={note}
+        />
+      );
     }
   }
 }

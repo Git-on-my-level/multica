@@ -41,6 +41,9 @@ vi.mock("@multica/core/paths", () => ({
 }));
 
 const viewState = vi.hoisted(() => ({
+  viewMode: "board",
+  grouping: "status",
+  swimlaneGrouping: "assignee",
   cardProperties: {
     priority: false,
     description: false,
@@ -48,7 +51,7 @@ const viewState = vi.hoisted(() => ({
     startDate: true,
     dueDate: true,
     project: false,
-    childProgress: true,
+    childProgress: false,
     labels: false,
   },
   cardPropertyIds: [],
@@ -67,10 +70,8 @@ vi.mock("@multica/core/workspace/hooks", () => ({
 }));
 
 vi.mock("../../i18n", () => ({
-  useT: () => ({
-    t: (_selector: unknown, options?: { count?: number }) =>
-      options?.count === undefined ? "Translated" : `${options.count} restricted`,
-  }),
+  useLocale: () => "en",
+  useT: () => ({ t: () => "Translated" }),
   useTimeAgo: () => () => "now",
 }));
 
@@ -100,6 +101,7 @@ const navigation: NavigationAdapter = {
   back: vi.fn(),
   pathname: "/acme/issues",
   searchParams: new URLSearchParams(),
+  hash: "",
   getShareableUrl: (path) => `https://app.example${path}`,
 };
 
@@ -164,27 +166,55 @@ describe("BoardCardContent assignee picker", () => {
     },
   );
 
-  it("shows the full progress and the number of restricted children", () => {
+  it("does not repeat the assignee inside an assignee-grouped board", () => {
+    viewState.grouping = "assignee";
     const issue = makeIssue("member");
-    render(
+    const { container } = render(
       <NavigationProvider value={navigation}>
         <IssueSurfaceActionsProvider actions={actions}>
-          <AppLink href={`/acme/issues/${issue.id}`}>
-            <BoardCardContent
-              issue={issue}
-              childProgress={{
-                done: 3,
-                total: 10,
-                visibleDone: 3,
-                visibleTotal: 4,
-                hiddenTotal: 6,
-              }}
-            />
-          </AppLink>
+          <BoardCardContent issue={issue} editable />
         </IssueSurfaceActionsProvider>
       </NavigationProvider>,
     );
-    expect(screen.getByText("3/10")).toBeInTheDocument();
-    expect(screen.getByText("6 restricted")).toBeInTheDocument();
+
+    expect(container.querySelector('[data-slot="avatar"]')).toBeNull();
+    viewState.grouping = "status";
+  });
+
+  it("does not repeat the assignee inside an assignee-grouped swimlane", () => {
+    viewState.viewMode = "swimlane";
+    const issue = makeIssue("member");
+    const { container } = render(
+      <NavigationProvider value={navigation}>
+        <IssueSurfaceActionsProvider actions={actions}>
+          <BoardCardContent issue={issue} editable />
+        </IssueSurfaceActionsProvider>
+      </NavigationProvider>,
+    );
+
+    expect(container.querySelector('[data-slot="avatar"]')).toBeNull();
+    viewState.viewMode = "board";
+  });
+
+  it("keeps empty priority and assignee fields visually silent", () => {
+    viewState.cardProperties.priority = true;
+    const issue = {
+      ...makeIssue("member"),
+      assignee_type: null,
+      assignee_id: null,
+      start_date: null,
+      due_date: null,
+    };
+    const { container } = render(
+      <NavigationProvider value={navigation}>
+        <IssueSurfaceActionsProvider actions={actions}>
+          <BoardCardContent issue={issue} editable />
+        </IssueSurfaceActionsProvider>
+      </NavigationProvider>,
+    );
+
+    expect(container.querySelector("svg")).toBeNull();
+    expect(screen.queryByText("Translated")).not.toBeInTheDocument();
+    viewState.cardProperties.priority = false;
   });
 });

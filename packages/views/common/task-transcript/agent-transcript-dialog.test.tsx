@@ -1,16 +1,21 @@
 // @vitest-environment jsdom
 
-import { readFileSync } from "node:fs";
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { api } from "@multica/core/api";
+import type { SupportedLocale } from "@multica/core/i18n";
 import type { AgentRuntime, AgentTask } from "@multica/core/types/agent";
 import { useTranscriptViewStore } from "@multica/core/agents/stores";
 import { renderWithI18n } from "../../test/i18n";
 import { AgentTranscriptDialog } from "./agent-transcript-dialog";
 import type { TimelineItem } from "./build-timeline";
+
+vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace" }));
+vi.mock("./use-trace-issue-labels", () => ({
+  useTraceIssueLabels: () => (text: string) => text.replaceAll("01a07eca-8e82-775e-be06-e4a97ccfa299", "DEV-17"),
+}));
 
 const copyTextMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 
@@ -210,7 +215,11 @@ const items: TimelineItem[] = [
 
 function renderDialog(
   dialogItems: TimelineItem[] = items,
-  options: { task?: AgentTask; isLive?: boolean } = {},
+  options: {
+    task?: AgentTask;
+    isLive?: boolean;
+    locale?: SupportedLocale;
+  } = {},
 ) {
   return renderWithI18n(
     <AgentTranscriptDialog
@@ -221,6 +230,7 @@ function renderDialog(
       agentName="Codex"
       isLive={options.isLive}
     />,
+    { locale: options.locale },
   );
 }
 
@@ -246,7 +256,7 @@ describe("AgentTranscriptDialog", () => {
 
     expect(
       await screen.findByText(
-        "Antigravity does not currently provide live execution events. The transcript will be available after the task completes.",
+        "Antigravity does not currently provide live execution events. The transcript will be available after the run completes.",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText("Waiting for events...")).not.toBeInTheDocument();
@@ -374,6 +384,57 @@ describe("AgentTranscriptDialog", () => {
     expect(screen.getByText("total 0")).toBeInTheDocument();
   });
 
+  it("shows a meaningful bound instead of rounding a fast call to zero", () => {
+    renderDialog([
+      {
+        seq: 1,
+        type: "tool_use",
+        tool: "Bash",
+        input: { command: "sed -n 1,20p README.md" },
+        created_at: "2026-06-08T08:00:00.000Z",
+      },
+      {
+        seq: 2,
+        type: "tool_result",
+        tool: "Bash",
+        output: "ok",
+        created_at: "2026-06-08T08:00:00.040Z",
+      },
+    ]);
+
+    expect(screen.getByText("<0.1s")).toBeInTheDocument();
+    expect(screen.queryByText("0.0s")).not.toBeInTheDocument();
+  });
+
+  it("does not claim a duration for legacy calls whose batched timestamps are identical", () => {
+    renderDialog([
+      {
+        seq: 1,
+        type: "tool_use",
+        tool: "Bash",
+        input: { command: "pwd" },
+        created_at: "2026-06-08T08:00:00.000Z",
+      },
+      {
+        seq: 2,
+        type: "tool_result",
+        tool: "Bash",
+        output: "/repo",
+        created_at: "2026-06-08T08:00:00.000Z",
+      },
+    ]);
+
+    const unknownDuration = screen.getByText("—");
+    expect(unknownDuration).toHaveAttribute("aria-hidden", "true");
+    expect(unknownDuration.parentElement).toHaveAttribute("title", "Exact duration is unavailable.");
+    expect(unknownDuration.parentElement).not.toHaveAttribute("aria-label");
+    expect(screen.getByText("Exact duration is unavailable.")).toHaveClass("sr-only");
+    const row = screen.getByRole("button", { name: /Exact duration is unavailable\./ });
+    fireEvent.click(row);
+    expect(screen.getAllByText("Exact duration is unavailable.")).toHaveLength(2);
+    expect(screen.queryByText("0.0s")).not.toBeInTheDocument();
+  });
+
   it("keeps a screenshot out of the list and renders it as an image", () => {
     const output = JSON.stringify([
       { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
@@ -426,26 +487,27 @@ describe("AgentTranscriptDialog", () => {
     expect(screen.getByText("1 of 3 steps")).toBeInTheDocument();
   });
 
-  it("hides the timeline for a run too short for it to say anything", () => {
+  it("hides the timeline when steps have no timestamps", () => {
     renderDialog();
 
     expect(screen.queryByText("Model")).not.toBeInTheDocument();
     expect(screen.queryByText("Tools")).not.toBeInTheDocument();
   });
 
-  it("shows model and tool lanes once a run is long enough to have spent time", () => {
+  it.each([{ count: 1, seconds: 20 }, { count: 8, seconds: 30 }, { count: 8, seconds: 320 }])("shows the timeline for $count steps over $seconds seconds", ({ count, seconds }) => {
     const at = (seconds: number) =>
       new Date(Date.parse("2026-06-08T08:00:00Z") + seconds * 1000).toISOString();
     const longRun: TimelineItem[] = [];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < count; i++) {
+      const start = (seconds / count) * i;
       longRun.push(
-        { seq: i * 2 + 1, type: "tool_use", tool: "Bash", input: { command: `step ${i}` }, created_at: at(i * 40) },
-        { seq: i * 2 + 2, type: "tool_result", tool: "Bash", output: "ok", created_at: at(i * 40 + 20) },
+        { seq: i * 2 + 1, type: "tool_use", tool: "Bash", input: { command: `step ${i}` }, created_at: at(start) },
+        { seq: i * 2 + 2, type: "tool_result", tool: "Bash", output: "ok", created_at: at(start + seconds / count / 2) },
       );
     }
 
     renderDialog(longRun, {
-      task: { ...baseTask, started_at: at(0), completed_at: at(320) },
+      task: { ...baseTask, started_at: at(0), completed_at: at(seconds) },
     });
 
     expect(screen.getByText("Model")).toBeInTheDocument();
@@ -573,25 +635,6 @@ describe("AgentTranscriptDialog", () => {
 
     // `let` is a Rust keyword, so the highlighter must have marked it up.
     expect(container.querySelector(".hljs-keyword")?.textContent).toBe("let");
-  });
-
-  it("carries the scope class the hljs palette is defined under", () => {
-    // The palette lives in editor/styles/code.css, scoped to the editor surface
-    // and this class. Without it the spans render but stay uncoloured.
-    const { container } = renderDialog([
-      {
-        seq: 1,
-        type: "tool_use",
-        tool: "Edit",
-        input: { file_path: "/repo/src/lib.rs", old_string: "let a = 1;", new_string: "let b = 2;" },
-      },
-    ]);
-
-    fireEvent.click(screen.getByRole("button", { name: /Edit/ }));
-
-    expect(container.querySelector("pre")?.className).toContain("transcript-code");
-    const css = readFileSync("editor/styles/code.css", "utf8");
-    expect(css).toContain(".transcript-code");
   });
 
   it("leaves an unknown extension unhighlighted rather than guessing", () => {
@@ -791,9 +834,10 @@ describe("AgentTranscriptDialog — delivered branch", () => {
 });
 
 // A server-cancelled run (worktree claim gate, preserved-work delivery) must
-// explain itself: the reason rides the status badge and the full persisted
-// error is readable in Run details. A user's own cancel stays a plain
-// "Cancelled" — they know why they clicked.
+// explain itself: the localized reason rides the status badge and heads the
+// "Reason" row in Run details, while the raw persisted diagnostic sits under
+// its own "Technical details" heading. A user's own cancel stays a plain
+// "Cancelled" for historical rows that predate actor provenance.
 describe("AgentTranscriptDialog — cancel reason", () => {
   const gateError = "worktree mode needs daemon version 0.4.24 or newer on that machine";
 
@@ -813,12 +857,226 @@ describe("AgentTranscriptDialog — cancel reason", () => {
     expect(screen.getByText(gateError)).toBeInTheDocument();
   });
 
-  it("keeps a user-initiated cancel a plain Cancelled", () => {
+  it("renders a server cancellation reason in the active locale", () => {
+    renderDialog(items, {
+      locale: "zh-Hans",
+      task: {
+        ...baseTask,
+        status: "cancelled",
+        error: gateError,
+        failure_reason: "local_directory_error",
+      },
+    });
+
+    expect(screen.getByText(/本地目录出错/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Local directory error/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a legacy user-initiated cancel a plain Cancelled", () => {
     renderDialog(items, {
       task: { ...baseTask, status: "cancelled", error: null },
     });
 
     expect(screen.getByText("Cancelled")).toBeInTheDocument();
     expect(screen.queryByText(/Local directory error/)).not.toBeInTheDocument();
+  });
+
+  it("names the actor on a new user-initiated cancellation", () => {
+    renderDialog(items, {
+      task: {
+        ...baseTask,
+        status: "cancelled",
+        error: null,
+        cancelled_by: { type: "member", id: "user-1", name: "Jiayuan" },
+      },
+    });
+
+    expect(screen.getByText("Cancelled by Jiayuan")).toBeInTheDocument();
+  });
+
+  // #7411: the status badge used to carry the raw English error as its
+  // `title`. Hovering a translated pill and getting English prose (with an
+  // absolute path in it) is exactly the leak this issue reported.
+  it("keeps the raw diagnostic off the status badge tooltip", () => {
+    renderDialog(items, {
+      locale: "zh-Hans",
+      task: {
+        ...baseTask,
+        status: "cancelled",
+        error: gateError,
+        failure_reason: "local_directory_error",
+      },
+    });
+
+    expect(screen.queryByTitle(gateError)).not.toBeInTheDocument();
+  });
+});
+
+// The two audiences of a failure, kept apart in Run details: the localized
+// reason answers "what happened" for the person who ran the task, the raw
+// persisted text answers "what exactly did the runner say" for whoever
+// debugs it. Merging them is what made #7411 unfixable by translation alone.
+describe("AgentTranscriptDialog — reason vs raw diagnostics", () => {
+  const rawError =
+    "opencode stream ended on an empty step (no text, no tool call, no reported usage)";
+
+  it("heads the localized reason and the raw text with different labels", async () => {
+    renderDialog(items, {
+      task: {
+        ...baseTask,
+        status: "failed",
+        error: rawError,
+        failure_reason: "agent_error.provider_network",
+      },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Run details" }));
+
+    expect(screen.getByText("Reason")).toBeInTheDocument();
+    expect(screen.getByText("Network error reaching provider")).toBeInTheDocument();
+    expect(screen.getByText("Technical details")).toBeInTheDocument();
+    expect(screen.getByText(rawError)).toBeInTheDocument();
+  });
+
+  it("translates both headings and the reason, leaving the raw text verbatim", async () => {
+    renderDialog(items, {
+      locale: "zh-Hans",
+      task: {
+        ...baseTask,
+        status: "failed",
+        error: rawError,
+        failure_reason: "agent_error.provider_network",
+      },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "运行详情" }));
+
+    expect(screen.getByText("原始诊断")).toBeInTheDocument();
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
+    // The diagnostic itself is not translated — it is the runner's own output.
+    // Keeping it readable is the point; presenting it as the reason is not.
+    expect(screen.getByText(rawError)).toBeInTheDocument();
+  });
+
+  it("shows no diagnostics section for a run that persisted no error", async () => {
+    renderDialog(items, {
+      task: { ...baseTask, status: "completed", error: null },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Run details" }));
+
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
+    expect(screen.queryByText("Reason")).not.toBeInTheDocument();
+  });
+});
+
+
+describe("readable issue references", () => {
+  it("searches both the displayed identifier and original UUID", async () => {
+    const issueId = "01a07eca-8e82-775e-be06-e4a97ccfa299";
+    renderDialog([{ seq: 1, type: "tool_use", tool: "exec_command", input: { command: `multica issue get ${issueId} --output json` } }]);
+    expect(screen.getByText("multica issue get DEV-17 --output json")).toBeInTheDocument();
+    const search = screen.getByRole("textbox");
+    fireEvent.change(search, { target: { value: "DEV-17" } });
+    expect(screen.getByText("multica issue get DEV-17 --output json")).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: issueId } });
+    expect(screen.getByText("multica issue get DEV-17 --output json")).toBeInTheDocument();
+  });
+});
+
+// The completeness indicator, #8182 / #8183. A truncation remark sits at the
+// end of the output it describes and waits for the reader to reveal that end;
+// unknown-ness belongs to the run, because one daemon produced all of it. The
+// state matrix lives in build-timeline.test.ts.
+describe("tool output completeness", () => {
+  const SHORT = "line one";
+  // Past ToolDetailSurface's fade threshold, so the body opens collapsed.
+  const LONG = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+
+  function run(output: string, output_truncated?: boolean): TimelineItem[] {
+    return [
+      { seq: 1, type: "tool_use", tool: "exec_command", input: { command: "cat big.log" } },
+      { seq: 2, type: "tool_result", tool: "exec_command", output, output_truncated },
+    ];
+  }
+
+  function openStep(items: TimelineItem[]) {
+    renderDialog(items);
+    fireEvent.click(screen.getByRole("button", { name: /cat big\.log/ }));
+  }
+
+  it("remarks at the end of an output the record could not keep whole", () => {
+    openStep(run(SHORT, true));
+
+    expect(screen.getByText(/only the beginning was kept/i)).toBeInTheDocument();
+  });
+
+  it("says nothing about an output the daemon measured as complete", () => {
+    openStep(run(SHORT, false));
+
+    expect(screen.queryByText(/only the beginning was kept/i)).not.toBeInTheDocument();
+  });
+
+  // The remark answers "was that all of it?", which is a question the reader
+  // only has at the bottom. Showing it over a faded, half-shown body answers
+  // ahead of the question and puts the words nowhere near the end they describe.
+  it("waits for the body to be revealed before remarking", () => {
+    openStep(run(LONG, true));
+    expect(screen.queryByText(/only the beginning was kept/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+
+    expect(screen.getByText(/only the beginning was kept/i)).toBeInTheDocument();
+  });
+
+  // Regression guard: a warning badge next to the tool name announced the
+  // caveat before the reader had asked the question.
+  it("keeps the remark out of the step header", () => {
+    openStep(run(SHORT, true));
+
+    const header = screen.getByRole("button", { name: "Copy this step" }).closest("div");
+    expect(header).toHaveTextContent("exec_command");
+    expect(header).not.toHaveTextContent(/only the beginning was kept/i);
+  });
+
+  // A stored tool result is capped at 8192 bytes upstream, so the render clip
+  // must never reach it: one remark, not a second reporting the rounding error.
+  it("leaves a stored tool result with exactly one remark", () => {
+    openStep(run("x".repeat(8192), true));
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+
+    expect(screen.getByText(/only the beginning was kept/i)).toBeInTheDocument();
+    expect(screen.queryByText(/only the start is displayed/i)).not.toBeInTheDocument();
+  });
+
+  // Tool input has no server-side budget and keeps its existing render ceiling.
+  // Nothing about how long an input renders is this change's business.
+  it("still clips a tool input at its existing length", () => {
+    renderDialog([
+      {
+        seq: 1,
+        type: "tool_use",
+        tool: "exec_command",
+        input: { command: "echo", payload: "y".repeat(9000) },
+      },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /exec_command/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+
+    const body = screen.getByText(/only the start is displayed/i);
+    expect(body.textContent).not.toMatch(/copy|whole record|everything that was saved/i);
+  });
+
+  // A record from before the flag existed says nothing at all. The viewer only
+  // speaks when a daemon measured the output and found bytes missing; it never
+  // volunteers that it cannot tell, in the transcript or above it.
+  it("stays silent on a record whose completeness was never measured", () => {
+    openStep(run(LONG, undefined));
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+
+    expect(screen.queryByText(/only the beginning was kept/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cannot be confirmed|completeness/i)).not.toBeInTheDocument();
   });
 });

@@ -206,7 +206,6 @@ func linkHandoffCandidate(ctx context.Context, q *db.Queries, candidate db.Issue
 		IssueID:             candidate.IssueID,
 		PullRequestID:       pr.ID,
 		CloseIntent:         false,
-		ReferenceOnly:       false,
 		PreserveCloseIntent: true,
 		LinkedByType:        pgtype.Text{String: "system", Valid: true},
 		LinkedByID:          pgtype.UUID{},

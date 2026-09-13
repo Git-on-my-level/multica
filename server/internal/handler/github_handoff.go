@@ -71,7 +71,6 @@ func (h *Handler) linkAwaitingHandoffsForPR(ctx context.Context, workspaceID pgt
 			IssueID:             candidate.IssueID,
 			PullRequestID:       pr.ID,
 			CloseIntent:         false,
-			ReferenceOnly:       false,
 			PreserveCloseIntent: true,
 			LinkedByType:        strToText("system"),
 			LinkedByID:          pgtype.UUID{},

@@ -240,9 +240,6 @@ func (h *Handler) pluginIssueForUser(w http.ResponseWriter, r *http.Request, cal
 		publicapiv1.WriteProblem(w, r, http.StatusNotFound, "not_found", "issue not found")
 		return db.Issue{}, false
 	}
-	if !h.authorizeIssueWindow(w, r, issue.ID, issue.WorkspaceID, "plugin") {
-		return db.Issue{}, false
-	}
 	return issue, true
 }
 
@@ -509,7 +506,7 @@ func (h *Handler) ListPluginComments(w http.ResponseWriter, r *http.Request) {
 }
 
 func publicPluginComment(comment db.Comment) publicapiv1.Comment {
-	return publicapiv1.Comment{
+	out := publicapiv1.Comment{
 		ID:         uuidToString(comment.ID),
 		AuthorType: comment.AuthorType,
 		AuthorID:   uuidToString(comment.AuthorID),
@@ -518,6 +515,10 @@ func publicPluginComment(comment db.Comment) publicapiv1.Comment {
 		ParentID:   uuidToString(comment.ParentID),
 		CreatedAt:  comment.CreatedAt.Time.UTC().Format(timeFormatRFC3339),
 	}
+	if comment.DeletedAt.Valid {
+		out.DeletedAt = comment.DeletedAt.Time.UTC().Format(timeFormatRFC3339)
+	}
+	return out
 }
 
 // CreatePluginComment — POST /v1/issues/{issue_ref}/comments

@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	dshProfile         = "multica"
-	dshProtocolVersion = 1
+	dshProfile = "multica"
+	// DshProtocolVersion is the DSH stdio protocol this backend speaks. Exported
+	// because the daemon's profile probe accepts or rejects a runtime profile on
+	// this exact number, and a second copy of it there is a copy that can drift.
+	DshProtocolVersion = 1
 	dshCancelGrace     = 3 * time.Second
 	dshTerminateGrace  = 2 * time.Second
 )
@@ -222,7 +225,6 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 	args := dshLaunchArgs()
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	configureProcessGroup(cmd)
 	cmd.Cancel = func() error { return nil }
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
@@ -242,7 +244,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 	}
 	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[dsh:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start dsh: %w", err)
 	}
@@ -252,7 +254,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		requestID = "multica-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 	command := dshExecuteCommand{
-		Version: dshProtocolVersion, Type: "execute", RequestID: requestID,
+		Version: DshProtocolVersion, Type: "execute", RequestID: requestID,
 		Cwd: opts.Cwd, Prompt: prompt, ResumeSessionID: opts.ResumeSessionID,
 		Model: model, ReasoningEffort: opts.ThinkingLevel, MCPServers: mcpServers,
 	}
@@ -266,6 +268,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 	if err := writeFrame(command); err != nil {
 		signalProcessGroup(cmd, syscall.SIGKILL)
 		_ = cmd.Wait()
+		releaseProcessGroup(cmd)
 		cancel()
 		return nil, fmt.Errorf("send dsh execute command: %w", err)
 	}
@@ -281,7 +284,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 			return
 		case <-runCtx.Done():
 		}
-		_ = writeFrame(dshCancelCommand{Version: dshProtocolVersion, Type: "cancel", RequestID: requestID})
+		_ = writeFrame(dshCancelCommand{Version: DshProtocolVersion, Type: "cancel", RequestID: requestID})
 		timer := time.NewTimer(dshCancelGrace)
 		defer timer.Stop()
 		select {
@@ -323,6 +326,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		}
 		exitErr := cmd.Wait()
 		close(procDone)
+		releaseProcessGroup(cmd)
 
 		result := state.result
 		if result == nil {
@@ -370,7 +374,7 @@ type dshRunState struct {
 }
 
 func handleDshFrame(frame dshFrame, requestID string, ch chan<- Message, state *dshRunState) {
-	if frame.Version != dshProtocolVersion {
+	if frame.Version != DshProtocolVersion {
 		state.protocolError = fmt.Sprintf("dsh returned unsupported protocol version %d", frame.Version)
 		return
 	}
@@ -441,14 +445,14 @@ func discoverDshModels(ctx context.Context, runtimeCmd Command) ([]Model, error)
 		return nil, err
 	}
 	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, runtimeCmd.logger); err != nil {
 		return nil, err
 	}
 	var models []Model
 	scanner := newAgentStreamScanner(stdout)
 	for scanner.Scan() {
 		var frame dshFrame
-		if json.Unmarshal(scanner.Bytes(), &frame) != nil || frame.Version != dshProtocolVersion || frame.Type != "models" {
+		if json.Unmarshal(scanner.Bytes(), &frame) != nil || frame.Version != DshProtocolVersion || frame.Type != "models" {
 			continue
 		}
 		for _, item := range frame.Models {
@@ -461,6 +465,7 @@ func discoverDshModels(ctx context.Context, runtimeCmd Command) ([]Model, error)
 	}
 	scanErr := scanner.Err()
 	exitErr := cmd.Wait()
+	releaseProcessGroup(cmd)
 	if scanErr != nil {
 		return nil, scanErr
 	}

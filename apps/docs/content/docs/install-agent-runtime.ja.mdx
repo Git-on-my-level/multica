@@ -1,6 +1,6 @@
 ---
 title: AI コーディングツールをインストールする
-description: 対応する AI コーディングツールをインストールしてログインし、Multica がローカル環境でタスクを実行できるようにします。
+description: 対応する AI コーディングツールをインストールしてログインし、Multica がローカル環境で作業を実行できるようにします。
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
@@ -18,6 +18,7 @@ Multica は現在、次のコマンドを検出します。
 | Antigravity CLI | `agy` | [Antigravity のインストールとログイン](https://antigravity.google/docs/cli-install) |
 | Claude Code | `claude` | [Claude Code クイックスタート](https://code.claude.com/docs/en/quickstart) |
 | CodeBuddy Code | `codebuddy` | [CodeBuddy クイックスタート](https://www.codebuddy.ai/docs/cli/quickstart) |
+| CodeArts | `codearts` | [CodeArts CLI クイックスタート](https://support.huaweicloud.com/qs-codeartssnap/codeartsagent_qs_0004.html) |
 | Codex CLI | `codex` | [Codex CLI](https://developers.openai.com/codex/cli/) |
 | GitHub Copilot CLI | `copilot` | [Copilot CLI のインストール](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) |
 | Cursor Agent | `cursor-agent` | [Cursor CLI のインストール](https://docs.cursor.com/en/cli/installation) |
@@ -32,7 +33,6 @@ Multica は現在、次のコマンドを検出します。
 | OpenCode | `opencode` | [OpenCode クイックスタート](https://opencode.ai/en/docs) |
 | Pi coding agent | `pi` | [Pi coding agent](https://github.com/earendil-works/pi) |
 | Oh-My-Pi | `omp` | [Oh-My-Pi インストール](https://omp.sh) |
-| Devin CLI | `devin` | [Devin CLI](https://docs.devin.ai/cli/quickstart) |
 | Qoder CLI | `qodercli` | [Qoder CLI クイックスタート](https://docs.qoder.com/en/cli/quick-start) |
 | Qoder CN CLI | `qoderclicn` | [Qoder CN CLI クイックスタート](https://help.aliyun.com/en/lingma/qodercli-cn/user-guide/qoder-cli-cn-get-started-quickly) |
 | Qwen Code | `qwen` | [Qwen Code](https://github.com/QwenLM/qwen-code) |
@@ -47,18 +47,20 @@ Multica は現在、次のコマンドを検出します。
 
 インストール後、まずターミナルからツールを単独で起動し、各ツールの手順に従ってログインするか、モデルプロバイダーを設定してください。ターミナル上でリクエストを実行できない場合は、デーモンから呼び出しても失敗します。
 
+CodeArts では、TUI だけでなく `codearts run --model provider/model "OK とだけ返してください"` で非対話モードを確認してください。現在の CodeArts CLI では、カスタム provider が TUI で動作しても、`run`、`models`、`serve` には引き続き [`CODEARTS_CLI_AK` / `CODEARTS_CLI_SK`](https://support.huaweicloud.com/usermanual-cli/codeartsagent_cli_0026.html) が必要な場合があります。Multica は `~/.codeartsdoer/codearts_cli.json` または `.jsonc` からカスタムモデルを検出できますが、実行には `codearts run` を使用するため、その認証要件に従います。
+
 Reasonix を使う場合は、デーモンを起動する前に `reasonix setup` を実行し、デフォルトのプロバイダーとモデルを設定してください。
 
 QwenPaw を使う場合は、QwenPaw 側の設定でプロバイダーとモデルを選んでください。Multica が実行時に QwenPaw のモデルを上書きすることはできません。
 
 MiniMax Code を使う場合は、対応する Node.js バージョン（`>=22.19 <23` または `>=24 <27`）をインストールし、`npm install --global @minimax-ai/code@latest` を実行してください。npm のグローバルインストールによって `mcode` は npm のグローバル実行ファイルディレクトリに配置されます。`command -v mcode` または `Get-Command mcode` で見つからない場合は、そのディレクトリを `PATH` に追加してください。その後 `mcode login` を実行します。モデルは MiniMax Code が管理し、Multica から ACP 経由で上書きすることはできません。
 
-DeepSeek Harness を使う場合は、Node.js 20+ をインストールして `npm install -g @deepseek-ai/dsh` を実行し、Multica ランタイムプロファイルを追加してください（`dsh plugin --profile multica add <bundle>`）。デーモンは `dsh --profile multica --probe` が成功した場合のみ DeepSeek Harness を登録します。デーモンを起動する前に `DEEPSEEK_API_KEY` を設定（または dsh の設定に保存）してください。
+DeepSeek Harness を使う場合は、Node.js 20+ をインストールして `npm install -g @deepseek-ai/dsh` を実行し、Multica ランタイムプロファイルを追加してください。このバンドルが Multica の利用する `--stdio` プロトコルを提供しており、素の `dsh` だけでは使えない理由でもあります。`MULTICA_DSH_PROFILE_BUNDLE` にインストールするバンドルを設定すればデーモンが追加します。手動で行う場合は `dsh plugin --profile multica add <bundle>` を実行します。`<bundle>` は `dsh plugin` が受け付けるもの、つまり npm のパッケージ名、ディレクトリ、パック済み tarball のいずれかで、Multica 自身のブリッジは [multica-ai/dsh-multica-runtime](https://github.com/multica-ai/dsh-multica-runtime) にあります。これはまだ公開 npm レジストリに公開されていないため（[multica#6936](https://github.com/multica-ai/multica/issues/6936)）、現時点でセルフホストのチームはそのリポジトリからビルドし、変数をビルド出力のディレクトリに向けます。デーモンを動かすマシンとビルドしたマシンが別なら、`npm pack` が生成する tarball を指定してください。ブリッジが公開されれば、パッケージ名を指定するのが最も簡単になります。いずれの場合も、自チームが公開・ビルドしたものを優先してください。この値は追加の確認なしに各デーモンホストの DSH ホームへインストールされるため、素性の分からないサードパーティのパッケージを指定することは利便性の問題ではなくサプライチェーンの判断です。npm パッケージではなく DeepSeek Harness Desktop をインストールした場合、デーモンはそのアプリが生成する CLI シムも、アプリ自身のユーザーデータディレクトリから探します。macOS は `~/Library/Application Support/DSH Desktop`、Windows は `%APPDATA%\DSH Desktop` です。Windows のそれはローミングのアプリケーションデータであり、インストール先ではありません。アプリ自体は Program Files または `%LOCALAPPDATA%\Programs` に入りますが、駆動される CLI はユーザーごとの他の状態と同じ場所に置かれます。これらのパスのバージョン部分は生成された ID なので、デーモンは列挙して最新のものを優先します。PATH に他のものは必要ありません。生成されたシムはアプリ同梱のランタイムを絶対パスで起動します。DSH Desktop が既定以外の場所にある場合は `MULTICA_DSH_PATH` でそのシムを指定してください。デーモンは `dsh --profile multica --probe` が成功した場合のみ DeepSeek Harness を登録し、失敗した場合は `/health` にプロファイルの欠落を報告します。デーモンを起動する前に `DEEPSEEK_API_KEY` を設定（または dsh の設定に保存）してください。
 
 ログイン情報はツールがローカル環境に保存します。Multica が Claude、Codex、Cursor などの CLI のログイントークンを受け取ることはありません。
 
 <Callout type="info">
-Claude Code は 2.0.0 以降、Codex は 0.100.0 以降、Copilot は 1.0.0 以降、Grok は 0.2.89 以降、Qwen Code は 0.20.0 以降、MiniMax Code は 0.1.2 以降が必要です。最低バージョンを満たしていない場合、デーモンはそのランタイムを登録しません。
+Antigravity は 1.1.10 以降、Claude Code は 2.0.0 以降、Codex は 0.100.0 以降、Copilot は 1.0.0 以降、Grok は 0.2.89 以降、Qwen Code は 0.20.0 以降、MiniMax Code は 0.1.2 以降が必要です。最低バージョンを満たしていない場合、デーモンはそのランタイムを登録しません。
 </Callout>
 
 ## 3. デーモンからコマンドを見つけられることを確認する
@@ -100,7 +102,7 @@ Multica Desktop を使っている場合は、アプリを終了して開き直�
 次に Multica の**ランタイム**ページを開きます。対象のコンピューターの下にツールが表示され、オンライン状態になっていることを確認してください。これで、エージェントを作成または編集するときにこのランタイムを選択できます。
 
 <Callout type="warning">
-デーモンの起動時には、標準対応している CLI が少なくとも 1 つ検出される必要があります。カスタムランタイム設定はデーモンの起動後に同期されるため、ツールが何もないコンピューターで唯一の起動条件として使うことはできません。
+デーモンの起動時には、標準対応している CLI が少なくとも 1 つ検出される必要があります。カスタムランタイム設定はデーモンの起動後に同期されるため、ツールが何もないコンピューターで唯一の起動条件として使うことはできません。例外は 1 つだけです。デーモンが DSH ランタイムプロファイルのインストール（`MULTICA_DSH_PROFILE_BUNDLE`）を開始した直後は、ランタイムが 1 つもない状態で起動し、そのインストールが完了した時点で DeepSeek Harness を登録します。そうしないと、プロファイルを必要とする DSH しかないコンピューターではインストールを完了できません。デーモンが完了前に終了し、インストール処理も道連れにしてしまうからです。
 </Callout>
 
 ## ツールが検出されない場合
@@ -113,7 +115,7 @@ Multica Desktop を使っている場合は、アプリを終了して開き直�
 4. デーモンを再起動し、現在の環境を読み込み直します。
 5. **ランタイム**ページに戻り、コンピューターとツールがどちらもオンラインであることを確認します。
 
-ツールがオンラインと表示されているのに実行が失敗する場合は、イシューの実行ログで CLI が返した具体的なエラーを確認するか、[トラブルシューティング](/troubleshooting)を参照してください。
+ツールがオンラインと表示されているのに実行が失敗する場合は、タスクの実行ログで CLI が返した具体的なエラーを確認するか、[トラブルシューティング](/troubleshooting)を参照してください。
 
 ## 次のステップ
 

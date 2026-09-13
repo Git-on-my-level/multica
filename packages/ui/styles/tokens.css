@@ -51,13 +51,74 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
-    --radius-sm: calc(var(--radius) * 0.6);
-    --radius-md: calc(var(--radius) * 0.8);
+    /* Compact product radius ladder. Keep the roles stable even when the base
+       value changes: xs=micro controls, sm=nested surfaces, md=rows/menus,
+       lg=controls/compact surfaces, xl=cards/dialogs. */
+    --radius-xs: calc(var(--radius) * 0.375);
+    --radius-sm: calc(var(--radius) * 0.5);
+    --radius-md: calc(var(--radius) * 0.75);
     --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+    --radius-xl: calc(var(--radius) * 1.5);
+    --radius-2xl: calc(var(--radius) * 2);
+    --radius-3xl: calc(var(--radius) * 2.5);
+    --radius-4xl: calc(var(--radius) * 3);
+}
+
+/* Type scale — the only font sizes product UI may use.
+ *
+ * There was no `--text-*` token here before, so sizes grew ad hoc: 51 distinct
+ * font sizes across web + desktop, 370 of them written as arbitrary values,
+ * including half-pixel steps (10.5 / 11.5 / 12.5 / 13.5 / 14.5 / 15.5px) that
+ * nobody chose deliberately — they appeared because there was no step to reach
+ * for. Hierarchy does not come from having more sizes; past a handful, every
+ * extra size makes the hierarchy blurrier, because two values a pixel apart
+ * read as "the same, but wrong" rather than as two levels.
+ *
+ * The steps are named for the role the text plays, not for a t-shirt size.
+ * That is what keeps the scale from drifting again: "what is this text for"
+ * has an answer a reader can check, "is this sm or base" does not.
+ *
+ * Six of the ten steps replace Tailwind's default scale and deliberately keep
+ * that scale's exact size/line-height pairs, so `text-sm` -> `text-body` moves
+ * nothing on screen. Only the steps that fill the old gaps — micro (11), label
+ * (13), body-lg (15) — are new sizes; those are the gaps the arbitrary values
+ * were papering over. Every step carries its own line-height so leading cannot
+ * fragment the way size did; a `leading-*` utility still wins where a specific
+ * block needs to override it.
+ *
+ * Landing-page display type (rem/clamp, 2.2-6.4rem) is marketing typography on
+ * a separate ramp and stays out of this scale on purpose. */
+@theme {
+    /* counters, badges, timestamps, overline labels */
+    --text-micro: 11px;
+    --text-micro--line-height: 15px;
+    /* secondary and helper text — was text-xs */
+    --text-caption: 12px;
+    --text-caption--line-height: 16px;
+    /* dense labels: table headers, metadata rows */
+    --text-label: 13px;
+    --text-label--line-height: 18px;
+    /* UI body, the workhorse — was text-sm */
+    --text-body: 14px;
+    --text-body--line-height: 20px;
+    /* roomier body: dialog copy, onboarding prose */
+    --text-body-lg: 15px;
+    --text-body-lg--line-height: 22px;
+    /* small headings — was text-base */
+    --text-title-sm: 16px;
+    --text-title-sm--line-height: 24px;
+    /* section headings — was text-lg */
+    --text-title: 18px;
+    --text-title--line-height: 28px;
+    /* card and dialog titles — was text-xl */
+    --text-title-lg: 20px;
+    --text-title-lg--line-height: 28px;
+    /* page titles — was text-2xl */
+    --text-display-sm: 24px;
+    --text-display-sm--line-height: 32px;
+    /* hero numbers and empty-state headlines — was text-3xl (30px) */
+    --text-display: 36px;
+    --text-display--line-height: 40px;
 }
 
 /* Type scale — the only font sizes product UI may use.
@@ -196,7 +257,7 @@
     --chart-3: oklch(0.76 0.10 255);
     --chart-4: oklch(0.85 0.06 255);
     --chart-5: oklch(0.92 0.03 255);
-    --radius: 0.625rem;
+    --radius: 0.5rem;
     --sidebar: oklch(0.964435 0.001327 286.375);
     --sidebar-foreground: oklch(0.141 0.005 285.823);
     --sidebar-primary: oklch(0.21 0.006 285.885);

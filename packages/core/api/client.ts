@@ -1,3 +1,4 @@
+import { configStore } from "../config";
 import type {
   Issue,
   IssuePriority,
@@ -205,8 +206,8 @@ import type {
   CreateBillingCheckoutSessionResponse,
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
-  WorkspaceSubscriptionEntitlements,
   WorkspaceSubscriptionSummary,
+  IssueLimitUsage,
   WorkspaceSubscriptionPrices,
   CreateWorkspaceSubscriptionCheckoutRequest,
   CreateWorkspaceSubscriptionCheckoutResponse,
@@ -216,6 +217,10 @@ import type {
   PurchaseWorkspaceSeatsRequest,
   PurchaseWorkspaceSeatsResponse,
   CreateWorkspaceSubscriptionPortalResponse,
+  SourceContextPreview,
+  CreateCommentSubIssueManualRequest,
+  CreateCommentSubIssueAgentRequest,
+  CreateCommentSubIssueRequest,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -240,6 +245,8 @@ import {
   ChatMessageListSchema,
   ChatMessagesPageSchema,
   ChatPendingTaskSchema,
+  ChatSessionListSchema,
+  ChatSessionSchema,
   PrioritizeQueuedChatTaskResponseSchema,
   SendChatMessageResponseSchema,
   StartMikaOnboardingResponseSchema,
@@ -265,6 +272,8 @@ import {
   EMPTY_ATTACHMENT,
   EMPTY_CHAT_MESSAGE_LIST,
   EMPTY_CHAT_PENDING_TASK,
+  EMPTY_CHAT_SESSION,
+  EMPTY_CHAT_SESSION_LIST,
   EMPTY_PRIORITIZE_QUEUED_CHAT_TASK_RESPONSE,
   EMPTY_CLOUD_RUNTIME_NODE,
   EMPTY_CLOUD_RUNTIME_NODE_LIST,
@@ -299,6 +308,9 @@ import {
   ListIssuesResponseSchema,
   CreateIssueResponseSchema,
   IssueSchema,
+  AgentTaskSchema,
+  SourceContextPreviewSchema,
+  CommentSubIssueTaskResponseSchema,
   ListWebhookDeliveriesResponseSchema,
   RuntimeHourlyActivityListSchema,
   RuntimeUsageByAgentListSchema,
@@ -310,6 +322,7 @@ import {
   SquadListSchema,
   SquadMemberStatusListResponseSchema,
   SubscribersListSchema,
+  TaskMessageListSchema,
   TimelineEntriesSchema,
   UserSchema,
   WebhookDeliveryResponseSchema,
@@ -321,8 +334,8 @@ import {
   CreateBillingCheckoutSessionResponseSchema,
   BillingCheckoutSessionStatusSchema,
   CreateBillingPortalSessionResponseSchema,
-  WorkspaceSubscriptionEntitlementsSchema,
   WorkspaceSubscriptionSummarySchema,
+  IssueLimitUsageSchema,
   WorkspaceSubscriptionPricesSchema,
   CreateWorkspaceSubscriptionCheckoutResponseSchema,
   WorkspaceSubscriptionSeatReconcileResultSchema,
@@ -385,9 +398,9 @@ import {
   EMPTY_LIST_PROPERTIES_RESPONSE,
   EMPTY_ISSUE_PROPERTIES_RESPONSE,
   EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
+  IssuePullRequestsResponseSchema,
   IssuePullRequestResponseSchema,
   EMPTY_ISSUE_PULL_REQUEST_RESPONSE,
-  IssuePullRequestsResponseSchema,
   ResourceLabelsResponseSchema,
   EMPTY_LABEL,
   EMPTY_LIST_LABELS_RESPONSE,
@@ -404,6 +417,8 @@ import {
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   SkillSchema,
   EMPTY_SKILL,
+  SkillImportResultSchema,
+  EMPTY_SKILL_IMPORT_RESULT,
   IssueViewSchema,
   IssueViewListSchema,
   IssueViewPreferenceSchema,
@@ -494,6 +509,19 @@ export class ApiError extends Error {
   }
 }
 
+function assertAgentConversationStartersWriteSupported(data: {
+  conversation_starters?: unknown;
+}): void {
+  if (
+    Object.prototype.hasOwnProperty.call(data, "conversation_starters") &&
+    !configStore.getState().agentConversationStartersSupported
+  ) {
+    throw new Error(
+      "This server version does not support agent conversation starters. Update the server before saving them.",
+    );
+  }
+}
+
 // errorCode extracts the stable `code` a handler attaches to a failure
 // (writeErrorCode), so a caller can render its own localized sentence instead
 // of toasting the server's English one. Returns undefined for a non-ApiError,
@@ -555,6 +583,37 @@ export class PreviewUnsupportedError extends Error {
     super("attachment type not supported for inline preview");
     this.name = "PreviewUnsupportedError";
   }
+}
+
+function remapSkillImportError(err: unknown): unknown {
+  if (!(err instanceof ApiError) || !err.body || typeof err.body !== "object") {
+    return err;
+  }
+  const body = err.body as { reason?: unknown; error?: unknown };
+  const reason = typeof body.reason === "string" && body.reason ? body.reason : "";
+  const error = typeof body.error === "string" && body.error ? body.error : "";
+  const message = reason || error;
+  if (!message || message === err.message) return err;
+  return new ApiError(message, err.status, err.statusText, err.body);
+}
+
+function skillFromImportResult(raw: unknown, endpoint: string): Skill {
+  const result = parseWithFallback(
+    raw,
+    SkillImportResultSchema,
+    EMPTY_SKILL_IMPORT_RESULT,
+    { endpoint },
+  );
+  if (
+    (result.status === "created" || result.status === "updated") &&
+    result.skill
+  ) {
+    const skill = parseWithFallback(result.skill, SkillSchema, EMPTY_SKILL, {
+      endpoint,
+    });
+    if (skill.id) return skill;
+  }
+  throw new Error(result.reason || "Import failed");
 }
 
 /**
@@ -1061,6 +1120,63 @@ export class ApiClient {
     });
   }
 
+  async getCommentSubIssuePreview(anchorCommentId: string): Promise<SourceContextPreview> {
+    const raw = await this.fetch<unknown>(`/api/comments/${anchorCommentId}/sub-issue-preview`);
+    const preview = parseWithFallback<SourceContextPreview | null>(
+      raw,
+      SourceContextPreviewSchema,
+      null,
+      { endpoint: "GET /api/comments/:id/sub-issue-preview" },
+    );
+    if (!preview) throw new Error("Invalid source context preview response");
+    return preview;
+  }
+
+  async createCommentSubIssue(
+    anchorCommentId: string,
+    data: CreateCommentSubIssueManualRequest,
+  ): Promise<Issue>;
+  async createCommentSubIssue(
+    anchorCommentId: string,
+    data: CreateCommentSubIssueAgentRequest,
+  ): Promise<{ task_id: string }>;
+  async createCommentSubIssue(
+    anchorCommentId: string,
+    data: CreateCommentSubIssueRequest,
+  ): Promise<Issue | { task_id: string }> {
+    try {
+      const raw = await this.fetch<unknown>(`/api/comments/${anchorCommentId}/sub-issues`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      });
+      if (data.mode === "manual") {
+        const issue = parseWithFallback<Issue | null>(raw, CreateIssueResponseSchema, null, {
+          endpoint: "POST /api/comments/:id/sub-issues (manual)",
+        });
+        if (!issue) throw new Error("Invalid sub-issue response");
+        return issue;
+      }
+      const task = parseWithFallback<{ task_id: string } | null>(
+        raw,
+        CommentSubIssueTaskResponseSchema,
+        null,
+        { endpoint: "POST /api/comments/:id/sub-issues (agent)" },
+      );
+      if (!task) throw new Error("Invalid quick-create response");
+      return task;
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+        throw new ApiError(
+          "Source-context sub-issues require a newer server",
+          error.status,
+          error.statusText,
+          { code: "source_context_server_unsupported" },
+        );
+      }
+      throw error;
+    }
+  }
+
   async createFeedback(data: {
     message: string;
     url?: string;
@@ -1119,19 +1235,26 @@ export class ApiClient {
   }
 
   async getChildIssueProgress(): Promise<{
-    progress: {
-      parent_issue_id: string;
-      total: number;
-      done: number;
-      visible_total?: number;
-      visible_done?: number;
-      hidden_total?: number;
-    }[];
+    progress: { parent_issue_id: string; total: number; done: number }[];
   }> {
     const raw = await this.fetch<unknown>("/api/issues/child-progress");
-    return parseWithFallback(raw, ChildIssueProgressResponseSchema, { progress: [] }, {
-      endpoint: "GET /api/issues/child-progress",
-    });
+    return parseWithFallback(
+      raw,
+      ChildIssueProgressResponseSchema,
+      { progress: [] },
+      { endpoint: "GET /api/issues/child-progress" },
+    );
+  }
+
+  async getIssueLimitUsage(): Promise<IssueLimitUsage | null> {
+    const raw = await this.fetch<unknown>("/api/issues/limit-usage");
+    if (raw == null) return null;
+    return parseWithFallback<IssueLimitUsage | null>(
+      raw,
+      IssueLimitUsageSchema,
+      null,
+      { endpoint: "GET /api/issues/limit-usage" },
+    );
   }
 
   async deleteIssue(id: string): Promise<void> {
@@ -1240,8 +1363,17 @@ export class ApiClient {
     });
   }
 
-  async deleteComment(commentId: string): Promise<void> {
-    await this.fetch(`/api/comments/${commentId}`, { method: "DELETE" });
+  /**
+   * `keepReplies` calls the route only servers that keep a deleted comment's
+   * replies expose (#8296): if the request reaches an older server it fails
+   * instead of deleting the replies too. Pass it only when the server declared
+   * `comment_delete_keep_replies_supported`.
+   */
+  async deleteComment(commentId: string, opts: { keepReplies?: boolean } = {}): Promise<void> {
+    const path = opts.keepReplies === true
+      ? `/api/comments/${commentId}/keep-replies`
+      : `/api/comments/${commentId}`;
+    await this.fetch(path, { method: "DELETE" });
   }
 
   async resolveComment(commentId: string): Promise<Comment> {
@@ -1345,6 +1477,7 @@ export class ApiClient {
   }
 
   async createAgent(data: CreateAgentRequest): Promise<Agent> {
+    assertAgentConversationStartersWriteSupported(data);
     return this.fetch("/api/agents", {
       method: "POST",
       body: JSON.stringify(data),
@@ -1460,6 +1593,7 @@ export class ApiClient {
   }
 
   async updateAgent(id: string, data: UpdateAgentRequest): Promise<Agent> {
+    assertAgentConversationStartersWriteSupported(data);
     return this.fetch(`/api/agents/${id}`, {
       method: "PUT",
       body: JSON.stringify(data),
@@ -1706,18 +1840,6 @@ export class ApiClient {
   //   - a 2xx body that does not match the contract returns null here.
   // ---------------------------------------------------------------------
 
-  async getWorkspaceSubscriptionEntitlements(): Promise<WorkspaceSubscriptionEntitlements | null> {
-    const raw = await this.fetch<unknown>(
-      "/api/cloud-subscriptions/entitlements",
-    );
-    return parseWithFallback<WorkspaceSubscriptionEntitlements | null>(
-      raw,
-      WorkspaceSubscriptionEntitlementsSchema,
-      null,
-      { endpoint: "GET /api/cloud-subscriptions/entitlements" },
-    );
-  }
-
   async getWorkspaceSubscriptionSummary(): Promise<WorkspaceSubscriptionSummary | null> {
     const raw = await this.fetch<unknown>("/api/cloud-subscriptions/summary");
     return parseWithFallback<WorkspaceSubscriptionSummary | null>(
@@ -1748,9 +1870,6 @@ export class ApiClient {
         body: JSON.stringify({
           interval: data.interval,
           idempotency_key: data.idempotencyKey,
-          ...(data.customerEmail
-            ? { customer_email: data.customerEmail }
-            : {}),
         }),
         extraHeaders: {
           "Content-Type": "application/json",
@@ -2160,10 +2279,17 @@ export class ApiClient {
   // than cast: an unparseable body degrades to an explicit "failed" record that
   // shows the discovery error and keeps manual model entry usable, instead of a
   // fabricated empty catalog or an endless spinner (MUL-5444).
-  async initiateListModels(runtimeId: string): Promise<RuntimeModelListRequest> {
-    const raw = await this.fetch<unknown>(`/api/runtimes/${runtimeId}/models`, {
-      method: "POST",
-    });
+  async initiateListModels(
+    runtimeId: string,
+    options: { force?: boolean } = {},
+  ): Promise<RuntimeModelListRequest> {
+    const query = options.force === true ? "?force=true" : "";
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/models${query}`,
+      {
+        method: "POST",
+      },
+    );
     return parseWithFallback<RuntimeModelListRequest>(
       raw,
       RuntimeModelListRequestSchema,
@@ -2224,7 +2350,10 @@ export class ApiClient {
   }
 
   async listAgentTasks(agentId: string): Promise<AgentTask[]> {
-    return this.fetch(`/api/agents/${agentId}/tasks`);
+    const raw = await this.fetch<unknown>(`/api/agents/${agentId}/tasks`);
+    return parseWithFallback<AgentTask[]>(raw, AgentTaskListSchema, [], {
+      endpoint: "GET /api/agents/:id/tasks",
+    });
   }
 
   // Workspace-scoped agent task snapshot: every active task
@@ -2279,7 +2408,10 @@ export class ApiClient {
   }
 
   async listTaskMessages(taskId: string): Promise<TaskMessagePayload[]> {
-    return this.fetch(`/api/tasks/${taskId}/messages`);
+    const raw = await this.fetch<unknown>(`/api/tasks/${taskId}/messages`);
+    return parseWithFallback<TaskMessagePayload[]>(raw, TaskMessageListSchema, [], {
+      endpoint: "GET /api/tasks/:id/messages",
+    });
   }
 
   async listTasksByIssue(issueId: string): Promise<AgentTask[]> {
@@ -2294,9 +2426,14 @@ export class ApiClient {
   }
 
   async cancelTask(issueId: string, taskId: string): Promise<AgentTask> {
-    return this.fetch(`/api/issues/${issueId}/tasks/${taskId}/cancel`, {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/tasks/${taskId}/cancel`, {
       method: "POST",
     });
+    const task = parseWithFallback<AgentTask | null>(raw, AgentTaskSchema, null, {
+      endpoint: "POST /api/issues/:id/tasks/:taskId/cancel",
+    });
+    if (!task) throw new Error("Invalid task cancellation response");
+    return task;
   }
 
   async rerunIssue(issueId: string, taskId?: string): Promise<AgentTask> {
@@ -2306,9 +2443,23 @@ export class ApiClient {
     });
   }
 
+  async retrySourceContextQuickCreate(taskId: string): Promise<AgentTask> {
+    const raw = await this.fetch<unknown>(`/api/tasks/${taskId}/retry-source-context`, {
+      method: "POST",
+    });
+    const task = parseWithFallback<AgentTask | null>(raw, AgentTaskSchema, null, {
+      endpoint: "POST /api/tasks/:id/retry-source-context",
+    });
+    if (!task) throw new Error("Invalid source-context retry response");
+    return task;
+  }
+
   // Inbox
   async listInbox(): Promise<InboxItem[]> {
-    return this.fetch("/api/inbox");
+    const raw = await this.fetch<unknown>("/api/inbox");
+    return parseWithFallback(raw, InboxItemListSchema, EMPTY_INBOX_ITEMS, {
+      endpoint: "GET /api/inbox",
+    });
   }
 
   async markInboxRead(id: string): Promise<InboxItem> {
@@ -2337,6 +2488,12 @@ export class ApiClient {
     return this.fetch(`/api/inbox/${id}/unarchive`, { method: "POST" });
   }
 
+  // Raw unread ROW count — not the number any badge shows. The inbox renders
+  // one row per issue, so a single issue with three unread notifications
+  // counts once there and three times here. `getInboxUnreadSummary` is the
+  // deduplicated, per-workspace count the UI is built on (see
+  // `useInboxUnreadCount`); reach for this one only when raw rows are what
+  // you actually mean.
   async getUnreadInboxCount(): Promise<{ count: number }> {
     return this.fetch("/api/inbox/unread-count");
   }
@@ -2916,6 +3073,36 @@ export class ApiClient {
     });
   }
 
+  /**
+   * Imports a skill from a local .skill / .zip archive. Not routed through
+   * `this.fetch`: the browser has to set the multipart boundary itself.
+   *
+   * The archive path always returns a structured `{ status, skill, reason }`
+   * body. Created/updated responses yield the skill; anything else throws
+   * with the server's reason (or `error`) so the dialog can show it.
+   */
+  async importSkillArchive(
+    file: File,
+    onConflict?: "fail" | "overwrite" | "rename" | "skip",
+  ): Promise<Skill> {
+    const formData = new FormData();
+    formData.append("file", file, file.name || "skill.zip");
+    if (onConflict) formData.append("on_conflict", onConflict);
+
+    let res: Response;
+    try {
+      res = await this.fetchRaw("/api/skills/import", {
+        method: "POST",
+        body: formData,
+      });
+    } catch (err) {
+      throw remapSkillImportError(err);
+    }
+
+    const raw = (await res.json()) as unknown;
+    return skillFromImportResult(raw, "POST /api/skills/import");
+  }
+
   // Re-downloads the skill from its stored config.origin source, replacing
   // name/description/content/files in place while preserving the skill id and
   // its agent bindings.
@@ -3036,13 +3223,19 @@ export class ApiClient {
     workspaceSlug?: string,
   ): Promise<ChatSession[]> {
     const query = params?.status ? `?status=${params.status}` : "";
-    return this.fetch(`/api/chat/sessions${query}`, {
+    const raw: unknown = await this.fetch(`/api/chat/sessions${query}`, {
       headers: workspaceHeader(workspaceSlug),
+    });
+    return parseWithFallback(raw, ChatSessionListSchema, EMPTY_CHAT_SESSION_LIST, {
+      endpoint: "GET /api/chat/sessions",
     });
   }
 
   async getChatSession(id: string): Promise<ChatSession> {
-    return this.fetch(`/api/chat/sessions/${id}`);
+    const raw: unknown = await this.fetch(`/api/chat/sessions/${id}`);
+    return parseWithFallback(raw, ChatSessionSchema, EMPTY_CHAT_SESSION, {
+      endpoint: "GET /api/chat/sessions/:id",
+    });
   }
 
   async createChatSession(
@@ -3999,7 +4192,9 @@ export class ApiClient {
         action: "off",
         used: null,
         reserved: null,
+        total: null,
         limit: null,
+        reached: null,
         period_start: null,
         period_end: null,
         reset_at: null,
@@ -4189,7 +4384,7 @@ export class ApiClient {
     );
   }
 
-
+  // Fork overlay: manual issue↔PR link API (POST link/unlink routes above).
   async linkIssuePullRequest(
     issueId: string,
     url: string,

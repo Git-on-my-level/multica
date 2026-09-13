@@ -29,6 +29,7 @@ import {
 import { agentTaskSnapshotOptions } from "@multica/core/agents";
 import {
   deriveRuntimeHealth,
+  isRuntimeUsableForUser,
   runtimeProfileListOptions,
   runtimeUsageOptions,
 } from "@multica/core/runtimes";
@@ -230,8 +231,8 @@ function RuntimeKindBadge({ runtime }: { runtime: AgentRuntime }) {
     <span
       className={
         isCustom
-          ? "inline-flex shrink-0 items-center rounded bg-info/10 px-1 text-micro font-medium text-info"
-          : "inline-flex shrink-0 items-center rounded bg-muted px-1 text-micro font-medium text-muted-foreground"
+          ? "inline-flex shrink-0 items-center rounded-xs bg-info/10 px-1 text-micro font-medium text-info"
+          : "inline-flex shrink-0 items-center rounded-xs bg-muted px-1 text-micro font-medium text-muted-foreground"
       }
     >
       {isCustom
@@ -246,13 +247,13 @@ function PendingRuntimeBadge({ runtime }: { runtime: AgentRuntime }) {
   if (!isPendingCustomRuntime(runtime)) return null;
   if (isDisabledCustomRuntime(runtime)) {
     return (
-      <span className="inline-flex shrink-0 items-center rounded bg-muted px-1 text-micro font-medium text-muted-foreground">
+      <span className="inline-flex shrink-0 items-center rounded-xs bg-muted px-1 text-micro font-medium text-muted-foreground">
         {t(($) => $.list.badge_disabled)}
       </span>
     );
   }
   return (
-    <span className="inline-flex shrink-0 items-center rounded bg-warning/10 px-1 text-micro font-medium text-warning">
+    <span className="inline-flex shrink-0 items-center rounded-xs bg-warning/10 px-1 text-micro font-medium text-warning">
       {t(($) => $.list.badge_registering)}
     </span>
   );
@@ -267,7 +268,7 @@ function VisibilityBadge({ runtime }: { runtime: AgentRuntime }) {
     <Tooltip>
       <TooltipTrigger
         render={
-          <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-info/10 px-1 text-micro font-medium text-info">
+          <span className="inline-flex shrink-0 items-center gap-0.5 rounded-xs bg-info/10 px-1 text-micro font-medium text-info">
             <Globe className="h-2.5 w-2.5" />
             {t(($) => $.detail.visibility_label.public)}
           </span>
@@ -342,7 +343,7 @@ function HealthCell({
   }
 
   const health = deriveRuntimeHealth(runtime, now);
-  const offline = health === "offline" || health === "about_to_gc";
+  const offline = health === "offline" || health === "long_offline";
   const lastSeen = runtime.last_seen_at ? timeAgo(runtime.last_seen_at) : null;
   const active = workload.runningCount + workload.queuedCount;
 
@@ -375,13 +376,27 @@ function HealthCell({
 // page are large.
 const COST_CELL_DAYS = 14;
 
-export function CostCell({ runtimeId }: { runtimeId: string }) {
+export function canReadRuntimeUsage(
+  runtime: AgentRuntime,
+  currentUserId: string | null,
+): boolean {
+  return isRuntimeUsableForUser(runtime, currentUserId);
+}
+
+export function CostCell({
+  runtimeId,
+  enabled,
+}: {
+  runtimeId: string;
+  enabled: boolean;
+}) {
   const { t, i18n } = useT("runtimes");
   const tz = useViewingTimezone();
   const locales = i18n.resolvedLanguage ?? i18n.language;
-  const { data: usage = [] } = useQuery(
-    runtimeUsageOptions(runtimeId, COST_CELL_DAYS, tz),
-  );
+  const { data: usage = [] } = useQuery({
+    ...runtimeUsageOptions(runtimeId, COST_CELL_DAYS, tz),
+    enabled,
+  });
   const cost7d = useMemo(() => computeCostInWindow(usage, 7, tz), [usage, tz]);
   const costPrev7d = useMemo(
     () => computeCostInWindow(usage, 7, tz, 7),
@@ -809,7 +824,10 @@ export function RuntimeList({
                     <span className="text-caption text-faint-foreground">—</span>
                   </div>
                 ) : (
-                  <CostCell runtimeId={row.runtime.id} />
+                  <CostCell
+                    runtimeId={row.runtime.id}
+                    enabled={canReadRuntimeUsage(row.runtime, user?.id ?? null)}
+                  />
                 )}
               </ListGridCell>
               <ListGridCell className="hidden @2xl:flex">
