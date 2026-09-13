@@ -2024,7 +2024,9 @@ func TestGateResumeToReachableSession(t *testing.T) {
 func TestGatePiResumeToSessionFile(t *testing.T) {
 	t.Parallel()
 
-	for _, provider := range []string{"pi", "omp"} {
+	// Fork overlay: omp is an ACP protocol family here, not a pi-family
+	// identity, so the pi session-file gate does not apply to it.
+	for _, provider := range []string{"pi"} {
 		t.Run(provider, func(t *testing.T) {
 			t.Parallel()
 
@@ -2239,7 +2241,6 @@ func TestGatePiResumeChecksRecordedCwd(t *testing.T) {
 			refusesMissingCwd bool
 		}{
 			{name: "pi", provider: "pi", refusesMissingCwd: true},
-			{name: "omp", provider: "omp", refusesMissingCwd: false},
 			// A custom runtime profile registers its protocol family as the
 			// provider, so an arbitrary command configured as `protocol_family:
 			// pi` also arrives here as "pi". It is not the binary whose refusal

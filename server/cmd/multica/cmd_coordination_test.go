@@ -31,7 +31,7 @@ func coordinationTestCommand() *cobra.Command {
 func TestRunIssueURLUsesConfiguredAppURLAndWorkspaceSlug(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/issues/" + coordinationIssueID:
+		case "/api/issues/" + coordinationIssueID, "/api/issues/SCA-112":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": coordinationIssueID, "identifier": "SCA-112",
 			})
@@ -48,7 +48,10 @@ func TestRunIssueURLUsesConfiguredAppURLAndWorkspaceSlug(t *testing.T) {
 
 	cmd := coordinationTestCommand()
 	out, err := captureStdout(t, func() error {
-		return runIssueURL(cmd, []string{coordinationIssueID})
+		// Identifier input takes the resolver's fetch path, so the output
+		// carries the display key; a bare UUID now fast-paths without a
+		// round trip (upstream GH #7017) and would print the raw id.
+		return runIssueURL(cmd, []string{"SCA-112"})
 	})
 	if err != nil {
 		t.Fatalf("runIssueURL: %v", err)

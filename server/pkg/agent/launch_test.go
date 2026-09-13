@@ -382,9 +382,12 @@ func TestBuiltinRuntimeIdentitiesFilterLaunchPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveBackend(omp): %v", err)
 	}
-	got := backend.(*piBackend).cfg.LaunchPrefix
-	if strings.Join(got, "\x00") != "start\x00q36" {
-		t.Fatalf("runtime identity did not inherit prefix filtering: %v", got)
+	// Fork overlay: omp resolves to its own ACP backend, which has no
+	// stream-json prefix policy to inherit — the configured prefix passes
+	// through verbatim.
+	got := backend.(*ompBackend).cfg.LaunchPrefix
+	if strings.Join(got, "\x00") != "start\x00q36\x00-p" {
+		t.Fatalf("omp ACP backend must not apply pi prefix filtering: %v", got)
 	}
 }
 
