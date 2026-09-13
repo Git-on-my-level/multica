@@ -31,6 +31,15 @@ const (
 	// delegatedFailureRecoverySweepInterval keeps the low-probability durable
 	// recovery scan off the latency-sensitive runtime liveness path.
 	delegatedFailureRecoverySweepInterval = 5 * time.Minute
+	// sweepOfflineConfirmWindow is how long a runtime's offline verdict must
+	// age before FailTasksForOfflineRuntimes may terminate its tasks
+	// (SCA-471). One full sweepInterval: the sweep that flips a runtime
+	// offline and the task-fail stage share a tick, so this buys a daemon
+	// that reconnects within one extra sweep the time to heartbeat — which
+	// flips the row online synchronously — instead of losing still-live
+	// tasks to the flip's own tick. It confirms the verdict; it does not
+	// raise the 150s staleness threshold.
+	sweepOfflineConfirmWindow = sweepInterval
 	// staleThresholdSeconds marks runtimes offline if no heartbeat for this
 	// long. The heartbeat timing derivation lives with the shared service
 	// constant so every task release path uses the same eligibility window.
@@ -298,6 +307,12 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 // heartbeat has exceeded the bounded reconnect grace. Running it every tick is
 // essential: the grace usually expires long after sweepStaleRuntimes performed
 // the one-time online→offline transition.
+//
+// SCA-471: the fail stage additionally requires the offline verdict to be at
+// least one sweep old (sweepOfflineConfirmWindow). The flip and this fail
+// call run back-to-back in the same tick, so a daemon that recovers within
+// one extra ~30s sweep re-heartbeats — flipping its row online synchronously
+// — and its running tasks survive what they already survived once.
 func sweepOfflineRuntimeTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, reconnectGrace time.Duration) (stats runtimeSweepStageStats) {
 	startedAt := time.Now()
 	defer func() {
@@ -306,6 +321,7 @@ func sweepOfflineRuntimeTasks(ctx context.Context, queries *db.Queries, taskSvc 
 
 	failedTasks, err := taskSvc.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
 		ReconnectGraceSecs: reconnectGrace.Seconds(),
+		OfflineConfirmSecs: sweepOfflineConfirmWindow.Seconds(),
 		MaxPerTick:         offlineTaskFailBatchSize,
 	})
 	if err != nil {

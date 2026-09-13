@@ -206,8 +206,10 @@ WITH victims AS (
     AND runtime.status = 'offline'
     AND COALESCE(runtime.last_seen_at, runtime.updated_at) <
         now() - make_interval(secs => $1::double precision)
+    AND runtime.updated_at <
+        now() - make_interval(secs => $2::double precision)
   ORDER BY COALESCE(runtime.last_seen_at, runtime.updated_at), task.created_at
-  LIMIT $2::int
+  LIMIT $3::int
   FOR UPDATE OF task SKIP LOCKED
 )
 UPDATE agent_task_queue AS task
@@ -222,6 +224,7 @@ RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, tas
 
 type FailTasksForOfflineRuntimesParams struct {
 	ReconnectGraceSecs float64 `json:"reconnect_grace_secs"`
+	OfflineConfirmSecs float64 `json:"offline_confirm_secs"`
 	MaxPerTick         int32   `json:"max_per_tick"`
 }
 
@@ -233,8 +236,20 @@ type FailTasksForOfflineRuntimesParams struct {
 // cannot monopolise the sweeper transaction. last_seen_at is normally set by
 // the first heartbeat; updated_at is only the fallback for a never-heartbeated
 // runtime, and a forced-offline write starts its grace from that update.
+//
+// SCA-471: the offline verdict itself must survive one extra sweep
+// (@offline_confirm_secs = sweepInterval) before any task dies. The sweep
+// that flips a runtime offline and this fail stage run back-to-back in the
+// same tick, so without this gate a daemon that reconnects and heartbeats a
+// few seconds after that tick — inside one extra ~30s sweep — would still
+// lose its running tasks to a race it had already survived. A recovered
+// heartbeat flips the row online synchronously (offline→online commits
+// before the heartbeat returns), which is why gating on updated_at (the
+// offline transition timestamp) closes the race. This confirms the verdict;
+// it deliberately does NOT raise the 150s staleness threshold or the
+// reconnect grace.
 func (q *Queries) FailTasksForOfflineRuntimes(ctx context.Context, arg FailTasksForOfflineRuntimesParams) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, failTasksForOfflineRuntimes, arg.ReconnectGraceSecs, arg.MaxPerTick)
+	rows, err := q.db.Query(ctx, failTasksForOfflineRuntimes, arg.ReconnectGraceSecs, arg.OfflineConfirmSecs, arg.MaxPerTick)
 	if err != nil {
 		return nil, err
 	}

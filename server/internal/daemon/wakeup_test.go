@@ -140,7 +140,8 @@ func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 		t.Fatalf("expected just-acked runtime to be fresh")
 	}
 
-	// Force the entry past the freshness window.
+	// Missed-ack case: force the entry past the freshness window. Two missed
+	// WS acks (~30s) re-enable HTTP on the next tick.
 	d.wsHBMu.Lock()
 	d.wsHBLastAck["runtime-1"] = time.Now().Add(-d.wsHeartbeatFreshness() - time.Second)
 	d.wsHBMu.Unlock()
@@ -148,10 +149,156 @@ func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 		t.Fatalf("expected aged runtime to be stale (HTTP heartbeat must resume)")
 	}
 
+	// Half-open case (SCA-471): the ack stamp is still inside the freshness
+	// window, but the connection has DELIVERED nothing for longer than the
+	// window — a dead inbound path whose writes only fail minutes later.
+	// Suppression must key off received frames, so the guard treats the
+	// socket as disconnected: ack set cleared, HTTP free to resume.
+	d.recordWSReceive()
+	d.recordWSHeartbeatAck("runtime-1")
+	d.wsHBMu.Lock()
+	d.wsLastReceive = time.Now().Add(-d.wsHeartbeatFreshness() - time.Second)
+	d.wsHBMu.Unlock()
+	if !d.wsHeartbeatRecentlyAcked("runtime-1") {
+		t.Fatalf("precondition: ack stamp should still sit inside the freshness window")
+	}
+	if !d.clearStaleWSHeartbeatAcks() {
+		t.Fatal("receive-silent wakeup websocket must clear the ack set (treated as disconnected)")
+	}
+	if d.wsHeartbeatRecentlyAcked("runtime-1") {
+		t.Fatal("half-open guard failed: receive-silent connection still suppresses HTTP")
+	}
+
+	// The whole suppression excursion is bounded by freshness after the last
+	// RECEIVED frame. Two freshness windows plus one HTTP tick must stay far
+	// below the server's 150s stale threshold, or one missed round trip
+	// could age the runtime out server-side while HTTP is still suppressed.
+	if budget := 2*d.wsHeartbeatFreshness() + 15*time.Second; budget >= 150*time.Second {
+		t.Fatalf("freshness budget %s is not comfortably inside the server's 150s stale window", budget)
+	}
+
 	d.recordWSHeartbeatAck("runtime-2")
 	d.clearWSHeartbeatAcks()
 	if d.wsHeartbeatRecentlyAcked("runtime-2") {
 		t.Fatalf("expected clearWSHeartbeatAcks to drop all entries")
+	}
+}
+
+// TestRunHeartbeatTickResumesHTTPWhenWSReceiveGoesSilent is the SCA-471
+// regression for the incident's suppression-stuck shape, and pins the
+// stall-independence invariant: the HTTP tick consults only the wsHBMu
+// freshness map (map ops, never I/O) — it does not wait on the wakeup
+// websocket's writer, workspace GC, or task-result reporting in any way. A
+// receive-silent websocket whose last ack still looks fresh must not keep the
+// HTTP fallback silenced; the simulated silence here (~35s at the 15s
+// interval) is far inside the server's 150s offline threshold, so the tick
+// proves liveness before the sweeper can declare the runtime stale.
+func TestRunHeartbeatTickResumesHTTPWhenWSReceiveGoesSilent(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/heartbeat" {
+			http.NotFound(w, r)
+			return
+		}
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	d := New(Config{HeartbeatInterval: 15 * time.Second}, slog.Default())
+	d.client = NewClient(srv.URL)
+	ctx := context.Background()
+
+	// Healthy WS: a receive inside the window plus a fresh ack suppresses
+	// the HTTP tick.
+	d.recordWSReceive()
+	d.recordWSHeartbeatAck("runtime-1")
+	d.runHeartbeatTick(ctx, "runtime-1")
+	if got := posts.Load(); got != 0 {
+		t.Fatalf("HTTP heartbeat posts = %d with fresh WS ack, want 0", got)
+	}
+
+	// Half-open: ack stamp still fresh, receive silent past the freshness
+	// window. The tick must clear the suppression and POST over HTTP now.
+	d.wsHBMu.Lock()
+	d.wsLastReceive = time.Now().Add(-(d.wsHeartbeatFreshness() + 5*time.Second))
+	d.wsHBMu.Unlock()
+	d.runHeartbeatTick(ctx, "runtime-1")
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("HTTP heartbeat posts = %d after receive silence, want 1", got)
+	}
+	d.wsHBMu.RLock()
+	_, hasAck := d.wsHBLastAck["runtime-1"]
+	d.wsHBMu.RUnlock()
+	if hasAck {
+		t.Fatal("half-open guard must purge the ack set when resuming HTTP")
+	}
+}
+
+// TestRunWSWriterSendsKeepalivePings pins the daemon-side ping half of the
+// half-open detection (SCA-471): the writer emits WebSocket PINGs on its own
+// ticker with no data frame in flight, and a failed ping write tears the
+// writer down exactly like a failed data write.
+func TestRunWSWriterSendsKeepalivePings(t *testing.T) {
+	oldPingPeriod := taskWakeupPingPeriod
+	taskWakeupPingPeriod = 50 * time.Millisecond
+	t.Cleanup(func() { taskWakeupPingPeriod = oldPingPeriod })
+
+	pingSeen := make(chan struct{}, 4)
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// gorilla never surfaces control frames through ReadMessage; the
+		// ping handler is where the server observes the keepalive.
+		conn.SetPingHandler(func(string) error {
+			select {
+			case pingSeen <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	d := New(Config{}, slog.Default())
+	writes := make(chan *wsOutbound)
+	done := make(chan struct{})
+	go d.runWSWriter(conn, writes, done)
+
+	// No data frame was ever queued, yet a PING must arrive.
+	select {
+	case <-pingSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer never sent a keepalive ping")
+	}
+
+	// Kill the socket from the client side. The next ping write fails and
+	// the writer must exit once writes is closed (the drain the teardown
+	// performs in production).
+	conn.Close()
+	time.Sleep(3 * taskWakeupPingPeriod)
+	close(writes)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not exit after ping write failure")
 	}
 }
 

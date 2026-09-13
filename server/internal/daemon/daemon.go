@@ -520,8 +520,9 @@ type Daemon struct {
 	// login-shell probe + version detection instead of one per task (MUL-4486).
 	healGroup singleflight.Group
 
-	wsHBMu      sync.RWMutex         // guards wsHBLastAck
-	wsHBLastAck map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	wsHBMu        sync.RWMutex         // guards wsHBLastAck and wsLastReceive
+	wsHBLastAck   map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	wsLastReceive time.Time            // last inbound wakeup-WS frame of any kind (ack, ping, pong, data); zero when no connection is up
 
 	// reconcile fans out a "re-check server state now" signal to subscribers
 	// (watchTaskCancellation, workspaceSyncLoop) so the WS connect/reconnect
@@ -1996,7 +1997,7 @@ func (w *runtimeSetWatcher) notify() {
 // "fresh enough" to suppress the HTTP heartbeat for that runtime. The window
 // is 2× HeartbeatInterval so a single dropped WS ack still keeps HTTP
 // suppressed, but two missed acks (~30s of WS silence) re-enable HTTP — well
-// inside the server-side 45s offline threshold.
+// inside the server-side 150s offline threshold.
 func (d *Daemon) wsHeartbeatFreshness() time.Duration {
 	if d.cfg.HeartbeatInterval <= 0 {
 		return 30 * time.Second
@@ -2012,6 +2013,17 @@ func (d *Daemon) recordWSHeartbeatAck(runtimeID string) {
 	}
 	d.wsHBMu.Lock()
 	d.wsHBLastAck[runtimeID] = time.Now()
+	d.wsHBMu.Unlock()
+}
+
+// recordWSReceive stamps that the wakeup websocket just delivered an inbound
+// frame of any kind — heartbeat ack, ping, pong, or data. The half-open guard
+// below keys off this stamp rather than the per-runtime ack map so that
+// suppression can never outlive actual receive liveness, whatever the ack map
+// claims. Called by the WS read pump and its control-frame handlers.
+func (d *Daemon) recordWSReceive() {
+	d.wsHBMu.Lock()
+	d.wsLastReceive = time.Now()
 	d.wsHBMu.Unlock()
 }
 
@@ -2036,6 +2048,33 @@ func (d *Daemon) clearWSHeartbeatAcks() {
 		delete(d.wsHBLastAck, k)
 	}
 	d.wsHBMu.Unlock()
+}
+
+// clearStaleWSHeartbeatAcks enforces the half-open guard (SCA-471): the
+// wakeup websocket must have RECEIVED a frame — heartbeat ack, ping, or pong
+// — within the freshness window for its acks to keep suppressing HTTP. When
+// the connection is receive-silent past that window it is treated as
+// disconnected even if the socket has not errored yet (the incident shape: a
+// half-open TCP path where the write side fails minutes later), all ack
+// records are dropped, and the caller resumes HTTP immediately. Returns true
+// when a stale record set was cleared.
+//
+// A zero wsLastReceive (no connection up, or one that never delivered a
+// frame) also counts as receive-silent: leftover ack entries cannot outlive
+// the connection they came from — teardown normally clears them via
+// clearWSHeartbeatAcks, this is the belt-and-braces re-check from the
+// heartbeat tick.
+func (d *Daemon) clearStaleWSHeartbeatAcks() bool {
+	d.wsHBMu.Lock()
+	defer d.wsHBMu.Unlock()
+	if time.Since(d.wsLastReceive) < d.wsHeartbeatFreshness() {
+		return false
+	}
+	cleared := len(d.wsHBLastAck) > 0
+	for k := range d.wsHBLastAck {
+		delete(d.wsHBLastAck, k)
+	}
+	return cleared
 }
 
 // Run starts the daemon: resolves auth, registers runtimes, then polls for tasks.
@@ -4486,14 +4525,28 @@ func (d *Daemon) runRuntimeHeartbeat(ctx context.Context, rid string) {
 
 // runHeartbeatTick returns true when the HTTP heartbeat hit a transient
 // failure that should count toward stale idle-connection cleanup.
+//
+// Stall-independence invariant (SCA-471): this tick must never wait on the
+// wakeup websocket's write path, workspace GC, or task-result reporting.
+// Those run on their own goroutines and share with this tick only (a) the
+// HTTP transport, which allows unlimited concurrent connections, and (b) the
+// wsHBMu freshness map, which is held for map operations only — never across
+// I/O — so a wedged WS writer or a stalled GC scan cannot delay an HTTP tick.
+// The WS coupling is deliberately one-way and time-bounded: WS activity may
+// suppress an HTTP tick, but only while frames were actually received within
+// the freshness window (see clearStaleWSHeartbeatAcks).
 func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
-	// Skip HTTP heartbeat for runtimes that successfully acked a recent
-	// WebSocket heartbeat. The WS path keeps last_seen_at fresh and delivers
-	// actions, so the HTTP write would be a duplicate DB update. If the WS
-	// heartbeat goes silent the freshness window expires and HTTP resumes
-	// automatically on the next tick — that is the fallback the WS path
-	// relies on.
-	if d.wsHeartbeatRecentlyAcked(rid) {
+	if d.clearStaleWSHeartbeatAcks() {
+		// Half-open wakeup websocket: no frame received within freshness.
+		// Treat it as disconnected and prove liveness over HTTP right now —
+		// the server's 150s stale window must not expire while a dead WS
+		// socket still suppresses the HTTP fallback.
+		d.logger.Info("heartbeat: wakeup websocket receive-silent beyond freshness; treating as disconnected, resuming HTTP heartbeats",
+			"runtime_id", rid, "freshness", d.wsHeartbeatFreshness())
+	} else if d.wsHeartbeatRecentlyAcked(rid) {
+		// Skip HTTP heartbeat for runtimes that successfully acked a recent
+		// WebSocket heartbeat. The WS path keeps last_seen_at fresh and
+		// delivers actions, so the HTTP write would be a duplicate DB update.
 		d.logger.Debug("heartbeat: skipping HTTP tick, WS recently acked", "runtime_id", rid)
 		return false
 	}
