@@ -450,7 +450,25 @@
     "workdir_path_copy_failed": "复制本地 workdir 路径失败",
     "workdir_path_unavailable": "暂无本地 workdir — 这个任务还没被本地智能体运行过",
     "unsubscribe_subtree_succeeded": "已取消订阅此任务及其子任务。",
-    "subscription_update_failed": "无法更新订阅状态，请重试。"
+    "subscription_update_failed": "无法更新订阅状态，请重试。",
+    "thread_nav": {
+      "button_label_other": "讨论（{{count}}）",
+      "search_placeholder": "搜索讨论或作者",
+      "match_count_other": "{{count}} 条命中",
+      "filter_all": "全部",
+      "filter_unresolved": "未解决",
+      "filter_resolved": "已解决",
+      "filter_mine": "@我",
+      "group": {
+        "today": "今天",
+        "yesterday": "昨天",
+        "earlier": "更早"
+      },
+      "empty": "没有匹配的讨论",
+      "hint_select": "选择",
+      "hint_jump": "跳转",
+      "hint_close": "关闭"
+    }
   },
   "timeline": {
     "loading": "加载中…"

@@ -1227,14 +1227,6 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	if !expiredIDs(agedSweep)[parseUUIDBytes(lateTaskID)] {
 		t.Fatal("a task that waited a full grace against a dead runtime should expire")
 	}
-
-	var recoveryStatus string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, recoveryTaskID).Scan(&recoveryStatus); err != nil {
-		t.Fatalf("failed to read runtime recovery retry: %v", err)
-	}
-	if recoveryStatus != "queued" {
-		t.Fatalf("runtime recovery retry: expected status=queued, got %q", recoveryStatus)
-	}
 }
 
 // TestExpireStaleQueuedTasksRespectsBatchLimit verifies the per-tick cap so

@@ -251,6 +251,10 @@
       "goSettings": {
         "label": "設定へ移動",
         "description": "ワークスペース設定を開きます。"
+      },
+      "openThreadNav": {
+        "label": "スレッドナビゲーターを開く",
+        "description": "開いているタスクのコメントスレッドを一覧・検索して移動します。"
       }
     },
     "fixed": {

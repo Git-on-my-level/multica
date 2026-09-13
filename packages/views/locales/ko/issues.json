@@ -450,7 +450,25 @@
     "project_directory_path_copied": "프로젝트 디렉터리 경로를 복사했습니다",
     "project_directory_path_copied_with_branch": "프로젝트 디렉터리 경로를 복사했습니다 — 작업은 {{branch}} 브랜치에 있습니다",
     "workdir_path_copy_failed": "작업 디렉터리 경로를 복사하지 못했습니다",
-    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 태스크를 실행하지 않았습니다"
+    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 태스크를 실행하지 않았습니다",
+    "thread_nav": {
+      "button_label_other": "스레드 ({{count}})",
+      "search_placeholder": "스레드 또는 작성자 검색",
+      "match_count_other": "{{count}}개 일치",
+      "filter_all": "전체",
+      "filter_unresolved": "미해결",
+      "filter_resolved": "해결됨",
+      "filter_mine": "@나",
+      "group": {
+        "today": "오늘",
+        "yesterday": "어제",
+        "earlier": "이전"
+      },
+      "empty": "일치하는 스레드가 없습니다",
+      "hint_select": "선택",
+      "hint_jump": "이동",
+      "hint_close": "닫기"
+    }
   },
   "timeline": {
     "loading": "불러오는 중..."

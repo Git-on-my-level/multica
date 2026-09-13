@@ -284,11 +284,14 @@ func TestBackendFactoriesSetCommandLogProvider(t *testing.T) {
 		t.Fatalf("claude log provider = %q, want claude", got)
 	}
 
+	// Fork overlay: omp is its own ACP protocol family, so NewRuntime(omp)
+	// hands back ompBackend (which satisfies the same override contract via
+	// applyBuiltinRuntimeOverrides), not upstream's piBackend.
 	omp, err := NewRuntime("omp", Config{Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("NewRuntime(omp): %v", err)
 	}
-	if got := omp.(*piBackend).cfg.provider; got != "omp" {
+	if got := omp.(*ompBackend).cfg.provider; got != "omp" {
 		t.Fatalf("omp log provider = %q, want omp", got)
 	}
 }

@@ -12,6 +12,7 @@ export type ShortcutActionId =
   | "toggleRightSidebar"
   | "toggleChat"
   | "findInIssue"
+  | "openThreadNav"
   | "archiveInboxItem"
   | "send"
   | "goBack"
@@ -94,6 +95,15 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = [
   // to keep working while the caret sits in the chat composer itself.
   { id: "toggleChat", category: "general", defaultShortcut: primary("J"), allowInEditable: true },
   { id: "findInIssue", category: "general", defaultShortcut: primary("F"), allowInEditable: true },
+  // Fork overlay: issue thread-navigation panel. Reserved-modifier notes mirror
+  // findInIssue — the desktop app receives the chord; web falls back to the
+  // settings-rebindable default.
+  {
+    id: "openThreadNav",
+    category: "general",
+    defaultShortcut: createShortcutChord("O", { primary: true, shift: true }),
+    allowInEditable: true,
+  },
   {
     id: "archiveInboxItem",
     category: "general",

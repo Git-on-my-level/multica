@@ -251,6 +251,10 @@
       "goSettings": {
         "label": "설정으로 이동",
         "description": "워크스페이스 설정을 엽니다."
+      },
+      "openThreadNav": {
+        "label": "스레드 내비게이터 열기",
+        "description": "열린 태스크의 댓글 스레드를 나열하고 검색해 이동합니다."
       }
     },
     "fixed": {

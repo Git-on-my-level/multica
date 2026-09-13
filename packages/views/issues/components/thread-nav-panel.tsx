@@ -173,7 +173,7 @@ export function highlightMatches(text: string, query: string): ReactNode {
     out.push(
       <mark
         key={at}
-        className="rounded-[3px] bg-[var(--find-match)] px-px text-[var(--find-match-foreground)]"
+        className="rounded-sm bg-[var(--find-match)] px-px text-[var(--find-match-foreground)]"
       >
         {text.slice(at, at + needle.length)}
       </mark>,

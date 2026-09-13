@@ -251,6 +251,10 @@
       "goSettings": {
         "label": "Go to Settings",
         "description": "Open workspace settings."
+      },
+      "openThreadNav": {
+        "label": "Open thread navigator",
+        "description": "List, search, and jump between the comment threads of the open issue."
       }
     },
     "fixed": {
