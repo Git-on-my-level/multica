@@ -140,3 +140,19 @@ func stringLit(e ast.Expr) string {
 	}
 	return lit.Value[1 : len(lit.Value)-1]
 }
+
+// calleeName renders a call's callee as a selector-qualified name
+// ("pkg.Func") or bare identifier, or "" for anything else.
+func calleeName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		if ident, ok := fn.X.(*ast.Ident); ok {
+			return ident.Name + "." + fn.Sel.Name
+		}
+		return fn.Sel.Name
+	case *ast.Ident:
+		return fn.Name
+	default:
+		return ""
+	}
+}

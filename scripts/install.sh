@@ -27,6 +27,11 @@ DEFAULT_BRANCH="${MULTICA_GITHUB_BRANCH:-main}"
 SELFHOST_BACKEND_PORT=""
 SELFHOST_FRONTEND_PORT=""
 
+# Host ports Compose reported after `up -d`; set by setup_server and reused by
+# the summary so the health check and the printed URLs cannot diverge.
+SELFHOST_BACKEND_PORT=""
+SELFHOST_FRONTEND_PORT=""
+
 # Colors (disabled when not a terminal)
 if [ -t 1 ] || [ -t 2 ]; then
   BOLD='\033[1m'

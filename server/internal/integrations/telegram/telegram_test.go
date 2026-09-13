@@ -153,16 +153,16 @@ func TestInboundGroupHumanReplyNewCommandPreservesQuotedContext(t *testing.T) {
 		MessageID:      10,
 		From:           &User{ID: 111, FirstName: "Grace"},
 		Chat:           Chat{ID: -100200, Type: "supergroup"},
-		Text:           "@my_bot /new summarize this",
+		Text:           "@my_bot /clear summarize this",
 		ReplyToMessage: quoted,
 	}}, 999, "my_bot")
 	if !ok || !msg.AddressedToBot {
 		t.Fatalf("message was not accepted: ok=%v addressed=%v", ok, msg.AddressedToBot)
 	}
 	if !msg.ForceFresh {
-		t.Fatal("/new human reply must request a fresh session before shared routing")
+		t.Fatal("/clear human reply must request a fresh session before shared routing")
 	}
-	if msg.CommandText != "/new summarize this" {
+	if msg.CommandText != "/clear summarize this" {
 		t.Fatalf("CommandText = %q, want original cleaned command", msg.CommandText)
 	}
 	for _, want := range []string{
@@ -174,8 +174,26 @@ func TestInboundGroupHumanReplyNewCommandPreservesQuotedContext(t *testing.T) {
 			t.Fatalf("enriched Text = %q, missing %q", msg.Text, want)
 		}
 	}
-	if strings.Contains(msg.Text, "/new") {
-		t.Fatalf("agent-readable Text still contains /new: %q", msg.Text)
+	if strings.Contains(msg.Text, "/clear") {
+		t.Fatalf("agent-readable Text still contains /clear: %q", msg.Text)
+	}
+}
+
+func TestInboundGroupChatCommandUsesSameControlNormalization(t *testing.T) {
+	msg, ok := inboundFromUpdate(Update{UpdateID: 1, Message: &Message{
+		MessageID: 10,
+		From:      &User{ID: 111, FirstName: "Grace"},
+		Chat:      Chat{ID: -100200, Type: "supergroup"},
+		Text:      "@my_bot /new inspect this",
+	}}, 999, "my_bot")
+	if !ok || !msg.AddressedToBot {
+		t.Fatalf("message was not accepted: ok=%v addressed=%v", ok, msg.AddressedToBot)
+	}
+	if msg.Text != "inspect this" || msg.CommandText != "/new inspect this" {
+		t.Fatalf("Text/CommandText = %q/%q", msg.Text, msg.CommandText)
+	}
+	if msg.ForceFresh {
+		t.Fatal("/new must not set /clear's ForceFresh semantic")
 	}
 }
 
@@ -250,7 +268,7 @@ func TestInboundTelegramCommandSuffixes(t *testing.T) {
 		wantFresh bool
 	}{
 		{text: "/fresh@my_bot continue", wantText: "/fresh continue", wantFresh: false},
-		{text: "/new@my_bot continue", wantText: "continue", wantFresh: true},
+		{text: "/clear@my_bot continue", wantText: "continue", wantFresh: true},
 		{text: "/issue@my_bot fix login", wantText: "/issue fix login", wantFresh: false},
 	} {
 		u := Update{UpdateID: 1, Message: &Message{
@@ -673,3 +691,24 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestInboundBareControlKeepsSelectedXMLContext(t *testing.T) {
+	for _, command := range []string{"/new", "/clear"} {
+		for _, mentioned := range []bool{false, true} {
+			text := command
+			if mentioned {
+				text = "@my_bot " + text
+			}
+			msg, ok := inboundFromUpdate(Update{UpdateID: 1, Message: &Message{
+				MessageID: 10, From: &User{ID: 111}, Chat: Chat{ID: -100200, Type: "supergroup"}, Text: text,
+				ReplyToMessage: &Message{MessageID: 9, From: &User{ID: 222, FirstName: "Ada"}, Text: "selected text"},
+			}}, 999, "my_bot")
+			if !ok || msg.HasSelectedContext != mentioned || msg.CommandText != command || msg.ForceFresh != (command == "/clear") {
+				t.Fatalf("selected Telegram control = %+v", msg)
+			}
+			if mentioned && (!strings.Contains(msg.Text, "<quoted_message ") || !strings.Contains(msg.Text, "selected text") || strings.Contains(msg.Text, command)) {
+				t.Fatalf("XML quote not preserved: %q", msg.Text)
+			}
+		}
+	}
+}

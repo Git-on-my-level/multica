@@ -33,7 +33,6 @@ var v7Writes = []struct {
 	{"agent_task_queue", "agent.sql", "CreateAgentTask", "id", "ID"},
 	{"agent_task_queue", "agent.sql", "CreateDeferredChannelIssueTask", "id", "ID"},
 	{"agent_task_queue", "agent.sql", "CreateQuickCreateTask", "id", "ID"},
-	{"agent_task_queue", "agent.sql", "CreateDeferredAgentTask", "id", "ID"},
 	{"agent_task_queue", "agent.sql", "CreateRetryTask", "new_task_id", "NewTaskID"},
 	{"agent_task_queue", "autopilot.sql", "CreateAutopilotTask", "id", "ID"},
 	{"agent_task_queue", "chat.sql", "CreateChatTask", "id", "ID"},

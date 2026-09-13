@@ -2,13 +2,14 @@
  * @vitest-environment jsdom
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import type { WSClient } from "../api/ws-client";
 import { defaultStorage } from "../platform/storage";
 import { issueKeys } from "../issues/queries";
 import { chatKeys } from "../chat/queries";
+import { runtimeKeys } from "../runtimes/queries";
 import { workspaceWorkingAgentsKeys } from "../agents/queries";
 import { workspaceKeys } from "../workspace/queries";
 import { issueStatusKeys } from "../issue-statuses/queries";
@@ -100,7 +101,7 @@ describe("useRealtimeSync — ws instance change", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
-  it("invalidates exactly once when a new ws instance appears after null gap", () => {
+  it("invalidates exactly once when a new ws instance appears after null gap", async () => {
     const ws1 = createMockWs();
     const { rerender } = renderHook(
       ({ ws }) => useRealtimeSync(ws, stores),
@@ -119,8 +120,12 @@ describe("useRealtimeSync — ws instance change", () => {
     // (16 workspace-scoped [incl. property definitions] + 6 per-issue
     // prefixes + the workspace working-agents projection + 5 per-chat
     // prefixes + 1 workspaceKeys.list() + 1 cross-workspace inbox unread
-    // summary = 31 calls)
-    expect(invalidateSpy).toHaveBeenCalledTimes(31);
+    // summary = 31 calls).
+    //
+    // Awaited rather than counted synchronously: the inbox unread summary
+    // refresh cancels any in-flight request before invalidating (see
+    // onInboxSummaryInvalidate), so that one lands after the synchronous ones.
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledTimes(31));
   });
 
   it("does not re-invalidate when rerendered with the same ws instance", () => {
@@ -157,6 +162,31 @@ describe("useRealtimeSync — ws instance change", () => {
     // A catalog edit made while this client was disconnected is otherwise
     // invisible for the query's whole 5-minute staleTime.
     expect(calls).toContainEqual(issueStatusKeys.all("ws-1"));
+  });
+
+  it("invalidates agent projections when a daemon changes liveness", () => {
+    vi.useFakeTimers();
+    try {
+      const ws = createMockWs();
+      renderHook(() => useRealtimeSync(ws, stores), {
+        wrapper: createWrapper(qc),
+      });
+      const onAny = vi.mocked(ws.onAny).mock.calls[0]?.[0];
+      expect(onAny).toBeDefined();
+
+      invalidateSpy.mockClear();
+      onAny!({ type: "daemon:register", payload: {} } as never);
+      vi.advanceTimersByTime(100);
+
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: runtimeKeys.all("ws-1"),
+      });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: workspaceKeys.agents("ws-1"),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("invalidates per-issue caches (no wsId in key) on ws instance change", () => {
@@ -274,6 +304,33 @@ describe("useRealtimeSync — ws instance change", () => {
     onAny!({ type: "dingtalk_group_route:updated", payload: {} } as never);
 
     expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it("invalidates the current workspace chat list when a channel creates a session", () => {
+    const ws = createMockWs();
+    renderHook(() => useRealtimeSync(ws, stores), {
+      wrapper: createWrapper(qc),
+    });
+    const sessionCreated = vi
+      .mocked(ws.on)
+      .mock.calls.find(([event]) => event === "chat:session_created")?.[1];
+    expect(sessionCreated).toBeDefined();
+
+    (sessionCreated as (payload: unknown) => void)({
+      workspace_id: "ws-1",
+      chat_session_id: "channel-session-1",
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: chatKeys.sessions("ws-1"),
+    });
+
+		invalidateSpy.mockClear();
+		(sessionCreated as (payload: unknown) => void)({
+			workspace_id: "ws-2",
+			chat_session_id: "other-workspace-session",
+		});
+		expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });
 

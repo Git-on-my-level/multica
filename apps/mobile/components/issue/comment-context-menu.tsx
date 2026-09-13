@@ -22,6 +22,7 @@ import { ActionSheetIOS, Alert } from "react-native";
 import { router } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
+import { useQuery } from "@tanstack/react-query";
 import type { Reaction, TimelineEntry } from "@multica/core/types";
 import { useAuthStore } from "@/data/auth-store";
 import { useWorkspaceStore } from "@/data/workspace-store";
@@ -29,10 +30,12 @@ import { useCommentSelectStore } from "@/data/comment-select-store";
 import { useReplyTargetStore } from "@/data/stores/reply-target-store";
 import { useActorLookup } from "@/data/use-actor-name";
 import {
+  commentDeleteKeepsReplies,
   useDeleteComment,
   useResolveComment,
   useToggleCommentReaction,
 } from "@/data/mutations/issues";
+import { appConfigOptions } from "@/data/queries/billing";
 import { QUICK_EMOJIS } from "@/lib/quick-emojis";
 
 const QUICK_ROW_SIZE = 5;
@@ -49,6 +52,12 @@ export function useCommentLongPress(
   const deleteComment = useDeleteComment(issueId);
   const resolveComment = useResolveComment(issueId);
   const { getName } = useActorLookup();
+  // Same config cache useDeleteComment reads when it runs, so the copy and
+  // the delete route agree.
+  const { data: keepReplies = false } = useQuery({
+    ...appConfigOptions(),
+    select: commentDeleteKeepsReplies,
+  });
 
   const onLongPress = useCallback(() => {
     const isOwn = entry.actor_type === "member" && entry.actor_id === userId;
@@ -118,10 +127,12 @@ export function useCommentLongPress(
             // Set the reply target — the InlineCommentComposer subscribes
             // to this store, auto-expands, and threads the next submit
             // under entry.id via useCreateComment's `parentId`.
-            const actorName = getName(
-              entry.actor_type as "member" | "agent" | null | undefined,
-              entry.actor_id,
-            );
+            const actorName =
+              entry.actor_name ||
+              getName(
+                entry.actor_type as "member" | "agent" | null | undefined,
+                entry.actor_id,
+              );
             useReplyTargetStore.getState().setTarget({
               commentId: entry.id,
               actorName: actorName || "comment",
@@ -175,7 +186,11 @@ export function useCommentLongPress(
           case "delete":
             Alert.alert(
               "Delete comment?",
-              "This comment will be permanently deleted. Replies in the thread will also be removed. This cannot be undone.",
+              // Promise kept replies only when the server declares it (#8296);
+              // older servers delete the replies too.
+              keepReplies
+                ? "This comment will be permanently deleted. Any replies to it stay in the thread. This cannot be undone."
+                : "This comment will be permanently deleted. Replies in the thread will also be removed. This cannot be undone.",
               [
                 { text: "Cancel", style: "cancel" },
                 {
@@ -198,6 +213,8 @@ export function useCommentLongPress(
     toggleReaction,
     deleteComment,
     resolveComment,
+    getName,
+    keepReplies,
   ]);
 
   return { onLongPress, isPressed };

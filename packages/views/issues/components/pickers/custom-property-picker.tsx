@@ -22,7 +22,7 @@ import {
 } from "@multica/ui/components/ui/popover";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
-import { useT } from "../../../i18n";
+import { useLocale, useT } from "../../../i18n";
 import { PropertyPicker, PickerItem } from "./property-picker";
 import { ActorPropertyPicker, ActorPropertyDisplay } from "./actor-property-picker";
 
@@ -279,7 +279,7 @@ export function CustomPropertyValueInput({
       return (
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger
-            className={triggerRender ? undefined : "flex items-center gap-1.5 cursor-pointer rounded px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden"}
+            className={triggerRender ? undefined : "flex items-center gap-1.5 cursor-pointer rounded-xs px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden"}
             render={triggerRender}
           >
             {valueTrigger}
@@ -415,7 +415,7 @@ function TextishPropertyEditor({
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger
-        className={triggerRender ? undefined : "flex items-center gap-1.5 cursor-pointer rounded px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden"}
+        className={triggerRender ? undefined : "flex items-center gap-1.5 cursor-pointer rounded-xs px-1 -mx-1 hover:bg-accent/30 transition-colors overflow-hidden"}
         render={triggerRender}
       >
         {trigger ?? (value === undefined ? (
@@ -473,6 +473,7 @@ export function CustomPropertyValueDisplay({
   value: IssuePropertyValue | undefined;
 }) {
   const { t } = useT("issues");
+  const locale = useLocale();
   if (value === undefined) {
     return (
       <span className="text-muted-foreground">
@@ -539,7 +540,7 @@ export function CustomPropertyValueDisplay({
         <span className="flex items-center gap-1.5">
           <CalendarDays className="h-3.5 w-3.5 text-muted-foreground" />
           {typeof value === "string"
-            ? formatDateOnly(value, { month: "short", day: "numeric" }, "en-US")
+            ? formatDateOnly(value, { month: "short", day: "numeric" }, locale)
             : String(value)}
         </span>
       );

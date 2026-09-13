@@ -32,6 +32,14 @@ interface ConfigState {
   // predate this signal are caught by the same net — indistinguishable from
   // here, and only one of the two answers is safe to guess.
   localWorktreeSupported: boolean;
+  // Whether this server persists conversation_starters on agent create/update.
+  // Older handlers accepted the unknown field and returned success while
+  // dropping it, so absent must fail closed.
+  agentConversationStartersSupported: boolean;
+  // Whether deleting a comment keeps its replies (#8296). Older servers
+  // deleted the replies too, so absent must fail closed: the client then
+  // promises nothing about replies and uses the legacy delete route.
+  commentDeleteKeepRepliesSupported: boolean;
   // Fork overlay: /api/config install + docs URLs for Git-on-my-level.
   githubRepo: string;
   githubBranch: string;
@@ -51,6 +59,8 @@ interface ConfigState {
   setFeatureFlags: (flags?: Record<string, boolean>) => void;
   setServerVersion: (version?: string) => void;
   setLocalWorktreeSupported: (supported?: boolean) => void;
+  setAgentConversationStartersSupported: (supported?: boolean) => void;
+  setCommentDeleteKeepRepliesSupported: (supported?: boolean) => void;
   setGithubConfig: (config: {
     githubRepo?: string;
     githubBranch?: string;
@@ -73,6 +83,8 @@ export const configStore = createStore<ConfigState>((set) => ({
   featureFlags: {},
   serverVersion: "",
   localWorktreeSupported: false,
+  agentConversationStartersSupported: false,
+  commentDeleteKeepRepliesSupported: false,
   githubRepo: "",
   githubBranch: "",
   docsBaseUrl: "",
@@ -90,6 +102,10 @@ export const configStore = createStore<ConfigState>((set) => ({
   setServerVersion: (version = "") => set({ serverVersion: version }),
   setLocalWorktreeSupported: (supported = false) =>
     set({ localWorktreeSupported: supported === true }),
+  setAgentConversationStartersSupported: (supported = false) =>
+    set({ agentConversationStartersSupported: supported === true }),
+  setCommentDeleteKeepRepliesSupported: (supported = false) =>
+    set({ commentDeleteKeepRepliesSupported: supported === true }),
   setGithubConfig: ({ githubRepo = "", githubBranch = "" }) =>
     set({ githubRepo, githubBranch }),
   setDocsConfig: ({ docsBaseUrl = "", changelogUrl = "" }) =>

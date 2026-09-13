@@ -193,11 +193,10 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, dimArgs...)
 	hideAgentWindow(cmd)
-	configureProcessGroup(cmd)
-	// Take over context cancellation: the default would SIGKILL only the
-	// leader the instant runCtx is done, orphaning descendants. We instead
-	// drive a group-wide SIGKILL from the deferred cleanup below. Returning
-	// nil keeps os/exec from racing us with its own kill.
+	// Take over context cancellation: the default kills the group the instant
+	// runCtx is done, leaving no chance to shut the ACP session down first. We
+	// instead drive a group-wide SIGKILL from the deferred cleanup below.
+	// Returning nil keeps os/exec from racing us with its own kill.
 	cmd.Cancel = func() error { return nil }
 	cmd.WaitDelay = 10 * time.Second
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(dimArgs, trustAgentCommandPositional(0, "acp")))
@@ -504,8 +503,6 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		}
 
 		c.sessionID = sessionID
-		// Early session pin so a cancelled run still preserves resume pointer.
-		msgStream.send(Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 		b.cfg.Logger.Info("dim session ready", "session_id", sessionID, "resumed", !freshSession)
 
 		// Dim's ACP server hardcodes a read-only permission preset at session
@@ -533,6 +530,10 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 				closeCtx, closeCancel := context.WithTimeout(context.Background(), dimSessionCloseTimeout)
 				_, _ = c.request(closeCtx, "session/close", map[string]any{"sessionId": sessionID})
 				closeCancel()
+				if setupFailureWithholdsSessionID(opts) {
+					// Closed just above, and never prompted either way.
+					sessionID = ""
+				}
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), SessionID: sessionID, ResumeRejected: resumeRejected}
 				return
 			}
@@ -552,6 +553,10 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 				closeCtx, closeCancel := context.WithTimeout(context.Background(), dimSessionCloseTimeout)
 				_, _ = c.request(closeCtx, "session/close", map[string]any{"sessionId": sessionID})
 				closeCancel()
+				if setupFailureWithholdsSessionID(opts) {
+					// Closed just above, and never prompted either way.
+					sessionID = ""
+				}
 				resCh <- Result{
 					Status:         finalStatus,
 					Error:          finalError,
@@ -575,6 +580,16 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		if opts.SystemPrompt != "" {
 			userText = opts.SystemPrompt + "\n\n---\n\n" + prompt
 		}
+
+		// Session pin for the daemon (PinTaskSession keys off
+		// MessageStatus+SessionID), deliberately sent only once setup has
+		// succeeded and the prompt is about to go out. Pinning right after
+		// session creation used to publish the id before set_model could fail,
+		// and FailAgentTask merges session_id with COALESCE — so a setup failure
+		// could no longer take the id back and left a ghost pointer on the task
+		// row for the next turn to resume forever (GH #8116). A cancel between
+		// here and the prompt response is still covered: this send happens first.
+		msgStream.send(Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,

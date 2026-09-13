@@ -25,11 +25,12 @@ import {
   UI_MOTION_DURATION,
 } from "@multica/ui/lib/motion";
 import { cn } from "@multica/ui/lib/utils";
-import { useGithubConfig } from "@multica/core/github/config";
 import { useNavigation } from "../../navigation";
 import { useT } from "../../i18n";
+import { useGithubConfig } from "@multica/core/github/config";
 
 type Step = "instructions" | "success";
+
 
 const CLOUD_SERVER_URL = "https://api.multica.ai";
 const CLOUD_APP_URL = "https://multica.ai";
@@ -179,7 +180,7 @@ function CopyButton({ text, ariaLabel }: { text: string; ariaLabel: string }) {
       type="button"
       onClick={handleCopy}
       aria-label={ariaLabel}
-      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="shrink-0 rounded-xs p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       {copied ? (
         <Check className="h-3.5 w-3.5 text-success" aria-hidden />
@@ -231,9 +232,9 @@ function CommandStep({
 
 function InstructionsStep({ onClose }: { onClose: () => void }) {
   const { t } = useT("runtimes");
-  const { cliInstallCommand } = useGithubConfig();
   const daemonServerUrl = useConfigStore((s) => s.daemonServerUrl);
   const daemonAppUrl = useConfigStore((s) => s.daemonAppUrl);
+  const { cliInstallCommand } = useGithubConfig();
   const { setupCmd, tokenCmd } = daemonCommands(daemonServerUrl, daemonAppUrl);
   return (
     <>
@@ -314,7 +315,7 @@ function TroubleshootingDetails({ tokenCmd }: { tokenCmd: string }) {
             {/* CLI command — literal shell string, not i18n content. */}
             <code
               className={cn(
-                "rounded bg-muted px-1.5 py-0.5 font-mono text-micro text-foreground",
+                "rounded-xs bg-muted px-1.5 py-0.5 font-mono text-micro text-foreground",
                 CODE_LIGATURE_CLASS,
               )}
             >
@@ -326,7 +327,7 @@ function TroubleshootingDetails({ tokenCmd }: { tokenCmd: string }) {
             {/* CLI command — literal shell string, not i18n content. */}
             <code
               className={cn(
-                "rounded bg-muted px-1.5 py-0.5 font-mono text-micro text-foreground",
+                "rounded-xs bg-muted px-1.5 py-0.5 font-mono text-micro text-foreground",
                 CODE_LIGATURE_CLASS,
               )}
             >

@@ -58,6 +58,11 @@ var legacyDuplicateMigrationStems = map[string][]string{
 	// agent_task_queue index), so they cannot be renumbered. Runner tracks by
 	// full stem, so both apply in lexical order without conflict.
 	"143": {"143_agent_task_queue_chat_pending_v2", "143_runtime_profile_add_omp"},
+	// Upstream-internal collision shipped by multica-ai at a9e82c797:
+	// 468_comment_deleted_at and 468_drop_reference_only_column picked the
+	// same prefix. Recorded rather than renumbered — both are already on
+	// upstream-deployed databases, and the runner tracks by full stem.
+	"468": {"468_comment_deleted_at", "468_drop_reference_only_column"},
 }
 
 var migrationPrefixPattern = regexp.MustCompile(`^(\d+)_`)

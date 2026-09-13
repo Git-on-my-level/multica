@@ -1,16 +1,16 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@multica/core/api";
+import { renderWithI18n } from "../test/i18n";
 import { AppSidebar } from "./app-sidebar";
 
-const { appForeground, chatSessions, chatStore, detail, deletePin, inboxItems, navigation, pins, sidebarState, summary, workspaces } = vi.hoisted(() => ({
+const { appForeground, chatSessions, chatStore, detail, deletePin, navigation, pins, sidebarState, summary, workspaces } = vi.hoisted(() => ({
   appForeground: { current: true },
   sidebarState: { setOpenMobile: vi.fn() },
   chatSessions: { current: [] as { id?: string; unread_count?: number }[] },
   chatStore: { current: { activeSessionId: null as string | null, isOpen: false } },
   detail: { current: { isPending: false, isError: false, data: null as unknown, error: null as unknown } },
   deletePin: vi.fn(),
-  inboxItems: { current: [] as { id: string; read: boolean }[] },
   navigation: { current: { pathname: "/acme/issues" } },
   summary: { current: [] as { workspace_id: string; count: number }[] },
   workspaces: {
@@ -57,12 +57,13 @@ vi.mock("@multica/ui/components/ui/sidebar", () => ({
     children,
     isActive,
     render,
+    ...props
   }: {
     children: React.ReactNode;
     isActive?: boolean;
     render?: React.ReactElement<{ href?: string }>;
-  }) => (
-    <button type="button" data-active={isActive ? "true" : undefined} data-href={render?.props.href}>
+  } & React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button {...props} type="button" data-active={isActive ? "true" : undefined} data-href={render?.props.href}>
       {children}
     </button>
   ),
@@ -149,9 +150,11 @@ vi.mock("@multica/core/api", async (importOriginal) => {
   };
 });
 vi.mock("@multica/core/inbox/queries", () => ({
-  deduplicateInboxItems: (items: unknown[]) => items,
-  inboxKeys: { list: () => ["inbox"], unreadSummary: () => ["inbox", "unread-summary"] },
   inboxUnreadSummaryOptions: () => ({ queryKey: ["inbox", "unread-summary"] }),
+  // The nav badge and the switcher dot read the SAME cross-workspace summary,
+  // so the fixture that drives one drives the other.
+  useInboxUnreadCount: (currentWsId: string | null) =>
+    summary.current.find((s) => s.workspace_id === currentWsId)?.count ?? 0,
   hasOtherWorkspaceUnread: (
     entries: { workspace_id: string; count: number }[],
     currentWsId: string | null,
@@ -181,7 +184,6 @@ vi.mock("@tanstack/react-query", async (importOriginal) => ({
     if (queryKey[0] === "pins") return { data: pins.current };
     if (queryKey[0] === "issue") return detail.current;
     if (queryKey[0] === "inbox" && queryKey[1] === "unread-summary") return { data: summary.current };
-    if (queryKey[0] === "inbox") return { data: inboxItems.current };
     if (queryKey[0] === "workspaces") return { data: workspaces.current };
     if (queryKey[0] === "chat" && queryKey[2] === "sessions") return { data: chatSessions.current };
     return { data: [] };
@@ -233,6 +235,42 @@ describe("PinRow", () => {
       "true",
     );
     expect(container.querySelector('button[data-href="/acme/issues"]')).not.toHaveAttribute("data-active");
+  });
+
+  it("keeps the parent route active until a hidden pin is expanded", () => {
+    const originalPins = pins.current;
+    pins.current = Array.from({ length: 6 }, (_, index) => ({
+      ...originalPins[0]!,
+      id: `pin-${index + 1}`,
+      item_id: `issue-${index + 1}`,
+      position: index,
+    }));
+    navigation.current.pathname = "/acme/issues/issue-6";
+    detail.current = {
+      isPending: false,
+      isError: false,
+      data: { identifier: "MUL-123", title: "Pinned issue", status: "todo" },
+      error: null,
+    };
+
+    try {
+      const { container } = renderWithI18n(<AppSidebar />);
+      const parent = () => container.querySelector('button[data-href="/acme/issues"]');
+      const lastPin = () => container.querySelector('button[data-href="/acme/issues/issue-6"]');
+
+      expect(lastPin()).not.toBeInTheDocument();
+      expect(parent()).toHaveAttribute("data-active", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "Show 1 more…" }));
+      expect(lastPin()).toHaveAttribute("data-active", "true");
+      expect(parent()).not.toHaveAttribute("data-active");
+
+      fireEvent.click(screen.getByRole("button", { name: "Show fewer" }));
+      expect(lastPin()).not.toBeInTheDocument();
+      expect(parent()).toHaveAttribute("data-active", "true");
+    } finally {
+      pins.current = originalPins;
+    }
   });
 });
 
@@ -333,10 +371,27 @@ describe("workspace-switcher dropdown per-workspace dot", () => {
   });
 });
 
+describe("navigation item presentation", () => {
+  it("keeps Analytics and Settings styled like the other nav items", () => {
+    const { container } = render(<AppSidebar />);
+    const referenceClassName = container.querySelector(
+      'button[data-href="/acme/issues"]',
+    )?.className;
+
+    expect(referenceClassName).toBeTruthy();
+
+    for (const href of ["/acme/usage", "/acme/settings"]) {
+      expect(container.querySelector(`button[data-href="${href}"]`)?.className).toBe(
+        referenceClassName,
+      );
+    }
+  });
+});
+
 describe("personal nav — Chat", () => {
   beforeEach(() => {
     chatSessions.current = [];
-    inboxItems.current = [];
+    summary.current = [];
     navigation.current = { pathname: "/acme/issues" };
     chatStore.current = { activeSessionId: null, isOpen: false };
     appForeground.current = true;
@@ -350,7 +405,7 @@ describe("personal nav — Chat", () => {
     chatNav(container)?.querySelector("number-flow-react") ?? null;
 
   it("keeps persistent Inbox and Chat counters static", () => {
-    inboxItems.current = [{ id: "inbox-1", read: false }];
+    summary.current = [{ workspace_id: "ws-1", count: 1 }];
     chatSessions.current = [{ id: "chat-1", unread_count: 2 }];
     const { container } = render(<AppSidebar />);
     const inboxBadge = container

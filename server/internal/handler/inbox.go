@@ -29,6 +29,7 @@ type InboxItemResponse struct {
 	Archived      bool            `json:"archived"`
 	CreatedAt     string          `json:"created_at"`
 	IssueStatus   *string         `json:"issue_status"`
+	IssuePriority *string         `json:"issue_priority"`
 	ActorType     *string         `json:"actor_type"`
 	ActorID       *string         `json:"actor_id"`
 	Details       json.RawMessage `json:"details"`
@@ -54,6 +55,62 @@ func inboxToResponse(i db.InboxItem) InboxItemResponse {
 	}
 }
 
+// inboxListBodyPreviewLimit caps, in characters, the body a comment
+// notification carries in the inbox LIST responses. The ellipsis counts
+// toward it.
+//
+// A comment notification stores the full comment it was raised for, and the
+// list shipped that verbatim — a several-thousand-character agent reply went
+// over the wire, through JSON parsing and into the client cache, only for
+// every client to render it as a single truncated line. 200 leaves ample room
+// for that one line at any width or script, while bounding what each row can
+// cost.
+const inboxListBodyPreviewLimit = 200
+
+// inboxListBody returns the body a notification carries in the inbox list:
+// comment notifications on an issue get a bounded preview, everything else is
+// returned as stored. The database keeps the full text.
+//
+// Scoped to exactly the rows whose full body no client ever reads from the
+// list. Opening an issue-backed notification renders the issue itself, and the
+// comment it points at is found through `details.comment_id`, which is left
+// intact — on every client already installed, so none needs to change. Other
+// notification types are NOT shortened: issue-less notifications render their
+// body in the detail pane straight from the list cache, and Quick Create
+// failures refill the composer from `details` — cutting those would lose
+// content, not just bytes.
+//
+// Truncation is by code point, so a multi-byte character is never split into
+// invalid UTF-8. A grapheme cluster (an emoji sequence, a letter with a
+// combining mark) can still be cut at the boundary; that lands ~200 characters
+// in, far past the single line any client shows.
+//
+// One pass that stops at the limit, rather than counting or converting the
+// whole string: the work per row stays bounded by the preview, not by however
+// long the comment happens to be.
+func inboxListBody(notifType string, issueID pgtype.UUID, body pgtype.Text) *string {
+	full := textToPtr(body)
+	if full == nil || notifType != "new_comment" || !issueID.Valid {
+		return full
+	}
+	// `range` yields the byte offset where each character starts. `cut` ends
+	// up where the ellipsis goes: after limit-1 characters.
+	cut, seen := 0, 0
+	for offset := range *full {
+		if seen == inboxListBodyPreviewLimit-1 {
+			cut = offset
+		}
+		if seen++; seen > inboxListBodyPreviewLimit {
+			preview := (*full)[:cut] + "…"
+			return &preview
+		}
+	}
+	return full
+}
+
+// inboxRowToResponse maps a LIST row — the main inbox and, through
+// archivedInboxRowToResponse, the archived view. Single-item responses go
+// through inboxToResponse and keep the full body.
 func inboxRowToResponse(r db.ListInboxItemsRow) InboxItemResponse {
 	return InboxItemResponse{
 		ID:            uuidToString(r.ID),
@@ -64,11 +121,12 @@ func inboxRowToResponse(r db.ListInboxItemsRow) InboxItemResponse {
 		Severity:      r.Severity,
 		IssueID:       uuidToPtr(r.IssueID),
 		Title:         r.Title,
-		Body:          textToPtr(r.Body),
+		Body:          inboxListBody(r.Type, r.IssueID, r.Body),
 		Read:          r.Read,
 		Archived:      r.Archived,
 		CreatedAt:     timestampToString(r.CreatedAt),
 		IssueStatus:   textToPtr(r.IssueStatus),
+		IssuePriority: textToPtr(r.IssuePriority),
 		ActorType:     textToPtr(r.ActorType),
 		ActorID:       uuidToPtr(r.ActorID),
 		Details:       json.RawMessage(r.Details),
@@ -76,7 +134,7 @@ func inboxRowToResponse(r db.ListInboxItemsRow) InboxItemResponse {
 }
 
 // ListArchivedInboxItemsRow carries the same columns as ListInboxItemsRow (both
-// queries select `inbox_item.*` plus the joined issue status), so the archived
+// queries select `inbox_item.*` plus the joined issue projections), so the archived
 // row converts to the active one and reuses its mapper. If either query's
 // column list drifts, this conversion stops compiling — which is the point.
 func archivedInboxRowToResponse(r db.ListArchivedInboxItemsRow) InboxItemResponse {
@@ -91,6 +149,8 @@ func (h *Handler) enrichInboxResponse(ctx context.Context, resp InboxItemRespons
 	if err == nil {
 		s := issue.Status
 		resp.IssueStatus = &s
+		p := issue.Priority
+		resp.IssuePriority = &p
 	}
 	return resp
 }
@@ -615,9 +675,15 @@ func (h *Handler) ArchiveCompletedInbox(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	terminalStatusKeys, err := h.terminalIssueStatusKeys(r.Context(), wsUUID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve status categories")
+		return
+	}
 	count, err := h.Queries.ArchiveCompletedInbox(r.Context(), db.ArchiveCompletedInboxParams{
-		WorkspaceID: wsUUID,
-		RecipientID: parseUUID(userID),
+		WorkspaceID:        wsUUID,
+		RecipientID:        parseUUID(userID),
+		TerminalStatusKeys: terminalStatusKeys,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to archive completed inbox")

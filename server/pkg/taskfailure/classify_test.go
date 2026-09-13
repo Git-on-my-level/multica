@@ -121,6 +121,15 @@ func TestClassifyRules(t *testing.T) {
 		{"opencode continuation never started", "opencode stream ended without a terminal signal (last step required a continuation that never started)", ReasonAgentProviderNetwork},
 		{"opencode empty final step", "opencode stream ended on an empty step (no text, no tool call, no reported usage) — the provider produced nothing", ReasonAgentProviderNetwork},
 		{"opencode empty step with process exit appended", "opencode stream ended on an empty step (no text, no tool call, no reported usage) — the provider produced nothing; opencode exited with error: exit status 1", ReasonAgentProviderNetwork},
+		// BHD-135: Pi's OpenAI-compatible SDK wording for a dropped LiteLLM
+		// call. Bare strings, then the same strings glued to "exit status 1"
+		// after pi-print-clean-exit forces a non-zero wrap-up.
+		{"pi connection error", "Connection error.", ReasonAgentProviderNetwork},
+		{"pi connection error with exit status wins over process failure", "Connection error.; pi exited with error: exit status 1", ReasonAgentProviderNetwork},
+		{"pi request timed out", "Request timed out.", ReasonAgentProviderNetwork},
+		{"pi request timed out with exit status wins over process failure", "Request timed out.; pi exited with error: exit status 1", ReasonAgentProviderNetwork},
+		{"omp connection error with exit status wins over process failure", "Connection error.; omp exited with error: exit status 1", ReasonAgentProviderNetwork},
+		{"codearts step open at EOF", "codearts stream ended without a terminal signal (step still open at EOF)", ReasonAgentProviderNetwork},
 
 		// 8. Model not found / unavailable.
 		{"model not found", "Error: model claude-3-opus-99 not found", ReasonAgentModelNotFoundOrUnavailable},
@@ -158,6 +167,12 @@ func TestClassifyRules(t *testing.T) {
 		// 14. Catchall.
 		{"unrecognized", "the agent gave up for reasons unknown", ReasonAgentUnknown},
 		{"sentence with no marker", "Hello world.", ReasonAgentUnknown},
+		// Pi's two short provider messages must not become broad substring
+		// matches: local tool and MCP failures are deterministic and retrying
+		// them only repeats the same failure.
+		{"local tool connection error is not provider network", "local tool connection error while opening its database", ReasonAgentUnknown},
+		{"mcp request timeout is not provider network", "MCP server request timed out while loading configuration", ReasonAgentUnknown},
+		{"local connection error with exit remains process failure", "MCP server connection error; agent exited with error: exit status 1", ReasonAgentProcessFailure},
 
 		// 15. Digit-boundary regression: 3-digit HTTP status codes must NOT
 		//     match when embedded in a longer number. Before the fix these
@@ -207,6 +222,12 @@ func TestClassifyOrderingPriorities(t *testing.T) {
 		// auth rejection.
 		{"missing api key beats 401", "missing api_key for openai (401 returned downstream)", ReasonAgentMissingConfig},
 
+		// Some Anthropic-compatible providers return 403 for a transient
+		// concurrency rejection. The semantic witness must beat generic auth and
+		// token/context matching even when the CLI prefixes both misleadingly.
+		{"403 concurrent request limit beats auth", "Failed to authenticate. API Error: 403 You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.", ReasonAgentProviderCapacityOrRateLimit},
+		{"access token concurrent request limit beats context", "Failed to refresh access token. API Error: 403 You've reached your concurrent request limit.", ReasonAgentProviderCapacityOrRateLimit},
+
 		// Both "429" and "rate limit" present — should still land in
 		// the capacity bucket, not the quota bucket.
 		{"429 rate limit", "API Error: 429 rate limit reached", ReasonAgentProviderCapacityOrRateLimit},
@@ -223,6 +244,30 @@ func TestClassifyOrderingPriorities(t *testing.T) {
 				t.Errorf("Classify(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeDaemonReasonUpgradesConcurrentRequestLimit(t *testing.T) {
+	t.Parallel()
+
+	const raw = "Failed to refresh access token. API Error: 403 You've reached your concurrent request limit."
+
+	for _, reason := range []string{
+		string(ReasonAgentContextOverflow),
+		string(ReasonAgentProviderAuthOrAccess),
+		string(ReasonAgentUnknown),
+		"agent_error",
+	} {
+		if got := NormalizeDaemonReason(reason, raw); got != ReasonAgentProviderCapacityOrRateLimit {
+			t.Errorf("NormalizeDaemonReason(%q, concurrent request rejection) = %q, want %q", reason, got, ReasonAgentProviderCapacityOrRateLimit)
+		}
+	}
+
+	if got := NormalizeDaemonReason(string(ReasonAgentProviderAuthOrAccess), "API Error: 403 Forbidden"); got != ReasonAgentProviderAuthOrAccess {
+		t.Errorf("plain 403 auth rejection changed to %q", got)
+	}
+	if got := NormalizeDaemonReason(string(ReasonAgentContextOverflow), "you exceeded the token limit"); got != ReasonAgentContextOverflow {
+		t.Errorf("ordinary token overflow changed to %q", got)
 	}
 }
 

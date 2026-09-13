@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
-import { readFileSync } from "node:fs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const { getAttachmentTextContentMock, resolveIssueIdentifierMock } = vi.hoisted(
@@ -89,6 +88,7 @@ Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
 
 import mermaid from "mermaid";
 import { ReadonlyContent } from "./readonly-content";
+import { composeAnnotatedReply } from "@multica/core/drafts/reply-annotation";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -96,20 +96,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
-});
-
-describe("ReadonlyContent memoization", () => {
-  // Long-timeline issues (Inbox + IssueDetail with thousands of comments)
-  // freeze the tab when each comment re-runs the full react-markdown pipeline
-  // on every parent re-render. Wrapping the component in React.memo is the
-  // mitigation; this test guards against a future revert that would silently
-  // reintroduce the perf regression.
-  it("is wrapped in React.memo", () => {
-    const memoTypeSymbol = Symbol.for("react.memo");
-    expect((ReadonlyContent as unknown as { $$typeof: symbol }).$$typeof).toBe(
-      memoTypeSymbol,
-    );
-  });
 });
 
 describe("ReadonlyContent math rendering", () => {
@@ -148,6 +134,57 @@ describe("ReadonlyContent line breaks", () => {
   it("renders a blank-line gap as separate paragraphs", () => {
     const { container } = render(<ReadonlyContent content={"para one\n\npara two"} />);
     expect(container.querySelectorAll("p").length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("ReadonlyContent annotated replies", () => {
+  it.each([
+    "steps:\n  - name: build\n    run: make\n  - name: test\n    run: make test",
+    "Summary\n---\nDetails\n===",
+    "5. alpha\n6) beta\n+ added\n- removed\n    indented code",
+  ])("preserves literal block markers and indentation in a selected quote: %s", (text) => {
+    const { container } = render(<ReadonlyContent content={composeAnnotatedReply("", [{
+      id: "literal", sourceCommentId: "source", sourceActorName: "Agent",
+      quote: text, note: "Keep the source intact", start: 0, prefix: "", suffix: "",
+    }])} />);
+    const quote = container.querySelector("blockquote")!;
+    expect(quote.querySelector("ul, ol, li, h1, h2, hr, pre")).toBeNull();
+    expect(quote.textContent?.replace(/\u00a0/g, " ").trim()).toBe(text);
+  });
+
+  it.each(["A note", "A note\n\nWith another paragraph"])("keeps a visible blank paragraph between annotations (note: %s)", (note) => {
+    const first = {
+      id: "first", sourceCommentId: "source", sourceActorName: "Agent",
+      quote: "First quote", note, start: 0, prefix: "", suffix: "",
+    };
+    const { container } = render(<ReadonlyContent content={composeAnnotatedReply("Overall reply", [
+      first, { ...first, id: "second", quote: "Second quote" },
+    ])} />);
+    const quotes = container.querySelectorAll("blockquote");
+    expect(quotes).toHaveLength(2);
+    expect(quotes[1]?.previousElementSibling?.tagName).toBe("P");
+    expect(quotes[1]?.previousElementSibling?.textContent).toBe("\u00a0");
+    expect(container.querySelectorAll("p").length).toBeGreaterThan(2);
+    expect(container.querySelector("a, ol")).toBeNull();
+    expect(container.querySelectorAll("hr")).toHaveLength(1);
+    expect(container.querySelector("hr")?.previousElementSibling?.textContent).toBe(note.split("\n\n").at(-1));
+    expect(container.querySelector("hr")?.nextElementSibling?.textContent).toBe("Overall reply");
+  });
+
+  it("renders quote snapshots and notes without generated links or numbered lists", () => {
+    const content = composeAnnotatedReply("", [{
+      id: "annotation", sourceCommentId: "source", sourceActorName: "Agent",
+      quote: "First <check>\nSecond line", note: "Please revise this.",
+      start: 0, prefix: "", suffix: "",
+    }]);
+    const { container } = render(<ReadonlyContent content={content} />);
+    const quote = container.querySelector("blockquote");
+    expect(quote?.textContent).toContain("First <check>");
+    expect(quote?.querySelector("br")).not.toBeNull();
+    expect(container.textContent).toContain("Please revise this.");
+    expect(quote?.textContent).not.toContain("Please revise this.");
+    expect(container.querySelector("a, ol, check")).toBeNull();
+    expect(container.textContent).not.toContain("Agent");
   });
 });
 
@@ -402,16 +439,6 @@ describe("ReadonlyContent code styling", () => {
     await waitFor(() => {
       expect(writeText).toHaveBeenCalledWith(source);
     });
-  });
-
-  it("keeps editor code literal by disabling font ligatures", () => {
-    const codeCss = readFileSync("editor/styles/code.css", "utf8");
-
-    expect(codeCss).toContain(".rich-text-editor code");
-    expect(codeCss).toContain(".rich-text-editor pre");
-    expect(codeCss).toContain(".rich-text-editor pre code");
-    expect(codeCss).toContain("font-variant-ligatures: none;");
-    expect(codeCss).toContain('font-feature-settings: "liga" 0;');
   });
 });
 

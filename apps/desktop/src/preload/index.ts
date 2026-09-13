@@ -30,7 +30,10 @@ import type {
 } from "../shared/daemon-types";
 import {
   MAIN_RENDERER_CHANNEL_STATE_CHANNEL,
+  parseTabSelectionShortcutKey,
+  TAB_SELECTION_SHORTCUT_CHANNEL,
   type MainRendererMessageChannel,
+  type TabSelectionShortcutKey,
 } from "../shared/main-renderer-messages";
 
 // Synchronously fetch app metadata from main at preload time so the renderer
@@ -231,6 +234,18 @@ const desktopAPI = {
    *  an issue window, because Settings is a tab. Returns an unsubscribe fn. */
   onOpenSettings: (callback: () => void) =>
     subscribeToMainRendererChannel("settings:open", () => callback()),
+  /** Listen for fixed Cmd/Ctrl+1..9 tab-selection requests. Only the main
+   *  window subscribes; main routes requests there from any focused window. */
+  onSelectTabShortcut: (
+    callback: (key: TabSelectionShortcutKey) => void,
+  ) =>
+    subscribeToMainRendererChannel<unknown>(
+      TAB_SELECTION_SHORTCUT_CHANNEL,
+      (payload) => {
+        const key = parseTabSelectionShortcutKey(payload);
+        if (key !== null) callback(key);
+      },
+    ),
   /** Ask the main process to close the window (used after closing the last tab). */
   closeWindow: () => ipcRenderer.send("window:close"),
   /** Open a validated issue-detail route in a dedicated native window. */
@@ -312,16 +327,8 @@ const updaterAPI = {
     ipcRenderer.on("updater:update-downloaded", handler);
     return () => ipcRenderer.removeListener("updater:update-downloaded", handler);
   },
-  onUpdateError: (
-    callback: (error: { code: string; message: string }) => void,
-  ) => {
-    const handler = (_: unknown, error: { code: string; message: string }) => callback(error);
-    ipcRenderer.on("updater:update-error", handler);
-    return () => ipcRenderer.removeListener("updater:update-error", handler);
-  },
   downloadUpdate: () => ipcRenderer.invoke("updater:download"),
   installUpdate: () => ipcRenderer.invoke("updater:install"),
-  getReleasesPageUrl: (): Promise<string> => ipcRenderer.invoke("updater:releases-page-url"),
   getPreferences: (): Promise<UpdaterPreferences> =>
     ipcRenderer.invoke("updater:get-preferences"),
   setAutomaticUpdates: (enabled: boolean): Promise<UpdaterPreferences> =>

@@ -28,7 +28,6 @@ images:
 #     --from-literal=RESEND_API_KEY="" \
 #     --from-literal=GOOGLE_CLIENT_SECRET="" \
 #     --from-literal=CLOUDFRONT_PRIVATE_KEY="" \
-#     --from-literal=MULTICA_ENTITLEMENT_SERVICE_TOKEN="" \
 #     --from-literal=MULTICA_DEV_VERIFICATION_CODE=""
 #
 # External postgres (postgres.external.enabled=true):
@@ -39,7 +38,6 @@ images:
 #     --from-literal=RESEND_API_KEY="" \
 #     --from-literal=GOOGLE_CLIENT_SECRET="" \
 #     --from-literal=CLOUDFRONT_PRIVATE_KEY="" \
-#     --from-literal=MULTICA_ENTITLEMENT_SERVICE_TOKEN="" \
 #     --from-literal=MULTICA_DEV_VERIFICATION_CODE=""
 #
 # The chart references this Secret by name; it does not template it, so real
@@ -119,6 +117,10 @@ backend:
     # Native connect_timeout / PGCONNECT_TIMEOUT / service settings take
     # precedence so existing deployments keep their pgx connection behavior.
     databaseConnectTimeout: 5s
+    # PostgreSQL work_mem ceiling in MB for search transactions. Set 1-64 to
+    # lower it for memory-constrained databases, or 0 to keep the database
+    # default. Invalid values fall back to 64 in the API process.
+    databaseSearchWorkMemMB: 64
     appEnv: production
     appUrl: http://multica.dev.lan
     frontendOrigin: http://multica.dev.lan
@@ -132,22 +134,19 @@ backend:
     # every caller. Bootstrap the workspace with this false, then flip to
     # true so users can only join via invitation.
     disableWorkspaceCreation: false
+    # Fork self-host: set githubRepo to owner/repo so /api/config drives
+    # install URLs and CLI installs at the fork instead of multica-ai/multica.
+    githubRepo: ""
+    githubBranch: ""
     # Self-host-only VCS integration (Forgejo / Gitea / GitLab). The official
     # chart enables the product surface by default; operators must also provide
     # MULTICA_VCS_SECRET_KEY through existingSecret before connections work.
     # Set false to hide and reject the integration for this deployment.
     vcsIntegrationEnabled: true
-    # Managed Cloud policy consumer. The public/self-host chart keeps this off
-    # by default, which also guarantees no quota-table access. To enable it,
-    # set enabled=true and url to multica-cloud's HTTPS internal base URL, then
-    # put a matching 32+ byte MULTICA_ENTITLEMENT_SERVICE_TOKEN in existingSecret.
-    entitlementPolicy:
-      enabled: false
+    # Managed multica-cloud connection. Empty keeps self-hosting independent.
+    # Fleet, Billing, entitlement policy and strict seat capacity share it.
+    cloud:
       url: ""
-      timeout: 3s
-      staleGrace: 15m
-      # Local down switch applied by the next chart rollout; it only forces off.
-      emergencyDisabled: false
     googleClientId: ""
     googleRedirectUri: http://multica.dev.lan/auth/callback
     s3Bucket: ""
@@ -155,15 +154,6 @@ backend:
     cloudfrontDomain: ""
     cloudfrontKeyPairId: ""
     localUploadBaseUrl: http://api.multica.dev.lan
-    # Fork self-host: set githubRepo to owner/repo so /api/config drives
-    # install commands, Help links, and feedback URLs at your fork.
-    githubRepo: ""
-    githubBranch: ""
-    # How long a task may sit in the queue unclaimed before failing with
-    # `queued_expired`; raise it when a runtime's low task concurrency lets
-    # tasks legitimately wait behind long-running work.
-    # Accepts a positive duration and empty/unset falls back to the server default of 2h.
-    taskQueuedTTL: 2h
   resources:
     requests:
       cpu: 100m
@@ -223,17 +213,3 @@ ingress:
   # tls:
   #   - hosts: [multica.dev.lan, api.multica.dev.lan]
   #     secretName: multica-tls
-
-# -----------------------------------------------------------------------------
-# Monitoring
-# -----------------------------------------------------------------------------
-monitoring:
-  prometheusRule:
-    # Requires the Prometheus Operator CRD (monitoring.coreos.com/v1). Kept
-    # disabled by default so minimal self-host installs without that CRD still
-    # render and install.
-    enabled: false
-    additionalLabels: {}
-    samplerQueryErrorsFor: 5m
-    samplerQueryLatencyFor: 10m
-    severity: warning

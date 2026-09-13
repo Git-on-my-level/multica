@@ -146,6 +146,12 @@ type InboundMessage struct {
 	// rewritten Text is never interpreted as a second command. Empty means Text.
 	CommandText string
 
+	// HasSelectedContext means Text includes a quote or forward explicitly
+	// selected by the sender, including an unavailable-content placeholder.
+	// It excludes automatic recent history and bare reply/thread coordinates.
+	// A selected context is input even when a control command has no own body.
+	HasSelectedContext bool
+
 	// MediaRefs is the OUTPUT channel of engine.MediaResolver.ResolveMedia:
 	// the objects it downloaded and uploaded for this message, each covered
 	// by an intent-ledger row written before its PUT. Inbound messages always
@@ -165,7 +171,7 @@ type InboundMessage struct {
 	AddressedToBot bool
 
 	// ForceFresh asks the core to start a fresh agent session for this message
-	// instead of resuming the prior one. Router recognizes the shared /new text
+	// instead of resuming the prior one. Router recognizes the shared /clear text
 	// command; adapters may also set this flag for a native platform affordance.
 	ForceFresh bool
 

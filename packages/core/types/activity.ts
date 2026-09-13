@@ -13,6 +13,9 @@ export interface TimelineEntry {
   actor_type: string;
   actor_id: string;
   created_at: string;
+  /** Display identity hydrated from the actor's global user row when available. */
+  actor_name?: string;
+  actor_avatar_url?: string;
   // Activity fields
   action?: string;
   details?: Record<string, unknown>;
@@ -30,6 +33,12 @@ export interface TimelineEntry {
   resolved_by_type?: CommentAuthorType | null;
   resolved_by_id?: string | null;
   source_task_id?: string | null;
+  /**
+   * Set only on a comment deleted while it still had replies: the server keeps
+   * it as an empty tombstone so the replies keep their parent. Read it through
+   * `isDeletedComment`.
+   */
+  deleted_at?: string | null;
   /** Set by frontend coalescing when consecutive identical activities are merged. */
   coalesced_count?: number;
 }

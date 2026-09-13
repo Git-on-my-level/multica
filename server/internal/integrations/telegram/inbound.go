@@ -61,13 +61,14 @@ func inboundFromUpdate(u Update, botID int64, botUsername string) (channel.Inbou
 	cleaned := normalizeText(text, botUsername)
 	commandText := cleaned
 	forceFresh := false
-	if body, fresh := engine.ParseFreshSessionCommand(cleaned); fresh {
-		cleaned = body
-		forceFresh = true
+	if control, ok := engine.ParseControlCommand(cleaned); ok {
+		cleaned = control.Body
+		forceFresh = control.Kind == engine.ControlCommandFreshSession
 	}
 	agentText := cleaned
 	quotedHuman := m.ReplyToMessage != nil && m.ReplyToMessage.From != nil && !m.ReplyToMessage.From.IsBot
-	if chatType == channel.ChatTypeGroup && mentioned && quotedHuman {
+	hasSelectedContext := chatType == channel.ChatTypeGroup && mentioned && quotedHuman
+	if hasSelectedContext {
 		agentText = enrichWithQuotedHumanMessage(cleaned, m.Chat.ID, m.ReplyToMessage)
 	}
 
@@ -96,13 +97,14 @@ func inboundFromUpdate(u Update, botID int64, botUsername string) (channel.Inbou
 		EventID: strconv.FormatInt(u.UpdateID, 10),
 		// Telegram message ids are only unique per chat, so the dedup key
 		// (installation, message_id) uses the composite chat:message form.
-		MessageID:      messageKey(m.Chat.ID, m.MessageID),
-		Type:           msgType,
-		Text:           agentText,
-		CommandText:    commandText,
-		ReplyTo:        reply,
-		AddressedToBot: addressed,
-		ForceFresh:     forceFresh,
+		MessageID:          messageKey(m.Chat.ID, m.MessageID),
+		Type:               msgType,
+		Text:               agentText,
+		CommandText:        commandText,
+		HasSelectedContext: hasSelectedContext,
+		ReplyTo:            reply,
+		AddressedToBot:     addressed,
+		ForceFresh:         forceFresh,
 		Source: channel.Source{
 			ChannelType: TypeTelegram,
 			ChatID:      chatID,
@@ -190,7 +192,7 @@ func mentionsBot(m *Message, botUsername string) bool {
 }
 
 // normalizeText strips the bot mention token while retaining shared commands
-// such as /new and /issue for the engine's command parser.
+// such as /clear and /issue for the engine's command parser.
 func normalizeText(text, botUsername string) string {
 	cleaned := text
 	if botUsername != "" {

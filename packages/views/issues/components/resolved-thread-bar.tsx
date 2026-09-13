@@ -2,6 +2,7 @@ import { CheckCircle2, ChevronRight } from "lucide-react";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { Card } from "@multica/ui/components/ui/card";
 import type { TimelineEntry } from "@multica/core/types";
+import { isDeletedComment } from "@multica/core/issues/comment-deletion";
 import { useT } from "../../i18n";
 
 interface ResolvedThreadBarProps {
@@ -21,23 +22,28 @@ const MAX_NAMED_AUTHORS = 2;
 
 // Distinct authors across `entries`, first-seen order, collapsed to a label
 // ("Alice", "Alice, Bob", "Alice, Bob and 2 others"). Shared by both bars.
+// Deleted comments name no author.
 function useAuthorsLabel(entries: TimelineEntry[]): string {
   const { t } = useT("issues");
   const { getActorName } = useActorName();
 
   const seen = new Set<string>();
-  const authors: Array<{ type: string; id: string }> = [];
+  const authors: Array<{ type: string; id: string; name?: string }> = [];
   for (const e of entries) {
+    if (isDeletedComment(e)) continue;
     const key = `${e.actor_type}:${e.actor_id}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    authors.push({ type: e.actor_type, id: e.actor_id });
+    authors.push({ type: e.actor_type, id: e.actor_id, name: e.actor_name });
   }
 
   if (authors.length <= MAX_NAMED_AUTHORS) {
-    return authors.map((a) => getActorName(a.type, a.id)).join(", ");
+    return authors.map((a) => a.name || getActorName(a.type, a.id)).join(", ");
   }
-  const named = authors.slice(0, MAX_NAMED_AUTHORS).map((a) => getActorName(a.type, a.id)).join(", ");
+  const named = authors
+    .slice(0, MAX_NAMED_AUTHORS)
+    .map((a) => a.name || getActorName(a.type, a.id))
+    .join(", ");
   return t(($) => $.comment.resolve.bar_authors_more, {
     names: named,
     count: authors.length - MAX_NAMED_AUTHORS,
