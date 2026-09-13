@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/channelmedia"
 	"github.com/multica-ai/multica/server/internal/dispatch"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
@@ -1225,6 +1226,31 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Fork overlay: enforce the recently-created issue window on the open
+		// board; observe-mode records what enforcement would have blocked.
+		if windowPolicy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID); windowEnabled {
+			openIDs := make([]pgtype.UUID, len(issues))
+			for i, issue := range issues {
+				openIDs[i] = issue.ID
+			}
+			if windowPolicy.action == entitlement.ActionEnforce {
+				visible, visibleErr := h.visibleIssueIDSet(ctx, wsUUID, windowPolicy, openIDs)
+				if visibleErr != nil {
+					writeError(w, http.StatusInternalServerError, "failed to list issues")
+					return
+				}
+				filtered := issues[:0]
+				for _, issue := range issues {
+					if _, ok := visible[issue.ID]; ok {
+						filtered = append(filtered, issue)
+					}
+				}
+				issues = filtered
+			} else {
+				h.observeIssueWindow(ctx, wsUUID, windowPolicy, openIDs, "list")
+			}
+		}
+
 		prefix := h.getIssuePrefix(ctx, wsUUID)
 		ids := make([]pgtype.UUID, len(issues))
 		for i, issue := range issues {
@@ -1547,6 +1573,11 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 )`, ref))
 	}
 
+	// Fork overlay: enforce the recently-created issue window inside the
+	// filtered board query itself (appendIssueWindow no-ops unless enforcing).
+	if windowPolicy, windowEnabled := h.issueWindowPolicy(ctx, wsUUID); windowEnabled {
+		where = appendIssueWindow(where, addArg, windowPolicy, "$1", "i")
+	}
 	whereSql := strings.Join(where, " AND ")
 
 	// Build ORDER BY clause.
@@ -2352,6 +2383,30 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list child issues")
 		return
 	}
+
+	// Fork overlay: enforce the issue window on children responses.
+	if windowPolicy, windowEnabled := h.issueWindowPolicy(r.Context(), issue.WorkspaceID); windowEnabled {
+		childIDs := make([]pgtype.UUID, len(children))
+		for i, child := range children {
+			childIDs[i] = child.ID
+		}
+		if windowPolicy.action == entitlement.ActionEnforce {
+			visible, visibleErr := h.visibleIssueIDSet(r.Context(), issue.WorkspaceID, windowPolicy, childIDs)
+			if visibleErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to list child issues")
+				return
+			}
+			filtered := children[:0]
+			for _, child := range children {
+				if _, ok := visible[child.ID]; ok {
+					filtered = append(filtered, child)
+				}
+			}
+			children = filtered
+		} else {
+			h.observeIssueWindow(r.Context(), issue.WorkspaceID, windowPolicy, childIDs, "children")
+		}
+	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 	ids := make([]pgtype.UUID, len(children))
 	for i, child := range children {
@@ -2438,6 +2493,30 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "failed to list child issues")
 		return
 	}
+
+	// Fork overlay: enforce the issue window on children responses.
+	if windowPolicy, windowEnabled := h.issueWindowPolicy(r.Context(), wsUUID); windowEnabled {
+		childIDs := make([]pgtype.UUID, len(children))
+		for i, child := range children {
+			childIDs[i] = child.ID
+		}
+		if windowPolicy.action == entitlement.ActionEnforce {
+			visible, visibleErr := h.visibleIssueIDSet(r.Context(), wsUUID, windowPolicy, childIDs)
+			if visibleErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to list child issues")
+				return
+			}
+			filtered := children[:0]
+			for _, child := range children {
+				if _, ok := visible[child.ID]; ok {
+					filtered = append(filtered, child)
+				}
+			}
+			children = filtered
+		} else {
+			h.observeIssueWindow(r.Context(), wsUUID, windowPolicy, childIDs, "children")
+		}
+	}
 	prefix := h.getIssuePrefix(r.Context(), wsUUID)
 	ids := make([]pgtype.UUID, len(children))
 	for i, child := range children {
@@ -2490,7 +2569,55 @@ func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
 		ParentIssueID string `json:"parent_issue_id"`
 		Total         int64  `json:"total"`
 		Done          int64  `json:"done"`
+		// Fork overlay: window-aware split (zero outside enforced windows).
+		VisibleTotal int64 `json:"visible_total"`
+		VisibleDone  int64 `json:"visible_done"`
+		HiddenTotal  int64 `json:"hidden_total"`
 	}
+
+	// Fork overlay: under an enforced issue window, split totals into
+	// visible/hidden so progress chips stay truthful next to the 402 gate.
+	if policy, enabled := h.issueWindowPolicy(r.Context(), wsUUID); enabled && policy.action == entitlement.ActionEnforce {
+		query := fmt.Sprintf(`WITH visible_issue_ids AS MATERIALIZED (
+			%s
+		)
+		SELECT i.parent_issue_id,
+			COUNT(*)::bigint AS total,
+			COUNT(*) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) = ANY($3))::bigint AS done,
+			COUNT(child_visible.id)::bigint AS visible_total,
+			COUNT(child_visible.id) FILTER (WHERE issue_effective_status(i.workspace_id, i.status) = ANY($3))::bigint AS visible_done
+		FROM issue i
+		JOIN visible_issue_ids parent_visible ON parent_visible.id = i.parent_issue_id
+		LEFT JOIN visible_issue_ids child_visible ON child_visible.id = i.id
+		WHERE i.workspace_id = $1
+		  AND i.parent_issue_id IS NOT NULL
+		GROUP BY i.parent_issue_id`, issueWindowVisibleSetSQL("$1", "$2"))
+		vrows, err := h.DB.Query(r.Context(), query, wsUUID, policy.limit, terminalStatusKeys)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+			return
+		}
+		defer vrows.Close()
+		vresp := []progressEntry{}
+		for vrows.Next() {
+			var parentID pgtype.UUID
+			var entry progressEntry
+			if err := vrows.Scan(&parentID, &entry.Total, &entry.Done, &entry.VisibleTotal, &entry.VisibleDone); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+				return
+			}
+			entry.ParentIssueID = uuidToString(parentID)
+			entry.HiddenTotal = entry.Total - entry.VisibleTotal
+			vresp = append(vresp, entry)
+		}
+		if err := vrows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get child issue progress")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"progress": vresp})
+		return
+	}
+
 	resp := make([]progressEntry, len(rows))
 	for i, row := range rows {
 		resp[i] = progressEntry{

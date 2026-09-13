@@ -1038,6 +1038,11 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 	// silently returns false for non-identifier strings, falling through to
 	// the UUID path below.
 	if issue, ok := h.resolveIssueByIdentifier(r.Context(), issueID, workspaceID); ok {
+		// Fork overlay: enforce the workspace's recently-created issue window
+		// on direct access (402 with an actionable payload when blocked).
+		if !h.authorizeIssueWindow(w, r, issue.ID, issue.WorkspaceID, "direct") {
+			return db.Issue{}, false
+		}
 		return issue, true
 	}
 
@@ -1059,6 +1064,10 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 	})
 	if err != nil {
 		writeError(w, http.StatusNotFound, "issue not found")
+		return db.Issue{}, false
+	}
+	// Fork overlay: same window gate on the UUID path.
+	if !h.authorizeIssueWindow(w, r, issue.ID, issue.WorkspaceID, "direct") {
 		return db.Issue{}, false
 	}
 	return issue, true
@@ -1230,6 +1239,11 @@ func (h *Handler) loadInboxItemForUser(w http.ResponseWriter, r *http.Request, i
 
 	if item.RecipientType != "member" || uuidToString(item.RecipientID) != userID {
 		writeError(w, http.StatusNotFound, "inbox item not found")
+		return db.InboxItem{}, false
+	}
+	// Fork overlay: hide inbox items whose issue fell outside the enforced
+	// window rather than leaking a notification for an unreadable issue.
+	if item.IssueID.Valid && !h.authorizeIssueWindow(w, r, item.IssueID, item.WorkspaceID, "inbox") {
 		return db.InboxItem{}, false
 	}
 	return item, true
