@@ -1,0 +1,4 @@
+-- Intentionally empty. The up is a convergence step that restores codearts and
+-- zeroclaw on databases whose leftover 485 CHECK omitted them. Re-dropping
+-- those families on rollback would reintroduce the exact CHECK rejection this
+-- migration closed. Full rollback of the Devin overlay is 485's down.
