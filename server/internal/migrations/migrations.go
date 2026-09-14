@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/multica-ai/multica/server/internal/selfexec"
@@ -50,7 +51,10 @@ func searchRoots() []string {
 }
 
 // Files returns sorted migration files for the given direction ("up" or
-// "down").
+// "down"). Apply order is the numeric prefix, then the remainder of the
+// stem. Path-string sort would put 9000_ before 900_ (ASCII '0' < '_'), so
+// fork overlays parked in 9xxx would run before an upstream 9xx CHECK
+// rewrite and drop families such as omp and devin on a fresh database.
 func Files(direction string) ([]string, error) {
 	dir, err := ResolveDir()
 	if err != nil {
@@ -63,12 +67,44 @@ func Files(direction string) ([]string, error) {
 		return nil, err
 	}
 
-	if direction == "down" {
-		sort.Sort(sort.Reverse(sort.StringSlice(files)))
-	} else {
-		sort.Strings(files)
-	}
+	sortMigrationFiles(files, direction == "down")
 	return files, nil
+}
+
+func sortMigrationFiles(files []string, reverse bool) {
+	sort.Slice(files, func(i, j int) bool {
+		if reverse {
+			return migrationFileLess(files[j], files[i])
+		}
+		return migrationFileLess(files[i], files[j])
+	})
+}
+
+func migrationFileLess(a, b string) bool {
+	na, resta := splitMigrationPrefix(filepath.Base(a))
+	nb, restb := splitMigrationPrefix(filepath.Base(b))
+	if na != nb {
+		return na < nb
+	}
+	if resta != restb {
+		return resta < restb
+	}
+	return a < b
+}
+
+func splitMigrationPrefix(name string) (prefix int, rest string) {
+	i := 0
+	for i < len(name) && name[i] >= '0' && name[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, name
+	}
+	n, err := strconv.Atoi(name[:i])
+	if err != nil {
+		return 0, name
+	}
+	return n, name[i:]
 }
 
 // AllVersions returns every "up" migration version found on disk, in apply

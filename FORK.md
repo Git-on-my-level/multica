@@ -46,10 +46,12 @@ After taking upstream during a sync:
 3. Run `make sqlc` and commit the generated diff. Do not hand-edit
    `server/pkg/db/generated/models.go`.
 4. **New fork-only migrations use `9xxx`.** Do not park them in the
-   next-free 3-digit slot — upstream will take that number. If an
-   existing overlay still sits in 3-digit space, remap it into `9xxx`
-   with idempotent SQL and a `forkStemAliases` ledger rewrite; do not
-   mix that remap into the sync PR.
+   next-free 3-digit slot — upstream will take that number. Apply order
+   is the numeric prefix (not the path string), so `9xxx` stays after
+   any live 3-digit `9xx` CHECK rewrite. If an existing overlay still sits
+   in 3-digit space, remap it into `9xxx` with idempotent SQL and a
+   `forkStemAliases` ledger rewrite; do not mix that remap into the
+   sync PR.
 
 ## Safe upstream sync
 
