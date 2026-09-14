@@ -1,5 +1,7 @@
 -- Fork overlay: add host-local Devin ACP as a first-party protocol family.
--- Idempotent: drop + add the full current whitelist plus omp + devin.
+-- Idempotent: drop + add the full current whitelist plus omp + devin. The
+-- whitelist keeps every family the post-sync tree grants: codearts (441) and
+-- zeroclaw (403) must survive this rewrite alongside the fork families.
 ALTER TABLE runtime_profile DROP CONSTRAINT IF EXISTS runtime_profile_protocol_family_check;
 
 ALTER TABLE runtime_profile ADD CONSTRAINT runtime_profile_protocol_family_check
@@ -9,6 +11,7 @@ ALTER TABLE runtime_profile ADD CONSTRAINT runtime_profile_protocol_family_check
         'codex',
         'copilot',
         'opencode',
+        'codearts',
         'openclaw',
         'hermes',
         'pi',
@@ -27,6 +30,7 @@ ALTER TABLE runtime_profile ADD CONSTRAINT runtime_profile_protocol_family_check
         'qwenpaw',
         'mcode',
         'dim',
+        'zeroclaw',
         'omp',
         'devin'
     )) NOT VALID;

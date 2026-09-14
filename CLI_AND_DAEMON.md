@@ -216,7 +216,7 @@ The daemon auto-detects these AI CLIs on your PATH:
 | Hermes | `hermes` | Nous Research coding agent |
 | [Pi](https://pi.dev/) | `pi` | Pi coding agent |
 | Oh-My-Pi | `omp` | Oh-My-Pi coding agent (fork overlay: ACP via `omp acp`, not the pi JSON protocol) |
-| Devin CLI | `devin` | Host-local Devin CLI over ACP (fork overlay; not cloud Devin) |
+| [Devin CLI](https://docs.devin.ai/cli/quickstart) | `devin` | Host-local Devin ACP (`devin acp`). Not cloud Devin VMs. Run `devin auth login` first. |
 | [Cursor Agent](https://cursor.com/) | `cursor-agent` | Cursor's headless coding agent |
 | Kimi | `kimi` | Moonshot coding agent |
 | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `reasonix` | DeepSeek-focused ACP coding agent (run `reasonix setup` first) |
@@ -338,6 +338,8 @@ Agent-specific overrides:
 | `MULTICA_REASONIX_MODEL` | Override the Reasonix model used |
 | `MULTICA_DIM_PATH` | Custom path to the `dim` binary |
 | `MULTICA_DIM_MODEL` | Override the Dim model used |
+| `MULTICA_DEVIN_PATH` | Custom path to the `devin` binary |
+| `MULTICA_DEVIN_MODEL` | Override the Devin model used |
 | `MULTICA_KIRO_PATH` | Custom path to the `kiro-cli` binary |
 | `MULTICA_KIRO_MODEL` | Override the Kiro model used |
 | `MULTICA_QODER_PATH` | Custom path to the `qodercli` binary |
