@@ -1,7 +1,11 @@
--- Fork overlay: add host-local Devin ACP as a first-party protocol family.
--- Idempotent: drop + add the full current whitelist plus omp + devin. The
--- whitelist keeps every family the post-sync tree grants: codearts (441) and
--- zeroclaw (403) must survive this rewrite alongside the fork families.
+-- Converge databases that already applied leftover 485_runtime_profile_add_devin.
+-- That leftover CHECK dropped codearts (441) and zeroclaw (403). The rewritten
+-- 485 put those families back, but the runner keys schema_migrations on the
+-- full stem and never re-runs a recorded version. This new stem is what actually
+-- rewrites the already-applied constraint.
+--
+-- Idempotent: drop + add the full current whitelist (post-sync families plus
+-- omp + devin). NOT VALID preserves historical-row tolerance.
 ALTER TABLE runtime_profile DROP CONSTRAINT IF EXISTS runtime_profile_protocol_family_check;
 
 ALTER TABLE runtime_profile ADD CONSTRAINT runtime_profile_protocol_family_check

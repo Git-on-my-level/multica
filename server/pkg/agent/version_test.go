@@ -215,6 +215,11 @@ func TestCheckMinVersion(t *testing.T) {
 		{"zeroclaw", "invalid", true},
 		{"dim", "0.2.99", true},
 		{"dim", "invalid", true},
+		{"devin", "3000.3.22", false},
+		{"devin", "devin 3000.10.21", false},
+		{"devin", "3000.3.21", true},
+		{"devin", "2000.9.9", true},
+		{"devin", "invalid", true},
 		{"unknown", "1.0.0", false},
 	}
 	for _, tt := range tests {

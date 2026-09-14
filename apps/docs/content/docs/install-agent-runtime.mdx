@@ -40,6 +40,7 @@ Multica currently detects these commands:
 | Reasonix | `reasonix` | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) |
 | TRAE CLI | `traecli` | [TRAE official site](https://www.trae.cn/) |
 | Dim | `dim` | [DimCode](https://dimagent.cn/en/docs/cli) |
+| Devin CLI | `devin` | [Devin CLI](https://docs.devin.ai/cli/quickstart) — local CLI only (`devin acp`); run `devin auth login` first |
 
 "Supported" means Multica can invoke that CLI. It does not mean Multica provides the tool's account, subscription, or model quota for you.
 
@@ -60,7 +61,7 @@ For DeepSeek Harness, install Node.js 20+ and run `npm install -g @deepseek-ai/d
 Those login credentials are stored locally by the tool itself. Multica never receives login tokens from Claude, Codex, Cursor, or any other CLI.
 
 <Callout type="info">
-Antigravity requires 1.1.10 or later, Claude Code requires 2.0.0 or later, Codex 0.100.0 or later, Copilot 1.0.0 or later, Grok 0.2.89 or later, Qwen Code 0.20.0 or later, and MiniMax Code 0.1.2 or later. Below the minimum version, the daemon does not register the corresponding runtime.
+Antigravity requires 1.1.10 or later, Claude Code requires 2.0.0 or later, Codex 0.100.0 or later, Copilot 1.0.0 or later, Grok 0.2.89 or later, Qwen Code 0.20.0 or later, MiniMax Code 0.1.2 or later, and Devin CLI 3000.3.22 or later. Below the minimum version, the daemon does not register the corresponding runtime.
 </Callout>
 
 ## 3. Confirm the daemon can find the command

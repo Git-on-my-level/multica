@@ -5,6 +5,8 @@ import { providerSupportsMcpConfig } from "./mcp-support";
 describe("providerSupportsMcpConfig", () => {
   it("accepts a provider whose runtime consumes mcp_config", () => {
     expect(providerSupportsMcpConfig("claude")).toBe(true);
+    // Devin's ACP backend forwards mcpServers on session/new + session/load.
+    expect(providerSupportsMcpConfig("devin")).toBe(true);
   });
   it("rejects providers whose runtime ignores mcp_config", () => {
     expect(providerSupportsMcpConfig("antigravity")).toBe(false);
