@@ -30,11 +30,11 @@ Current isolated overlays:
 | Linked-worktree repair | `server/internal/daemon/repocache/cache_fork.go` |
 | Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
-| Event tables without capture | `403–416` leftover tables; `418` drops leftover capture triggers |
+| Event tables without capture | `9xxx` leftover tables; `9015` drops leftover capture triggers |
 | Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
 
 Leftover `workspace_event_*` tables are fine. Do **not** re-enable
-`415_workspace_event_capture` triggers: they take a
+`9012`/`415` capture triggers: they take a
 `workspace_event_cursor` lock on every issue/task write and deadlock
 upstream FailTask/Rerun plus workspace-delete fence tests.
 
@@ -45,8 +45,11 @@ After taking upstream during a sync:
 2. Delete leftover tests that import files upstream deleted.
 3. Run `make sqlc` and commit the generated diff. Do not hand-edit
    `server/pkg/db/generated/models.go`.
-4. Renumber any fork migration prefix that collides with a new upstream
-   prefix above 148. Make the new `.up.sql` idempotent.
+4. **New fork-only migrations use `9xxx`.** Do not park them in the
+   next-free 3-digit slot — upstream will take that number. If an
+   existing overlay still sits in 3-digit space, remap it into `9xxx`
+   with idempotent SQL and a `forkStemAliases` ledger rewrite; do not
+   mix that remap into the sync PR.
 
 ## Safe upstream sync
 
@@ -66,10 +69,11 @@ git merge --no-ff upstream/main -m 'merge: sync upstream main into fork'
 ```
 
 Resolve conflicts by retaining current upstream behavior and the fork contracts
-above. Do not rebase, squash, force-push, mutate tags, or delete an overlay
-unless upstream fully supersedes it and focused tests prove the fork behavior
-remains. Run the relevant Go/TypeScript tests plus `make check`, then push the
-merge normally.
+above. Land the sync as a **merge commit** (not squash — squash leaves GitHub
+showing the fork behind upstream). Do not rebase, force-push, mutate tags, or
+delete an overlay unless upstream fully supersedes it and focused tests prove
+the fork behavior remains. Run the relevant Go/TypeScript tests plus
+`make check`, then push the merge normally.
 
 ## Releases
 

@@ -303,19 +303,41 @@ var concurrentIndexCleanups = map[string]string{
 	"460_agent_task_queue_autopilot_run_created_at_index":       "idx_agent_task_queue_autopilot_run_created_at",
 	"465_agent_task_queue_chat_with_session_index":              "idx_agent_task_queue_chat_with_session_created_at",
 	"466_activity_log_member_assignee_frequency_index":          "idx_activity_log_member_assignee_frequency",
-	// Fork overlay migrations (renumbered from their 403-419 stems during the
-	// 20260913 upstream sync; see FORK.md). Existing fork databases re-run
-	// these under the new stems, so their concurrent builds must be registered
-	// for the same invalid-leftover cleanup as any other concurrent build.
-	"470_issue_pr_handoff_candidate_unique":    "issue_pr_handoff_candidate_task_url_uidx",
-	"471_issue_pr_handoff_candidate_address":   "issue_pr_handoff_candidate_address_idx",
-	"472_issue_pr_handoff_candidate_id_unique": "issue_pr_handoff_candidate_id_uidx",
-	"475_workspace_event_cursor_unique":        "workspace_event_cursor_workspace_uidx",
-	"476_workspace_event_source_unique":        "workspace_event_outbox_source_uidx",
-	"477_workspace_event_sequence_unique":      "workspace_event_outbox_sequence_uidx",
-	"479_issue_create_idempotency_unique":      "issue_create_idempotency_workspace_key_uidx",
-	"480_workspace_event_id_unique":            "workspace_event_outbox_id_uidx",
-	"482_workspace_event_retention_index":      "workspace_event_outbox_retention_idx",
+	// Fork overlay migrations live in 9xxx so they never collide with
+	// upstream's live 3-digit sequence. See FORK.md and forkStemAliases.
+	"9001_issue_pr_handoff_candidate_unique":    "issue_pr_handoff_candidate_task_url_uidx",
+	"9002_issue_pr_handoff_candidate_address":   "issue_pr_handoff_candidate_address_idx",
+	"9003_issue_pr_handoff_candidate_id_unique": "issue_pr_handoff_candidate_id_uidx",
+	"9006_workspace_event_cursor_unique":        "workspace_event_cursor_workspace_uidx",
+	"9007_workspace_event_source_unique":        "workspace_event_outbox_source_uidx",
+	"9008_workspace_event_sequence_unique":      "workspace_event_outbox_sequence_uidx",
+	"9010_issue_create_idempotency_unique":      "issue_create_idempotency_workspace_key_uidx",
+	"9011_workspace_event_id_unique":            "workspace_event_outbox_id_uidx",
+	"9013_workspace_event_retention_index":      "workspace_event_outbox_retention_idx",
+}
+
+// forkStemAliases rewrites schema_migrations after a fork-only prefix remap.
+// Applied under the migrate advisory lock before the file loop. New fork-only
+// stems use 9xxx; do not add pairs into the live 3-digit sequence.
+var forkStemAliases = [][2]string{
+	{"469_issue_pr_handoff_candidate", "9000_issue_pr_handoff_candidate"},
+	{"470_issue_pr_handoff_candidate_unique", "9001_issue_pr_handoff_candidate_unique"},
+	{"471_issue_pr_handoff_candidate_address", "9002_issue_pr_handoff_candidate_address"},
+	{"472_issue_pr_handoff_candidate_id_unique", "9003_issue_pr_handoff_candidate_id_unique"},
+	{"473_issue_pr_handoff_candidate_primary_key", "9004_issue_pr_handoff_candidate_primary_key"},
+	{"474_workspace_event_outbox", "9005_workspace_event_outbox"},
+	{"475_workspace_event_cursor_unique", "9006_workspace_event_cursor_unique"},
+	{"476_workspace_event_source_unique", "9007_workspace_event_source_unique"},
+	{"477_workspace_event_sequence_unique", "9008_workspace_event_sequence_unique"},
+	{"478_issue_create_idempotency", "9009_issue_create_idempotency"},
+	{"479_issue_create_idempotency_unique", "9010_issue_create_idempotency_unique"},
+	{"480_workspace_event_id_unique", "9011_workspace_event_id_unique"},
+	{"481_workspace_event_capture", "9012_workspace_event_capture"},
+	{"482_workspace_event_retention_index", "9013_workspace_event_retention_index"},
+	{"483_runtime_profile_add_omp", "9014_runtime_profile_add_omp"},
+	{"484_disable_workspace_event_capture_triggers", "9015_disable_workspace_event_capture_triggers"},
+	{"485_runtime_profile_add_devin", "9016_runtime_profile_add_devin"},
+	{"486_runtime_profile_restore_codearts_zeroclaw", "9017_runtime_profile_restore_codearts_zeroclaw"},
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction
@@ -901,6 +923,12 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		return fmt.Errorf("create migrations table: %w", err)
 	}
 
+	if opts.Direction == "up" {
+		if err := applyForkStemAliases(ctx, conn, tableIdent); err != nil {
+			return err
+		}
+	}
+
 	existsSQL := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE version = $1)", tableIdent)
 	insertSQL := fmt.Sprintf("INSERT INTO %s (version) VALUES ($1)", tableIdent)
 	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE version = $1", tableIdent)
@@ -974,6 +1002,21 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		}
 	}
 
+	return nil
+}
+
+func applyForkStemAliases(ctx context.Context, conn *pgxpool.Conn, tableIdent string) error {
+	sql := fmt.Sprintf(`
+UPDATE %s SET version = $1
+WHERE version = $2
+  AND NOT EXISTS (SELECT 1 FROM %s WHERE version = $1)
+`, tableIdent, tableIdent)
+	for _, pair := range forkStemAliases {
+		oldName, newName := pair[0], pair[1]
+		if _, err := conn.Exec(ctx, sql, newName, oldName); err != nil {
+			return fmt.Errorf("alias fork migration %q -> %q: %w", oldName, newName, err)
+		}
+	}
 	return nil
 }
 
