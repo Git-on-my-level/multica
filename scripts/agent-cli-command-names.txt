@@ -25,3 +25,4 @@ qwenpaw
 reasonix
 traecli
 zeroclaw
+zcode-acp-server
