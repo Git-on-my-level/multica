@@ -111,8 +111,11 @@ func runZcodeTest(t *testing.T, env map[string]string, opts ExecOptions) (*Resul
 	if err != nil {
 		t.Fatalf("new zcode backend: %v", err)
 	}
+	// Generous ceiling, not a sleep: the fake bridge is a /bin/sh loop that
+	// forks sed per RPC line, so under heavy parallel test load a handful of
+	// round trips can take seconds. The outer wait below scales with it.
 	if opts.Timeout == 0 {
-		opts.Timeout = 5 * time.Second
+		opts.Timeout = 60 * time.Second
 	}
 	session, err := backend.Execute(context.Background(), "reply with pong", opts)
 	if err != nil {
@@ -130,7 +133,7 @@ func runZcodeTest(t *testing.T, env map[string]string, opts ExecOptions) (*Resul
 	case result := <-session.Result:
 		<-done
 		return &result, msgs
-	case <-time.After(10 * time.Second):
+	case <-time.After(120 * time.Second):
 		t.Fatal("timeout waiting for result")
 		return nil, nil
 	}
@@ -155,7 +158,7 @@ func TestZcodeBackendLaunchesBridgeWithoutSubcommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new zcode backend: %v", err)
 	}
-	session, err := backend.Execute(context.Background(), "hi", ExecOptions{Timeout: 5 * time.Second})
+	session, err := backend.Execute(context.Background(), "hi", ExecOptions{Timeout: 60 * time.Second})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -165,7 +168,7 @@ func TestZcodeBackendLaunchesBridgeWithoutSubcommand(t *testing.T) {
 	}()
 	select {
 	case <-session.Result:
-	case <-time.After(10 * time.Second):
+	case <-time.After(120 * time.Second):
 		t.Fatal("timeout waiting for result")
 	}
 	raw, err := os.ReadFile(argcFile)
@@ -332,7 +335,7 @@ func TestZcodeBackendSendsGracefulCancel(t *testing.T) {
 	// branch (the session exists and the turn is in flight) before
 	// cancelling, so the test does not race session creation under parallel
 	// load.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if raw, err := os.ReadFile(requestsFile); err == nil && strings.Contains(string(raw), `"method":"session/prompt"`) {
 			break
@@ -346,7 +349,7 @@ func TestZcodeBackendSendsGracefulCancel(t *testing.T) {
 		if result.Status != "aborted" && result.Status != "failed" {
 			t.Fatalf("expected aborted/failed after cancel, got %q (error=%q)", result.Status, result.Error)
 		}
-	case <-time.After(15 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("timeout waiting for result after cancel")
 	}
 
@@ -354,7 +357,7 @@ func TestZcodeBackendSendsGracefulCancel(t *testing.T) {
 	// defer, which runs after the Result is delivered — poll for it instead
 	// of racing a single read.
 	var sawCancel bool
-	pollDeadline := time.Now().Add(5 * time.Second)
+	pollDeadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(pollDeadline) {
 		raw, err := os.ReadFile(requestsFile)
 		if err == nil && strings.Contains(string(raw), `"method":"session/cancel"`) {
@@ -461,7 +464,7 @@ func TestZcodeBackendAppliesThinkingLevel(t *testing.T) {
 		t.Fatalf("new zcode backend: %v", err)
 	}
 	session, err := backend.Execute(context.Background(), "reply with pong", ExecOptions{
-		Timeout:       5 * time.Second,
+		Timeout:       60 * time.Second,
 		ThinkingLevel: "high",
 	})
 	if err != nil {

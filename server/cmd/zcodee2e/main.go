@@ -64,8 +64,8 @@ func main() {
 			fatal("resume needs a session id")
 		}
 		execAndReport(b, agent.ExecOptions{
-			Cwd:            "/tmp",
-			Timeout:        4 * time.Minute,
+			Cwd:             "/tmp",
+			Timeout:         4 * time.Minute,
 			ResumeSessionID: os.Args[2],
 		}, "In my previous message, what exact text did I ask you to echo? Answer with just that text.")
 	case "deadresume":
@@ -131,14 +131,14 @@ func execAndReport(b agent.Backend, opts agent.ExecOptions, prompt string) {
 
 func printResult(start time.Time, res agent.Result, msgCount int) {
 	out, _ := json.MarshalIndent(map[string]any{
-		"status":          res.Status,
-		"sessionID":       res.SessionID,
-		"resumeRejected":  res.ResumeRejected,
-		"durationMs":      res.DurationMs,
-		"messageCount":    msgCount,
-		"error":           res.Error,
-		"output":          res.Output,
-		"usage":           res.Usage,
+		"status":         res.Status,
+		"sessionID":      res.SessionID,
+		"resumeRejected": res.ResumeRejected,
+		"durationMs":     res.DurationMs,
+		"messageCount":   msgCount,
+		"error":          res.Error,
+		"output":         res.Output,
+		"usage":          res.Usage,
 	}, "", "  ")
 	fmt.Printf("[%6.1fs] RESULT %s\n", time.Since(start).Seconds(), out)
 }
