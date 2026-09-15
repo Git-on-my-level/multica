@@ -280,9 +280,16 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- medium network partition must not terminate a daemon process that is still
 -- running locally; a real daemon restart is recovered separately through
 -- RecoverOrphanedTasksForRuntime. Bounded per tick so a large recovery backlog
--- cannot monopolise the sweeper transaction. last_seen_at is normally set by
--- the first heartbeat; updated_at is only the fallback for a never-heartbeated
--- runtime, and a forced-offline write starts its grace from that update.
+-- cannot monopolise the sweeper transaction.
+--
+-- Reconnect grace is measured from updated_at, which every online→offline
+-- write (MarkRuntimesOfflineByIDs, SetAgentRuntimeOffline, ForceOffline…)
+-- stamps to now(). last_seen_at is the wrong clock here: Redis liveness can
+-- keep a runtime status=online for hours while the batched DB flush lags, so
+-- last_seen_at is already past @reconnect_grace_secs the instant the sweeper
+-- finally flips the row. Using it failed in-flight Studio work 3–16 minutes
+-- after a WS drop with error 'runtime went offline' (SCA-483). The heartbeat
+-- column still drives SelectStaleOnlineRuntimes / claim freshness.
 --
 -- SCA-471: the offline verdict itself must survive one extra sweep
 -- (@offline_confirm_secs = sweepInterval) before any task dies. The sweep
@@ -301,11 +308,11 @@ WITH victims AS (
   JOIN agent_runtime runtime ON runtime.id = task.runtime_id
   WHERE task.status IN ('dispatched', 'running', 'waiting_local_directory')
     AND runtime.status = 'offline'
-    AND COALESCE(runtime.last_seen_at, runtime.updated_at) <
+    AND runtime.updated_at <
         now() - make_interval(secs => @reconnect_grace_secs::double precision)
     AND runtime.updated_at <
         now() - make_interval(secs => @offline_confirm_secs::double precision)
-  ORDER BY COALESCE(runtime.last_seen_at, runtime.updated_at), task.created_at
+  ORDER BY runtime.updated_at, task.created_at
   LIMIT @max_per_tick::int
   FOR UPDATE OF task SKIP LOCKED
 )

@@ -131,10 +131,10 @@ func ageOutAgentRuntime(t *testing.T, agentID string, staleAgo time.Duration) {
 	})
 }
 
-// setAgentRuntimeOffline marks the agent's runtime offline with BOTH clocks
-// the offline-task fail path reads: last_seen_at (the reconnect grace) and
-// updated_at (the offline transition — the SCA-471 one-sweep confirmation
-// gate). Pinning both keeps the caller's intent ("offline since X ago")
+// setAgentRuntimeOffline marks the agent's runtime offline and ages BOTH
+// clocks: last_seen_at (claim/UI freshness) and updated_at (the offline
+// transition — reconnect grace AND the SCA-471 one-sweep confirmation gate).
+// Pinning both keeps the caller's intent ("offline since X ago")
 // deterministic regardless of unrelated writes to the row.
 func setAgentRuntimeOffline(t *testing.T, agentID string, lastSeenAgo time.Duration) {
 	t.Helper()
@@ -702,7 +702,7 @@ func TestOfflineRuntimeTasksRespectReconnectGrace(t *testing.T) {
 
 	if _, err := testPool.Exec(ctx, `
 		UPDATE agent_runtime
-		SET last_seen_at = now() - make_interval(secs => $1)
+		SET updated_at = now() - make_interval(secs => $1)
 		WHERE id = (SELECT runtime_id FROM agent WHERE id = $2)
 	`, (defaultRuntimeReconnectGrace + time.Hour).Seconds(), agentID); err != nil {
 		t.Fatalf("age runtime beyond grace: %v", err)
@@ -782,16 +782,16 @@ func TestOfflineRuntimeTasksRequireSecondStaleSweep(t *testing.T) {
 		}
 	}
 
-	// One extra sweep later the verdict has aged past the confirmation
-	// window; with the grace also exceeded, the task now fails. A daemon
-	// that had re-heartbeated would have flipped the row online and never
-	// reached this point.
+	// Past both the confirmation window and the reconnect grace (both read
+	// updated_at). last_seen_at was already beyond grace; a daemon that had
+	// re-heartbeated would have flipped the row online and never reached this
+	// point.
 	if _, err := testPool.Exec(ctx, `
 		UPDATE agent_runtime
 		SET updated_at = now() - make_interval(secs => $1)
 		WHERE id = (SELECT runtime_id FROM agent WHERE id = $2)
-	`, (sweepOfflineConfirmWindow + time.Minute).Seconds(), agentID); err != nil {
-		t.Fatalf("age offline verdict past confirm window: %v", err)
+	`, (minGrace + time.Minute).Seconds(), agentID); err != nil {
+		t.Fatalf("age offline verdict past reconnect grace: %v", err)
 	}
 
 	failed, err = queries.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
@@ -812,7 +812,89 @@ func TestOfflineRuntimeTasksRequireSecondStaleSweep(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("task was not failed after offline verdict outlived the confirmation window")
+		t.Fatal("task was not failed after offline verdict outlived reconnect grace")
+	}
+}
+
+// TestOfflineRuntimeTasksIgnoreStaleLastSeenAtInsideGrace is the SCA-483
+// incident: Redis liveness kept the runtime online while last_seen_at froze
+// (batched WS heartbeat flush lag). When the wakeup socket finally dropped,
+// the sweeper flipped the row offline — last_seen_at was already past the
+// 3h grace, updated_at was "just now". Measuring grace from last_seen_at
+// killed the still-running task within one extra sweep (~30s) as
+// `runtime went offline`. Grace must start at the offline transition.
+func TestOfflineRuntimeTasksIgnoreStaleLastSeenAtInsideGrace(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database connection")
+	}
+
+	ctx := context.Background()
+	issueID, agentID, taskID := setupSweeperTestFixture(t, "running")
+	t.Cleanup(func() { cleanupSweeperFixture(t, issueID, agentID) })
+	queries := db.New(testPool)
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_runtime
+		SET status = 'offline',
+		    last_seen_at = now() - make_interval(secs => $1),
+		    updated_at = now() - make_interval(secs => $2)
+		WHERE id = (SELECT runtime_id FROM agent WHERE id = $3)
+	`, (defaultRuntimeReconnectGrace + time.Hour).Seconds(),
+		(sweepOfflineConfirmWindow + time.Minute).Seconds(),
+		agentID); err != nil {
+		t.Fatalf("stage redis-lagged offline verdict: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `
+			UPDATE agent_runtime SET status = 'online', last_seen_at = now(), updated_at = now()
+			WHERE id = (SELECT runtime_id FROM agent WHERE id = $1)
+		`, agentID)
+	})
+
+	failed, err := queries.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
+		ReconnectGraceSecs: defaultRuntimeReconnectGrace.Seconds(),
+		OfflineConfirmSecs: sweepOfflineConfirmWindow.Seconds(),
+		MaxPerTick:         offlineTaskFailBatchSize,
+	})
+	if err != nil {
+		t.Fatalf("FailTasksForOfflineRuntimes with stale last_seen_at: %v", err)
+	}
+	for _, task := range failed {
+		if task.ID.Bytes == parseUUIDBytes(taskID) {
+			t.Fatal("running task was failed because last_seen_at was already past grace at the offline flip")
+		}
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_runtime
+		SET updated_at = now() - make_interval(secs => $1)
+		WHERE id = (SELECT runtime_id FROM agent WHERE id = $2)
+	`, (defaultRuntimeReconnectGrace + time.Hour).Seconds(), agentID); err != nil {
+		t.Fatalf("age offline verdict past grace: %v", err)
+	}
+
+	failed, err = queries.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{
+		ReconnectGraceSecs: defaultRuntimeReconnectGrace.Seconds(),
+		OfflineConfirmSecs: sweepOfflineConfirmWindow.Seconds(),
+		MaxPerTick:         offlineTaskFailBatchSize,
+	})
+	if err != nil {
+		t.Fatalf("FailTasksForOfflineRuntimes beyond verdict grace: %v", err)
+	}
+	found := false
+	for _, task := range failed {
+		if task.ID.Bytes == parseUUIDBytes(taskID) {
+			found = true
+			if !task.FailureReason.Valid || task.FailureReason.String != "runtime_offline" {
+				t.Fatalf("failure reason = %q, want runtime_offline", task.FailureReason.String)
+			}
+			if !task.Error.Valid || task.Error.String != "runtime went offline" {
+				t.Fatalf("error = %q, want %q", task.Error.String, "runtime went offline")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("task was not failed after the offline verdict outlived reconnect grace")
 	}
 }
 

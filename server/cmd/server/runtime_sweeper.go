@@ -38,7 +38,9 @@ const (
 	// that reconnects within one extra sweep the time to heartbeat — which
 	// flips the row online synchronously — instead of losing still-live
 	// tasks to the flip's own tick. It confirms the verdict; it does not
-	// raise the 150s staleness threshold.
+	// raise the 150s staleness threshold. Reconnect grace itself is also
+	// measured from that same updated_at stamp (SCA-483): last_seen_at can
+	// already be hours stale when Redis liveness had been covering the row.
 	sweepOfflineConfirmWindow = sweepInterval
 	// staleThresholdSeconds marks runtimes offline if no heartbeat for this
 	// long. The heartbeat timing derivation lives with the shared service
@@ -304,10 +306,16 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 	return
 }
 
-// sweepOfflineRuntimeTasks terminates work only after the runtime's last
-// heartbeat has exceeded the bounded reconnect grace. Running it every tick is
+// sweepOfflineRuntimeTasks terminates work only after the runtime's offline
+// verdict has exceeded the bounded reconnect grace. Running it every tick is
 // essential: the grace usually expires long after sweepStaleRuntimes performed
 // the one-time online→offline transition.
+//
+// Grace is the age of that verdict (agent_runtime.updated_at), not of
+// last_seen_at. Redis can keep a runtime "alive" for hours while the DB
+// heartbeat column lags, so last_seen_at is already past the grace the
+// moment the row flips offline — SCA-483's `runtime went offline` at 3–16
+// minutes on a still-working Studio daemon.
 //
 // SCA-471: the fail stage additionally requires the offline verdict to be at
 // least one sweep old (sweepOfflineConfirmWindow). The flip and this fail

@@ -262,9 +262,17 @@ func (b *BatchedHeartbeatScheduler) flushOnce(ctx context.Context) {
 	now := time.Now()
 	for _, state := range states {
 		existing[state.ID] = struct{}{}
-		if state.Status != "offline" || !state.LastSeenAt.Valid || now.Sub(state.LastSeenAt.Time) < heartbeatReceiptRecoveryThreshold {
-			// The omission was not a stale-sweeper race. In particular, preserve
-			// recent explicit deregistration and its offline_reason metadata.
+		if state.Status != "offline" {
+			// TouchAgentRuntimesLastSeenBatch only updates online rows. An
+			// omitted online row is a miss, not a deregister: requeue so
+			// last_seen_at cannot freeze while Redis liveness keeps the
+			// sweeper from flipping the runtime offline (SCA-483).
+			b.requeue([]pgtype.UUID{state.ID})
+			continue
+		}
+		if !state.LastSeenAt.Valid || now.Sub(state.LastSeenAt.Time) < heartbeatReceiptRecoveryThreshold {
+			// Preserve recent explicit deregistration and its offline_reason
+			// metadata. A stale-sweeper race is recovered below.
 			preservedOffline++
 			continue
 		}
