@@ -32,6 +32,7 @@ Current isolated overlays:
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
 | Event tables without capture | `9xxx` leftover tables; `9015` drops leftover capture triggers |
 | Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
+| ZCode (Z.ai) ACP family | `server/pkg/agent/zcode.go` + probe for `zcode-acp-server`; migration `9018` (port of upstream #6987, which numbers it 469) |
 
 Leftover `workspace_event_*` tables are fine. Do **not** re-enable
 `9012`/`415` capture triggers: they take a
