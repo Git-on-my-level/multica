@@ -248,11 +248,17 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 
 	// Drive the ACP session lifecycle in a goroutine.
 	go func() {
-		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
 		defer func() {
 			stdin.Close()
+			// Cancellation must be reachable before Wait. A child that
+			// ignores EOF on stdin and only exits on context cancel would
+			// otherwise block Wait forever, leaving a later deferred cancel
+			// unreachable. WaitDelay only starts after the context is
+			// cancelled, and cmd.Cancel is a no-op so that delay is the
+			// hard backstop that reaps a bridge ignoring stdin EOF.
+			cancel()
 			_ = cmd.Wait()
 		}()
 
@@ -440,6 +446,16 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		// execenv writes the brief there; zcode is deliberately not in
 		// providerNeedsInlineSystemPrompt), so opts.SystemPrompt is always
 		// empty on this path and the prompt goes through verbatim.
+		// Session pin for the daemon (PinTaskSession keys off
+		// MessageStatus+SessionID), deliberately sent only once setup has
+		// succeeded and the prompt is about to go out. Pinning right after
+		// session creation used to publish the id before setModel could fail,
+		// and FailAgentTask merges session_id with COALESCE — so a setup failure
+		// could no longer take the id back and left a ghost pointer on the task
+		// row for the next turn to resume forever (GH #8116). A cancel between
+		// here and the prompt response is still covered: this send happens first.
+		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
+
 		streamingCurrentTurn.Store(true)
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,

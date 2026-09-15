@@ -34,6 +34,15 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
+      if [ "$ZC_INIT_FAIL_HANG" = "1" ]; then
+        # Ignore TERM and hang so the process does not exit on stdin EOF —
+        # exercises the WaitDelay cleanup path after a setup failure.
+        trap '' TERM
+        sleep 60 &
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"initialize failed"}}\n' "$id"
+        wait
+        exit 0
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"zcode-acp-server","version":"%s"},"agentCapabilities":{"loadSession":true}}}\n' "$id" "$ZC_VERSION"
       ;;
     *'"method":"session/new"'*)
@@ -41,7 +50,7 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"zcode create failed: timeout"}}}\n' "$id"
         exit 0
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"glm-5.3"},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"glm-5.3","options":[{"value":"glm-5.3","name":"GLM-5.3"},{"value":"glm-5-turbo","name":"GLM-5-Turbo"}]},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
       ;;
     *'"method":"session/set_config_option"'*)
       requested=$(printf '%s' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
@@ -202,7 +211,7 @@ func TestZcodeBackendStreamsPromptAndResult(t *testing.T) {
 	if result.ResumeRejected {
 		t.Error("unexpected ResumeRejected on a fresh session")
 	}
-	var sawTool, sawText bool
+	var sawTool, sawText, sawSessionStatus bool
 	for _, m := range msgs {
 		if m.Type == MessageToolUse && m.Tool == "Bash" {
 			// The bridge's tool name must arrive unmapped — hermesClient's
@@ -213,9 +222,15 @@ func TestZcodeBackendStreamsPromptAndResult(t *testing.T) {
 		if m.Type == MessageText && m.Content == "pong" {
 			sawText = true
 		}
+		if m.Type == MessageStatus && m.Status == "running" && m.SessionID == "ses_zc_new" {
+			sawSessionStatus = true
+		}
 	}
 	if !sawTool || !sawText {
 		t.Errorf("expected a tool_use and a text message on the stream, got tool=%v text=%v (%d messages)", sawTool, sawText, len(msgs))
+	}
+	if !sawSessionStatus {
+		t.Error("expected a running status message carrying the session id for PinTaskSession")
 	}
 }
 
@@ -491,5 +506,176 @@ func TestZcodeBackendAppliesThinkingLevel(t *testing.T) {
 	}
 	if !strings.Contains(requests, `"configId":"thought"`) || !strings.Contains(requests, `"value":"high"`) {
 		t.Errorf("expected the advertised option id and verbatim value, got:\n%s", requests)
+	}
+}
+
+// TestListModelsZcodeWithoutBinary pins that zcode is a first-class
+// ListModels provider: a missing bridge must not fall through to
+// "unknown agent type". The shared ACP helper swallows lookup failures
+// into an empty catalog so the picker keeps manual entry.
+func TestListModelsZcodeWithoutBinary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	modelCacheMu.Lock()
+	delete(modelCache, "zcode")
+	modelCacheMu.Unlock()
+
+	got, err := ListModels(ctx, "zcode", Command{Path: missingAgentExecutable(t, "zcode-acp-server")})
+	if err != nil {
+		t.Fatalf("ListModels(zcode) should not treat zcode as unknown, got: %v", err)
+	}
+	if got.Models == nil {
+		t.Error("expected a non-nil slice even when the bridge is missing")
+	}
+	if len(got.Models) != 0 {
+		t.Errorf("a missing bridge must carry no models, got %+v", got.Models)
+	}
+}
+
+// TestListModelsZcodeDiscoversConfigOptions covers the live discovery path:
+// session/new configOptions populate the catalog, and the thought option
+// annotates only the model the session currently reports.
+func TestListModelsZcodeDiscoversConfigOptions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "zcode-acp-server")
+	writeTestExecutable(t, fakePath, []byte(fakeZcodeACPScript()))
+
+	got, err := ListModels(context.Background(), "zcode", Command{Path: fakePath})
+	if err != nil {
+		t.Fatalf("ListModels(zcode) error: %v", err)
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("expected 2 models from configOptions, got %+v", got.Models)
+	}
+	var current, other *Model
+	for i := range got.Models {
+		switch got.Models[i].ID {
+		case "glm-5.3":
+			current = &got.Models[i]
+		case "glm-5-turbo":
+			other = &got.Models[i]
+		}
+	}
+	if current == nil || other == nil {
+		t.Fatalf("expected glm-5.3 and glm-5-turbo, got %+v", got.Models)
+	}
+	if !current.Default {
+		t.Error("glm-5.3 is the session's currentValue and should be marked default")
+	}
+	if current.Thinking == nil || len(current.Thinking.SupportedLevels) == 0 {
+		t.Errorf("expected thinking annotation on the current model, got %+v", current.Thinking)
+	}
+	if other.Thinking != nil {
+		t.Errorf("thinking must not leak onto a model the session is not on, got %+v", other.Thinking)
+	}
+}
+
+// TestZcodeBackendEmitsSessionStatusBeforeCompletion pins the producer side of
+// the daemon's mid-flight resume contract: the session id must appear on the
+// message bus before the prompt finishes, otherwise a daemon restart during
+// a long ZCode turn loses the only usable resume pointer.
+func TestZcodeBackendEmitsSessionStatusBeforeCompletion(t *testing.T) {
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "zcode-acp-server")
+	writeTestExecutable(t, fakePath, []byte(fakeZcodeACPScript()))
+	requestsFile := filepath.Join(dir, "requests")
+
+	backend, err := New("zcode", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env: map[string]string{
+			"ZC_REQUESTS_FILE": requestsFile,
+			"ZC_HANG":          "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("new zcode backend: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session, err := backend.Execute(ctx, "long-running prompt", ExecOptions{Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	select {
+	case msg, ok := <-session.Messages:
+		if !ok {
+			t.Fatal("message channel closed before session status")
+		}
+		if msg.Type != MessageStatus || msg.Status != "running" || msg.SessionID != "ses_zc_new" {
+			t.Fatalf("session status = %+v, want running with session ID ses_zc_new", msg)
+		}
+	case result := <-session.Result:
+		t.Fatalf("terminal result arrived before session status: %+v", result)
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for mid-flight session status")
+	}
+
+	cancel()
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for result after cancel")
+	}
+}
+
+// TestZcodeCleanupDoesNotDeadlockOnSetupFailure pins that a bridge which
+// ignores stdin EOF after initialize fails cannot hang cmd.Wait forever:
+// cancel must run before Wait so WaitDelay can reap the process and the
+// message channel can close.
+func TestZcodeCleanupDoesNotDeadlockOnSetupFailure(t *testing.T) {
+	origDelay := zcodeCancelWaitDelay
+	zcodeCancelWaitDelay = 800 * time.Millisecond
+	t.Cleanup(func() { zcodeCancelWaitDelay = origDelay })
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "zcode-acp-server")
+	writeTestExecutable(t, fakePath, []byte(fakeZcodeACPScript()))
+
+	backend, err := New("zcode", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"ZC_INIT_FAIL_HANG": "1"},
+	})
+	if err != nil {
+		t.Fatalf("new zcode backend: %v", err)
+	}
+
+	session, err := backend.Execute(context.Background(), "test prompt", ExecOptions{Timeout: 20 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		for range session.Messages {
+		}
+		close(done)
+	}()
+
+	select {
+	case result := <-session.Result:
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed from the initialize error, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, "initialize failed") {
+			t.Errorf("expected initialize failure in error, got %q", result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Result never closed: cleanup Wait deadlocked on a hanging bridge")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Messages never closed: cleanup Wait deadlocked on a hanging bridge")
 	}
 }
