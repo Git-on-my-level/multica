@@ -88,11 +88,12 @@ const (
 	// decides stuck-vs-long-running via its inactivity watchdogs (idle/tool),
 	// so the server-side wall clock is only a defensive backstop for the
 	// pathological case where a runtime row somehow retains status='online'
-	// with a stale DB heartbeat for longer than this timeout. The primary
-	// "daemon died" path is `sweepStaleRuntimes` in the same tick (Redis
-	// liveness + DB stale + FailTasksForOfflineRuntimes), which typically
+	// with a stale DB heartbeat for longer than this timeout. Sized at 12h so
+	// a healthy PR/implementer run is never the thing this backstop is for.
+	// The primary "daemon died" path is `sweepStaleRuntimes` in the same tick
+	// (Redis liveness + DB stale + FailTasksForOfflineRuntimes), which typically
 	// reclaims orphaned tasks within ~180s.
-	runningTimeoutSeconds = 9000.0
+	runningTimeoutSeconds = 12 * 3600.0
 	// queuedExpireBatchSize caps how many queued rows a single sweeper tick
 	// transitions to failed. Keeps the sweep transaction short even when
 	// the historical backlog is large (~89k at MUL-1899 baseline). At 30s
