@@ -793,6 +793,15 @@ type Issue struct {
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
 }
 
+type IssueChildAttention struct {
+	ChildID     pgtype.UUID        `json:"child_id"`
+	Generation  pgtype.UUID        `json:"generation"`
+	ParentID    pgtype.UUID        `json:"parent_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Status      string             `json:"status"`
+	AvailableAt pgtype.Timestamptz `json:"available_at"`
+}
+
 type IssueCreateIdempotency struct {
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
 	ClientKeyHash  string             `json:"client_key_hash"`

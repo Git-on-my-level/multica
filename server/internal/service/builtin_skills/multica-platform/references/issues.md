@@ -341,6 +341,25 @@ multica issue status <child-id> todo   # promote when the previous step is truly
 
 Creating every serial step as `todo` enqueues the whole chain at once.
 
+### Child review and blocker handoffs
+
+When a child transitions into `in_review` or `blocked`, the server durably queues
+an attention handoff to the parent agent or squad leader. Nearby sibling
+transitions are grouped into one comment and run. A different parent run already
+queued or running does not consume this signal; the queue serializes the work.
+Recovery runs after server restarts. Unavailable owners are retried, with bounded
+batches and a retry delay. Parents observed as parked, closed, or human-assigned
+at capture or delivery stay inert. A brief ineligible interval between those
+observations does not cancel a captured handoff if the parent is eligible again
+when delivery runs. Read the current child state before acting on queued work.
+
+This signal means **review the delivery or help with the blocker**. It does not
+accept the child, mark it `done`, close a stage, or promote another stage. Read
+the parent's plan and current child state, apply its acceptance requirements,
+and continue coordination. Do not post extra parent mentions to manufacture a
+wake. Reopening and later delivering a child creates a new handoff; saving its
+unchanged status does not. Historical statuses are not replayed at installation.
+
 ### Stages: order sub-issues into barrier groups
 
 `--stage <N>` (N >= 1) groups sub-issues under the same parent into ordered
