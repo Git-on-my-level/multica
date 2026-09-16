@@ -447,6 +447,129 @@ func TestChildAttentionWorkspaceLockOrderDoesNotDeadlockDeletion(t *testing.T) {
 	}
 }
 
+func TestChildAttentionRuntimeLockOrderDoesNotDeadlockDeletion(t *testing.T) {
+	f := newChildAttentionFixture(t)
+	f.child(t, "in_review")
+	ctx := context.Background()
+
+	deleteTx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteTx.Rollback(ctx)
+	if _, err := deleteTx.Exec(ctx, `SELECT id FROM agent_runtime WHERE id = $1 FOR UPDATE`, f.runtimeID); err != nil {
+		t.Fatal(err)
+	}
+	// If the recovery worker locked the agent before waiting for the runtime,
+	// this transaction's agent lock below would wait. Bound that assertion so a
+	// lock-order regression fails promptly and cannot hang the test process.
+	if _, err := deleteTx.Exec(ctx, `SET LOCAL lock_timeout = '500ms'`); err != nil {
+		t.Fatal(err)
+	}
+
+	workerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	workerDone := make(chan struct {
+		queued int
+		err    error
+	}, 1)
+	go func() {
+		queued, err := f.service.RecoverChildAttention(workerCtx, 100)
+		workerDone <- struct {
+			queued int
+			err    error
+		}{queued: queued, err: err}
+	}()
+
+	// The runtime pre-lock is the first lock that can conflict with teardown.
+	// Wait for that exact query to become blocked, with PostgreSQL identifying
+	// the blocker; a scheduler delay alone cannot satisfy this condition.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var blocked int
+		if err := f.pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity a
+			WHERE a.pid <> pg_backend_pid()
+			  AND a.wait_event_type = 'Lock'
+			  AND a.query ILIKE '%agent_runtime%'
+			  AND cardinality(pg_blocking_pids(a.pid)) > 0`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked > 0 {
+			break
+		}
+		select {
+		case result := <-workerDone:
+			t.Fatalf("worker completed before runtime lock wait: queued=%d err=%v", result.queued, result.err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker never reached the runtime lock wait")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Teardown must still be able to acquire the agent row while recovery is
+	// waiting on the runtime. This proves the worker did not acquire agent first.
+	if _, err := deleteTx.Exec(ctx, `SELECT id FROM agent WHERE id = $1 FOR UPDATE`, f.agentID); err != nil {
+		t.Fatalf("deletion agent lock was blocked by recovery: %v", err)
+	}
+	if err := deleteTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result := <-workerDone
+	if result.err != nil || result.queued != 1 {
+		t.Fatalf("worker after runtime deletion rollback: queued=%d err=%v; want one delivery", result.queued, result.err)
+	}
+	if f.commentCount(t) != 1 || f.taskCount(t) != 1 || f.signalCount(t) != 0 {
+		t.Fatalf("post-runtime-lock delivery counts comments=%d tasks=%d signals=%d; want 1/1/0", f.commentCount(t), f.taskCount(t), f.signalCount(t))
+	}
+}
+
+func TestChildAttentionAgentReassignmentContentionReturnsWithoutDelivery(t *testing.T) {
+	f := newChildAttentionFixture(t)
+	f.child(t, "in_review")
+	ctx := context.Background()
+
+	// FOR NO KEY UPDATE is the lock taken by an agent runtime reassignment. It
+	// conflicts with the recovery worker's FOR SHARE NOWAIT and therefore must
+	// not leave a recovery transaction waiting behind an administrative write.
+	reassignTx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reassignTx.Rollback(ctx)
+	if _, err := reassignTx.Exec(ctx, `SELECT id FROM agent WHERE id = $1 FOR NO KEY UPDATE`, f.agentID); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	workerCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	queued, err := f.service.RecoverChildAttention(workerCtx, 100)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("recovery waited %s on agent reassignment lock; NOWAIT should return promptly", elapsed)
+	}
+	if err != nil || queued != 0 {
+		t.Fatalf("contended recovery queued=%d err=%v; want no delivery", queued, err)
+	}
+	if f.commentCount(t) != 0 || f.taskCount(t) != 0 || f.signalCount(t) != 1 {
+		t.Fatalf("contended recovery partial state: comments=%d tasks=%d signals=%d; want 0/0/1", f.commentCount(t), f.taskCount(t), f.signalCount(t))
+	}
+
+	if err := reassignTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.forceDue(t)
+	if queued, err := f.service.RecoverChildAttention(ctx, 100); err != nil || queued != 1 {
+		t.Fatalf("recovery after reassignment rollback queued=%d err=%v; want one delivery", queued, err)
+	}
+	if f.commentCount(t) != 1 || f.taskCount(t) != 1 || f.signalCount(t) != 0 {
+		t.Fatalf("post-reassignment delivery counts comments=%d tasks=%d signals=%d; want 1/1/0", f.commentCount(t), f.taskCount(t), f.signalCount(t))
+	}
+}
+
 func TestChildAttentionRollsBackCommentWhenTaskDeliveryFails(t *testing.T) {
 	f := newChildAttentionFixture(t)
 	f.child(t, "in_review")

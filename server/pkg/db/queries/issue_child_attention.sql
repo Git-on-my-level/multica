@@ -13,12 +13,20 @@ SELECT * FROM issue WHERE id = $1 FOR UPDATE;
 SELECT w.id FROM workspace w JOIN issue i ON i.workspace_id = w.id
 WHERE i.id = $1 FOR KEY SHARE OF w;
 
+-- name: LockChildAttentionRuntime :one
+SELECT r.id FROM issue i
+LEFT JOIN squad s ON i.assignee_type = 'squad' AND s.id = i.assignee_id AND s.workspace_id = i.workspace_id
+JOIN agent a ON a.id = CASE WHEN i.assignee_type = 'agent' THEN i.assignee_id ELSE s.leader_id END
+    AND a.workspace_id = i.workspace_id
+JOIN agent_runtime r ON r.id = a.runtime_id AND r.workspace_id = i.workspace_id
+WHERE i.id = $1 FOR KEY SHARE OF r;
+
 -- name: LockChildAttentionAgent :one
 SELECT a.id FROM issue i
 LEFT JOIN squad s ON i.assignee_type = 'squad' AND s.id = i.assignee_id AND s.workspace_id = i.workspace_id
 JOIN agent a ON a.id = CASE WHEN i.assignee_type = 'agent' THEN i.assignee_id ELSE s.leader_id END
     AND a.workspace_id = i.workspace_id
-WHERE i.id = $1 FOR KEY SHARE OF a;
+WHERE i.id = $1 FOR SHARE OF a NOWAIT;
 
 -- name: LockChildAttention :many
 SELECT * FROM issue_child_attention

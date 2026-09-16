@@ -377,7 +377,10 @@ an attention handoff to the parent agent or squad leader. Nearby sibling
 transitions are grouped into one comment and run. A different parent run already
 queued or running does not consume this signal; the queue serializes the work.
 Recovery runs after server restarts. Unavailable owners are retried, with bounded
-batches and a retry delay. Parked, closed, and human-assigned parents stay inert.
+batches and a retry delay. Parents observed as parked, closed, or human-assigned
+at capture or delivery stay inert. A brief ineligible interval between those
+observations does not cancel a captured handoff if the parent is eligible again
+when delivery runs. Read the current child state before acting on queued work.
 
 This signal means **review the delivery or help with the blocker**. It does not
 accept the child, mark it `done`, close a stage, or promote another stage. Read
