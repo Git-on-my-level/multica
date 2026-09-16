@@ -806,6 +806,15 @@ type Issue struct {
 	TriageState        pgtype.Text        `json:"triage_state"`
 }
 
+type IssueChildAttention struct {
+	ChildID     pgtype.UUID        `json:"child_id"`
+	Generation  pgtype.UUID        `json:"generation"`
+	ParentID    pgtype.UUID        `json:"parent_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Status      string             `json:"status"`
+	AvailableAt pgtype.Timestamptz `json:"available_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`
