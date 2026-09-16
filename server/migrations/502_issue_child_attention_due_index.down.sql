@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY issue_child_attention_due_idx;

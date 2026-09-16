@@ -1,0 +1,113 @@
+---
+title: Managed macOS daemon with launchd
+description: Install a Multica daemon as a user-owned macOS launch agent with idle-safe activation.
+---
+
+The repository includes `scripts/install-daemon-macos.sh` for dedicated macOS
+worker machines. It generates a per-user LaunchAgent plist, sets the daemon's
+runtime environment explicitly, and uses `launchctl` as the only service
+manager. The script does not manage AI tools, stop arbitrary processes, or
+infer work from a PID.
+
+## Install and activate
+
+Run the script from a Multica checkout after installing and authenticating the
+CLI:
+
+```bash
+scripts/install-daemon-macos.sh \
+  --activate \
+  --binary "$(command -v multica)" \
+  --profile worker \
+  --no-auto-update
+```
+
+The explicit `--activate` action writes
+`~/Library/LaunchAgents/com.multica.daemon.plist` and loads it into the
+current user's `gui/<uid>` launchd domain. The daemon starts with
+`multica daemon start --foreground`, so launchd owns its process lifetime and
+the daemon owns task execution and recovery.
+
+Use a different label and plist for each profile on the same Mac:
+
+```bash
+scripts/install-daemon-macos.sh \
+  --activate \
+  --binary "$(command -v multica)" \
+  --profile staging \
+  --label com.multica.staging \
+  --no-auto-update
+```
+
+Named profiles use the same deterministic health-port calculation as the CLI.
+The script derives the probe port from `--profile`; there is no second port
+setting that could silently disagree with the daemon's actual listener.
+
+The script exports the invoking user's `HOME` and `PATH` in the plist. If the
+CLI or an agent executable is available only through a package manager or a
+version manager, pass the complete path explicitly:
+
+```bash
+scripts/install-daemon-macos.sh \
+  --binary /Users/you/.local/bin/multica \
+  --path "/opt/homebrew/bin:/Users/you/.local/bin:/usr/bin:/bin"
+```
+
+The default action is `--render`, which prints the exact XML without writing a
+file or contacting launchd:
+
+```bash
+scripts/install-daemon-macos.sh --render \
+  --binary "$(command -v multica)" > daemon.plist
+plutil -lint daemon.plist
+```
+
+## Safe activation and updates
+
+Before an activation that would replace a loaded service, the script probes
+`http://127.0.0.1:<health-port>/health`. It requires a `running` daemon whose
+JSON has the exact profile and PID reported by launchd, with zero
+`active_task_count`, `running_task_count`, and `resource_wait_task_count`. A
+`starting`, malformed, or otherwise incomplete response is not proof of
+idleness. A loaded service with an unreachable health response is treated as
+unknown and the operation stops. A response on the port while the configured
+launchd label is not loaded is also treated as a foreign or manually started
+daemon and the operation stops. This avoids turning a launchd refresh into an
+agent interruption or port collision.
+
+If the generated plist is unchanged and the service is already loaded, the
+script leaves the process alone. If it changed, it performs a fresh launchd
+PID and health check immediately before `launchctl bootout`, followed by
+`launchctl bootstrap` only after that check succeeds. The same check protects
+`--deactivate`. The check and bootout are separate OS operations, so a daemon
+can claim new work in the small gap; if the launchd state changes during the
+preflight the script aborts and the daemon remains untouched:
+
+```bash
+scripts/install-daemon-macos.sh --deactivate \
+  --label com.multica.daemon \
+  --profile worker
+```
+
+Deactivation retains the plist so a later `--activate` can restore it. Python
+3 is required for activation and deactivation so the health payload is parsed
+as JSON with strict non-negative integer checks; `--render` does not need it.
+For a first activation, an absent health endpoint is expected because no
+daemon is running yet; the script still requires the service manager and
+executable to be present.
+
+## Scheduling policy
+
+The generated plist uses `ProcessType=Interactive`, `RunAtLoad`, and
+`KeepAlive`. `Interactive` is appropriate for a dedicated worker Mac because
+it prevents macOS background scheduling heuristics from starving prompt task
+pickup under load. It can increase power use and thermal pressure, so use the
+standard background policy for personal laptops or shared machines instead of
+installing this profile there. This setting does not grant GUI, filesystem, or
+agent-provider permissions; those remain the responsibility of the signed-in
+user and the configured tools.
+
+launchd remains the authority for this local process. Host configuration and
+diagnostics can report the service state, while fleet coordination observes
+drift and health. Neither layer should rewrite this plist or terminate a task
+process behind the daemon's back.

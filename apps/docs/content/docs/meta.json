@@ -30,6 +30,7 @@
     "---Runtime & execution---",
     "tasks",
     "daemon-runtimes",
+    "daemon-launchd",
     "install-agent-runtime",
     "providers",
     "---Automation---",
