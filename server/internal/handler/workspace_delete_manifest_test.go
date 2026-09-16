@@ -70,6 +70,7 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"inbox_item":                         workspaceDelete,
 	"instance_telemetry_state":           workspaceDeleteKeep,
 	"issue":                              workspaceDelete,
+	"issue_child_attention":              workspaceDelete, // Cleared by the issue deletion trigger.
 	"issue_view":                         workspaceDelete,
 	"issue_view_preference":              workspaceDelete,
 	"issue_dependency":                   workspaceDelete,
