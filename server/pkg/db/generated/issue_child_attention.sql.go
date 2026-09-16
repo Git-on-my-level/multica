@@ -99,7 +99,7 @@ SELECT a.id FROM issue i
 LEFT JOIN squad s ON i.assignee_type = 'squad' AND s.id = i.assignee_id AND s.workspace_id = i.workspace_id
 JOIN agent a ON a.id = CASE WHEN i.assignee_type = 'agent' THEN i.assignee_id ELSE s.leader_id END
     AND a.workspace_id = i.workspace_id
-WHERE i.id = $1 FOR KEY SHARE OF a
+WHERE i.id = $1 FOR SHARE OF a NOWAIT
 `
 
 func (q *Queries) LockChildAttentionAgent(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
@@ -147,6 +147,22 @@ func (q *Queries) LockChildAttentionParent(ctx context.Context, id pgtype.UUID) 
 		&i.LastActivityAt,
 	)
 	return i, err
+}
+
+const lockChildAttentionRuntime = `-- name: LockChildAttentionRuntime :one
+SELECT r.id FROM issue i
+LEFT JOIN squad s ON i.assignee_type = 'squad' AND s.id = i.assignee_id AND s.workspace_id = i.workspace_id
+JOIN agent a ON a.id = CASE WHEN i.assignee_type = 'agent' THEN i.assignee_id ELSE s.leader_id END
+    AND a.workspace_id = i.workspace_id
+JOIN agent_runtime r ON r.id = a.runtime_id AND r.workspace_id = i.workspace_id
+WHERE i.id = $1 FOR KEY SHARE OF r
+`
+
+func (q *Queries) LockChildAttentionRuntime(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockChildAttentionRuntime, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const lockChildAttentionWorkspace = `-- name: LockChildAttentionWorkspace :one

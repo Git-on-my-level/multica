@@ -67,12 +67,18 @@ func (s *TaskService) recoverChildAttentionParent(ctx context.Context, parentID 
 	if err != nil || !locked {
 		return false, err
 	}
-	// Match queue insertion and deletion's lock order: workspace, agent, issue,
-	// attention rows. Taking the issue first deadlocks against workspace
+	// Match runtime teardown and workspace deletion: workspace, runtime, agent,
+	// issue, attention rows. Taking the issue first deadlocks against workspace
 	// teardown when CreateAgentTask subsequently acquires its workspace fence.
 	if _, err := q.LockChildAttentionWorkspace(ctx, parentID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
+	lockedRuntimeID, runtimeLockErr := q.LockChildAttentionRuntime(ctx, parentID)
+	if runtimeLockErr != nil && !errors.Is(runtimeLockErr, pgx.ErrNoRows) {
+		return false, runtimeLockErr
+	}
+	// Freeze runtime reassignment through enqueue, but never wait behind an
+	// agent-first mutation while holding the runtime fence. Retry contention.
 	lockedAgentID, agentLockErr := q.LockChildAttentionAgent(ctx, parentID)
 	if agentLockErr != nil && !errors.Is(agentLockErr, pgx.ErrNoRows) {
 		return false, agentLockErr
@@ -101,7 +107,8 @@ func (s *TaskService) recoverChildAttentionParent(ctx context.Context, parentID 
 		return false, settle()
 	}
 	// Preserve the established parked/closed/human-parent behavior. A parked
-	// parent stays inert; promoting it later must not replay old attention.
+	// parent stays inert when observed by capture or delivery. A brief parked
+	// interval between those observations does not cancel an existing handoff.
 	status := issuestatus.Effective(ctx, q, parent.WorkspaceID, parent.Status)
 	if status == "backlog" || status == "done" || status == "cancelled" || parent.Status == "triage" ||
 		(parent.AssigneeType.Valid && parent.AssigneeType.String == "member") {
@@ -149,6 +156,9 @@ func (s *TaskService) recoverChildAttentionParent(ctx context.Context, parentID 
 	agent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: agentID, WorkspaceID: parent.WorkspaceID})
 	if err != nil {
 		return false, err
+	}
+	if agent.RuntimeID != lockedRuntimeID {
+		return false, fmt.Errorf("parent runtime changed while acquiring handoff locks")
 	}
 	if agent.ArchivedAt.Valid || !agent.RuntimeID.Valid {
 		return false, fmt.Errorf("parent owner is archived or has no runtime")
