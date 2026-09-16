@@ -4497,16 +4497,10 @@ func (d *Daemon) runRuntimeHeartbeat(ctx context.Context, rid string) {
 // runHeartbeatTick returns true when the HTTP heartbeat hit a transient
 // failure that should count toward stale idle-connection cleanup.
 func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
-	// Skip HTTP heartbeat for runtimes that successfully acked a recent
-	// WebSocket heartbeat. The WS path keeps last_seen_at fresh and delivers
-	// actions, so the HTTP write would be a duplicate DB update. If the WS
-	// heartbeat goes silent the freshness window expires and HTTP resumes
-	// automatically on the next tick — that is the fallback the WS path
-	// relies on.
-	if d.wsHeartbeatRecentlyAcked(rid) {
-		d.logger.Debug("heartbeat: skipping HTTP tick, WS recently acked", "runtime_id", rid)
-		return false
-	}
+	// Always HTTP-heartbeat. A recent WS ack is not liveness: a half-open
+	// TCP path can look freshly acked on the client while the server never
+	// receives frames. Duplicate last_seen bumps are cheap; skipped HTTP
+	// ticks are not.
 	d.logger.Debug("heartbeat: HTTP tick", "runtime_id", rid)
 	resp, err := d.client.SendHeartbeat(ctx, rid)
 	if err != nil {
@@ -4593,10 +4587,7 @@ func (d *Daemon) handleHeartbeatActions(ctx context.Context, runtimeID string, r
 // The HTTP heartbeat is used on purpose rather than queueing a WS frame: the
 // hint arrives on the read pump, the WS write path may be backed up or tearing
 // down, and this is a human-interactive, low-frequency path where one extra
-// request is cheaper than a missed wakeup. Note it intentionally bypasses the
-// wsHeartbeatRecentlyAcked suppression that the scheduled HTTP tick honours —
-// that suppression exists to avoid duplicate periodic writes, not to block an
-// explicitly requested pull.
+// request is cheaper than a missed wakeup.
 func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 	if runtimeID == "" {
 		return

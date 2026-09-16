@@ -154,6 +154,31 @@ func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 	}
 }
 
+// TestRunHeartbeatTickAlwaysPOSTs: a recent WS ack must not skip HTTP.
+// A half-open TCP path can look freshly acked on the client while the
+// server never receives frames.
+func TestRunHeartbeatTickAlwaysPOSTs(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/heartbeat" {
+			http.NotFound(w, r)
+			return
+		}
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	d := New(Config{HeartbeatInterval: 15 * time.Second}, slog.Default())
+	d.client = NewClient(srv.URL)
+	d.recordWSHeartbeatAck("runtime-1")
+	d.runHeartbeatTick(context.Background(), "runtime-1")
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("HTTP heartbeat posts = %d with fresh WS ack, want 1", got)
+	}
+}
+
 func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
 	overrideTaskWakeupTimings(t, time.Second, 100*time.Millisecond, taskWakeupBackoffResetAfter)
 
