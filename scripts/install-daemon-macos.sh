@@ -165,7 +165,7 @@ launchctl_loaded() {
 read_health() {
   local body
   HEALTH_BODY=''
-  if ! body="$("$CURL_BIN" --silent --show-error --fail --max-time 2 "http://127.0.0.1:$HEALTH_PORT/health" 2>/dev/null)"; then
+  if ! body="$("$CURL_BIN" --silent --show-error --fail --max-time 2 --max-filesize 65536 "http://127.0.0.1:$HEALTH_PORT/health" 2>/dev/null)"; then
     return 1
   fi
   HEALTH_BODY=$body
@@ -231,11 +231,10 @@ activate() {
   check_idle_before_change "$loaded"
   mkdir -p "$(dirname "$PLIST_PATH")"
   if [ "$loaded" = true ] && [ -f "$PLIST_PATH" ] && cmp -s "$temp_plist" "$PLIST_PATH"; then
-    info "launchd service $LAUNCH_DOMAIN/$LABEL is already active with the requested configuration"
+    info "launchd service $LAUNCH_DOMAIN/$LABEL plist is unchanged; leaving the existing loaded process running"
     return
   fi
 
-  mv "$temp_plist" "$PLIST_PATH"
   if [ "$loaded" = true ]; then
     # Refresh launchd's PID and the daemon's health immediately before the
     # destructive half of a reload. A daemon can claim work between the first
@@ -245,7 +244,13 @@ activate() {
       die "launchd service $LAUNCH_DOMAIN/$LABEL changed state during activation; refusing to boot it out"
     fi
     check_idle_before_change true
+    # Keep the currently loaded plist intact until the final health guard
+    # passes. If the daemon claims work during the second check, a retry must
+    # still compare against the plist that is actually installed.
+    mv "$temp_plist" "$PLIST_PATH"
     "$LAUNCHCTL_BIN" bootout "$LAUNCH_DOMAIN/$LABEL"
+  else
+    mv "$temp_plist" "$PLIST_PATH"
   fi
   "$LAUNCHCTL_BIN" bootstrap "$LAUNCH_DOMAIN" "$PLIST_PATH"
   info "activated $LAUNCH_DOMAIN/$LABEL from $PLIST_PATH"

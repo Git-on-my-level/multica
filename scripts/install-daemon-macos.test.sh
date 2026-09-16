@@ -62,6 +62,16 @@ STUB
 if [ "${MULTICA_TEST_CURL_STATE:-unreachable}" != healthy ]; then
   exit 7
 fi
+if [ -n "${MULTICA_TEST_HEALTH_SEQUENCE_FILE:-}" ]; then
+  count_file="${MULTICA_TEST_HEALTH_SEQUENCE_FILE}.count"
+  count=1
+  if [ -f "$count_file" ]; then
+    count=$(( $(cat "$count_file") + 1 ))
+  fi
+  printf '%s' "$count" >"$count_file"
+  sed -n "${count}p" "$MULTICA_TEST_HEALTH_SEQUENCE_FILE"
+  exit 0
+fi
 printf '%s' "$MULTICA_TEST_HEALTH"
 STUB
   chmod +x "$TEST_STUBS/curl"
@@ -85,6 +95,7 @@ run_installer() {
     MULTICA_LAUNCHCTL_BIN="$TEST_STUBS/launchctl" \
     MULTICA_CURL_BIN="$TEST_STUBS/curl" \
     MULTICA_PYTHON_BIN="$TEST_PYTHON" \
+    MULTICA_TEST_HEALTH_SEQUENCE_FILE="${MULTICA_TEST_HEALTH_SEQUENCE_FILE:-}" \
     MULTICA_TEST_LAUNCHCTL_STATE="$state" \
     MULTICA_TEST_CURL_STATE="$curl_state" \
     MULTICA_TEST_HEALTH="${MULTICA_TEST_HEALTH:-}" \
@@ -168,6 +179,24 @@ test_loaded_same_configuration_is_idempotent() {
   assert_not_contains 'bootout' "$TEST_LOG"
 }
 
+test_second_health_guard_preserves_installed_plist() {
+  setup_case
+  plist="$TEST_HOME/Library/LaunchAgents/com.test.multica.plist"
+  mkdir -p "$(dirname "$plist")"
+  printf '%s\n' '<old-plist/>' >"$plist"
+  sequence="$TEST_TMP/health-sequence"
+  printf '%s\n' \
+    '{"status":"running","pid":4242,"profile":"worker","active_task_count":0,"running_task_count":0,"resource_wait_task_count":0}' \
+    '{"status":"running","pid":4242,"profile":"worker","active_task_count":1,"running_task_count":1,"resource_wait_task_count":0}' \
+    >"$sequence"
+  MULTICA_TEST_HEALTH_SEQUENCE_FILE="$sequence" run_installer loaded healthy --activate
+  [ "$TEST_STATUS" -ne 0 ] || fail "second health guard unexpectedly succeeded"
+  assert_contains 'active=1 running=1 resource_wait=0' "$TEST_TMP/err"
+  assert_contains '<old-plist/>' "$plist"
+  assert_not_contains 'bootout' "$TEST_LOG"
+  assert_not_contains 'bootstrap' "$TEST_LOG"
+}
+
 test_foreign_health_endpoint_refuses_when_label_not_loaded() {
   setup_case
   MULTICA_TEST_HEALTH='{"status":"running","pid":4242,"profile":"worker","active_task_count":0,"running_task_count":0,"resource_wait_task_count":0}' run_installer absent healthy --activate
@@ -219,6 +248,7 @@ test_busy_service_refuses_reload
 test_loaded_service_with_unknown_health_refuses_reload
 test_loaded_idle_service_reloads
 test_loaded_same_configuration_is_idempotent
+test_second_health_guard_preserves_installed_plist
 test_foreign_health_endpoint_refuses_when_label_not_loaded
 test_malformed_health_fields_fail_closed
 test_deactivate_refuses_busy_service

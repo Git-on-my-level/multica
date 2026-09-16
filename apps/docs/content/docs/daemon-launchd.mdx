@@ -111,3 +111,9 @@ launchd remains the authority for this local process. Host configuration and
 diagnostics can report the service state, while fleet coordination observes
 drift and health. Neither layer should rewrite this plist or terminate a task
 process behind the daemon's back.
+
+The plist compares paths and arguments; it cannot detect an in-place binary
+replacement at the same path. For upgrades, prefer a versioned executable
+path so activation produces a plist change. If the path must stay the same,
+run `--deactivate` and then an explicit `--activate`; both operations retain
+the idle guard.
