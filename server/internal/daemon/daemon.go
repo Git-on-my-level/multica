@@ -2028,8 +2028,8 @@ func (d *Daemon) recordWSReceive() {
 }
 
 // wsHeartbeatRecentlyAcked reports whether the runtime received a WS
-// heartbeat ack inside the freshness window. The HTTP heartbeat loop uses
-// this to skip duplicate work when WS is already keeping the runtime alive.
+// heartbeat ack inside the freshness window. HTTP heartbeats do not skip
+// based on this; it remains a diagnostic for wakeup-socket freshness.
 func (d *Daemon) wsHeartbeatRecentlyAcked(runtimeID string) bool {
 	d.wsHBMu.RLock()
 	last, ok := d.wsHBLastAck[runtimeID]
@@ -4532,24 +4532,21 @@ func (d *Daemon) runRuntimeHeartbeat(ctx context.Context, rid string) {
 // HTTP transport, which allows unlimited concurrent connections, and (b) the
 // wsHBMu freshness map, which is held for map operations only — never across
 // I/O — so a wedged WS writer or a stalled GC scan cannot delay an HTTP tick.
-// The WS coupling is deliberately one-way and time-bounded: WS activity may
-// suppress an HTTP tick, but only while frames were actually received within
-// the freshness window (see clearStaleWSHeartbeatAcks).
+// HTTP heartbeats always fire. WS receive freshness is used only to detect a
+// half-open wakeup socket (see clearStaleWSHeartbeatAcks), never to skip the
+// HTTP tick.
 func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
 	if d.clearStaleWSHeartbeatAcks() {
 		// Half-open wakeup websocket: no frame received within freshness.
-		// Treat it as disconnected and prove liveness over HTTP right now —
-		// the server's 150s stale window must not expire while a dead WS
-		// socket still suppresses the HTTP fallback.
-		d.logger.Info("heartbeat: wakeup websocket receive-silent beyond freshness; treating as disconnected, resuming HTTP heartbeats",
+		// Treat it as disconnected. HTTP still runs on this tick either way.
+		d.logger.Info("heartbeat: wakeup websocket receive-silent beyond freshness; treating as disconnected",
 			"runtime_id", rid, "freshness", d.wsHeartbeatFreshness())
-	} else if d.wsHeartbeatRecentlyAcked(rid) {
-		// Skip HTTP heartbeat for runtimes that successfully acked a recent
-		// WebSocket heartbeat. The WS path keeps last_seen_at fresh and
-		// delivers actions, so the HTTP write would be a duplicate DB update.
-		d.logger.Debug("heartbeat: skipping HTTP tick, WS recently acked", "runtime_id", rid)
-		return false
 	}
+	// Always HTTP-heartbeat. A recent WS ack is not liveness: a half-open
+	// Tailscale TCP path can look freshly acked on the client while the
+	// server never receives frames, then FailTasksForOfflineRuntimes
+	// (or the 150s stale flip) races the write-side broken pipe. Duplicate
+	// last_seen bumps are cheap; skipped HTTP ticks are not.
 	d.logger.Debug("heartbeat: HTTP tick", "runtime_id", rid)
 	resp, err := d.client.SendHeartbeat(ctx, rid)
 	if err != nil {
@@ -4636,10 +4633,7 @@ func (d *Daemon) handleHeartbeatActions(ctx context.Context, runtimeID string, r
 // The HTTP heartbeat is used on purpose rather than queueing a WS frame: the
 // hint arrives on the read pump, the WS write path may be backed up or tearing
 // down, and this is a human-interactive, low-frequency path where one extra
-// request is cheaper than a missed wakeup. Note it intentionally bypasses the
-// wsHeartbeatRecentlyAcked suppression that the scheduled HTTP tick honours —
-// that suppression exists to avoid duplicate periodic writes, not to block an
-// explicitly requested pull.
+// request is cheaper than a missed wakeup.
 func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 	if runtimeID == "" {
 		return

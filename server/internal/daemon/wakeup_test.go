@@ -125,10 +125,10 @@ func TestRunTaskWakeupConnectionSignalsDisconnect(t *testing.T) {
 	}
 }
 
-// TestWSHeartbeatFreshnessSuppressesHTTP pins the WS-vs-HTTP coordination:
-// once a runtime acked over WS within the freshness window the HTTP
-// heartbeat loop must skip it to avoid duplicate DB writes.
-func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
+// TestWSHeartbeatFreshnessWindow pins the WS freshness helpers. HTTP
+// heartbeats must not be suppressed by a recent WS ack: a half-open
+// Tailscale socket can look freshly acked while the server never sees it.
+func TestWSHeartbeatFreshnessWindow(t *testing.T) {
 	d := New(Config{HeartbeatInterval: 15 * time.Second}, slog.Default())
 
 	if d.wsHeartbeatRecentlyAcked("runtime-1") {
@@ -184,16 +184,11 @@ func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 	}
 }
 
-// TestRunHeartbeatTickResumesHTTPWhenWSReceiveGoesSilent is the SCA-471
-// regression for the incident's suppression-stuck shape, and pins the
-// stall-independence invariant: the HTTP tick consults only the wsHBMu
-// freshness map (map ops, never I/O) — it does not wait on the wakeup
-// websocket's writer, workspace GC, or task-result reporting in any way. A
-// receive-silent websocket whose last ack still looks fresh must not keep the
-// HTTP fallback silenced; the simulated silence here (~35s at the 15s
-// interval) is far inside the server's 150s offline threshold, so the tick
-// proves liveness before the sweeper can declare the runtime stale.
-func TestRunHeartbeatTickResumesHTTPWhenWSReceiveGoesSilent(t *testing.T) {
+// TestRunHeartbeatTickAlwaysPOSTs is the regression for skipping HTTP while
+// WS looked fresh. A half-open Tailscale socket can still have a recent ack
+// stamp; HTTP must POST anyway. The receive-silent path (SCA-471) still
+// clears the ack set.
+func TestRunHeartbeatTickAlwaysPOSTs(t *testing.T) {
 	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/daemon/heartbeat" {
@@ -210,23 +205,24 @@ func TestRunHeartbeatTickResumesHTTPWhenWSReceiveGoesSilent(t *testing.T) {
 	d.client = NewClient(srv.URL)
 	ctx := context.Background()
 
-	// Healthy WS: a receive inside the window plus a fresh ack suppresses
-	// the HTTP tick.
+	// Healthy WS: a receive inside the window plus a fresh ack must still
+	// POST over HTTP. Skipping that tick is what let a half-open Tailscale
+	// socket mark Studio runtimes offline while OMP was still working.
 	d.recordWSReceive()
 	d.recordWSHeartbeatAck("runtime-1")
 	d.runHeartbeatTick(ctx, "runtime-1")
-	if got := posts.Load(); got != 0 {
-		t.Fatalf("HTTP heartbeat posts = %d with fresh WS ack, want 0", got)
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("HTTP heartbeat posts = %d with fresh WS ack, want 1", got)
 	}
 
 	// Half-open: ack stamp still fresh, receive silent past the freshness
-	// window. The tick must clear the suppression and POST over HTTP now.
+	// window. HTTP must keep posting (second tick).
 	d.wsHBMu.Lock()
 	d.wsLastReceive = time.Now().Add(-(d.wsHeartbeatFreshness() + 5*time.Second))
 	d.wsHBMu.Unlock()
 	d.runHeartbeatTick(ctx, "runtime-1")
-	if got := posts.Load(); got != 1 {
-		t.Fatalf("HTTP heartbeat posts = %d after receive silence, want 1", got)
+	if got := posts.Load(); got != 2 {
+		t.Fatalf("HTTP heartbeat posts = %d after receive silence, want 2", got)
 	}
 	d.wsHBMu.RLock()
 	_, hasAck := d.wsHBLastAck["runtime-1"]
