@@ -782,6 +782,74 @@ func TestDeleteWorkspaceRequiresOwner(t *testing.T) {
 	}
 }
 
+func TestWorkspaceEventRoute(t *testing.T) {
+	resp := authRequest(t, http.MethodGet, "/api/events?cursor=0&limit=1", nil)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("member GET /api/events status = %d, want 200", resp.StatusCode)
+	}
+	var page struct {
+		Events     []map[string]any `json:"events"`
+		NextCursor string           `json:"next_cursor"`
+		HasMore    bool             `json:"has_more"`
+	}
+	readJSON(t, resp, &page)
+	if page.Events == nil {
+		t.Fatal("expected events array in response, got null")
+	}
+	if page.NextCursor == "" {
+		t.Fatal("expected non-empty next_cursor")
+	}
+	for _, event := range page.Events {
+		if event["workspace_id"] != testWorkspaceID {
+			t.Fatalf("event workspace_id = %v, want %s", event["workspace_id"], testWorkspaceID)
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodGet, testServer.URL+"/api/events?cursor=0&limit=1", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/events status = %d, want 401", resp.StatusCode)
+	}
+
+	ctx := context.Background()
+	foreignSlug := "integration-tests-foreign-events-" + testWorkspaceID
+	var foreignWorkspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, "Integration Tests Foreign Events", foreignSlug, "Workspace event isolation test").Scan(&foreignWorkspaceID); err != nil {
+		t.Fatalf("create foreign workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, foreignWorkspaceID)
+	})
+
+	req, err = http.NewRequest(http.MethodGet, testServer.URL+"/api/events?cursor=0&limit=1", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-Workspace-ID", foreignWorkspaceID)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-member GET /api/events status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestDingTalkGroupsThroughRouterSupportsFilteredWorkspaceAndAgentScopes(t *testing.T) {
 	removedRouteResp := authRequest(t, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/dingtalk/group-routes", nil)
 	removedRouteResp.Body.Close()
