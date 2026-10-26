@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
-import type { InboxItem } from "@multica/core/types";
+import { ApiError } from "@multica/core/api";
+import type { AgentTask, InboxItem } from "@multica/core/types";
+import { useInboxFilterStore } from "@multica/core/inbox/filter-store";
 import { InboxPage } from "./inbox-page";
 
 vi.mock("sonner", () => ({
@@ -15,17 +17,37 @@ vi.mock("react-resizable-panels", () => ({
 // The page runs two queries — the active list and the archived one. They are
 // told apart by the queryKey their options carry, so each test can stock the
 // two lists independently.
-const listData: { active: InboxItem[]; archived: InboxItem[] } = {
+const listData: { active: InboxItem[]; archived: InboxItem[]; lookup?: InboxItem[]; tasks: AgentTask[] } = {
   active: [],
   archived: [],
+  tasks: [],
 };
 
+const queryCalls: Array<{ queryKey: readonly unknown[]; enabled?: boolean }> = [];
+const lookupState = { isLoading: false, isError: false, refetch: vi.fn() };
+const queryClient = vi.hoisted(() => ({ setQueryData: vi.fn() }));
 vi.mock("@tanstack/react-query", () => ({
-  useQuery: (options: { queryKey: readonly unknown[] }) => ({
-    data: options.queryKey.includes("archived") ? listData.archived : listData.active,
+  queryOptions: (options: unknown) => options,
+  useQueryClient: () => queryClient,
+  useQuery: (options: { queryKey: readonly unknown[]; enabled?: boolean }) => {
+    queryCalls.push(options);
+    return ({
+    data: options.queryKey.includes("archived")
+      ? { items: listData.lookup ?? listData.archived, hasMore: false, nextCursor: null }
+      : options.queryKey.includes("agent-task-snapshot") ? listData.tasks : listData.active,
     isLoading: false,
     isError: false,
-  }),
+    refetch: vi.fn(),
+    ...(options.queryKey.includes("lookup") ? lookupState : {}),
+  }); },
+  useInfiniteQuery: (options: { queryKey: readonly unknown[]; enabled?: boolean }) => {
+    queryCalls.push(options);
+    return ({
+    data: { pages: [{ items: listData.archived, hasMore: false, nextCursor: null }] },
+    isLoading: false, isError: false, hasNextPage: false,
+    isFetchingNextPage: false, isFetchNextPageError: false,
+    fetchNextPage: vi.fn(), refetch: vi.fn(),
+  }); },
 }));
 
 vi.mock("@multica/core/hooks", () => ({
@@ -53,7 +75,8 @@ vi.mock("@multica/core/issues/stores/draft-store", () => ({
 
 vi.mock("@multica/core/inbox/queries", () => ({
   inboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "list"] }),
-  archivedInboxListOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived"] }),
+  archivedInboxPagesOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived", "pages"] }),
+  archivedInboxLookupOptions: () => ({ queryKey: ["inbox", "workspace-1", "archived", "lookup"] }),
   deduplicateInboxItems: (items: InboxItem[]) => items.filter((i) => !i.archived),
   deduplicateArchivedInboxItems: (items: InboxItem[]) => items.filter((i) => i.archived),
   useInboxUnreadCount: () => 2,
@@ -65,6 +88,16 @@ const markReadMutate = vi.fn();
 const markUnreadMutate = vi.fn();
 const archiveMutate = vi.fn();
 const unarchiveMutate = vi.fn();
+const retrySourceContextMutateAsync = vi.fn();
+const showIssueLimitUpgradePrompt = vi.hoisted(() => vi.fn());
+const showAutopilotQuotaRecoveryPrompt = vi.hoisted(() => vi.fn());
+
+vi.mock("../../modals/use-issue-limit-upgrade-prompt", () => ({
+  useIssueLimitUpgradePrompt: (reason?: string) =>
+    reason === "autopilot_quota"
+      ? showAutopilotQuotaRecoveryPrompt
+      : showIssueLimitUpgradePrompt,
+}));
 
 vi.mock("@multica/core/inbox/mutations", () => {
   const mutation = () => ({ mutate: vi.fn() });
@@ -77,6 +110,10 @@ vi.mock("@multica/core/inbox/mutations", () => {
     useArchiveAllInbox: mutation,
     useArchiveAllReadInbox: mutation,
     useArchiveCompletedInbox: mutation,
+    useRetrySourceContextQuickCreate: () => ({
+      mutateAsync: retrySourceContextMutateAsync,
+      isPending: false,
+    }),
   };
 });
 
@@ -86,12 +123,11 @@ vi.mock("@multica/core/inbox/mutations", () => {
 const issueDetailProps = vi.hoisted(
   () => [] as Array<Record<string, unknown>>,
 );
-vi.mock("../../issues/components", () => ({
+vi.mock("../../issues/components/issue-detail", () => ({
   IssueDetail: (props: Record<string, unknown>) => {
     issueDetailProps.push(props);
     return null;
   },
-  StatusIcon: () => null,
   issueHighlightMementoKey: (issueId: string) => `highlight:${issueId}`,
 }));
 
@@ -123,8 +159,27 @@ vi.mock("@multica/ui/components/ui/resizable", () => ({
   ResizablePanelGroup: ({ children }: { children: React.ReactNode }) => (
     <div>{children}</div>
   ),
-  ResizablePanel: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
+  ResizablePanel: ({
+    children,
+    id,
+    defaultSize,
+    minSize,
+    maxSize,
+  }: {
+    children: React.ReactNode;
+    id: string;
+    defaultSize?: number;
+    minSize?: number | string;
+    maxSize?: number | string;
+  }) => (
+    <div
+      data-testid={`panel-${id}`}
+      data-default-size={defaultSize}
+      data-min-size={minSize}
+      data-max-size={maxSize}
+    >
+      {children}
+    </div>
   ),
   ResizableHandle: () => null,
 }));
@@ -133,10 +188,14 @@ vi.mock("./inbox-list", () => ({
     items,
     view,
     onSelect,
+    emptyLabel,
+    emptyAction,
   }: {
     items: InboxItem[];
     view: string;
     onSelect: (item: InboxItem) => void;
+    emptyLabel?: string;
+    emptyAction?: React.ReactNode;
   }) => (
     <div data-testid="list" data-view={view}>
       {items.map((i) => (
@@ -144,8 +203,13 @@ vi.mock("./inbox-list", () => ({
           {i.id}
         </button>
       ))}
+      {items.length === 0 && emptyLabel && <p>{emptyLabel}</p>}
+      {items.length === 0 && emptyAction}
     </div>
   ),
+}));
+vi.mock("./inbox-filter-menu", () => ({
+  InboxFilterMenu: () => <button type="button">Filter inbox</button>,
 }));
 vi.mock("./inbox-list-item", () => ({ useTimeAgo: () => vi.fn() }));
 
@@ -169,6 +233,21 @@ vi.mock("./inbox-context-menu", () => ({
   },
 }));
 vi.mock("./inbox-detail-label", () => ({ useTypeLabels: () => ({}) }));
+vi.mock("./autopilot-quota-notice", () => ({
+  AutopilotQuotaNotice: ({
+    onOpenRecovery,
+  }: {
+    onOpenRecovery: () => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="autopilot-quota-recovery"
+      onClick={onOpenRecovery}
+    >
+      Recover
+    </button>
+  ),
+}));
 vi.mock("../../i18n", () => ({ useT: () => ({ t: () => "Inbox" }) }));
 
 function item(overrides: Partial<InboxItem> = {}): InboxItem {
@@ -185,6 +264,7 @@ function item(overrides: Partial<InboxItem> = {}): InboxItem {
     title: "Issue title",
     body: null,
     issue_status: null,
+    issue_priority: null,
     read: true,
     archived: false,
     created_at: "2026-06-15T08:00:00Z",
@@ -196,21 +276,93 @@ function item(overrides: Partial<InboxItem> = {}): InboxItem {
 function reset() {
   listData.active = [];
   listData.archived = [];
+  listData.lookup = undefined;
+  listData.tasks = [];
+  lookupState.isLoading = false;
+  lookupState.isError = false;
+  lookupState.refetch.mockClear();
+  queryCalls.length = 0;
   searchParams = new URLSearchParams();
   replace.mockClear();
-  markReadMutate.mockClear();
+  markReadMutate.mockReset();
   markUnreadMutate.mockClear();
   archiveMutate.mockClear();
   unarchiveMutate.mockClear();
+  retrySourceContextMutateAsync.mockReset();
+  retrySourceContextMutateAsync.mockResolvedValue({});
+  showIssueLimitUpgradePrompt.mockClear();
+  showAutopilotQuotaRecoveryPrompt.mockClear();
   modalState.modal = null;
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   rowActions = null;
   issueDetailProps.length = 0;
   layout.width = PHONE;
+  useInboxFilterStore.setState({ filtersByWorkspace: {} });
 }
 
 describe("InboxPage", () => {
+  it.each([false, true])("enabling idle hides an already busy row with unread pin=%s", (unreadOnly) => {
+    reset();
+    layout.width = DESKTOP;
+    listData.active = [item({ id: "busy-row", issue_id: "busy-issue", read: !unreadOnly })];
+    listData.tasks = [{ id: "task-a", agent_id: "agent-1", issue_id: "busy-issue", status: "running" }] as AgentTask[];
+    if (unreadOnly) useInboxFilterStore.getState().toggleUnreadOnly("workspace-1");
+    markReadMutate.mockImplementation(() => {
+      listData.active = listData.active.map((current) => ({ ...current, read: true }));
+    });
+    const { rerender } = render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    rerender(<InboxPage />);
+    expect(screen.getByTestId("row")).toHaveTextContent("busy-row");
+
+    act(() => useInboxFilterStore.getState().toggleIdleOnly("workspace-1"));
+
+    expect(screen.queryByTestId("row")).toBeNull();
+  });
+
+  it("enabling unread hides a read row pinned by idle", () => {
+    reset();
+    layout.width = DESKTOP;
+    listData.active = [item({ id: "read-row", issue_id: "idle-issue", read: true })];
+    useInboxFilterStore.getState().toggleIdleOnly("workspace-1");
+    render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+
+    act(() => useInboxFilterStore.getState().toggleUnreadOnly("workspace-1"));
+
+    expect(screen.queryByTestId("row")).toBeNull();
+  });
+
+  it("re-enabling idle evaluates current activity after disabling it", () => {
+    reset();
+    layout.width = DESKTOP;
+    listData.active = [item({ id: "was-idle", issue_id: "issue-a", read: true })];
+    useInboxFilterStore.getState().toggleIdleOnly("workspace-1");
+    const { rerender } = render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    act(() => useInboxFilterStore.getState().toggleIdleOnly("workspace-1"));
+    listData.tasks = [{ id: "task-a", agent_id: "agent-1", issue_id: "issue-a", status: "running" }] as AgentTask[];
+    rerender(<InboxPage />);
+    expect(screen.getByTestId("row")).toHaveTextContent("was-idle");
+
+    act(() => useInboxFilterStore.getState().toggleIdleOnly("workspace-1"));
+
+    expect(screen.queryByTestId("row")).toBeNull();
+  });
+
+  it("keeps the list subordinate to the detail pane on desktop", () => {
+    reset();
+    layout.width = DESKTOP;
+
+    render(<InboxPage />);
+
+    const listPanel = screen.getByTestId("panel-list");
+    expect(listPanel).toHaveAttribute("data-default-size", "260");
+    expect(listPanel).toHaveAttribute("data-min-size", "240");
+    expect(listPanel).toHaveAttribute("data-max-size", "400");
+  });
+
   it("keeps the title unread count static", () => {
     reset();
     const { container } = render(<InboxPage />);
@@ -231,6 +383,199 @@ describe("InboxPage", () => {
 
     expect(screen.getByTestId("list").dataset.view).toBe("inbox");
     expect(screen.getByTestId("row").textContent).toBe("active-1");
+  });
+
+  it("filters the list by status and priority together", () => {
+    reset();
+    listData.active = [
+      item({
+        id: "todo-high",
+        issue_id: "issue-1",
+        issue_status: "todo",
+        issue_priority: "high",
+      }),
+      item({
+        id: "done-low",
+        issue_id: "issue-2",
+        issue_status: "done",
+        issue_priority: "low",
+      }),
+      item({ id: "system", issue_id: null }),
+    ];
+    const filters = useInboxFilterStore.getState();
+    filters.toggleStatusFilter("workspace-1", "done");
+    filters.togglePriorityFilter("workspace-1", "low");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row")).toHaveLength(1);
+    expect(screen.getByTestId("row")).toHaveTextContent("done-low");
+  });
+
+  it("hides read notifications while the unread filter is on", () => {
+    reset();
+    listData.active = [
+      item({ id: "unread-row", issue_id: "issue-1", read: false }),
+      item({ id: "read-row", issue_id: "issue-2", read: true }),
+    ];
+    useInboxFilterStore.getState().toggleUnreadOnly("workspace-1");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row")).toHaveLength(1);
+    expect(screen.getByTestId("row")).toHaveTextContent("unread-row");
+  });
+
+  it("filters by the actor the row carries", () => {
+    reset();
+    listData.active = [
+      item({ id: "from-alice", issue_id: "issue-1", actor_type: "member", actor_id: "alice" }),
+      item({ id: "from-bob", issue_id: "issue-2", actor_type: "agent", actor_id: "bob" }),
+    ];
+    useInboxFilterStore.getState().toggleActorFilter("workspace-1", "member:alice");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row")).toHaveLength(1);
+    expect(screen.getByTestId("row")).toHaveTextContent("from-alice");
+  });
+
+  it("hides issues an agent is running or queued on while the idle filter is on", () => {
+    reset();
+    listData.active = [
+      item({ id: "running", issue_id: "issue-1" }),
+      item({ id: "queued", issue_id: "issue-2" }),
+      item({ id: "finished", issue_id: "issue-3" }),
+      item({ id: "untouched", issue_id: "issue-4" }),
+    ];
+    listData.tasks = [
+      { id: "task-1", agent_id: "agent-1", issue_id: "issue-1", status: "running" },
+      { id: "task-2", agent_id: "agent-1", issue_id: "issue-2", status: "queued" },
+      { id: "task-3", agent_id: "agent-1", issue_id: "issue-3", status: "completed" },
+    ] as AgentTask[];
+    useInboxFilterStore.getState().toggleIdleOnly("workspace-1");
+
+    render(<InboxPage />);
+
+    expect(screen.getAllByTestId("row").map((row) => row.textContent)).toEqual([
+      "finished",
+      "untouched",
+    ]);
+  });
+
+  it("offers to clear filters when they hide every notification", () => {
+    reset();
+    listData.active = [
+      item({
+        id: "todo-high",
+        issue_status: "todo",
+        issue_priority: "high",
+      }),
+    ];
+    useInboxFilterStore
+      .getState()
+      .togglePriorityFilter("workspace-1", "urgent");
+
+    render(<InboxPage />);
+
+    expect(screen.queryByTestId("row")).toBeNull();
+    // The test's `useT` names every control "Inbox"; the header's batch menu
+    // shares the name, so skip the menu trigger.
+    const clearFilters = screen
+      .getAllByRole("button", { name: "Inbox" })
+      .find((button) => !button.hasAttribute("aria-haspopup"));
+    fireEvent.click(clearFilters!);
+    expect(screen.getByTestId("row")).toHaveTextContent("todo-high");
+  });
+
+  it("ignores a priority filter when a legacy response omits the projection", () => {
+    reset();
+    const legacyItem = item({
+      id: "legacy-todo",
+      issue_status: "todo",
+    });
+    delete legacyItem.issue_priority;
+    listData.active = [legacyItem];
+    useInboxFilterStore
+      .getState()
+      .togglePriorityFilter("workspace-1", "urgent");
+
+    render(<InboxPage />);
+
+    expect(screen.getByTestId("row")).toHaveTextContent("legacy-todo");
+  });
+
+  it("only enables the current inbox view's list", () => {
+    reset();
+    const main = render(<InboxPage />);
+    expect(queryCalls.find((q) => q.queryKey.includes("list"))?.enabled).toBe(true);
+    expect(queryCalls.find((q) => q.queryKey.includes("pages"))?.enabled).toBe(false);
+    main.unmount();
+    reset();
+    searchParams = new URLSearchParams("view=archived");
+    render(<InboxPage />);
+    expect(queryCalls.find((q) => q.queryKey.includes("list"))?.enabled).toBe(false);
+    expect(queryCalls.find((q) => q.queryKey.includes("pages"))?.enabled).toBe(true);
+  });
+
+  it("opens a deep-linked archive group outside the loaded pages with its comment anchor", () => {
+    reset();
+    searchParams = new URLSearchParams("view=archived&issue=old-issue");
+    listData.archived = [item({ id: "recent", archived: true })];
+    listData.lookup = [item({ id: "older", issue_id: "old-issue", archived: true, details: { comment_id: "old-comment" } })];
+    render(<InboxPage />);
+    expect(replace).not.toHaveBeenCalled();
+    expect(issueDetailProps.at(-1)).toMatchObject({ issueId: "old-issue", highlightCommentId: "old-comment" });
+    expect(queryCalls.find((q) => q.queryKey.includes("lookup"))?.enabled).toBe(true);
+  });
+
+  describe.each([PHONE, DESKTOP])("archive deep links at width %s", (width) => {
+    function setupLookup() {
+      reset();
+      layout.width = width;
+      searchParams = new URLSearchParams("view=archived&issue=old-issue");
+      listData.archived = [item({ id: "recent", issue_id: "recent-issue", archived: true })];
+      listData.lookup = [];
+    }
+
+    it("keeps loaded rows visible while resolving the selection, then opens its detail", () => {
+      setupLookup();
+      lookupState.isLoading = true;
+      const { rerender } = render(<InboxPage />);
+      expect(screen.getByTestId("row")).toHaveTextContent("recent");
+      expect(replace).not.toHaveBeenCalled();
+      expect(issueDetailProps).toHaveLength(0);
+
+      lookupState.isLoading = false;
+      listData.lookup = [item({ id: "older", issue_id: "old-issue", archived: true })];
+      rerender(<InboxPage />);
+      expect(issueDetailProps.at(-1)).toMatchObject({ issueId: "old-issue" });
+      expect(replace).not.toHaveBeenCalled();
+    });
+
+    it("keeps the list usable on lookup failure and retries only the lookup", () => {
+      setupLookup();
+      lookupState.isError = true;
+      render(<InboxPage />);
+      expect(screen.getByTestId("row")).toHaveTextContent("recent");
+      expect(replace).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("alert").querySelector("button")!);
+      expect(lookupState.refetch).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByTestId("row"));
+      expect(issueDetailProps.at(-1)).toMatchObject({ issueId: "recent-issue" });
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("only falls back to the issue after the lookup confirms the group is absent", () => {
+      setupLookup();
+      lookupState.isLoading = true;
+      const { rerender } = render(<InboxPage />);
+      expect(replace).not.toHaveBeenCalled();
+      lookupState.isLoading = false;
+      rerender(<InboxPage />);
+      expect(replace).toHaveBeenCalledWith("/acme/issues/old-issue");
+    });
   });
 
   it("renders the archived list when the URL asks for it", () => {
@@ -260,16 +605,27 @@ describe("InboxPage", () => {
     expect(archivedView.querySelector('[aria-haspopup="menu"]')).toBeNull();
   });
 
-  it("falls back to the main inbox when the archive drains", () => {
-    // Restoring the last archived item must not strand the user on an empty
-    // archive — same fallback chat's archived view has.
+  it("ignores a carried-over idle selection in the archive", () => {
     reset();
     searchParams = new URLSearchParams("view=archived");
-    listData.archived = [];
+    listData.archived = [item({ id: "archived-busy", issue_id: "issue-1", archived: true })];
+    listData.tasks = [
+      { id: "task-1", agent_id: "agent-1", issue_id: "issue-1", status: "running" },
+    ] as AgentTask[];
+    useInboxFilterStore.getState().toggleIdleOnly("workspace-1");
 
     render(<InboxPage />);
 
-    expect(replace).toHaveBeenCalledWith("/acme/inbox");
+    expect(screen.getByTestId("row")).toHaveTextContent("archived-busy");
+  });
+
+  it("keeps the archive open when it is empty", () => {
+    reset();
+    searchParams = new URLSearchParams("view=archived");
+    listData.archived = [];
+    render(<InboxPage />);
+    expect(replace).not.toHaveBeenCalled();
+    expect(screen.getByTestId("list").dataset.view).toBe("archived");
   });
 
   it("replays the comment highlight when the already-open row is clicked again", () => {
@@ -341,6 +697,81 @@ describe("InboxPage", () => {
     expect(screen.getByTestId("row")).toBeInTheDocument();
   });
 
+  it("retries a failed quick-create with its original source context", async () => {
+    reset();
+    listData.active = [
+      item({
+        id: "source-context-failure",
+        issue_id: null,
+        type: "quick_create_failed",
+        details: {
+          task_id: "task-1",
+          source_context_id: "context-1",
+          original_prompt: "make a child",
+        },
+      }),
+    ];
+
+    render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    fireEvent.click(screen.getByTestId("retry-source-context"));
+
+    await act(async () => undefined);
+    expect(retrySourceContextMutateAsync).toHaveBeenCalledWith("task-1");
+    expect(toast.success).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens quota-specific recovery from an autopilot quota notice", () => {
+    reset();
+    listData.active = [
+      item({
+        id: "autopilot-quota",
+        issue_id: null,
+        type: "autopilot_quota_exceeded",
+      }),
+    ];
+
+    render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    fireEvent.click(screen.getByTestId("autopilot-quota-recovery"));
+
+    expect(showAutopilotQuotaRecoveryPrompt).toHaveBeenCalledTimes(1);
+    expect(showIssueLimitUpgradePrompt).not.toHaveBeenCalled();
+  });
+
+  it("shows issue-limit recovery when a source-context retry is rejected", async () => {
+    reset();
+    retrySourceContextMutateAsync.mockRejectedValue(
+      new ApiError(
+        "workspace has reached its issue limit",
+        402,
+        "Payment Required",
+        { code: "issue_limit_reached" },
+      ),
+    );
+    listData.active = [
+      item({
+        id: "source-context-limit",
+        issue_id: null,
+        type: "quick_create_failed",
+        details: {
+          task_id: "task-1",
+          source_context_id: "context-1",
+          original_prompt: "make a child",
+        },
+      }),
+    ];
+
+    render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    fireEvent.click(screen.getByTestId("retry-source-context"));
+
+    await act(async () => undefined);
+    expect(showIssueLimitUpgradePrompt).toHaveBeenCalledTimes(1);
+    expect(showAutopilotQuotaRecoveryPrompt).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
   it("marks the opened notification read", () => {
     reset();
     listData.active = [
@@ -351,6 +782,57 @@ describe("InboxPage", () => {
     fireEvent.click(screen.getByTestId("row"));
 
     expect(markReadMutate).toHaveBeenCalledWith("inbox-a", expect.anything());
+  });
+
+  it("keeps an unread-filtered notification open after it is marked read", () => {
+    // Opening a row marks it read. With the unread filter on, that would drop
+    // the row before its detail renders and clear the selection, so the click
+    // looked like it only made the notification disappear.
+    reset();
+    layout.width = DESKTOP;
+    listData.active = [
+      item({ id: "inbox-a", issue_id: "issue-a", read: false }),
+    ];
+    useInboxFilterStore.getState().toggleUnreadOnly("workspace-1");
+    markReadMutate.mockImplementation((id: string) => {
+      listData.active = listData.active.map((current) =>
+        current.id === id ? { ...current, read: true } : current,
+      );
+    });
+
+    const { rerender } = render(<InboxPage />);
+    fireEvent.click(screen.getByTestId("row"));
+    rerender(<InboxPage />);
+
+    expect(screen.getByTestId("row")).toHaveTextContent("inbox-a");
+    expect(replace).not.toHaveBeenCalledWith("/acme/inbox");
+  });
+
+  it("keeps an idle-filtered notification open after an agent starts on it", () => {
+    // Replying from the detail can start an agent on the open issue. With the
+    // idle filter on, that would drop the row the user is working in.
+    reset();
+    layout.width = DESKTOP;
+    listData.active = [
+      item({ id: "inbox-a", issue_id: "issue-a", read: true }),
+      item({ id: "inbox-b", issue_id: "issue-b", read: true }),
+    ];
+    useInboxFilterStore.getState().toggleIdleOnly("workspace-1");
+
+    const { rerender } = render(<InboxPage />);
+    fireEvent.click(screen.getAllByTestId("row")[0]!);
+    rerender(<InboxPage />);
+    listData.tasks = [
+      { id: "task-a", agent_id: "agent-1", issue_id: "issue-a", status: "queued" },
+      { id: "task-b", agent_id: "agent-1", issue_id: "issue-b", status: "running" },
+    ] as AgentTask[];
+    rerender(<InboxPage />);
+
+    // The open row stays; another row that turned busy is still filtered.
+    expect(screen.getAllByTestId("row").map((row) => row.textContent)).toEqual([
+      "inbox-a",
+    ]);
+    expect(replace).not.toHaveBeenCalledWith("/acme/inbox");
   });
 
   it("keeps an explicitly unread row unread while it stays open", () => {

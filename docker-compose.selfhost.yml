@@ -63,7 +63,14 @@ services:
       - backend_uploads:/app/data/uploads
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-multica}:${POSTGRES_PASSWORD:-multica}@postgres:5432/${POSTGRES_DB:-multica}?sslmode=disable
+      DATABASE_SEARCH_WORK_MEM_MB: ${DATABASE_SEARCH_WORK_MEM_MB:-64}
+      DATABASE_REPLICA_URL: ${DATABASE_REPLICA_URL:-}
+      DATABASE_REPLICA_MAX_CONNS: ${DATABASE_REPLICA_MAX_CONNS:-}
+      DATABASE_REPLICA_MIN_CONNS: ${DATABASE_REPLICA_MIN_CONNS:-}
+      REDIS_URL: ${REDIS_URL:-}
+      REDIS_CLUSTER_MODE: ${REDIS_CLUSTER_MODE:-false}
       PORT: "8080"
+      MAINTENANCE_PORT: ${MAINTENANCE_PORT:-}
       METRICS_ADDR: ${METRICS_ADDR:-}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random value — generate one with 'openssl rand -hex 32'}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
@@ -100,20 +107,15 @@ services:
       MULTICA_DATABASE_CONNECT_TIMEOUT: ${MULTICA_DATABASE_CONNECT_TIMEOUT:-5s}
       MULTICA_SHUTDOWN_HOLD_DURATION: ${MULTICA_SHUTDOWN_HOLD_DURATION:-}
       MULTICA_RUNTIME_RECONNECT_GRACE: ${MULTICA_RUNTIME_RECONNECT_GRACE:-}
-      MULTICA_TASK_QUEUED_TTL: ${MULTICA_TASK_QUEUED_TTL:-}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}
       DISABLE_WORKSPACE_CREATION: ${DISABLE_WORKSPACE_CREATION:-}
-      # Managed entitlement policy is explicitly opt-in. The false/empty
-      # defaults keep self-hosted installs on the legacy path with no Cloud
-      # request and no quota-table access.
-      MULTICA_ENTITLEMENT_POLICY_ENABLED: ${MULTICA_ENTITLEMENT_POLICY_ENABLED:-false}
-      MULTICA_ENTITLEMENT_POLICY_URL: ${MULTICA_ENTITLEMENT_POLICY_URL:-}
-      MULTICA_ENTITLEMENT_SERVICE_TOKEN: ${MULTICA_ENTITLEMENT_SERVICE_TOKEN:-}
-      MULTICA_ENTITLEMENT_POLICY_TIMEOUT: ${MULTICA_ENTITLEMENT_POLICY_TIMEOUT:-3s}
-      MULTICA_ENTITLEMENT_STALE_GRACE: ${MULTICA_ENTITLEMENT_STALE_GRACE:-15m}
-      MULTICA_ENTITLEMENT_EMERGENCY_DISABLED: ${MULTICA_ENTITLEMENT_EMERGENCY_DISABLED:-false}
+      WORKSPACE_CREATION_ALLOWED_EMAILS: ${WORKSPACE_CREATION_ALLOWED_EMAILS:-}
+      DO_NOT_TRACK: ${DO_NOT_TRACK:-}
+      # Managed Cloud stays off for self-hosting. All managed Cloud clients use
+      # this single URL when it is configured.
+      MULTICA_CLOUD_URL: ${MULTICA_CLOUD_URL:-}
       GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       # App API credentials. The pull_request webhook is what mirrors a PR
@@ -141,6 +143,10 @@ services:
       MULTICA_PLUGIN_SURFACE_ORIGIN: ${MULTICA_PLUGIN_SURFACE_ORIGIN:-}
       MULTICA_PLUGIN_API_URL: ${MULTICA_PLUGIN_API_URL:-}
       MULTICA_PLUGIN_DIR: ${MULTICA_PLUGIN_DIR:-}
+      # Optional API URL shown in self-host daemon setup commands. Set this
+      # when the daemon reaches the API through a different URL than the one
+      # used for public webhook URLs; otherwise MULTICA_PUBLIC_URL is used.
+      MULTICA_DAEMON_SERVER_URL: ${MULTICA_DAEMON_SERVER_URL:-}
       # Comma-separated CIDRs whose source IP is allowed to set
       # X-Forwarded-For / X-Real-IP for the webhook per-IP rate limiter.
       # Empty default = headers ignored, RemoteAddr used. Set e.g.
@@ -151,10 +157,13 @@ services:
       # and callers fall back silently rather than failing. MULTICA_LLM_MAX_RETRIES
       # is the retry budget: unset = 2, 0 = disabled, 1-5 = an exact ceiling.
       # Anything else fails the boot instead of being silently corrected.
+      # MULTICA_LLM_DISABLE_THINKING asks gateways that honor the field to
+      # turn model reasoning off; see .env.example for the contract.
       MULTICA_LLM_API_KEY: ${MULTICA_LLM_API_KEY:-}
       MULTICA_LLM_BASE_URL: ${MULTICA_LLM_BASE_URL:-}
       MULTICA_LLM_DEFAULT_MODEL: ${MULTICA_LLM_DEFAULT_MODEL:-}
       MULTICA_LLM_MAX_RETRIES: ${MULTICA_LLM_MAX_RETRIES:-}
+      MULTICA_LLM_DISABLE_THINKING: ${MULTICA_LLM_DISABLE_THINKING:-}
       # Lark / Feishu bot integration. MULTICA_LARK_SECRET_KEY is the
       # opt-in: unset = integration disabled. Mainland 飞书 and international
       # Lark are auto-detected per installation and served side by side, so
@@ -173,6 +182,11 @@ services:
       # in the database, so this single deployment-wide key is all the operator
       # needs to set here.
       MULTICA_SLACK_SECRET_KEY: ${MULTICA_SLACK_SECRET_KEY:-}
+      # DingTalk bot integration. MULTICA_DINGTALK_SECRET_KEY is the opt-in:
+      # unset = integration disabled. It encrypts each installation's AppSecret
+      # at rest, so this single deployment-wide key is all the operator needs
+      # to set here.
+      MULTICA_DINGTALK_SECRET_KEY: ${MULTICA_DINGTALK_SECRET_KEY:-}
       # Self-hosted Git provider integration (Forgejo / Gitea / GitLab). This
       # is a self-host-only feature, so the compose file turns it on by default;
       # the managed cloud leaves it unset (off). It still needs a valid
@@ -197,6 +211,12 @@ services:
       # for a debugging session and unset it when that session ends, because
       # what it records is user message content.
       MULTICA_WECOM_TRACE: ${MULTICA_WECOM_TRACE:-}
+      # Telegram bot integration. MULTICA_TELEGRAM_SECRET_KEY is the
+      # opt-in: unset = integration disabled. It decrypts the
+      # per-installation bot token stored in channel_installation.config
+      # (bot_token_encrypted), so this single deployment-wide key is all
+      # the operator needs to set here.
+      MULTICA_TELEGRAM_SECRET_KEY: ${MULTICA_TELEGRAM_SECRET_KEY:-}
     restart: unless-stopped
 
   frontend:

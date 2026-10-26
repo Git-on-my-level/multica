@@ -11,6 +11,8 @@ import { useQuery } from "@tanstack/react-query";
 import {
   EMPTY_AGENT_DRAFT,
   isDraftDescriptionWithinLimit,
+  AGENT_CONVERSATION_STARTER_LABEL_MAX_LENGTH,
+  AGENT_CONVERSATION_STARTER_MAX_LENGTH,
   type AgentDraft,
 } from "@multica/core/agents";
 import { useAuthStore } from "@multica/core/auth";
@@ -50,8 +52,10 @@ interface RuntimeSeed {
    * never win a race against the authoritative answer.
    */
   ready: boolean;
-  /** The runtime to adopt; empty falls back to the first usable one. */
+  /** The runtime to adopt; empty may fall back to the first usable one. */
   runtimeId: string;
+  /** Live builder sessions must be explicitly rebound before adopting one. */
+  fallbackToFirstUsable?: boolean;
 }
 
 const IMMEDIATE_RUNTIME_SEED: RuntimeSeed = { ready: true, runtimeId: "" };
@@ -112,17 +116,26 @@ export function useCreateAgentForm(options?: {
   const seed = options?.runtimeSeed ?? IMMEDIATE_RUNTIME_SEED;
   const seedReady = seed.ready;
   const seedRuntimeId = seed.runtimeId;
+  const fallbackToFirstUsable = seed.fallbackToFirstUsable !== false;
   useEffect(() => {
     if (draft.runtimeId || !seedReady) return;
-    const next = seedRuntimeId || usableRuntimes[0]?.id || "";
+    const next = seedRuntimeId || (fallbackToFirstUsable ? usableRuntimes[0]?.id : "") || "";
     if (!next) return;
     setDraft((current) => ({ ...current, runtimeId: next }));
-  }, [draft.runtimeId, seedReady, seedRuntimeId, usableRuntimes]);
+  }, [draft.runtimeId, seedReady, seedRuntimeId, fallbackToFirstUsable, usableRuntimes]);
 
   const accessInvalid =
     draft.permissionScope === "members" &&
     draft.memberIds.size === 0 &&
     draft.teamIds.size === 0;
+
+  const conversationStartersInvalid = draft.conversationStarters.some(
+    (item) =>
+      item.label.trim().length === 0 ||
+      item.prompt.trim().length === 0 ||
+      [...item.label].length > AGENT_CONVERSATION_STARTER_LABEL_MAX_LENGTH ||
+      [...item.prompt].length > AGENT_CONVERSATION_STARTER_MAX_LENGTH,
+  );
 
   return {
     draft,
@@ -138,7 +151,9 @@ export function useCreateAgentForm(options?: {
     draftReady:
       selectedRuntime != null &&
       isRuntimeUsableForUser(selectedRuntime, currentUserId) &&
+      (selectedRuntime.provider !== "qoder_cloud" || !!draft.qoderAgentId) &&
       isDraftDescriptionWithinLimit(draft.description) &&
-      !accessInvalid,
+      !accessInvalid &&
+      !conversationStartersInvalid,
   };
 }

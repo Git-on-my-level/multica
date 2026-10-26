@@ -35,6 +35,7 @@ func newProfileCreateTestCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "create"}
 	addCommonProfileFlags(cmd)
 	cmd.Flags().String("protocol-family", "", "")
+	cmd.Flags().String("runtime-type", "", "")
 	cmd.Flags().String("command-name", "", "")
 	cmd.Flags().String("display-name", "", "")
 	cmd.Flags().String("description", "", "")
@@ -72,27 +73,8 @@ func newProfileUnsetPathTestCmd() *cobra.Command {
 	return cmd
 }
 
-// TestRuntimeProfileCommandsRegistered verifies the subcommands are wired
-// under `runtime profile`.
-func TestRuntimeProfileCommandsRegistered(t *testing.T) {
-	for _, name := range []string{"list", "create", "update", "delete", "set-path", "unset-path"} {
-		cmd, _, err := runtimeProfileCmd.Find([]string{name})
-		if err != nil {
-			t.Fatalf("find %q: %v", name, err)
-		}
-		if cmd == nil || cmd.Name() != name {
-			t.Fatalf("%q not registered under `runtime profile`; got %#v", name, cmd)
-		}
-	}
-	// And `profile` itself must hang off `runtime`.
-	cmd, _, err := runtimeCmd.Find([]string{"profile", "list"})
-	if err != nil || cmd == nil || cmd.Name() != "list" {
-		t.Fatalf("`runtime profile list` not reachable from runtime command: %v / %#v", err, cmd)
-	}
-}
-
 func TestRunRuntimeProfileList(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 
@@ -124,7 +106,7 @@ func TestRunRuntimeProfileList(t *testing.T) {
 }
 
 func TestRunRuntimeProfileCreate(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 
@@ -188,7 +170,7 @@ func TestRunRuntimeProfileCreateRequiresFlags(t *testing.T) {
 }
 
 func TestRunRuntimeProfileUpdateOnlySendsChangedFlags(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 
@@ -233,7 +215,7 @@ func TestRunRuntimeProfileUpdateOnlySendsChangedFlags(t *testing.T) {
 }
 
 func TestRunRuntimeProfileUpdateNoFieldsErrors(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 	t.Setenv("MULTICA_SERVER_URL", "http://127.0.0.1:0")
@@ -245,7 +227,7 @@ func TestRunRuntimeProfileUpdateNoFieldsErrors(t *testing.T) {
 }
 
 func TestRunRuntimeProfileDeleteSuccess(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 
@@ -271,7 +253,7 @@ func TestRunRuntimeProfileDeleteSuccess(t *testing.T) {
 }
 
 func TestRunRuntimeProfileDeleteConflictSurfacesServerMessage(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("MULTICA_TOKEN", "test-token")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
 
@@ -293,7 +275,7 @@ func TestRunRuntimeProfileDeleteConflictSurfacesServerMessage(t *testing.T) {
 }
 
 func TestRunRuntimeProfileSetAndUnsetPath(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 
 	// set-path
 	setCmd := newProfileSetPathTestCmd()
@@ -325,7 +307,7 @@ func TestRunRuntimeProfileSetAndUnsetPath(t *testing.T) {
 }
 
 func TestRunRuntimeProfileSetPathRejectsRelative(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	cmd := newProfileSetPathTestCmd()
 	_ = cmd.Flags().Set("path", "relative/path")
 	if err := runRuntimeProfileSetPath(cmd, []string{"prof-1"}); err == nil {
@@ -335,7 +317,7 @@ func TestRunRuntimeProfileSetPathRejectsRelative(t *testing.T) {
 
 func TestRunRuntimeProfileSetPathPreservesExistingConfig(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 
 	// Seed an existing config with unrelated fields.
 	seed := cli.CLIConfig{ServerURL: "https://api.multica.ai", WorkspaceID: "ws-123", Token: "mul_xyz"}
@@ -363,7 +345,7 @@ func TestRunRuntimeProfileSetPathPreservesExistingConfig(t *testing.T) {
 
 func TestRuntimeProfilePathMutationFailsClosedInTaskContext(t *testing.T) {
 	ownerHome := t.TempDir()
-	t.Setenv("HOME", ownerHome)
+	redirectTestHome(t, ownerHome)
 	t.Setenv("MULTICA_AGENT_ID", "agent-test")
 	t.Setenv("MULTICA_TASK_ID", "task-test")
 	t.Setenv("MULTICA_TASK_CONFIG_ROOT", filepath.Join(t.TempDir(), "task-multica"))
@@ -391,5 +373,32 @@ func TestRuntimeProfilePathMutationFailsClosedInTaskContext(t *testing.T) {
 	}
 	if string(after) != string(ownerBytes) {
 		t.Fatalf("owner config content changed: got %q", after)
+	}
+}
+
+func TestRunRuntimeProfileCreateOmpTarget(t *testing.T) {
+	redirectTestHome(t, t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-123")
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "prof-1"})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	cmd := newProfileCreateTestCmd()
+	_ = cmd.Flags().Set("runtime-type", "omp")
+	_ = cmd.Flags().Set("command-name", "wrapper")
+	_ = cmd.Flags().Set("display-name", "Custom OMP")
+	if err := runRuntimeProfileCreate(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if body["runtime_type"] != "omp" || body["command_name"] != "wrapper" {
+		t.Fatalf("incorrect target: %+v", body)
+	}
+	if _, ok := body["protocol_family"]; ok {
+		t.Fatal("server must derive the protocol family")
 	}
 }

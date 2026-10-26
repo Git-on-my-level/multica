@@ -1,14 +1,17 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,17 +77,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	// Run claude in its own process group so cancellation can reach the whole
-	// tree — the claude CLI plus the MCP servers and tool subprocesses it
-	// spawns — not just the direct child. The default CommandContext behaviour
-	// SIGKILLs only the leader, which orphans those descendants; on a resumed
-	// stream-json session with no wall-clock timeout they then keep running and
-	// burning model budget long after the task was cancelled, and under
-	// --max-concurrent-tasks 1 starve every queued task (#5918). This mirrors
-	// the fix already made for codex (#4520) and opencode (#4533).
-	configureProcessGroup(cmd)
-	// Take over context cancellation: the default would SIGKILL only the leader
-	// the instant runCtx is done. We instead drive a graceful group-wide
+	// Take over context cancellation: the default kills the whole group the
+	// instant runCtx is done. We instead drive a graceful group-wide
 	// SIGTERM→SIGKILL from the cancellation goroutine below and close stdout
 	// only after the tree has been signalled. Returning nil keeps os/exec from
 	// racing us with its own kill; WaitDelay remains the hard backstop.
@@ -100,6 +94,16 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, err
 	}
 
+	var usageSnapshot *claudeUsageSnapshot
+	if opts.ResumeSessionID != "" {
+		snapshot, snapshotErr := captureClaudeUsageSnapshot(cmd.Env, cmd.Dir, opts.ResumeSessionID)
+		if snapshotErr != nil {
+			b.cfg.Logger.Warn("claude usage baseline unavailable; falling back to reported totals", "error", snapshotErr)
+		} else {
+			usageSnapshot = snapshot
+		}
+	}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -110,8 +114,18 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		cancel()
 		return nil, fmt.Errorf("claude stdin pipe: %w", err)
 	}
+	inputWriter := &claudeInputWriter{w: stdin}
+	var supplements *claudeSupplementSession
+	if opts.EnableTaskSupplement {
+		supplements = newClaudeSupplementSession(runCtx)
+	}
 	var closeStdinOnce sync.Once
-	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
+	closeStdin := func() {
+		closeStdinOnce.Do(func() { _ = stdin.Close() })
+		if supplements != nil {
+			supplements.end()
+		}
+	}
 	// Capture stderr into both the daemon log (as before) and a bounded tail
 	// buffer so we can include the last few KB in Result.Error when claude
 	// exits unexpectedly. Without the tail, an exit-code-only failure looks
@@ -120,7 +134,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[claude:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		closeStdin()
 		cancel()
 		return nil, fmt.Errorf("start claude: %w", err)
@@ -128,7 +142,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
-	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
+	// The process started — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
 
 	msgCh := make(chan Message, 256)
@@ -154,9 +168,18 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// timeout.
 	writeDone := make(chan error, 1)
 	go func() {
-		err := writeClaudeInput(stdin, prompt)
+		if supplements != nil {
+			if initErr := supplements.initialize(inputWriter, opts.HandshakeTimeout); initErr != nil {
+				b.cfg.Logger.Warn("Claude additional messages unavailable; continuing normally", "error", initErr)
+				supplements.end()
+			}
+		}
+		err := writeClaudeInput(inputWriter, prompt)
 		if err != nil {
 			closeStdin()
+			if supplements != nil {
+				cancel()
+			}
 		}
 		writeDone <- err
 	}()
@@ -176,13 +199,17 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		resultIsError := false
 		terminalReasonError := ""
 		var sessionID string
+		var lastUsageResult *claudeSDKMessage
 		sawAsyncLaunch := false
 		usage := make(map[string]TokenUsage)
+		seenUsage := make(map[string]struct{})
 		eventCount := 0
 		invalidEventCount := 0
 		assistantEventCount := 0
 		toolUseCount := 0
 		unreadableAssistantCount := 0
+		controlErrors := make(chan error, 1)
+		var controlWrites sync.WaitGroup
 
 		// On cancellation / timeout, terminate claude (and every MCP server and
 		// tool subprocess it spawned) BEFORE unblocking the scanner. EOF stdin
@@ -234,7 +261,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			switch msg.Type {
 			case "assistant":
 				assistantEventCount++
-				turn := b.handleAssistant(msg, msgCh, usage)
+				turn := b.handleAssistant(msg, msgCh, usage, seenUsage)
 				toolUseCount += turn.toolUses
 				if !turn.understood {
 					unreadableAssistantCount++
@@ -255,8 +282,14 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				resultIsError = msg.IsError
 				terminalReasonError = claudeTerminalReasonFailure(msg.TerminalReason, msg.ResultText)
 				sessionID = msg.SessionID
-				if resultUsage := claudeResultUsage(msg, opts.Model); len(resultUsage) > 0 {
+				var baseline map[string]TokenUsage
+				if usageSnapshot != nil {
+					baseline = usageSnapshot.baseline
+				}
+				if resultUsage, authoritative := claudeResultUsageSince(msg, opts.Model, baseline); authoritative {
 					usage = resultUsage
+					usageMsg := msg
+					lastUsageResult = &usageMsg
 				}
 				closeStdin()
 			case "log":
@@ -268,7 +301,29 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					})
 				}
 			case "control_request":
-				b.handleControlRequest(msg, stdin)
+				var reply func(io.Writer) error
+				if supplements != nil {
+					reply, _ = supplements.prepareHook(msg)
+				}
+				controlWrites.Add(1)
+				go func(msg claudeSDKMessage, reply func(io.Writer) error) {
+					defer controlWrites.Done()
+					if reply == nil {
+						b.handleControlRequest(msg, inputWriter)
+						return
+					}
+					if err := reply(inputWriter); err != nil {
+						select {
+						case controlErrors <- err:
+						default:
+						}
+						cancel()
+					}
+				}(msg, reply)
+			case "control_response":
+				if supplements != nil {
+					supplements.handleResponse(msg.Response)
+				}
 			}
 		}
 		scanErr := scanner.Err()
@@ -284,11 +339,37 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// Wait for process exit, then release the cancellation handler.
 		exitErr := cmd.Wait()
 		close(procDone)
+		// The leader is reaped; drop ownership. On Windows that closes the Job
+		// Object, which kills anything still inside it — precisely what should
+		// happen to a descendant that outlived the CLI (GH #7522).
+		releaseProcessGroup(cmd)
 		duration := time.Since(startTime)
 		// writeDone is buffered (cap 1) and the writer always sends — by the
 		// time cmd has exited, the prompt write has either succeeded, hit a
 		// broken pipe, or been unblocked by the kill that ended cmd.
 		writeErr := <-writeDone
+		controlWrites.Wait()
+		if writeErr == nil {
+			select {
+			case writeErr = <-controlErrors:
+			default:
+			}
+		}
+		// Internal protocol failures cancel the process to unblock its pipes.
+		// Preserve the actual failure instead of reporting a user cancellation.
+		if supplements != nil && writeErr != nil && ctx.Err() == nil && terminalReasonError == "" && !errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			terminalReasonError = fmt.Sprintf("claude input/control protocol failed: %v", writeErr)
+		}
+
+		if !sawResult && usageSnapshot != nil {
+			appendedUsage, found, snapshotErr := usageSnapshot.appendedCostStateUsage()
+			switch {
+			case snapshotErr != nil:
+				b.cfg.Logger.Warn("claude final cost state unavailable; keeping stream usage fallback", "error", snapshotErr)
+			case found:
+				usage = subtractClaudeUsage(appendedUsage, usageSnapshot.baseline)
+			}
+		}
 
 		completionGuardError := ""
 		if sawAsyncLaunch {
@@ -346,6 +427,13 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		resumeRejected := resumeWasRejected(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
 		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
 		if resumeRejected {
+			// A rejected resume may emit usage for a newly-created session. Its
+			// totals do not share the requested session's baseline.
+			if lastUsageResult != nil {
+				if resultUsage, authoritative := claudeResultUsageSince(*lastUsageResult, opts.Model, nil); authoritative {
+					usage = resultUsage
+				}
+			}
 			b.cfg.Logger.Info("claude resume was rejected; dropping session id and signalling fresh-session retry",
 				"requested_resume", opts.ResumeSessionID,
 				"emitted_session", sessionID,
@@ -363,10 +451,15 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	session := &Session{Messages: msgCh, Result: resCh}
+	if supplements != nil {
+		session.Supplement = supplements.supplement
+		session.SupplementReady = supplements.ready
+	}
+	return session, nil
 }
 
-func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage) assistantTurn {
+func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage, seenUsage map[string]struct{}) assistantTurn {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
 		// Unreadable body: understood stays false so the caller drops any
@@ -377,11 +470,22 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 	var assistantText strings.Builder
 	toolUseCount := 0
 
-	// Accumulate token usage per model.
-	if content.Usage != nil && content.Model != "" {
+	// A response can emit several assistant blocks with the same message ID
+	// and usage. Count its input/cache tokens once, without dropping any of
+	// the blocks below. Missing IDs retain best-effort per-event accounting.
+	// This fallback covers only the main loop: assistant output_tokens is a
+	// placeholder, and subagent totals require the final result's modelUsage.
+	// https://code.claude.com/docs/en/agent-sdk/cost-tracking#track-per-step-usage
+	_, counted := seenUsage[content.ID]
+	if msg.ParentToolUseID == "" && content.Usage != nil && content.Model != "" &&
+		(content.ID == "" || !counted) && claudeUsageHasTokens(
+		content.Usage.InputTokens, 0, content.Usage.CacheReadInputTokens, content.Usage.CacheCreationInputTokens,
+	) {
+		if content.ID != "" {
+			seenUsage[content.ID] = struct{}{}
+		}
 		u := usage[content.Model]
 		u.InputTokens += content.Usage.InputTokens
-		u.OutputTokens += content.Usage.OutputTokens
 		u.CacheReadTokens += content.Usage.CacheReadInputTokens
 		u.CacheWriteTokens += content.Usage.CacheCreationInputTokens
 		usage[content.Model] = u
@@ -540,11 +644,12 @@ func claudeMapHasAsyncLaunchStatus(value map[string]any) bool {
 // ── Claude SDK JSON types ──
 
 type claudeSDKMessage struct {
-	Type      string          `json:"type"`
-	Message   json.RawMessage `json:"message,omitempty"`
-	Subtype   string          `json:"subtype,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	Model     string          `json:"model,omitempty"`
+	Type            string          `json:"type"`
+	Message         json.RawMessage `json:"message,omitempty"`
+	Subtype         string          `json:"subtype,omitempty"`
+	SessionID       string          `json:"session_id,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	ParentToolUseID string          `json:"parent_tool_use_id,omitempty"`
 
 	// result fields
 	ResultText string `json:"result,omitempty"`
@@ -564,6 +669,7 @@ type claudeSDKMessage struct {
 	// control request fields
 	RequestID string          `json:"request_id,omitempty"`
 	Request   json.RawMessage `json:"request,omitempty"`
+	Response  json.RawMessage `json:"response,omitempty"`
 }
 
 type claudeLogEntry struct {
@@ -572,6 +678,7 @@ type claudeLogEntry struct {
 }
 
 type claudeMessageContent struct {
+	ID      string               `json:"id"`
 	Role    string               `json:"role"`
 	Model   string               `json:"model"`
 	Content []claudeContentBlock `json:"content"`
@@ -625,21 +732,15 @@ func claudeTerminalReasonFailure(terminalReason, resultText string) string {
 }
 
 func claudeResultUsage(msg claudeSDKMessage, fallbackModel string) map[string]TokenUsage {
+	usage, _ := claudeResultUsageSince(msg, fallbackModel, nil)
+	return usage
+}
+
+func claudeResultUsageSince(msg claudeSDKMessage, fallbackModel string, baseline map[string]TokenUsage) (map[string]TokenUsage, bool) {
 	if len(msg.ModelUsage) > 0 {
-		usage := make(map[string]TokenUsage, len(msg.ModelUsage))
-		for model, u := range msg.ModelUsage {
-			if model == "" || !claudeUsageHasTokens(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens) {
-				continue
-			}
-			usage[model] = TokenUsage{
-				InputTokens:      u.InputTokens,
-				OutputTokens:     u.OutputTokens,
-				CacheReadTokens:  u.CacheReadInputTokens,
-				CacheWriteTokens: u.CacheCreationInputTokens,
-			}
-		}
+		usage := claudeModelUsage(msg.ModelUsage)
 		if len(usage) > 0 {
-			return usage
+			return subtractClaudeUsage(usage, baseline), true
 		}
 	}
 
@@ -653,7 +754,7 @@ func claudeResultUsage(msg claudeSDKMessage, fallbackModel string) map[string]To
 		msg.Usage.CacheReadInputTokens,
 		msg.Usage.CacheCreationInputTokens,
 	) {
-		return nil
+		return nil, false
 	}
 	return map[string]TokenUsage{
 		model: {
@@ -662,7 +763,265 @@ func claudeResultUsage(msg claudeSDKMessage, fallbackModel string) map[string]To
 			CacheReadTokens:  msg.Usage.CacheReadInputTokens,
 			CacheWriteTokens: msg.Usage.CacheCreationInputTokens,
 		},
+	}, true
+}
+
+func claudeModelUsage(modelUsage map[string]claudeResultModelUsage) map[string]TokenUsage {
+	usage := make(map[string]TokenUsage, len(modelUsage))
+	for model, u := range modelUsage {
+		if model == "" || !claudeUsageHasTokens(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens) {
+			continue
+		}
+		usage[model] = TokenUsage{
+			InputTokens:      u.InputTokens,
+			OutputTokens:     u.OutputTokens,
+			CacheReadTokens:  u.CacheReadInputTokens,
+			CacheWriteTokens: u.CacheCreationInputTokens,
+		}
 	}
+	return usage
+}
+
+func subtractClaudeUsage(current, baseline map[string]TokenUsage) map[string]TokenUsage {
+	// A baseline is usable only when Claude restored all of it. Older versions,
+	// downgrades, and future counter resets report per-run totals instead; in
+	// those cases subtracting even one historical field would silently undercount.
+	if !claudeUsageIncludesBaseline(current, baseline) {
+		usage := make(map[string]TokenUsage, len(current))
+		for model, modelUsage := range current {
+			usage[model] = modelUsage
+		}
+		return usage
+	}
+	usage := make(map[string]TokenUsage, len(current))
+	for model, currentUsage := range current {
+		base := baseline[model]
+		delta := TokenUsage{
+			InputTokens:      currentUsage.InputTokens - base.InputTokens,
+			OutputTokens:     currentUsage.OutputTokens - base.OutputTokens,
+			CacheReadTokens:  currentUsage.CacheReadTokens - base.CacheReadTokens,
+			CacheWriteTokens: currentUsage.CacheWriteTokens - base.CacheWriteTokens,
+		}
+		if claudeUsageHasTokens(delta.InputTokens, delta.OutputTokens, delta.CacheReadTokens, delta.CacheWriteTokens) {
+			usage[model] = delta
+		}
+	}
+	return usage
+}
+
+func claudeUsageIncludesBaseline(current, baseline map[string]TokenUsage) bool {
+	for model, base := range baseline {
+		modelUsage, ok := current[model]
+		if !ok || modelUsage.InputTokens < base.InputTokens ||
+			modelUsage.OutputTokens < base.OutputTokens ||
+			modelUsage.CacheReadTokens < base.CacheReadTokens ||
+			modelUsage.CacheWriteTokens < base.CacheWriteTokens {
+			return false
+		}
+	}
+	return true
+}
+
+const claudeSessionReadChunkSize = 64 * 1024
+
+type claudeUsageSnapshot struct {
+	path     string
+	fileInfo os.FileInfo
+	offset   int64
+	baseline map[string]TokenUsage
+}
+
+func captureClaudeUsageSnapshot(env []string, cwd, sessionID string) (*claudeUsageSnapshot, error) {
+	configDir, err := claudeConfigDir(env, cwd)
+	if err != nil {
+		return nil, err
+	}
+	path, err := findClaudeSessionFile(configDir, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open Claude session: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Claude session: %w", err)
+	}
+	baseline, _, err := readLastClaudeCostStateUsage(f, 0, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("read Claude usage baseline: %w", err)
+	}
+	return &claudeUsageSnapshot{
+		path:     path,
+		fileInfo: info,
+		offset:   info.Size(),
+		baseline: baseline,
+	}, nil
+}
+
+func (s *claudeUsageSnapshot) appendedCostStateUsage() (map[string]TokenUsage, bool, error) {
+	f, err := os.Open(s.path)
+	if err != nil {
+		return nil, false, fmt.Errorf("reopen Claude session: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf("stat Claude session after exit: %w", err)
+	}
+	if !os.SameFile(s.fileInfo, info) {
+		return nil, false, errors.New("Claude session file was replaced during execution")
+	}
+	if info.Size() < s.offset {
+		return nil, false, errors.New("Claude session file shrank during execution")
+	}
+	return readLastClaudeCostStateUsage(f, s.offset, info.Size())
+}
+
+func claudeConfigDir(env []string, cwd string) (string, error) {
+	if value, ok := lastClaudeEnvValue(env, "CLAUDE_CONFIG_DIR"); ok && value != "" {
+		return resolveClaudeConfigPath(value, cwd)
+	}
+	if runtime.GOOS == "windows" {
+		if value, ok := lastClaudeEnvValue(env, "USERPROFILE"); ok && value != "" {
+			return resolveClaudeConfigPath(filepath.Join(value, ".claude"), cwd)
+		}
+	} else if value, ok := lastClaudeEnvValue(env, "HOME"); ok && value != "" {
+		return resolveClaudeConfigPath(filepath.Join(value, ".claude"), cwd)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory for Claude config: %w", err)
+	}
+	return resolveClaudeConfigPath(filepath.Join(home, ".claude"), cwd)
+}
+
+func resolveClaudeConfigPath(path, cwd string) (string, error) {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	if cwd != "" {
+		if !filepath.IsAbs(cwd) {
+			absoluteCwd, err := filepath.Abs(cwd)
+			if err != nil {
+				return "", fmt.Errorf("resolve Claude working directory: %w", err)
+			}
+			cwd = absoluteCwd
+		}
+		return filepath.Clean(filepath.Join(cwd, path)), nil
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve Claude config directory: %w", err)
+	}
+	return absolutePath, nil
+}
+
+func lastClaudeEnvValue(env []string, key string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		name, value, ok := strings.Cut(env[i], "=")
+		matches := name == key
+		if runtime.GOOS == "windows" {
+			matches = strings.EqualFold(name, key)
+		}
+		if ok && matches {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func findClaudeSessionFile(configDir, sessionID string) (string, error) {
+	if sessionID == "" || sessionID == "." || sessionID == ".." || strings.ContainsAny(sessionID, "/\\:\x00") {
+		return "", fmt.Errorf("invalid Claude session id %q", sessionID)
+	}
+	projectsDir := filepath.Join(configDir, "projects")
+	projects, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return "", fmt.Errorf("read Claude projects directory: %w", err)
+	}
+	var bestPath string
+	var bestInfo os.FileInfo
+	var firstErr error
+	for _, project := range projects {
+		path := filepath.Join(projectsDir, project.Name(), sessionID+".jsonl")
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			if !errors.Is(statErr, os.ErrNotExist) && firstErr == nil {
+				firstErr = statErr
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if bestInfo == nil || info.ModTime().After(bestInfo.ModTime()) {
+			bestPath = path
+			bestInfo = info
+		}
+	}
+	if bestPath != "" {
+		return bestPath, nil
+	}
+	if firstErr != nil {
+		return "", fmt.Errorf("locate Claude session: %w", firstErr)
+	}
+	return "", fmt.Errorf("locate Claude session %q: %w", sessionID, os.ErrNotExist)
+}
+
+func readLastClaudeCostStateUsage(f *os.File, start, end int64) (map[string]TokenUsage, bool, error) {
+	if start < 0 || end < start {
+		return nil, false, fmt.Errorf("invalid Claude session range [%d,%d)", start, end)
+	}
+	var suffix []byte
+	for position := end; position > start; {
+		chunkStart := max(position-claudeSessionReadChunkSize, start)
+		chunk := make([]byte, position-chunkStart)
+		if _, err := f.ReadAt(chunk, chunkStart); err != nil && !errors.Is(err, io.EOF) {
+			return nil, false, fmt.Errorf("read Claude session: %w", err)
+		}
+		data := make([]byte, 0, len(chunk)+len(suffix))
+		data = append(data, chunk...)
+		data = append(data, suffix...)
+		lines := bytes.Split(data, []byte{'\n'})
+		firstComplete := chunkStart == start
+		firstLine := 0
+		if !firstComplete {
+			suffix = append(suffix[:0], lines[0]...)
+			firstLine = 1
+		}
+		for i := len(lines) - 1; i >= firstLine; i-- {
+			line := bytes.TrimSpace(lines[i])
+			if len(line) == 0 {
+				continue
+			}
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(line, &envelope); err != nil {
+				continue
+			}
+			if envelope.Type == "cost-state" {
+				var state struct {
+					ModelUsage map[string]claudeResultModelUsage `json:"modelUsage"`
+				}
+				if err := json.Unmarshal(line, &state); err != nil {
+					continue
+				}
+				usage := claudeModelUsage(state.ModelUsage)
+				if len(usage) == 0 {
+					// An empty or newly-incompatible shape is not authoritative.
+					// Keeping the stream fallback is safer than dropping usage.
+					return nil, false, nil
+				}
+				return usage, true, nil
+			}
+		}
+		position = chunkStart
+	}
+	return nil, false, nil
 }
 
 func claudeUsageHasTokens(input, output, cacheRead, cacheWrite int64) bool {
@@ -687,12 +1046,14 @@ type claudeControlRequestPayload struct {
 
 // ── Shared helpers ──
 
-func trySend(ch chan<- Message, msg Message) {
+func trySend(ch chan<- Message, msg Message) bool {
 	select {
 	case ch <- msg:
+		return true
 	default:
 		// Channel full — drop message. Result.Output is finalized independently,
 		// so only live transcript consumers are affected.
+		return false
 	}
 }
 
@@ -1109,24 +1470,103 @@ var detectVersionTimeout = 10 * time.Second
 func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
+	if runtime.GOOS == "windows" {
+		if native := resolveCodeArtsNativeFromShim(runtimeCmd.Path, os.Stat); native != "" {
+			runtimeCmd.Path = native
+		}
+	}
 
+	// outputOwned, not the collector in run_collect_quiet.go, and the difference
+	// is which signal means "the answer is in". A broken CLI (node/bun shim) can
+	// leave grandchildren that inherited and still hold our stdout pipe open, and
+	// os/exec's Wait blocks until those pipes reach EOF — which is why this call
+	// carries a WaitDelay backstop, and why the deadline above needs one at all.
+	//
+	// An earlier revision of this branch used the collector here, so that Wait
+	// returned on the *direct child's* exit whatever a descendant was holding.
+	// That is wrong on this path: a wrapper may exit successfully while the real
+	// CLI, its descendant, still owes us the version. Review measured it — the
+	// wrapper exits 0, its child prints the version 500ms later, and treating
+	// leader exit as completion killed the child and returned an empty version
+	// with a nil error, where outputOwned returns the version. Pipe EOF is the
+	// only signal that means "no more output is coming"; leader exit does not.
+	//
+	// What this branch still fixes here is the *reporting*: a lingering
+	// descendant makes Wait hit WaitDelay and report exec.ErrWaitDelay even
+	// though the version arrived, and a failed --version probe skips runtime
+	// registration entirely (#6084 reverted a WaitDelay backstop over exactly
+	// that). So the error is dropped when — and only when — the answer itself is
+	// present. See salvageProbeAnswer.
+	//
+	// Built through runtimeCmd.exec so a custom runtime's fixed_args prefix is
+	// still applied (MUL-6260).
 	cmd := runtimeCmd.exec(ctx, "--version")
 	hideAgentWindow(cmd)
-	// exec.CommandContext only kills the direct child on timeout. A broken CLI
-	// (node/bun shim) can leave grandchildren that inherited and still hold our
-	// stdout pipe open, and cmd.Output() blocks in Wait() until that pipe
-	// closes — defeating the timeout above. WaitDelay forces the pipes shut and
-	// reaps shortly after the context fires so this call always returns.
-	cmd.WaitDelay = 2 * time.Second
-	data, err := cmd.Output()
+	cmd.WaitDelay = probeWaitDelay
+	data, err := outputOwned(cmd, runtimeCmd.logger)
+	version, recognised := extractVersionLine(string(data))
 	if err != nil {
+		// recognised, not `version != ""`. The two differ exactly where it
+		// matters: extractVersionLine falls back to the trimmed raw output when
+		// no line carries a semver token, so non-empty means "the CLI printed
+		// something", which on this path may be a banner its wrapper emitted
+		// before the real version existed. Review measured that — a stub
+		// printing "initializing plugins", exiting 0, with the version arriving
+		// after WaitDelay — registering `initializing plugins` as the version
+		// with a nil error. A salvage decision needs the stronger question, so
+		// it asks whether a version was actually recognised.
+		//
+		// The fallback still stands on the success path: a CLI that exits 0 with
+		// an unusual version format is reporting its version, and dropping that
+		// to empty would be a regression (#2516). It is only unusable as
+		// evidence that a *bounded, incomplete* read already contains the
+		// answer.
+		if salvaged := salvageProbeAnswer(runtimeCmd, "--version", recognised, err); salvaged {
+			return version, nil
+		}
 		// One provider-agnostic boundary for probes: DetectVersion routes every
 		// provider through here, so an ENOEXEC diagnosis added at this point
 		// reaches the reason the daemon reports for a skipped runtime
 		// (MUL-6164).
 		return "", fmt.Errorf("detect version for %s: %w", runtimeCmd, ExplainExecError(err))
 	}
-	return extractVersionLine(string(data)), nil
+	return version, nil
+}
+
+// salvageProbeAnswer decides whether a one-shot probe that produced its answer
+// may ignore the error os/exec reported, and logs the decision.
+//
+// It exists for one shape: the CLI printed what we asked for, and then something
+// about its *lifecycle* failed — a descendant held the output pipes past
+// cmd.WaitDelay (exec.ErrWaitDelay), so Wait reports failure over an answer that
+// is already in the buffer. OpenClaw does this on every invocation: it forks an
+// `openclaw-config` helper that inherits stdout. #6084 measured that shape,
+// tried a WaitDelay backstop, and reverted it on review precisely because the
+// call then fails; MUL-5467 is the follow-up.
+//
+// Deliberately narrow, because "we have output" must never be confused with "we
+// have the answer":
+//
+//   - answered is the caller's own *recognition* of the answer, not a length
+//     check and not a parse that falls back to accepting anything. A version is
+//     salvaged only if extractVersionLine matched a version-shaped line — its
+//     trimmed-raw fallback does not qualify, since a wrapper's banner satisfies
+//     it — and a catalog only if it parsed.
+//   - Only ErrWaitDelay qualifies. A non-zero exit still fails: a CLI that
+//     printed something and then exited 1 is reporting a problem, and its stderr
+//     is the diagnosis. Cancellation and deadlines still fail too — reaching the
+//     deadline means the CLI never finished, and this is not the layer that
+//     decides a timeout was acceptable.
+func salvageProbeAnswer(runtimeCmd Command, probe string, answered bool, err error) bool {
+	if !answered || !errors.Is(err, exec.ErrWaitDelay) {
+		return false
+	}
+	if runtimeCmd.logger != nil {
+		runtimeCmd.logger.Warn("agent: CLI answered but left its output pipes open; "+
+			"using the answer and reaping the tree",
+			"command", runtimeCmd.String(), "probe", probe, "err", err)
+	}
+	return true
 }
 
 // extractVersionLine pulls the version line out of a `<cli> --version` capture,
@@ -1140,17 +1580,24 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 // or "codex-cli 0.118.0" survive unchanged because the whole matching line is
 // returned. If no line carries a semver token, fall back to the trimmed raw
 // output so unusual version formats aren't silently dropped to empty.
-func extractVersionLine(raw string) string {
+//
+// The second return reports whether that scan actually matched, i.e. whether the
+// first return is a recognised version or only the fallback. It exists because
+// the fallback accepts *any* non-empty text, which is fine when the CLI exited
+// cleanly (it said what it says) and unusable as evidence when a caller has to
+// decide whether an incomplete read already holds the answer — see
+// salvageProbeAnswer.
+func extractVersionLine(raw string) (string, bool) {
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		if versionRe.MatchString(line) {
-			return line
+			return line, true
 		}
 	}
-	return strings.TrimSpace(raw)
+	return strings.TrimSpace(raw), false
 }
 
 // logWriter adapts a *slog.Logger to an io.Writer for capturing stderr.

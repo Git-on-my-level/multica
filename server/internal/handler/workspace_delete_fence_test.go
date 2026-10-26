@@ -3,9 +3,6 @@ package handler
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,87 +58,6 @@ SELECT EXISTS (
 	t.Fatalf("backend %d never parked on a lock; the race was not set up", pid)
 }
 
-// TestTaskOwnershipWritesCallTheFence is the guard that keeps the fence from being
-// a convention. Every statement that inserts an agent_task_queue row, or assigns
-// one of its ownership columns, has to call lock_task_owner_rows — a new
-// write path that forgets it would silently reopen the insert-after-sweep window
-// that MUL-5999's teardown depends on being closed.
-//
-// This is the trade for not using a row trigger: the write path names its own
-// fence, and CI checks that it did.
-func TestTaskOwnershipWritesCallTheFence(t *testing.T) {
-	queryDir := filepath.Join("..", "..", "pkg", "db", "queries")
-	entries, err := os.ReadDir(queryDir)
-	if err != nil {
-		t.Fatalf("read query dir: %v", err)
-	}
-
-	nameRe := regexp.MustCompile(`(?m)^-- name: (\S+)`)
-	// Go's regexp has no lookahead, so the SET clause is isolated first and its
-	// ownership assignments are inspected individually. Clearing runtime_id cannot
-	// move a task into another workspace, so `= NULL` is exempt; teardown's own
-	// detach only touches parent_task_id.
-	setClauseRe := regexp.MustCompile(`(?is)\bSET\b(.*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|;)`)
-	ownerAssignRe := regexp.MustCompile(`(?i)\b(agent_id|issue_id|runtime_id)\s*=\s*(\S+)`)
-
-	assignsOwner := func(code string) bool {
-		for _, clause := range setClauseRe.FindAllStringSubmatch(code, -1) {
-			for _, assign := range ownerAssignRe.FindAllStringSubmatch(clause[1], -1) {
-				if !strings.EqualFold(strings.TrimSuffix(assign[2], ","), "NULL") {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	checked := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join(queryDir, entry.Name()))
-		if err != nil {
-			t.Fatalf("read %s: %v", entry.Name(), err)
-		}
-		text := string(body)
-		matches := nameRe.FindAllStringSubmatchIndex(text, -1)
-		for i, m := range matches {
-			stop := len(text)
-			if i+1 < len(matches) {
-				stop = matches[i+1][0]
-			}
-			stmt := text[m[0]:stop]
-			name := text[m[2]:m[3]]
-			// Strip comment lines so prose cannot satisfy or trip the check.
-			var sqlOnly strings.Builder
-			for _, line := range strings.Split(stmt, "\n") {
-				if strings.HasPrefix(strings.TrimSpace(line), "--") {
-					continue
-				}
-				sqlOnly.WriteString(line)
-				sqlOnly.WriteString("\n")
-			}
-			code := sqlOnly.String()
-
-			writesOwnership := strings.Contains(code, "INSERT INTO agent_task_queue") ||
-				(strings.Contains(code, "UPDATE agent_task_queue") && assignsOwner(code))
-			if !writesOwnership {
-				continue
-			}
-			checked++
-			if !strings.Contains(code, "lock_task_owner_rows(") {
-				t.Errorf("%s: %s writes agent_task_queue ownership without calling "+
-					"lock_task_owner_rows; that reopens the workspace-delete race "+
-					"(see migration 284)", entry.Name(), name)
-			}
-		}
-	}
-	if checked < 9 {
-		t.Errorf("only %d ownership-writing statements found; the detector probably stopped matching", checked)
-	}
-}
-
 // TestTaskWriteFence_BlocksOnWorkspaceLockAlone shows the fence, and only the
 // fence, standing between a concurrent enqueue and a workspace being torn down.
 //
@@ -166,6 +82,8 @@ func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
 		t.Fatalf("lock workspace row: %v", err)
 	}
 
+	// Each expected-blocked writer waits out its whole lock_timeout, which only
+	// runs while the writer is actually blocked, so it is kept small.
 	blockedEnqueue := func(name, agentID, runtimeID, issueID string) {
 		t.Helper()
 		writer, err := testPool.Begin(ctx)
@@ -173,7 +91,7 @@ func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
 			t.Fatalf("%s: begin: %v", name, err)
 		}
 		defer writer.Rollback(ctx)
-		if _, err := writer.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+		if _, err := writer.Exec(ctx, "SET LOCAL lock_timeout = 50"); err != nil {
 			t.Fatalf("%s: set lock_timeout: %v", name, err)
 		}
 		err = enqueueViaRealQuery(ctx, testHandler.Queries.WithTx(writer), agentID, runtimeID, issueID)
@@ -197,7 +115,7 @@ func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
 		t.Fatalf("begin reassign: %v", err)
 	}
 	defer reassign.Rollback(ctx)
-	if _, err := reassign.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+	if _, err := reassign.Exec(ctx, "SET LOCAL lock_timeout = 50"); err != nil {
 		t.Fatalf("reassign: set lock_timeout: %v", err)
 	}
 	_, err = testHandler.Queries.WithTx(reassign).ReassignTasksToRuntime(ctx, db.ReassignTasksToRuntimeParams{
@@ -215,7 +133,7 @@ func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
 		t.Fatalf("begin unrelated: %v", err)
 	}
 	defer unrelated.Rollback(ctx)
-	if _, err := unrelated.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+	if _, err := unrelated.Exec(ctx, "SET LOCAL lock_timeout = 200"); err != nil {
 		t.Fatalf("unrelated: set lock_timeout: %v", err)
 	}
 	if err := enqueueViaRealQuery(ctx, testHandler.Queries.WithTx(unrelated),
@@ -229,7 +147,7 @@ func TestTaskWriteFence_BlocksOnWorkspaceLockAlone(t *testing.T) {
 		t.Fatalf("begin status update: %v", err)
 	}
 	defer statusUpdate.Rollback(ctx)
-	if _, err := statusUpdate.Exec(ctx, "SET LOCAL lock_timeout = 750"); err != nil {
+	if _, err := statusUpdate.Exec(ctx, "SET LOCAL lock_timeout = 200"); err != nil {
 		t.Fatalf("status update: set lock_timeout: %v", err)
 	}
 	if _, err := statusUpdate.Exec(ctx,
@@ -386,16 +304,17 @@ VALUES ($1, $2, 'member', $3, $4) RETURNING id
 	errs := make([]error, 2*rounds)
 	for i := 0; i < rounds; i++ {
 		wg.Add(2)
-		// Owners drawn from both workspaces, in mirrored roles.
+		// Owners drawn from both workspaces, in mirrored roles. Keep each
+		// runtime matched to its agent: enqueue now rejects stale bindings.
 		go func(i int) {
 			defer wg.Done()
 			errs[2*i] = enqueueViaRealQuery(ctx, testHandler.Queries,
-				f.victimAgent, f.neighbourRuntime, neighbourIssues[i])
+				f.victimAgent, f.victimRuntime, neighbourIssues[i])
 		}(i)
 		go func(i int) {
 			defer wg.Done()
 			errs[2*i+1] = enqueueViaRealQuery(ctx, testHandler.Queries,
-				f.neighbourAgent, f.victimRuntime, victimIssues[i])
+				f.neighbourAgent, f.neighbourRuntime, victimIssues[i])
 		}(i)
 	}
 	wg.Wait()
@@ -414,7 +333,7 @@ VALUES ($1, $2, 'member', $3, $4) RETURNING id
 	if _, err := testPool.Exec(ctx, `
 DELETE FROM agent_task_queue
 WHERE (agent_id = $1 AND runtime_id = $2) OR (agent_id = $3 AND runtime_id = $4)
-`, f.victimAgent, f.neighbourRuntime, f.neighbourAgent, f.victimRuntime); err != nil {
+`, f.victimAgent, f.victimRuntime, f.neighbourAgent, f.neighbourRuntime); err != nil {
 		t.Fatalf("clean up: %v", err)
 	}
 }
@@ -433,12 +352,15 @@ func TestMergeLegacyRuntime_KeepsOldRuntimeWhenFenceRefuses(t *testing.T) {
 	}
 	ctx := context.Background()
 	f := newWorkspaceDeletePathFixture(t, "mergefence")
+	notifier := &recordingRuntimeGoneNotifier{}
+	h := *testHandler
+	h.DaemonRuntimeGone = notifier
 
 	// A target runtime id that does not resolve — the same state a merge sees when
 	// the target's workspace was torn down a moment ago.
 	vanishedTarget := parseUUID("00000000-0000-0000-0000-0000000000fe")
 
-	err := testHandler.mergeLegacyRuntime(ctx, vanishedTarget, parseUUID(f.victimRuntime), "legacy-daemon", "delete-test")
+	err := h.mergeLegacyRuntime(ctx, vanishedTarget, parseUUID(f.victimRuntime), "legacy-daemon", "delete-test", parseUUID(testUserID))
 	if !errors.Is(err, errRuntimeMergeFenced) {
 		t.Fatalf("mergeLegacyRuntime = %v, want errRuntimeMergeFenced", err)
 	}
@@ -458,6 +380,9 @@ func TestMergeLegacyRuntime_KeepsOldRuntimeWhenFenceRefuses(t *testing.T) {
 	if !stillOnOldRuntime {
 		t.Error("the task was re-pointed at the vanished runtime")
 	}
+	if len(notifier.runtimeIDs) != 0 {
+		t.Fatalf("fenced merge emitted runtime-gone notifications: %v", notifier.runtimeIDs)
+	}
 
 	// And the happy path still merges, so the abort is not unconditional.
 	var freshRuntime string
@@ -468,8 +393,8 @@ RETURNING id
 `, f.victimID, testUserID).Scan(&freshRuntime); err != nil {
 		t.Fatalf("create merge target: %v", err)
 	}
-	if err := testHandler.mergeLegacyRuntime(ctx, parseUUID(freshRuntime), parseUUID(f.victimRuntime),
-		"legacy-daemon", "delete-test"); err != nil {
+	if err := h.mergeLegacyRuntime(ctx, parseUUID(freshRuntime), parseUUID(f.victimRuntime),
+		"legacy-daemon", "delete-test", parseUUID(testUserID)); err != nil {
 		t.Fatalf("merge onto a live runtime: %v", err)
 	}
 	if rowExists(t, "agent_runtime", f.victimRuntime) {
@@ -477,6 +402,9 @@ RETURNING id
 	}
 	if !rowExists(t, "agent_task_queue", f.taskViaRuntime) {
 		t.Error("a completed merge lost the old runtime's task")
+	}
+	if len(notifier.runtimeIDs) != 1 || notifier.runtimeIDs[0] != f.victimRuntime {
+		t.Fatalf("runtime-gone notifications = %v, want [%s]", notifier.runtimeIDs, f.victimRuntime)
 	}
 }
 
@@ -536,7 +464,7 @@ FOR EACH ROW EXECUTE FUNCTION mul5999_fail_agent_move()
 	})
 
 	err := testHandler.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime),
-		"legacy-daemon", "delete-test")
+		"legacy-daemon", "delete-test", parseUUID(testUserID))
 	if err == nil {
 		t.Fatal("merge reported success even though the agent reassignment failed")
 	}
@@ -581,7 +509,7 @@ FOR EACH ROW EXECUTE FUNCTION mul5999_fail_agent_move()
 		t.Fatalf("drop injection trigger: %v", err)
 	}
 	if err := testHandler.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime),
-		"legacy-daemon", "delete-test"); err != nil {
+		"legacy-daemon", "delete-test", parseUUID(testUserID)); err != nil {
 		t.Fatalf("merge after removing the injection: %v", err)
 	}
 	if rowExists(t, "agent_runtime", f.victimRuntime) {

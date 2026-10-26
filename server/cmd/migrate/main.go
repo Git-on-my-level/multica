@@ -11,8 +11,10 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/attributionbackfill"
+	"github.com/multica-ai/multica/server/internal/chatoriginbackfill"
 	"github.com/multica-ai/multica/server/internal/dbstartup"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/migrations"
@@ -57,6 +59,27 @@ var commentContentBigramIndex = usableIndexRequirement{
 	AccessMethod:  "gin",
 	OperatorClass: "gin_bigm_ops",
 	Expression:    "lower(content)",
+	Extension:     "pg_bigm",
+}
+
+// extensionOperatorClass names an operator class a migration writes literally
+// into a CREATE INDEX, together with the extension that must own it. A
+// migration cannot both build concurrently and swallow a missing extension in a
+// DO ... EXCEPTION block, so the ones that need an optional opclass are gated on
+// this instead.
+type extensionOperatorClass struct {
+	AccessMethod  string
+	OperatorClass string
+	Extension     string
+}
+
+// pgBigmOperatorClass gates migrations that build optional pg_bigm indexes.
+// pg_bigm ships with neither core Postgres nor the pgvector image CI and
+// self-hosted deployments run, so those migrations must remain safe when the
+// operator class is unavailable.
+var pgBigmOperatorClass = extensionOperatorClass{
+	AccessMethod:  "gin",
+	OperatorClass: "gin_bigm_ops",
 	Extension:     "pg_bigm",
 }
 
@@ -117,6 +140,55 @@ var commentContentBigramIndex = usableIndexRequirement{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
+	"563_search_index_change_changed_at_index":                  "idx_search_index_change_changed_at",
+	"562_search_index_change_workspace_index":                   "idx_search_index_change_workspace_xid",
+	"552_agent_task_history_page_index":                         "idx_agent_task_queue_history_page",
+	"535_github_pr_address_index":                               "idx_github_pull_request_pr_owner_repo",
+	"539_task_supplement_request_index":                         "task_supplement_task_request_uidx",
+	"540_task_supplement_capability_index":                      "task_supplement_capability_task_uidx",
+	"541_task_supplement_comment_index":                         "task_supplement_comment_uidx",
+	"546_issue_pr_automation_workspace_index":                   "idx_issue_pr_automation_workspace",
+	"547_issue_pull_request_exclusion_workspace_index":          "idx_issue_pull_request_exclusion_workspace",
+	"548_task_supplement_comment_task_index":                    "task_supplement_comment_task_uidx",
+	"574_issue_workflow_pkey_index":                             "issue_workflow_pkey_uidx",
+	"576_issue_workflow_workspace_name_index":                   "idx_issue_workflow_workspace_name",
+	"582_issue_workflow_default_index":                          "idx_issue_workflow_workspace_default",
+	"554_wakeup_expiry_index":                                   "issue_wakeup_expiry_idx",
+	"556_wakeup_system_rule_index":                              "issue_wakeup_system_rule_idx",
+	"559_issue_child_event_id":                                  "issue_child_event_id_idx",
+	"560_issue_child_event_pending":                             "issue_child_event_pending_idx",
+	"566_channel_typing_reaction_id_idx":                        "channel_typing_reaction_id_idx",
+	"567_channel_typing_reaction_retry_idx":                     "channel_typing_reaction_retry_idx",
+	"568_channel_typing_reaction_gc_idx":                        "channel_typing_reaction_gc_idx",
+	"570_channel_typing_quota_idx":                              "channel_typing_reaction_quota_idx",
+	"571_channel_typing_expiry_idx":                             "channel_typing_reaction_expiry_idx",
+	"572_channel_typing_abandoned_idx":                          "channel_typing_reaction_abandoned_idx",
+	"510_wakeup_id":                                             "issue_wakeup_id_idx",
+	"511_wakeup_issue":                                          "issue_wakeup_issue_idx",
+	"512_wakeup_due":                                            "issue_wakeup_due_idx",
+	"513_wakeup_receipt_id":                                     "issue_wakeup_receipt_id_idx",
+	"514_wakeup_receipt_key":                                    "issue_wakeup_receipt_key_idx",
+	"515_wakeup_receipt_pending":                                "issue_wakeup_receipt_pending_idx",
+	"519_wakeup_event_issue":                                    "idx_wakeup_event_issue",
+	"521_wakeup_workspace_summary":                              "idx_wakeup_workspace_enabled",
+	"522_wakeup_run_lookup":                                     "agent_task_wakeup_lookup_idx",
+	"524_wakeup_workspace_history":                              "issue_wakeup_workspace_history_idx",
+	"525_wakeup_active_runs":                                    "agent_task_wakeup_active_idx",
+	"526_wakeup_terminal_runs":                                  "agent_task_wakeup_terminal_idx",
+	"527_wakeup_receipt_expiry":                                 "issue_wakeup_receipt_expiry_idx",
+	"529_wakeup_pending_event":                                  "issue_wakeup_pending_event_idx",
+	"503_channel_reply_delivery_turn_index":                     "idx_channel_reply_delivery_turn",
+	"504_channel_reply_delivery_installation_index":             "idx_channel_reply_delivery_installation",
+	"505_channel_reply_delivery_binding_index":                  "idx_channel_reply_delivery_binding",
+	"495_issue_to_label_label_id_index":                         "issue_to_label_label_idx",
+	"496_chat_session_agent_id_index":                           "idx_chat_session_agent_id",
+	"497_agent_task_queue_delegated_failure_evidence_index":     "idx_agent_task_queue_delegated_failure_evidence",
+	"498_chat_session_runtime_id_index":                         "idx_chat_session_runtime_id",
+	"486_maintenance_job_id_index":                              "idx_maintenance_job_id",
+	"487_maintenance_job_idempotency_index":                     "idx_maintenance_job_idempotency",
+	"488_maintenance_job_active_index":                          "idx_maintenance_job_active",
+	"587_cloud_agent_connection_provider_index":                 "cloud_agent_connection_provider_index",
+	"590_member_delegation_day_unique_index":                    "member_delegation_day_user_date_uidx",
 	"035_task_queue_issue_id_index":                             "idx_agent_task_queue_issue_id",
 	"067_task_queue_claim_candidate_index":                      "idx_agent_task_queue_claim_candidates",
 	"074_task_usage_updated_at_index":                           "idx_task_usage_updated_at",
@@ -254,6 +326,39 @@ var concurrentIndexCleanups = map[string]string{
 	"398_issue_workspace_status_position_index":                 "idx_issue_workspace_status_position",
 	"400_plugin_hook_schedule_installation_key_index":           "idx_plugin_hook_schedule_installation_key",
 	"401_plugin_hook_schedule_enabled_index":                    "idx_plugin_hook_schedule_enabled",
+	"408_issue_source_context_id_index":                         "idx_issue_source_context_id",
+	"409_issue_source_context_issue_index":                      "idx_issue_source_context_issue",
+	"410_issue_source_context_origin_task_index":                "idx_issue_source_context_origin_task",
+	"411_attachment_source_context_index":                       "idx_attachment_source_context",
+	"412_issue_source_context_object_intent_key_index":          "idx_issue_source_context_object_intent_key",
+	"413_issue_source_context_object_intent_due_index":          "idx_issue_source_context_object_intent_due",
+	"414_issue_source_context_object_intent_context_index":      "idx_issue_source_context_object_intent_context",
+	"416_seat_capacity_operation_token_index":                   "idx_seat_capacity_outbox_operation_token",
+	"418_seat_capacity_due_index":                               "idx_seat_capacity_outbox_due",
+	"419_seat_capacity_share_join_index":                        "idx_seat_capacity_outbox_share_join",
+	"421_channel_chat_active_route_index":                       "idx_channel_chat_session_binding_active_route",
+	"423_channel_task_delivery_pkey_index":                      "channel_task_delivery_pkey",
+	"426_channel_outbound_message_id_index":                     "idx_channel_outbound_message_id",
+	"428_channel_task_delivery_binding_index":                   "idx_channel_task_delivery_binding",
+	"429_channel_task_delivery_installation_index":              "idx_channel_task_delivery_installation",
+	"430_channel_outbound_message_binding_index":                "idx_channel_outbound_message_binding_route",
+	"438_agent_runtime_online_last_seen_index":                  "idx_agent_runtime_online_last_seen",
+	"439_agent_runtime_offline_last_seen_index":                 "idx_agent_runtime_offline_last_seen",
+	"440_github_pr_head_sha_index":                              "idx_github_pull_request_head_sha",
+	"443_issue_project_status_index":                            "idx_issue_project_status",
+	"445_comment_delegated_failure_unsettled_index":             "idx_comment_delegated_failure_unsettled",
+	"446_issue_properties_bigm_index":                           "idx_issue_properties_bigm",
+	"452_agent_task_pending_thread_unique":                      "idx_one_pending_task_per_issue_agent_thread",
+	"459_chat_message_assistant_task_index":                     "idx_chat_message_assistant_task",
+	"460_agent_task_queue_autopilot_run_created_at_index":       "idx_agent_task_queue_autopilot_run_created_at",
+	"465_agent_task_queue_chat_with_session_index":              "idx_agent_task_queue_chat_with_session_created_at",
+	"466_activity_log_member_assignee_frequency_index":          "idx_activity_log_member_assignee_frequency",
+	"472_agent_task_queue_chat_session_index":                   "idx_agent_task_queue_chat_session",
+	"474_dingtalk_bot_identity_workspace_index":                 "idx_dingtalk_bot_identity_workspace",
+	"480_instance_telemetry_state_singleton_index":              "instance_telemetry_state_singleton_uidx",
+	"482_agent_task_queue_telemetry_started_index":              "idx_agent_task_queue_telemetry_started",
+	"484_issue_triage_state_index":                              "idx_issue_triage_state",
+	"537_issue_duplicate_of_index":                              "idx_issue_duplicate_of",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction
@@ -267,6 +372,7 @@ var concurrentDownIndexCleanups = map[string]string{
 	"256_drop_agent_task_queue_chat_pending_v2":             "idx_agent_task_queue_chat_pending_v2",
 	"258_drop_pending_issue_agent_v1":                       "idx_one_pending_task_per_issue_agent",
 	"262_drop_agent_task_queue_terminal_completed_at_v1":    "idx_agent_task_queue_terminal_completed_at",
+	"422_channel_chat_route_history":                        "channel_chat_session_binding_installation_id_channel_chat_i_key",
 	"300_drop_redundant_issue_workspace_number_index":       "idx_issue_workspace_number",
 	"301_drop_redundant_sys_cron_job_plan_index":            "idx_sys_cron_exec_job_plan",
 	"302_drop_redundant_channel_chat_session_binding_index": "idx_channel_chat_session_binding_session",
@@ -275,12 +381,22 @@ var concurrentDownIndexCleanups = map[string]string{
 	"371_comment_content_search_index_strategy":             "idx_comment_content_trgm",
 	"375_drop_issue_last_activity_index":                    "idx_issue_workspace_last_activity",
 	"391_drop_agent_task_queue_dispatched_prepare_index":    "idx_agent_task_queue_dispatched_prepare",
+	"437_drop_agent_runtime_last_seen_at_index":             "idx_agent_runtime_last_seen_at",
+	"450_drop_comment_delegated_failure_pending_index":      "idx_comment_delegated_failure_pending",
+	"453_drop_pending_issue_agent_unique":                   "idx_one_pending_task_per_issue_agent_v2",
+	"548_task_supplement_comment_task_index":                "task_supplement_comment_uidx",
+	"454_drop_comment_content_bigm_index":                   "idx_comment_content_bigm",
+	"455_drop_comment_content_trgm_index":                   "idx_comment_content_trgm",
+	"463_drop_issue_description_bigm_index":                 "idx_issue_description_bigm",
+	"464_drop_issue_description_trgm_index":                 "idx_issue_description_trgm",
+	"473_drop_agent_task_queue_chat_with_session_index":     "idx_agent_task_queue_chat_with_session_created_at",
 }
 
 var preMigrationHooks = func() map[string]preMigrationHook {
 	hooks := map[string]preMigrationHook{
 		"103_drop_legacy_daily_rollups":                         runTaskUsageHourlyHook,
 		"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
+		"431_chat_explicit_origin_backfill":                     runChatOriginBackfillHook,
 	}
 	for version, index := range concurrentIndexCleanups {
 		hooks[version] = cleanupInvalidConcurrentIndexHook(index)
@@ -289,21 +405,93 @@ var preMigrationHooks = func() map[string]preMigrationHook {
 }()
 
 var preRollbackHooks = func() map[string]preMigrationHook {
-	hooks := make(map[string]preMigrationHook, len(concurrentDownIndexCleanups))
+	hooks := make(map[string]preMigrationHook, len(concurrentDownIndexCleanups)+len(sourceContextMigrationVersions)+1)
 	for version, index := range concurrentDownIndexCleanups {
 		hooks[version] = cleanupInvalidConcurrentIndexHook(index)
 	}
+	// Source-context indexes are split into one-statement concurrent
+	// migrations. Register the guard on every step so a rollback from any
+	// partially applied version fails before dropping its first live index.
+	for _, version := range sourceContextMigrationVersions {
+		hooks[version] = ensureSourceContextRollbackSafe
+	}
+	hooks["430_channel_outbound_message_binding_index"] = refuseChannelChatRouteHistoryRollback
 	return hooks
 }()
 
+var sourceContextMigrationVersions = []string{
+	"407_issue_source_context",
+	"408_issue_source_context_id_index",
+	"409_issue_source_context_issue_index",
+	"410_issue_source_context_origin_task_index",
+	"411_attachment_source_context_index",
+	"412_issue_source_context_object_intent_key_index",
+	"413_issue_source_context_object_intent_due_index",
+	"414_issue_source_context_object_intent_context_index",
+}
+
+type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func refuseChannelChatRouteHistoryRollback(ctx context.Context, pool *pgxpool.Pool) error {
+	return refuseChannelChatRouteHistoryRollbackWith(ctx, pool)
+}
+
+func runChatOriginBackfillHook(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := chatoriginbackfill.Hook(ctx, pool, chatoriginbackfill.HookOptions{})
+	return err
+}
+
+func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQuerier) error {
+	var channelChatRouteStateExists bool
+	if err := query.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM channel_chat_session_binding AS binding
+			LEFT JOIN chat_session AS session ON session.id = binding.chat_session_id
+			WHERE binding.retired_at IS NOT NULL
+			   OR session.explicitly_created_at IS NOT NULL
+		)
+	`).Scan(&channelChatRouteStateExists); err != nil {
+		return fmt.Errorf("check channel chat route state: %w", err)
+	}
+	if channelChatRouteStateExists {
+		return errors.New("cannot roll back channel chat routes after /new has created a channel Chat")
+	}
+	return nil
+}
+
 var upMigrationConditions = map[string]migrationCondition{
-	// Fresh databases that successfully built the CJK-friendly bigram index do
-	// not need to build the trigram fallback only to remove it at migration 371.
-	"140_comment_content_trgm_index": whenIndexNotUsable(commentContentBigramIndex),
+	// Preserve applied history; pending 469 is superseded by the bounded expand
+	// migration. SaaS backfills separately; self-host converges in 491.
+	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
+	// Current search no longer consumes an issue-description GIN. Fresh installs
+	// should not build the historical fallback only to retire it at migration 464.
+	"139_issue_description_trgm_index": skipMigration("issue description search indexes are retired by migration 464"),
+	// Current search no longer consumes a comment-content GIN. Fresh installs
+	// should not build the historical fallback only to retire it at migration 455.
+	"140_comment_content_trgm_index": skipMigration("comment content search indexes are retired by migration 455"),
 	// Existing pg_bigm deployments already have both indexes. Remove the
 	// fallback only after proving the preferred index has the exact usable shape;
 	// pg_bigm-less self-hosted databases keep trgm and record 371 as a no-op.
 	"371_comment_content_search_index_strategy": whenIndexUsable(commentContentBigramIndex),
+	// The properties prefilter index is an optimization, not a correctness
+	// requirement: build it where pg_bigm exists and record a no-op everywhere
+	// else, rather than failing the run (and with it backend startup) on every
+	// database without the extension.
+	"446_issue_properties_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
+}
+
+// Migrations 454 and 455 restore the mutually exclusive comment search index
+// selected before its retirement: pg_bigm deployments get the preferred bigram
+// index, while pg_bigm-less self-hosted deployments get the trigram fallback.
+// Migration 463 independently restores the optional issue-description bigram;
+// migration 464's portable trigram rollback is unconditional.
+var downMigrationConditions = map[string]migrationCondition{
+	"454_drop_comment_content_bigm_index":   whenOperatorClassAvailable(pgBigmOperatorClass),
+	"455_drop_comment_content_trgm_index":   whenOperatorClassUnavailable(pgBigmOperatorClass),
+	"463_drop_issue_description_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
 }
 
 func hooksForDirection(direction string) map[string]preMigrationHook {
@@ -317,13 +505,36 @@ func hooksForDirection(direction string) map[string]preMigrationHook {
 	}
 }
 
-func conditionsForDirection(direction string) map[string]migrationCondition {
-	if direction == "up" {
-		return upMigrationConditions
+func ensureSourceContextRollbackSafe(ctx context.Context, pool *pgxpool.Pool) error {
+	var dataExists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM issue_source_context)
+		    OR EXISTS (SELECT 1 FROM attachment WHERE source_context_id IS NOT NULL)
+		    OR EXISTS (SELECT 1 FROM issue_source_context_object_intent)
+	`).Scan(&dataExists); err != nil {
+		return fmt.Errorf("inspect source-context rollback ownership: %w", err)
 	}
-	// Rollbacks intentionally ignore environment gates: they restore the
-	// portable pre-migration schema regardless of which up SQL actually ran.
+	if dataExists {
+		return errors.New("cannot roll back issue source context while captured data or stored objects still exist; remove source-context captures and their stored objects through application cleanup, then retry")
+	}
 	return nil
+}
+
+func conditionsForDirection(direction string) map[string]migrationCondition {
+	switch direction {
+	case "up":
+		return upMigrationConditions
+	case "down":
+		return downMigrationConditions
+	default:
+		return nil
+	}
+}
+
+func skipMigration(reason string) migrationCondition {
+	return func(context.Context, *pgxpool.Conn) (bool, string, error) {
+		return false, reason, nil
+	}
 }
 
 func whenIndexUsable(requirement usableIndexRequirement) migrationCondition {
@@ -347,6 +558,56 @@ func whenIndexNotUsable(requirement usableIndexRequirement) migrationCondition {
 		}
 		if usable {
 			return false, fmt.Sprintf("preferred index %s is ready", requirement.IndexRegclass), nil
+		}
+		return true, "", nil
+	}
+}
+
+// whenOperatorClassAvailable lets a migration's SQL run only where the operator
+// class it names is installed, owned by the expected extension, and visible on
+// the search_path the migration itself will resolve the unqualified name
+// against — the condition runs on the same pinned connection as the SQL.
+//
+// Checking the extension alone would be weaker: an opclass in a schema outside
+// the search_path still fails the CREATE INDEX, which would abort the run.
+func whenOperatorClassAvailable(opclass extensionOperatorClass) migrationCondition {
+	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
+		var available bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_opclass opc
+				JOIN pg_am am ON am.oid = opc.opcmethod
+				JOIN pg_depend dep
+				  ON dep.classid = 'pg_opclass'::regclass
+				 AND dep.objid = opc.oid
+				 AND dep.refclassid = 'pg_extension'::regclass
+				 AND dep.deptype = 'e'
+				JOIN pg_extension ext ON ext.oid = dep.refobjid
+				WHERE opc.opcname = $1
+				  AND am.amname = $2
+				  AND ext.extname = $3
+				  AND pg_opclass_is_visible(opc.oid)
+			)
+		`, opclass.OperatorClass, opclass.AccessMethod, opclass.Extension).Scan(&available); err != nil {
+			return false, "", fmt.Errorf("inspect operator class %q: %w", opclass.OperatorClass, err)
+		}
+		if !available {
+			return false, fmt.Sprintf("operator class %s (%s) is not installed", opclass.OperatorClass, opclass.Extension), nil
+		}
+		return true, "", nil
+	}
+}
+
+func whenOperatorClassUnavailable(opclass extensionOperatorClass) migrationCondition {
+	availableCondition := whenOperatorClassAvailable(opclass)
+	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
+		available, _, err := availableCondition(ctx, conn)
+		if err != nil {
+			return false, "", err
+		}
+		if available {
+			return false, fmt.Sprintf("operator class %s (%s) is installed", opclass.OperatorClass, opclass.Extension), nil
 		}
 		return true, "", nil
 	}
@@ -551,7 +812,13 @@ func main() {
 	}
 
 	startupSettings := dbstartup.SettingsFromEnv()
-	pool, err := dbstartup.NewPool(context.Background(), dbURL, startupSettings.ConnectTimeout)
+	poolConfig, err := dbstartup.ParsePoolConfig(dbURL, startupSettings.ConnectTimeout)
+	if err != nil {
+		slog.Error("unable to connect to database", "error", err)
+		os.Exit(1)
+	}
+	poolConfig.ConnConfig.OnNotice = logMigrationNotice
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)
@@ -612,6 +879,33 @@ func main() {
 	}
 
 	fmt.Println("Done.")
+}
+
+// migrationReportPrefix marks a notice a migration raises on purpose to say
+// what it changed, e.g.
+//
+//	RAISE NOTICE 'migration report: renamed % row(s)', n;
+//
+// Only these reach the migration log. The server's own notices cannot be told
+// apart from a deliberate RAISE by condition code — "does not exist, skipping"
+// and the rename notice of ADD CONSTRAINT ... USING INDEX both carry SQLSTATE
+// 00000 — so the marker is explicit.
+const migrationReportPrefix = "migration report: "
+
+// migrationReport returns the text of a notice raised with
+// migrationReportPrefix, and false for every other notice.
+func migrationReport(notice *pgconn.Notice) (string, bool) {
+	return strings.CutPrefix(notice.Message, migrationReportPrefix)
+}
+
+// logMigrationNotice forwards migration reports to the migration log. pgx
+// drops server notices unless a handler is set, so without it the per-row
+// report a data-repair migration prints (e.g. 476) never reached whoever ran
+// the deploy.
+func logMigrationNotice(_ *pgconn.PgConn, notice *pgconn.Notice) {
+	if report, ok := migrationReport(notice); ok {
+		slog.Info("migration report", "message", report)
+	}
 }
 
 // runMigrations applies (direction="up") or rolls back (direction="down")

@@ -8,6 +8,7 @@ import {
   type AgentDraft,
   type AgentPermissionScope,
 } from "@multica/core/agents";
+import { useConfigStore } from "@multica/core/config";
 import type { MemberWithUser, RuntimeDevice } from "@multica/core/types";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { Input } from "@multica/ui/components/ui/input";
@@ -24,8 +25,10 @@ import { CharCounter } from "../components/char-counter";
 import { ServiceTierSettingField } from "../components/inspector/service-tier-setting-field";
 import { ThinkingSettingField } from "../components/inspector/thinking-prop-row";
 import { ModelDropdown } from "../components/model-dropdown";
+import { QoderAgentSelect } from "../components/qoder-agent-select";
 import { RuntimePicker } from "../components/runtime-picker";
 import { SkillMultiSelect } from "../components/skill-multi-select";
+import { ConversationStartersEditor } from "../components/conversation-starters-editor";
 
 const PERMISSION_SCOPES: AgentPermissionScope[] = [
   "private",
@@ -36,6 +39,7 @@ const PERMISSION_SCOPES: AgentPermissionScope[] = [
 export function AgentConfigurationPanel({
   draft,
   onChange,
+  onAutomaticChange = onChange,
   runtimes,
   runtimesLoading,
   members,
@@ -46,9 +50,12 @@ export function AgentConfigurationPanel({
   onRuntimeSelect,
   runtimeSwitchPending = false,
   runtimeSwitchInFlight = false,
+  runtimeSummary,
 }: {
   draft: AgentDraft;
   onChange: (draft: AgentDraft) => void;
+  /** Value cleanup without user interaction, such as an unsupported model. */
+  onAutomaticChange?: (draft: AgentDraft) => void;
   runtimes: RuntimeDevice[];
   runtimesLoading: boolean;
   members: MemberWithUser[];
@@ -64,8 +71,14 @@ export function AgentConfigurationPanel({
   runtimeSwitchPending?: boolean;
   /** A rebind request is in flight. */
   runtimeSwitchInFlight?: boolean;
+  /** Replaces the runtime picker when the runtime was chosen in an earlier
+   *  step and changing it means going back there. */
+  runtimeSummary?: ReactNode;
 }) {
   const { t } = useT("agents");
+  const conversationStartersSupported = useConfigStore(
+    (state) => state.agentConversationStartersSupported,
+  );
   const selectedRuntime =
     runtimes.find((runtime) => runtime.id === draft.runtimeId) ?? null;
   const set = <K extends keyof AgentDraft>(key: K, value: AgentDraft[K]) =>
@@ -74,6 +87,9 @@ export function AgentConfigurationPanel({
     (member) => member.user_id !== currentUserId,
   );
   const runtimeLocked = runtimeSwitchPending || runtimeSwitchInFlight;
+  // The Qoder bridge refuses tasks from agents with skills or per-agent
+  // config, so the fields that would produce them are not offered.
+  const qoderRuntime = selectedRuntime?.provider === "qoder_cloud";
   const handleRuntimeSelect = (id: string) => {
     if (id === draft.runtimeId) return;
     if (onRuntimeSelect) {
@@ -90,7 +106,6 @@ export function AgentConfigurationPanel({
     <div className={cn("space-y-8", compact && "space-y-6")}>
       <SettingsSection
         title={t(($) => $.creation_studio.sections.identity)}
-        description={t(($) => $.creation_studio.sections.identity_hint)}
       >
         <SettingsCard>
           <DraftFieldRow
@@ -143,12 +158,24 @@ export function AgentConfigurationPanel({
               />
             </div>
           </DraftFieldRow>
+          {conversationStartersSupported && !qoderRuntime ? (
+            <DraftFieldRow
+              compact={compact}
+              align="start"
+              label={t(($) => $.conversation_starters.label)}
+              description={t(($) => $.conversation_starters.create_hint)}
+            >
+              <ConversationStartersEditor
+                value={draft.conversationStarters}
+                onChange={(value) => set("conversationStarters", value)}
+              />
+            </DraftFieldRow>
+          ) : null}
         </SettingsCard>
       </SettingsSection>
 
       <SettingsSection
         title={t(($) => $.creation_studio.sections.behavior)}
-        description={t(($) => $.creation_studio.sections.behavior_hint)}
       >
         <SettingsCard>
           <DraftFieldRow
@@ -170,12 +197,18 @@ export function AgentConfigurationPanel({
               className="min-h-44 resize-y font-mono text-label leading-6"
             />
           </DraftFieldRow>
-          <div className="px-4 py-4">
-            <SkillMultiSelect
-              selectedIds={draft.skillIds}
-              onChange={(ids) => set("skillIds", ids)}
-            />
-          </div>
+          {qoderRuntime ? (
+            <p className="px-4 py-3 text-caption text-muted-foreground">
+              {t(($) => $.creation_studio.cloud_fields_note)}
+            </p>
+          ) : (
+            <div className="px-4 py-4">
+              <SkillMultiSelect
+                selectedIds={draft.skillIds}
+                onChange={(ids) => set("skillIds", ids)}
+              />
+            </div>
+          )}
         </SettingsCard>
       </SettingsSection>
 
@@ -188,6 +221,7 @@ export function AgentConfigurationPanel({
             className={cn("grid gap-4 px-4 py-4", !compact && "sm:grid-cols-2")}
           >
             <div className="min-w-0">
+              {runtimeSummary ?? (
               <RuntimePicker
                 runtimes={runtimes}
                 runtimesLoading={runtimesLoading}
@@ -196,7 +230,9 @@ export function AgentConfigurationPanel({
                 selectedRuntimeId={draft.runtimeId}
                 onSelect={handleRuntimeSelect}
                 disabled={runtimeLocked}
+                autoSelect={!onRuntimeSelect}
               />
+              )}
               {/* A silently greyed-out picker is the worst version of this: the
                   user reaches for it exactly when the current runtime has gone
                   wrong, so say what unblocks it instead of just refusing. */}
@@ -206,15 +242,28 @@ export function AgentConfigurationPanel({
                 </p>
               )}
             </div>
-            <ModelDropdown
-              runtimeId={selectedRuntime?.id ?? null}
-              runtimeOnline={selectedRuntime?.status === "online"}
-              value={draft.model}
-              onChange={(value) => onChange(applyDraftModelChange(draft, value))}
-              // A successful switch clears the model, so an edit made while the
-              // rebind is in flight would be silently discarded.
-              disabled={!selectedRuntime || runtimeSwitchInFlight}
-            />
+            {qoderRuntime ? (
+              <QoderAgentSelect
+                value={draft.qoderAgentId}
+                onChange={(value) => set("qoderAgentId", value)}
+                disabled={runtimeLocked}
+              />
+            ) : (
+              <ModelDropdown
+                runtimeId={selectedRuntime?.id ?? null}
+                runtimeOnline={selectedRuntime?.status === "online"}
+                value={draft.model}
+                onChange={(value) =>
+                  onChange(applyDraftModelChange(draft, value))
+                }
+                onAutomaticChange={(value) =>
+                  onAutomaticChange(applyDraftModelChange(draft, value))
+                }
+                // A successful switch clears the model, so an edit made while the
+                // rebind is in flight would be silently discarded.
+                disabled={!selectedRuntime || runtimeSwitchInFlight}
+              />
+            )}
           </div>
           {/* Both fields fail closed: they render only when the exact selected
               model's live catalog advertises the capability (or a value is
@@ -232,7 +281,6 @@ export function AgentConfigurationPanel({
 
       <SettingsSection
         title={t(($) => $.creation_studio.sections.access)}
-        description={t(($) => $.creation_studio.sections.access_hint)}
       >
         <SettingsCard>
           <div
@@ -416,12 +464,14 @@ export function AgentExecutionOverrides({
 
 function DraftFieldRow({
   label,
+  description,
   children,
   compact = false,
   align = "center",
   htmlFor,
 }: {
   label: string;
+  description?: string;
   children: ReactNode;
   compact?: boolean;
   align?: "center" | "start";
@@ -437,13 +487,20 @@ function DraftFieldRow({
         !compact && (align === "center" ? "sm:items-center" : "sm:items-start"),
       )}
     >
-      {htmlFor ? (
-        <label htmlFor={htmlFor} className="text-body font-medium">
-          {label}
-        </label>
-      ) : (
-        <div className="text-body font-medium">{label}</div>
-      )}
+      <div className="min-w-0">
+        {htmlFor ? (
+          <label htmlFor={htmlFor} className="text-body font-medium">
+            {label}
+          </label>
+        ) : (
+          <div className="text-body font-medium">{label}</div>
+        )}
+        {description ? (
+          <p className="mt-0.5 text-caption leading-5 text-muted-foreground">
+            {description}
+          </p>
+        ) : null}
+      </div>
       <div className="min-w-0">{children}</div>
     </div>
   );

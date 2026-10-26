@@ -23,24 +23,24 @@ const (
 	// gate pinned Task/Run execution: disabling discovery and management must not
 	// mutate an immutable execution manifest that is already in flight.
 	PluginsV1 = "plugins_v1"
-	// CustomIssueStatuses gates CREATING a custom issue status (MUL-6243). It is
-	// a rollout gate, not a behavior switch, and it is deliberately one-way.
-	//
-	// The readers ship unconditionally and are safe to: issuestatus.Effective is
-	// the identity function on the 7 built-in keys, so a pod running this code
-	// behaves exactly as before until a custom status exists. The hazard is the
-	// other direction — the first custom status written by a new pod is a value
-	// an OLD pod cannot interpret, and old pods would fall back to literal
-	// comparisons and mishandle the issue's events and tasks. Gating creation
-	// means that value cannot come into existence until the whole fleet can read
-	// it, which removes the need for a coordinated restart.
-	//
-	// Enable only after every pod is running this version or later. Once a
-	// workspace has custom statuses, turning it back off stops new ones being
-	// created but does NOT make the existing ones safe for an older binary; a
-	// true rollback requires migrating those issues back to built-in statuses
-	// first (migration 337's down direction refuses precisely because of this).
-	CustomIssueStatuses = "custom_issue_statuses"
+	// TriageV1 gates the Triage inbox (MUL-7189): creating issues into Triage,
+	// triage runs, and the Triage page. It is a GLOBAL switch — per-workspace
+	// targeting has no production wiring — which is enough because a
+	// workspace with no triager configured and no Triage issues sees nothing
+	// either way. Turning it off stops new intake and triage runs but leaves
+	// existing Triage issues workable.
+	TriageV1 = "triage_v1"
+	// ProjectWorkflowsV1 gates project workflows (MUL-7420): creating a
+	// workflow and pointing a project at one, plus the Settings → Workflows
+	// and project workflow UI. Turning it off stops new adoption but leaves
+	// workflows already in use working, and a project can always switch back
+	// to the Default workflow.
+	ProjectWorkflowsV1 = "project_workflows_v1"
+	// LocalSearchIndex gates the sync endpoints behind Web/Desktop local search
+	// (MUL-7754). On by default. Turning it off (FF_LOCAL_SEARCH_INDEX=off)
+	// makes those endpoints answer 404, so clients stop syncing and search
+	// through the server again without a client release.
+	LocalSearchIndex = "local_search_index"
 	// agentBuilderCompat is no longer a release flag. Keep publishing the key
 	// as enabled so installed desktop clients that still gate the AI creation
 	// entry on this config decision receive the permanently enabled behavior.
@@ -62,9 +62,7 @@ var frontendPublicFlags = []string{
 	BillingWorkspaceSubscriptions,
 	ComposioMCPApps,
 	PluginsV1,
-	// The settings UI needs this to decide whether to offer status creation at
-	// all. Without it the tab would show a "New status" button that 403s.
-	CustomIssueStatuses,
+	ProjectWorkflowsV1,
 }
 
 func BillingWorkspaceSubscriptionsEnabled(ctx context.Context, flags *featureflag.Service) bool {
@@ -79,11 +77,12 @@ func PluginsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
 	return flags.IsEnabled(ctx, PluginsV1, false)
 }
 
-// CustomIssueStatusesEnabled reports whether creating custom issue statuses is
-// allowed. Default false: a fleet mid-rollout must not be able to mint a status
-// value its older pods cannot interpret.
-func CustomIssueStatusesEnabled(ctx context.Context, flags *featureflag.Service) bool {
-	return flags.IsEnabled(ctx, CustomIssueStatuses, false)
+func TriageV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
+	return flags.IsEnabled(ctx, TriageV1, false)
+}
+
+func LocalSearchIndexEnabled(ctx context.Context, flags *featureflag.Service) bool {
+	return flags.IsEnabled(ctx, LocalSearchIndex, true)
 }
 
 func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service) map[string]bool {
@@ -95,4 +94,8 @@ func EvaluateFrontendPublicFlags(ctx context.Context, flags *featureflag.Service
 	out[agentSkillTogglesCompat] = true
 	out[resourceLabelsCompat] = true
 	return out
+}
+
+func ProjectWorkflowsV1Enabled(ctx context.Context, flags *featureflag.Service) bool {
+	return flags.IsEnabled(ctx, ProjectWorkflowsV1, false)
 }

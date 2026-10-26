@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -19,7 +20,6 @@ func newAutopilotCreateTestCmd() *cobra.Command {
 	cmd.Flags().String("description", "", "")
 	cmd.Flags().String("agent", "", "")
 	cmd.Flags().String("mode", "", "")
-	cmd.Flags().String("priority", "none", "")
 	cmd.Flags().String("project", "", "")
 	cmd.Flags().String("issue-title-template", "", "")
 	cmd.Flags().StringArray("subscriber", nil, "")
@@ -33,7 +33,6 @@ func newAutopilotUpdateTestCmd() *cobra.Command {
 	cmd.Flags().String("description", "", "")
 	cmd.Flags().String("agent", "", "")
 	cmd.Flags().String("project", "", "")
-	cmd.Flags().String("priority", "", "")
 	cmd.Flags().String("status", "", "")
 	cmd.Flags().String("mode", "", "")
 	cmd.Flags().String("issue-title-template", "", "")
@@ -43,11 +42,75 @@ func newAutopilotUpdateTestCmd() *cobra.Command {
 	return cmd
 }
 
+func TestAutopilotCommandsRejectRemovedPriorityFlag(t *testing.T) {
+	for name, cmd := range map[string]*cobra.Command{
+		"create": autopilotCreateCmd,
+		"update": autopilotUpdateCmd,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if cmd.Flags().Lookup("priority") != nil {
+				t.Fatalf("autopilot %s still exposes the removed --priority flag", name)
+			}
+			if err := cmd.ParseFlags([]string{"--priority", "high"}); err == nil {
+				t.Fatalf("autopilot %s silently accepted the removed --priority flag", name)
+			}
+		})
+	}
+}
+
 func newAutopilotGetTestCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "get"}
 	cmd.Flags().String("output", "json", "")
 	cmd.Flags().Bool("show-secrets", false, "")
 	return cmd
+}
+
+func newAutopilotListTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "list"}
+	cmd.Flags().String("status", "", "")
+	cmd.Flags().String("output", "table", "")
+	cmd.Flags().Bool("full-id", false, "")
+	return cmd
+}
+
+func TestRunAutopilotListTableShowsLastRunStatus(t *testing.T) {
+	const autopilotID = "11111111-1111-1111-1111-111111111111"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/autopilots" {
+			t.Fatalf("request = %s %s, want GET /api/autopilots", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"autopilots": []map[string]any{
+				{
+					"id":              autopilotID,
+					"title":           "GitHub Ops — Stall & Sync Sweep",
+					"status":          "active",
+					"last_run_status": "failed",
+					"execution_mode":  "run_only",
+					"last_run_at":     "2026-09-09T20:00:02Z",
+					"next_run_at":     "2026-09-10T08:00:00Z",
+				},
+			},
+			"total": 1,
+		})
+	}))
+	defer srv.Close()
+
+	setCLITestServerEnv(t, srv.URL)
+
+	out, err := captureStdout(t, func() error {
+		return runAutopilotList(newAutopilotListTestCmd(), nil)
+	})
+	if err != nil {
+		t.Fatalf("runAutopilotList: %v", err)
+	}
+
+	for _, want := range []string{"LAST_STATUS", "failed", "active", "run_only"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("table output missing %q:\n%s", want, out)
+		}
+	}
 }
 
 func TestRunAutopilotGetRedactsWebhookCredentialsByDefault(t *testing.T) {
@@ -728,4 +791,312 @@ func TestUUIDRegexp(t *testing.T) {
 			t.Errorf("uuidRegexp.MatchString(%q) = %v, want %v", tt.in, got, tt.want)
 		}
 	}
+}
+
+func newAutopilotTriggerListTestCmd(output string) *cobra.Command {
+	cmd := &cobra.Command{Use: "trigger-list"}
+	cmd.Flags().String("output", output, "")
+	cmd.Flags().Bool("full-id", false, "")
+	return cmd
+}
+
+// TestRunAutopilotTriggerListSurfacesIDs covers MUL-6680: the trigger ids that
+// trigger-update / trigger-delete / trigger-rotate-url require must be readable
+// from a command of their own, not only by knowing that `get --output json`
+// returns "triggers" as a sibling of "autopilot".
+func TestRunAutopilotTriggerListSurfacesIDs(t *testing.T) {
+	const (
+		autopilotID = "11111111-1111-1111-1111-111111111111"
+		triggerID   = "22222222-2222-2222-2222-222222222222"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/autopilots/"+autopilotID {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"autopilot": map[string]any{"id": autopilotID, "title": "Deploy"},
+			"triggers": []map[string]any{
+				{
+					"id":              triggerID,
+					"kind":            "schedule",
+					"enabled":         true,
+					"cron_expression": "0 9 * * 1-5",
+					"timezone":        "America/New_York",
+					"label":           "weekday morning",
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	// A task-scoped mat_ token so the test also passes inside an agent workdir,
+	// where a daemon task marker makes newAPIClient reject a plain token.
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+
+	out, err := captureStdout(t, func() error {
+		return runAutopilotTriggerList(newAutopilotTriggerListTestCmd("table"), []string{autopilotID})
+	})
+	if err != nil {
+		t.Fatalf("runAutopilotTriggerList: %v", err)
+	}
+	// The short id prefix is what trigger-update accepts, so it must be visible.
+	for _, want := range []string{triggerID[:8], "schedule", "0 9 * * 1-5", "weekday morning"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table output missing %q:\n%s", want, out)
+		}
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runAutopilotTriggerList(newAutopilotTriggerListTestCmd("json"), []string{autopilotID})
+	})
+	if err != nil {
+		t.Fatalf("runAutopilotTriggerList (json): %v", err)
+	}
+	var got struct {
+		Triggers []map[string]any `json:"triggers"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json output is not valid JSON: %v\n%s", err, out)
+	}
+	if got.Total != 1 || len(got.Triggers) != 1 {
+		t.Fatalf("expected exactly one trigger, got total=%d triggers=%v", got.Total, got.Triggers)
+	}
+	if got.Triggers[0]["id"] != triggerID {
+		t.Errorf("id = %#v, want %q", got.Triggers[0]["id"], triggerID)
+	}
+}
+
+// Webhook triggers carry a URL that grants the ability to fire the autopilot,
+// so trigger-list must redact it the same way `get` does.
+func TestRunAutopilotTriggerListRedactsWebhookCredentials(t *testing.T) {
+	const (
+		autopilotID  = "11111111-1111-1111-1111-111111111111"
+		webhookToken = "awt_super-secret-7890"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/autopilots/"+autopilotID {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"autopilot": map[string]any{"id": autopilotID},
+			"triggers": []map[string]any{
+				{
+					"id":            "22222222-2222-2222-2222-222222222222",
+					"kind":          "webhook",
+					"enabled":       true,
+					"webhook_token": webhookToken,
+					"webhook_path":  "/api/webhooks/autopilots/" + webhookToken,
+					"webhook_url":   "https://hooks.example.com/api/webhooks/autopilots/" + webhookToken,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	// A task-scoped mat_ token so the test also passes inside an agent workdir,
+	// where a daemon task marker makes newAPIClient reject a plain token.
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+
+	out, err := captureStdout(t, func() error {
+		return runAutopilotTriggerList(newAutopilotTriggerListTestCmd("json"), []string{autopilotID})
+	})
+	if err != nil {
+		t.Fatalf("runAutopilotTriggerList: %v", err)
+	}
+	if strings.Contains(out, webhookToken) {
+		t.Fatalf("trigger-list leaked webhook credential:\n%s", out)
+	}
+}
+
+func TestRelativeTimestampAt(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string {
+		return now.Add(d).Format(time.RFC3339)
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// An autopilot with no schedule must read as visibly different from
+		// one that is scheduled — that ambiguity is the MUL-6680 misdiagnosis.
+		{"empty", "", "—"},
+		{"unparseable", "not-a-timestamp", "—"},
+		{"seconds ahead", at(30 * time.Second), "in 30s"},
+		{"minutes ahead", at(45 * time.Minute), "in 45m"},
+		{"hours ahead", at(2 * time.Hour), "in 2h"},
+		{"days ahead", at(72 * time.Hour), "in 3d"},
+		{"minutes past", at(-45 * time.Minute), "45m ago"},
+		{"hours past", at(-2 * time.Hour), "2h ago"},
+		{"days past", at(-72 * time.Hour), "3d ago"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relativeTimestampAt(tc.in, now); got != tc.want {
+				t.Errorf("relativeTimestampAt(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutopilotRunStarted pins the success whitelist for a manual trigger.
+//
+// Before #8078 the CLI printed "Autopilot triggered" and exited 0 for every
+// response the server returned, including a `skipped` run that dispatched
+// nothing — so an operator, and any agent running the command on their behalf,
+// read success and moved on. Success must therefore be an explicit start
+// status, never "anything that is not skipped or failed": the run schema accepts
+// any status string for forward compatibility, so an unknown one has to read as
+// "did not start". Mirrors runNowToastKind on the web client.
+func TestAutopilotRunStarted(t *testing.T) {
+	cases := []struct {
+		status string
+		want   bool
+	}{
+		{"issue_created", true},
+		{"running", true},
+		{"skipped", false},
+		{"failed", false},
+		{"pending", false},
+		{"completed", false},
+		{"", false},
+		// A status this build has never heard of must not be reported as a
+		// successful trigger.
+		{"deferred", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			if got := autopilotRunStarted(tc.status); got != tc.want {
+				t.Errorf("autopilotRunStarted(%q) = %v, want %v", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutopilotWriteRequestError_SurfacesRefusalToTheUser is the same
+// assertion for the other autopilot writes (create / update / delete /
+// trigger-*), which refuse for the same reasons a trigger does: an agent whose
+// run records no human, or whose human holds nothing here.
+//
+// It runs the real cli.FormatError for the same reason: FormatError collapses
+// every 403 into "no access", which for an agent caller is a statement about
+// the WRONG person — the fact worth printing is that the refusal belongs to
+// whoever asked (MUL-7108).
+func TestAutopilotWriteRequestError_SurfacesRefusalToTheUser(t *testing.T) {
+	forbidden := func(body string) error {
+		return &cli.HTTPError{
+			Method:     "PATCH",
+			Path:       "/api/autopilots/x",
+			StatusCode: 403,
+			Body:       body,
+		}
+	}
+
+	cases := []struct {
+		name     string
+		body     string
+		wantText string
+	}{
+		{
+			name:     "no originator names the missing human",
+			body:     `{"error":"no human authorized this change: the calling run records no originator","code":"autopilot_no_originator"}`,
+			wantText: "no originating human",
+		},
+		{
+			name:     "forbidden names who may manage the autopilot",
+			body:     `{"error":"only the autopilot creator, a workspace admin, or a granted collaborator can manage this autopilot","code":"autopilot_forbidden"}`,
+			wantText: "granted collaborator",
+		},
+		{
+			// create's refusal is a different fact: nobody is being told to
+			// go get a collaborator grant they could not hold anyway.
+			name:     "non-member names the workspace, not a grant",
+			body:     `{"error":"the person this run acts for is not a member of this workspace","code":"autopilot_actor_not_member"}`,
+			wantText: "not a member of this workspace",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := autopilotWriteRequestError("update autopilot", forbidden(tc.body))
+			got := cli.FormatError(err, false)
+			if !strings.Contains(got, tc.wantText) {
+				t.Errorf("output = %q, want it to contain %q", got, tc.wantText)
+			}
+			if cli.ExitCodeFor(err) == 0 {
+				t.Error("a refused write must not exit 0")
+			}
+		})
+	}
+
+	// A 403 this command has not opted into keeps the deliberately vague copy,
+	// and the action name still says which call failed.
+	t.Run("unrecognized 403 keeps the generic copy", func(t *testing.T) {
+		err := autopilotWriteRequestError("delete autopilot", forbidden(`{"error":"some other resource is off limits"}`))
+		got := cli.FormatError(err, false)
+		if strings.Contains(got, "some other resource is off limits") {
+			t.Errorf("output = %q, must not echo an un-opted-in 403 body", got)
+		}
+		if !strings.Contains(err.Error(), "delete autopilot") {
+			t.Errorf("error = %q, want it to name the failed action", err.Error())
+		}
+	})
+}
+
+// TestAutopilotTriggerRequestError_SurfacesRefusalToTheUser is the end-to-end
+// assertion for what a person (or an agent reading its own output) actually sees
+// when a manual trigger is refused.
+//
+// It runs the real cli.FormatError, because the defect it guards is precisely
+// that FormatError collapses a 403 into generic "no access" copy: the handler
+// can name the cause perfectly and the user still learns nothing. Asserting only
+// that the code was matched would not catch a regression in that collapse.
+func TestAutopilotTriggerRequestError_SurfacesRefusalToTheUser(t *testing.T) {
+	forbidden := func(body string) error {
+		return &cli.HTTPError{
+			Method:     "POST",
+			Path:       "/api/autopilots/x/trigger",
+			StatusCode: 403,
+			Body:       body,
+		}
+	}
+
+	t.Run("no originator names the missing human", func(t *testing.T) {
+		err := autopilotTriggerRequestError(forbidden(
+			`{"error":"no human authorized this trigger: the calling run records no originator","code":"autopilot_trigger_no_originator"}`))
+		got := cli.FormatError(err, false)
+		if !strings.Contains(got, "no originating human") {
+			t.Errorf("output = %q, want it to name the missing originator", got)
+		}
+		if cli.ExitCodeFor(err) == 0 {
+			t.Error("a refused trigger must not exit 0")
+		}
+	})
+
+	t.Run("forbidden names who may trigger", func(t *testing.T) {
+		got := cli.FormatError(autopilotTriggerRequestError(forbidden(
+			`{"error":"only the autopilot creator, a workspace admin, or a granted collaborator can trigger this autopilot","code":"autopilot_trigger_forbidden"}`)), false)
+		if !strings.Contains(got, "granted collaborator") {
+			t.Errorf("output = %q, want it to name who may trigger", got)
+		}
+	})
+
+	// A 403 this command has not opted into keeps the deliberately vague copy:
+	// the opt-out is per-code, not "surface every 403 body".
+	t.Run("unrecognized 403 keeps the generic copy", func(t *testing.T) {
+		got := cli.FormatError(autopilotTriggerRequestError(forbidden(
+			`{"error":"some other resource is off limits"}`)), false)
+		if strings.Contains(got, "some other resource is off limits") {
+			t.Errorf("output = %q, must not echo an un-opted-in 403 body", got)
+		}
+	})
 }

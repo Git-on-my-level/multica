@@ -46,12 +46,15 @@ func (f *fakeGroupPresenceQueries) RecordDingTalkGroupActivity(_ context.Context
 }
 
 type captureChatSession struct {
-	ensure      engine.EnsureSessionInput
-	ensureCalls int
-	ensureErr   error
-	append      engine.AppendInput
-	appendErr   error
-	media       engine.BindMediaInput
+	ensure       engine.EnsureSessionInput
+	ensureCalls  int
+	ensureErr    error
+	start        engine.StartSessionInput
+	append       engine.AppendInput
+	appendErr    error
+	appendResult engine.AppendResult
+	startResult  engine.StartSessionResult
+	media        engine.BindMediaInput
 }
 
 func (c *captureChatSession) EnsureSession(_ context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error) {
@@ -59,10 +62,14 @@ func (c *captureChatSession) EnsureSession(_ context.Context, in engine.EnsureSe
 	c.ensureCalls++
 	return pgtype.UUID{}, c.ensureErr
 }
+func (c *captureChatSession) StartSession(_ context.Context, in engine.StartSessionInput) (engine.StartSessionResult, error) {
+	c.start = in
+	return c.startResult, c.ensureErr
+}
 func (c *captureChatSession) MarkPendingFresh(context.Context, pgtype.UUID, string) error { return nil }
 func (c *captureChatSession) AppendUserMessage(_ context.Context, in engine.AppendInput) (engine.AppendResult, error) {
 	c.append = in
-	return engine.AppendResult{}, c.appendErr
+	return c.appendResult, c.appendErr
 }
 
 func TestSessionBinder_RecordsActivityOnlyAfterSuccessfulGroupAppend(t *testing.T) {
@@ -108,13 +115,6 @@ func (c *captureChatSession) BindMediaRefs(_ context.Context, in engine.BindMedi
 	return nil
 }
 
-func TestNewDingTalkResolverSetUsesDatabaseBackedIssueOrigin(t *testing.T) {
-	set := NewDingTalkResolverSet(nil, nil, nil, nil, nil, nil)
-	if set.OriginType != originDingTalkChat {
-		t.Fatalf("OriginType = %q, want %q", set.OriginType, originDingTalkChat)
-	}
-}
-
 func TestSessionBinder_MapsCommandTextAndMediaDeadline(t *testing.T) {
 	var session, sender, inst, claim pgtype.UUID
 	session.Bytes[0], sender.Bytes[0], inst.Bytes[0], claim.Bytes[0] = 2, 3, 4, 5
@@ -137,6 +137,35 @@ func TestSessionBinder_MapsCommandTextAndMediaDeadline(t *testing.T) {
 	}
 	if in.MediaPendingSeconds != 45 || !in.ForceFresh || in.SessionID != session || in.Sender != sender || in.InstallationID != inst || in.ClaimToken != claim {
 		t.Fatalf("mapped append input = %+v", in)
+	}
+}
+
+func TestSessionBinder_StartSessionCarriesDingTalkRouteAndFirstTurn(t *testing.T) {
+	capture := &captureChatSession{}
+	binder := &sessionBinder{session: capture}
+	_, err := binder.StartSession(context.Background(), engine.StartSessionParams{
+		Installation: engine.ResolvedInstallation{
+			ID:          pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+			WorkspaceID: pgtype.UUID{Bytes: [16]byte{2}, Valid: true},
+			AgentID:     pgtype.UUID{Bytes: [16]byte{3}, Valid: true},
+		},
+		Creator: pgtype.UUID{Bytes: [16]byte{4}, Valid: true},
+		Sender:  pgtype.UUID{Bytes: [16]byte{5}, Valid: true},
+		Message: channel.InboundMessage{
+			MessageID: "m1", Text: "first turn", CommandText: "current instruction",
+			Source: channel.Source{ChatID: "cid-platform", ChatType: channel.ChatTypeGroup, ThreadID: "thread-1"},
+		},
+		PersistMessage: true,
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	got := capture.start
+	if got.BindingKey != "cid-platform" || got.MessageID != "m1" || got.ThreadID != "thread-1" || got.Body != "first turn" || got.CommandText != "current instruction" || !got.PersistMessage {
+		t.Fatalf("start mapping wrong: %+v", got)
+	}
+	if got.Sender != (pgtype.UUID{Bytes: [16]byte{4}, Valid: true}) || got.Initiator != (pgtype.UUID{Bytes: [16]byte{5}, Valid: true}) {
+		t.Fatalf("creator/initiator mapping wrong: %+v", got)
 	}
 }
 
@@ -319,7 +348,7 @@ func TestSessionBinder_MapsMediaBodyAndIssueTarget(t *testing.T) {
 	base := pgtype.Text{String: "[Image]\nfix login", Valid: true}
 	capture := &captureChatSession{}
 	binder := &sessionBinder{session: capture}
-	if err := binder.BindMedia(context.Background(), engine.BindMediaParams{
+	if _, err := binder.BindMedia(context.Background(), engine.BindMediaParams{
 		MessageID: message, SessionID: session, WorkspaceID: workspace, Sender: sender,
 		IssueID: issue, IssueDescriptionBase: base, IssueCommandText: "/issue fix login", Body: "[Image]\nfix login", MediaRefs: []channel.MediaRef{ref},
 	}); err != nil {
@@ -380,5 +409,55 @@ func TestOutboundTarget_FallsBackToChatID(t *testing.T) {
 	target := outboundTarget(db.ChannelChatSessionBinding{ChannelChatID: "cid-4"})
 	if target.ConversationType != convTypeGroup || target.ConversationID != "cid-4" {
 		t.Errorf("missing config must fall back to a group send on chat id: %+v", target)
+	}
+}
+
+func TestDingTalkVisibleQuoteTextPreservesCurrentImagePlaceholders(t *testing.T) {
+	tests := []struct {
+		name        string
+		msg         channel.InboundMessage
+		currentText string
+		want        string
+	}{
+		{
+			name: "multi-level reply",
+			msg: channel.InboundMessage{
+				Text:        channel.FormatQuotedMessage("", "internal card JSON") + "\n\nVerify this information",
+				CommandText: "Verify this information",
+				ReplyTo:     &channel.ReplyCtx{MessageID: "parent"},
+			},
+			currentText: "Verify this information",
+			want:        "Verify this information",
+		},
+		{
+			name: "images with instruction",
+			msg: channel.InboundMessage{
+				Type: channel.MsgTypeImage, Text: "[Image]\n[Image]\nReview these", CommandText: "Review these",
+			},
+			currentText: "[Image]\n[Image]\nReview these",
+			want:        "[Image]\n[Image]\nReview these",
+		},
+		{
+			name: "image only",
+			msg: channel.InboundMessage{
+				Type: channel.MsgTypeImage, Text: dingtalkImagePlaceholder, CommandText: dingtalkImagePlaceholder,
+			},
+			currentText: dingtalkImagePlaceholder,
+			want:        dingtalkImagePlaceholder,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.msg.Source = channel.Source{ChatID: "group", ChatType: channel.ChatTypeGroup, SenderID: "staff-7"}
+			tc.msg.Raw, _ = json.Marshal(dingtalkRawEvent{
+				CurrentText: tc.currentText,
+			})
+			if got := dingtalkVisibleQuoteText(tc.msg); got != tc.want {
+				t.Fatalf("visible quote = %q, want %q", got, tc.want)
+			}
+			if target := targetFromMessage(tc.msg); target.QuoteText != tc.want || target.StaffID != "" {
+				t.Fatalf("immediate-reply target = %+v, want quote %q without a group mention recipient", target, tc.want)
+			}
+		})
 	}
 }

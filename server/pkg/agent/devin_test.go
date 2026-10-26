@@ -10,21 +10,11 @@ import (
 	"time"
 )
 
-func TestDevinIsACPFamily(t *testing.T) {
+func TestDevinNativeBackendConstruction(t *testing.T) {
 	t.Parallel()
 
-	desc, ok := BuiltinRuntimeByID("devin")
-	if !ok {
-		t.Fatal("devin missing from BuiltinRuntimes")
-	}
-	if desc.ProtocolFamily != "devin" || desc.DefaultCommand != "devin" {
-		t.Fatalf("unexpected descriptor: %+v", desc)
-	}
-	if desc.LaunchHeader != "devin acp" {
-		t.Fatalf("launch header = %q, want devin acp", desc.LaunchHeader)
-	}
-	if desc.ModelDiscovery == nil {
-		t.Fatal("devin ModelDiscovery is nil")
+	if !IsSupportedType("devin") || IsBuiltinRuntime("devin") {
+		t.Fatal("Devin must be a native protocol family, not a self-referencing derived runtime")
 	}
 
 	b, err := New("devin", Config{Logger: slog.Default(), ExecutablePath: "devin"})
@@ -61,7 +51,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true}}}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_devin","models":{"currentModelId":"kimi-k2.5"}}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_devin","models":{"currentModelId":"swe-1.7-lightning"}}}\n' "$id"
       ;;
     *'"method":"session/load"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_loaded"}}\n' "$id"
@@ -143,7 +133,9 @@ func TestDevinBlockedArgsFiltering(t *testing.T) {
 		for range session.Messages {
 		}
 	}()
-	<-session.Result
+	if result := <-session.Result; result.Status != "completed" {
+		t.Fatalf("task failed: %s", result.Error)
+	}
 
 	raw, err := os.ReadFile(argsFile)
 	if err != nil {
@@ -196,7 +188,9 @@ func TestDevinPassesModelFlag(t *testing.T) {
 		for range session.Messages {
 		}
 	}()
-	<-session.Result
+	if result := <-session.Result; result.Status != "completed" {
+		t.Fatalf("task failed: %s", result.Error)
+	}
 	raw, err := os.ReadFile(argsFile)
 	if err != nil {
 		t.Fatalf("read args: %v", err)

@@ -70,7 +70,13 @@ vi.mock("../../common/actor-avatar", () => ({
     />
   ),
 }));
-vi.mock("./inbox-detail-label", () => ({ InboxDetailLabel: () => null }));
+vi.mock("./inbox-detail-label", () => ({
+  InboxDetailLabel: () => null,
+  useTypeLabels: () => ({
+    autopilot_paused: "Autopilot paused",
+    autopilot_quota_exceeded: "Autopilot run limit reached",
+  }),
+}));
 vi.mock("../../i18n", () => ({ useT: () => ({ t: () => "label" }) }));
 
 function item(overrides: Partial<InboxItem> = {}): InboxItem {
@@ -104,6 +110,7 @@ function makeAdapter(
     back: vi.fn(),
     pathname: "/",
     searchParams: new URLSearchParams(),
+    hash: "",
     getShareableUrl: (p) => p,
     ...overrides,
   };
@@ -342,7 +349,7 @@ const IN_REVIEW_BUILT_IN: IssueStatusEntry = {
   key: "in_review",
   name: "In Review",
   description: "",
-  category: "in_review",
+  category: "started",
   color: "#8b5cf6",
   is_system: true,
   position: 0,
@@ -371,7 +378,7 @@ describe("InboxListItem status glyph", () => {
     });
 
     const icon = getByTestId("status-icon");
-    expect(icon.getAttribute("data-category")).toBe("in_review");
+    expect(icon.getAttribute("data-category")).toBe("started");
     expect(icon.getAttribute("data-color")).toBe("#ff0000");
   });
 
@@ -400,7 +407,7 @@ describe("InboxListItem status glyph", () => {
   });
 
   it("still renders a custom status before the catalog lands", () => {
-    // categoryOf falls back to `todo` for an unresolved key; the row must show
+    // categoryOf falls back to `unstarted` for an unresolved key; the row must show
     // the glyph anyway rather than dropping the status entirely.
     catalogEntries = undefined;
 

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -133,7 +134,7 @@ func (h *Handler) resolveMikaAgent(w http.ResponseWriter, r *http.Request, works
 	if !ok {
 		return db.Agent{}, false, false
 	}
-	runtime, err := h.Queries.GetAgentRuntime(r.Context(), runtimeID)
+	runtime, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if err != nil || uuidToString(runtime.WorkspaceID) != workspaceID {
 		writeError(w, http.StatusBadRequest, "runtime not found in this workspace")
 		return db.Agent{}, false, false
@@ -173,6 +174,26 @@ func (h *Handler) resolveMikaAgent(w http.ResponseWriter, r *http.Request, works
 		return existing, false, true
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, "failed to look up the workspace agent")
+		return db.Agent{}, false, false
+	}
+
+	// Existing Mika requests return above without changing a binding. A new
+	// Mika must serialize authorization and INSERT with runtime revocation.
+	if _, err := qtx.LockWorkspaceForChatSessionCreate(r.Context(), wsUUID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "workspace not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to lock workspace")
+		}
+		return db.Agent{}, false, false
+	}
+	runtime, err = qtx.LockAgentRuntimeForAccessChange(r.Context(), runtimeID)
+	if err != nil || runtime.WorkspaceID != wsUUID {
+		writeError(w, http.StatusBadRequest, "runtime not found in this workspace")
+		return db.Agent{}, false, false
+	}
+	if !canUseRuntimeForAgent(member, runtime) {
+		writeError(w, http.StatusForbidden, "you cannot bind an agent to this runtime")
 		return db.Agent{}, false, false
 	}
 
@@ -303,6 +324,10 @@ func (h *Handler) getOrCreateMikaSession(ctx context.Context, agent db.Agent, wo
 		CreatorID:   creatorUUID,
 		Title:       strings.TrimSpace(title),
 	})
+	if err != nil {
+		return db.ChatSession{}, err
+	}
+	created, err = qtx.MarkChatSessionExplicitlyCreated(ctx, created.ID)
 	if err != nil {
 		return db.ChatSession{}, err
 	}

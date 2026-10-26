@@ -1,6 +1,7 @@
 import { renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { buildIssueStatusCatalog } from "@multica/core/issue-statuses";
+import { statusCategoryOfKey } from "@multica/core/issues";
 import type { IssueStatusEntry } from "@multica/core/types";
 import en from "../../locales/en/issues.json";
 import { useStatusOptions } from "./status-options";
@@ -34,7 +35,7 @@ function entry(overrides: Partial<IssueStatusEntry>): IssueStatusEntry {
     key: "custom",
     name: "Custom",
     description: "",
-    category: "in_review",
+    category: "started",
     color: "#ff0000",
     is_system: false,
     position: 1,
@@ -54,7 +55,7 @@ const BUILT_INS: IssueStatusEntry[] = (
     // Seeded in English by the server on purpose — a label resolved from here
     // instead of i18n is the regression this fixture exists to catch.
     name: key === "in_progress" ? "In Progress" : key,
-    category: key,
+    category: statusCategoryOfKey(key),
     is_system: true,
     position: 0,
   }),
@@ -72,8 +73,8 @@ describe("useStatusOptions", () => {
       "todo",
       "in_progress",
       "in_review",
-      "done",
       "blocked",
+      "done",
       "cancelled",
     ]);
   });
@@ -82,7 +83,7 @@ describe("useStatusOptions", () => {
   // directly after the built-in of the category it behaves as, so the whole
   // catalog reads top to bottom in canonical order.
   it("places a custom status inline, after the built-in of its category", () => {
-    catalogEntries = [...BUILT_INS, entry({ key: "qa", name: "QA", category: "in_review" })];
+    catalogEntries = [...BUILT_INS, entry({ key: "qa", name: "QA", category: "started" })];
     const { result } = renderHook(() => useStatusOptions("workspace-1"));
 
     expect(result.current.map((o) => o.key)).toEqual([
@@ -90,9 +91,9 @@ describe("useStatusOptions", () => {
       "todo",
       "in_progress",
       "in_review",
+      "blocked",
       "qa",
       "done",
-      "blocked",
       "cancelled",
     ]);
   });
@@ -100,10 +101,10 @@ describe("useStatusOptions", () => {
   // The category is what the row's icon and hover color are drawn from, so it
   // travels with the option now that no heading states it.
   it("carries the category a custom status behaves as", () => {
-    catalogEntries = [...BUILT_INS, entry({ key: "qa", name: "QA", category: "in_review" })];
+    catalogEntries = [...BUILT_INS, entry({ key: "qa", name: "QA", category: "started" })];
     const { result } = renderHook(() => useStatusOptions("workspace-1"));
 
-    expect(result.current.find((o) => o.key === "qa")?.category).toBe("in_review");
+    expect(result.current.find((o) => o.key === "qa")?.category).toBe("started");
   });
 
   // Archiving retires a status from FUTURE assignment. Offering it here would
@@ -116,6 +117,22 @@ describe("useStatusOptions", () => {
     const { result } = renderHook(() => useStatusOptions("workspace-1"));
 
     expect(result.current.map((o) => o.key)).not.toContain("qa");
+  });
+
+  it("lets a read-only filter include an archived status still in use", () => {
+    catalogEntries = [
+      ...BUILT_INS,
+      entry({
+        key: "qa",
+        name: "QA",
+        archived_at: "2026-01-01T00:00:00Z",
+      }),
+    ];
+    const { result } = renderHook(() =>
+      useStatusOptions("workspace-1", ["qa"]),
+    );
+
+    expect(result.current.map((o) => o.key)).toContain("qa");
   });
 
   // Built-ins keep their semantic token color; a hex here would override it.

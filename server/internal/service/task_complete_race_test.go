@@ -110,9 +110,12 @@ func TestCompleteTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.CompleteTask(context.Background(), taskID, nil, "", "", "", false, "", "")
+			got, transitioned, err := svc.CompleteTaskWithTransition(context.Background(), taskID, nil, "", "", "", false, "", "")
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
+			}
+			if transitioned {
+				t.Fatal("already-finalized task reported a new completion transition")
 			}
 			if got == nil {
 				t.Fatal("expected task, got nil")
@@ -152,9 +155,12 @@ func TestFailTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.FailTask(context.Background(), taskID, "agent crashed", "", "", "", "", false, "", "")
+			got, transitioned, err := svc.FailTaskWithTransition(context.Background(), taskID, "agent crashed", "", "", "", "", false, "", "")
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
+			}
+			if transitioned {
+				t.Fatal("already-finalized task reported a new failure transition")
 			}
 			if got == nil {
 				t.Fatal("expected task, got nil")
@@ -257,6 +263,9 @@ func TestTaskFailureClassifiers(t *testing.T) {
 		// Transient mid-stream provider disconnect (MUL-4910): retryable, and
 		// resume-safe so the retry continues the truncated conversation.
 		{reason: "agent_error.provider_network", wantType: "agent_error", wantResumeOK: true, wantRetry: true},
+		// Capacity/rate-limit failures keep their existing user-retry posture.
+		// Correcting a misleading auth label must not enable an automatic resend.
+		{reason: "agent_error.provider_capacity_or_rate_limit", wantType: "agent_error", wantResumeOK: true, wantRetry: false},
 		{reason: "runtime_recovery", wantType: "runtime", wantResumeOK: true, wantRetry: true},
 		{reason: "iteration_limit", wantType: "agent_output", wantResumeOK: false, wantRetry: false},
 		{reason: "api_invalid_request", wantType: "agent_error", wantResumeOK: false, wantRetry: false},
@@ -302,6 +311,27 @@ func TestRuntimeCLITimeoutIsNotAutoRetried(t *testing.T) {
 	}
 	if !retryableReasons["agent_error.provider_network"] {
 		t.Error("agent_error.provider_network must stay retryable: real provider stalls are transient")
+	}
+}
+
+// TestEnvironmentPrepareFailureIsNotAutoRetried pins the retry posture for
+// #7913. The reason moved out of agent_error.* purely so the label is honest —
+// it must not quietly buy the failure a retry it never had. Its causes are the
+// host's: a full volume, a denied permission, a directory another process
+// holds. None of them changes because Multica asked a second time, and
+// preparation already waits out the one transient case it knows about (a prior
+// run still holding the directory) before it fails.
+//
+// Resume stays safe: the agent process never started, so the session the user's
+// next message resumes is untouched.
+func TestEnvironmentPrepareFailureIsNotAutoRetried(t *testing.T) {
+	const reason = "environment_prepare_failed"
+
+	if retryableReasons[reason] {
+		t.Errorf("retryableReasons[%q] = true, want false: the disk or permission problem is the same on the next attempt", reason)
+	}
+	if resumeUnsafeFailureReason(reason) {
+		t.Errorf("resumeUnsafeFailureReason(%q) = true, want false: the agent never started", reason)
 	}
 }
 

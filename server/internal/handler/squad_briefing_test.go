@@ -13,26 +13,6 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// TestSquadOperatingProtocolOwnsParentStatus locks the parent-issue status
-// contract: first dispatch moves todo→in_progress and stays there; only a
-// later confirmation of overall completion may advance to in_review; done is
-// left to humans / integrations.
-func TestSquadOperatingProtocolOwnsParentStatus(t *testing.T) {
-	protocol := squadOperatingProtocolFor(true)
-	compact := strings.Join(strings.Fields(protocol), " ")
-	for _, want := range []string{
-		"Own the parent issue status",
-		"move the parent to `in_progress`",
-		"successful dispatch is not completion",
-		"multica issue status <issue-id> in_review",
-		"Leave `done` to a human reviewer",
-	} {
-		if !strings.Contains(compact, want) {
-			t.Errorf("expected squad operating protocol to contain %q\n--- protocol ---\n%s", want, protocol)
-		}
-	}
-}
-
 // TestSquadOperatingProtocolScopesParentStatusOwnership is the guard for the
 // MUL-5156 review finding: the briefing is injected on every leader path,
 // including an @squad mention on an issue assigned to someone else. Status
@@ -82,25 +62,6 @@ func TestSquadOperatingProtocolScopesParentStatusOwnership(t *testing.T) {
 	// rules in the brief and the per-turn prompt refer to by name.
 	if !strings.Contains(guest, "## Squad Operating Protocol") {
 		t.Error("guest-leader protocol lost its section header")
-	}
-}
-
-// TestSquadOperatingProtocolWarnsAgainstDualTrigger locks in the rule
-// added for #3033: the protocol must tell the squad leader that a `todo`
-// child issue with an agent assignee already fires that agent, so they
-// must not also @mention the same agent on the parent issue for the
-// same work. Asserts behavior, not exact wording — keep the substrings
-// narrow so harmless rewording doesn't break the test.
-func TestSquadOperatingProtocolWarnsAgainstDualTrigger(t *testing.T) {
-	protocol := squadOperatingProtocolFor(true)
-	compact := strings.Join(strings.Fields(protocol), " ")
-	for _, want := range []string{
-		"--status todo` and an agent assignee already fires that agent automatically",
-		"Never both for the same work.",
-	} {
-		if !strings.Contains(compact, want) {
-			t.Errorf("expected squad operating protocol to contain %q\n--- protocol ---\n%s", want, protocol)
-		}
 	}
 }
 
@@ -180,6 +141,43 @@ func seededHumanMember(t *testing.T) (memberID, userID, userName string) {
 		t.Fatalf("load seeded member: %v", err)
 	}
 	return
+}
+
+// TestSquadOperatingProtocolOwnsNoActionRule pins the protocol as the single
+// statement of the no_action rule (MUL-6984). It used to be written four
+// times — here, in the per-turn prompt, in the brief's workflow step 4, and in
+// the brief's ## Output — and the four copies had already drifted: only some
+// of them carried the MUL-6622 / GH #7487 escape hatch, which is what keeps a
+// FAILED `squad activity` call from ending the turn in silence. The other
+// three surfaces now point here, so this text has to carry the whole rule:
+// the prohibition, its exact scope, and the failure fallback.
+func TestSquadOperatingProtocolOwnsNoActionRule(t *testing.T) {
+	for _, ownsParentStatus := range []bool{true, false} {
+		protocol := squadOperatingProtocolFor(ownsParentStatus)
+		compact := strings.Join(strings.Fields(protocol), " ")
+
+		for _, want := range []string{
+			// the rule and how it is recorded
+			"multica squad activity <issue-id> <outcome> --reason",
+			"record `no_action` and exit silently",
+			// what "silently" forbids — MUL-2168 was a leader posting
+			// "no reply needed. Exiting silently."
+			"posting NO comment at all",
+			"not one saying you are exiting",
+			// MUL-6622 / #7487: the prohibition lapses when the call fails,
+			// because the server only rejects a leader comment once the
+			// no_action activity exists.
+			"holds only while the call succeeds",
+			"responsibility 3 applies",
+			// one comment, not two — the fallback must not collide with the
+			// one-comment-per-turn rule
+			"never post a second comment",
+		} {
+			if !strings.Contains(compact, want) {
+				t.Errorf("ownsParentStatus=%v: protocol missing %q\n--- protocol ---\n%s", ownsParentStatus, want, protocol)
+			}
+		}
+	}
 }
 
 func TestBuildSquadLeaderBriefing_FullSquad(t *testing.T) {
@@ -364,8 +362,16 @@ func TestBuildSquadLeaderBriefing_MentionsRoundTrip(t *testing.T) {
 // returns the agent block of the response. Fails the test on non-200.
 func claimAndDecodeAgent(t *testing.T, runtimeID string) *TaskAgentData {
 	t.Helper()
+	// The shared TestMain runtime heartbeats only at suite start, and claims
+	// skip runtimes unseen for RuntimeClaimFreshnessSeconds (150s). This file
+	// runs late enough to cross that on a slow -race runner, so refresh first.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE agent_runtime SET status = 'online', last_seen_at = now() WHERE id = $1`, runtimeID,
+	); err != nil {
+		t.Fatalf("refresh runtime heartbeat: %v", err)
+	}
 	w := httptest.NewRecorder()
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-squad-briefing")
+	req := newOwnerDaemonRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
@@ -376,11 +382,12 @@ func claimAndDecodeAgent(t *testing.T, runtimeID string) *TaskAgentData {
 			Agent *TaskAgentData `json:"agent"`
 		} `json:"task"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+	body := w.Body.String()
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if resp.Task == nil || resp.Task.Agent == nil {
-		t.Fatalf("expected task.agent in response, got: %s", w.Body.String())
+		t.Fatalf("expected task.agent in response, got: %s", body)
 	}
 	return resp.Task.Agent
 }

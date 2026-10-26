@@ -6,34 +6,60 @@ import (
 )
 
 // providerHTTP5xxRe matches a 3-digit number starting with 5 (5xx HTTP
-// status code) that isn't surrounded by other digits. Mirrors the SQL
-// regex `(^|[^0-9])5[0-9][0-9]([^0-9]|$)` from MUL-1949 — keeps phrases
-// like "1500ms" or "1.5.0" from accidentally landing in
+// status code) that isn't embedded in a longer run of digits OR letters.
+// Adapted from the SQL regex `(^|[^0-9])5[0-9][0-9]([^0-9]|$)` from
+// MUL-1949 (with the boundary widened below) — keeps phrases like
+// "1500ms" or "1.5.0" from accidentally landing in
 // provider_server_error.
+//
+// The boundary excludes letters as well as digits (#9146): workspace and
+// task IDs are hex, so a path like "...c429f4b/worktree" embeds "429"
+// between letters, and the digit-only guard let it fire. Any offline
+// backfill SQL regenerated from MUL-1949 needs the same widened boundary
+// (`[^0-9a-z]`) to stay in lock-step.
 //
 // Compiled at package init: the classifier is on the in-flight write
 // path for every failed task, so paying the regex compile cost at
 // startup rather than per-call matters.
-var providerHTTP5xxRe = regexp.MustCompile(`(^|[^0-9])5[0-9][0-9]([^0-9]|$)`)
+var providerHTTP5xxRe = regexp.MustCompile(`(^|[^0-9a-z])5[0-9][0-9]([^0-9a-z]|$)`)
 
 // httpAuthCodeRe / httpQuotaCodeRe / httpCapacityCodeRe match specific 3-digit
-// HTTP status codes only when they are NOT embedded in a longer number, using
-// the same digit-boundary guard as providerHTTP5xxRe. Without this guard the
-// bare substrings "401"/"402"/"403"/"429"/"529" fire on unrelated numbers —
-// e.g. "402913 tokens", "15290ms", "exit status 4030" — misclassifying process
-// or unknown failures as provider billing / rate-limit errors. That pollutes
-// failure observability: a genuine process crash gets filed under a provider
-// bucket, masking the real cause on failure dashboards. (A misfire here still
-// can't cause a spurious retry: the auth / quota / capacity buckets these
-// regexes guard are all non-retryable. The only agent_error.* reason on
-// internal/service/task.go's retryableReasons allowlist is provider_network
-// — MUL-4910 — and these regexes never route into it.) The 5xx bucket was
-// already anchored for exactly this reason (MUL-1949); these codes were not.
+// HTTP status codes only when they are NOT embedded in a longer number or an
+// identifier, using the same alphanumeric-boundary guard as providerHTTP5xxRe.
+// Without this guard the bare substrings "401"/"402"/"403"/"429"/"529" fire on
+// unrelated numbers — e.g. "402913 tokens", "15290ms", "exit status 4030" —
+// misclassifying process or unknown failures as provider billing / rate-limit
+// errors. That pollutes failure observability: a genuine process crash gets
+// filed under a provider bucket, masking the real cause on failure dashboards.
+// (A misfire here still can't cause a spurious retry: the auth / quota /
+// capacity buckets these regexes guard are all non-retryable. The only
+// agent_error.* reason on internal/service/task.go's retryableReasons
+// allowlist is provider_network — MUL-4910 — and these regexes never route
+// into it.) The 5xx bucket was already anchored for exactly this reason
+// (MUL-1949); these codes were not. #9146 widened every boundary from
+// digits-only to alphanumerics because hex workspace IDs put these digit runs
+// between letters ("...c429f4b...").
 var (
-	httpAuthCodeRe     = regexp.MustCompile(`(^|[^0-9])(401|403)([^0-9]|$)`)
-	httpQuotaCodeRe    = regexp.MustCompile(`(^|[^0-9])402([^0-9]|$)`)
-	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9])(429|529)([^0-9]|$)`)
+	httpAuthCodeRe     = regexp.MustCompile(`(^|[^0-9a-z])(401|403)([^0-9a-z]|$)`)
+	httpQuotaCodeRe    = regexp.MustCompile(`(^|[^0-9a-z])402([^0-9a-z]|$)`)
+	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9a-z])(429|529)([^0-9a-z]|$)`)
 )
+
+// concurrentRequestLimitWitness is emitted by Anthropic-compatible providers
+// that use HTTP 403 for a transient concurrency rejection. Claude Code may
+// prefix it with an authentication or access-token failure, but credentials
+// remain valid and a later request can succeed. Match the semantic witness
+// before both token-window and generic auth rules so the persisted reason and
+// member-facing recovery guidance describe the actual failure.
+const concurrentRequestLimitWitness = "concurrent request limit"
+
+var httpForbiddenCodeRe = regexp.MustCompile(`(^|[^0-9a-z])403([^0-9a-z]|$)`)
+
+// isUsageLimit403 is shared by Classify and NormalizeDaemonReason so new and
+// old daemons land on the same reason.
+func isUsageLimit403(lower string) bool {
+	return httpForbiddenCodeRe.MatchString(lower) && strings.Contains(lower, "usage limit")
+}
 
 // Classify maps a free-form error string from the agent runtime / CLI
 // to one of the 14 agent_error.* sub-reasons. Always returns a valid
@@ -69,8 +95,39 @@ func Classify(rawError string) Reason {
 		return ReasonAgentUnknown
 	}
 	lower := strings.ToLower(trimmed)
+	// Cursor's adapter adds event counts to known transport failures. Those
+	// numbers are not HTTP status codes (event_count=429 is not a rate limit).
+	// Apply the existing precedence to the provider stderr, keeping real auth
+	// or quota evidence there while excluding the adapter's diagnostics.
+	if isCursorProviderNetworkError(lower) {
+		if stderr, wrapped := cursorProviderStderr(lower); wrapped {
+			lower = stderr
+		}
+		// Node stack locations such as index.js:500:403 are not HTTP codes
+		// either. Keep non-frame error lines, including actual provider errors.
+		lines := strings.Split(lower, "\n")
+		for i, line := range lines {
+			if cursorStackFrame(line) {
+				lines[i] = ""
+			}
+		}
+		lower = strings.Join(lines, "\n")
+	}
 
 	switch {
+	// A concurrent-request rejection can contain both "access token" and HTTP
+	// 403. Its specific semantic witness must beat the broader context and auth
+	// rules below; this classification does not itself make the reason retryable.
+	case strings.Contains(lower, concurrentRequestLimitWitness):
+		return ReasonAgentProviderCapacityOrRateLimit
+
+	// Some providers (e.g. Kimi Code) report an exhausted usage window as HTTP
+	// 403, and Claude Code may prefix it with an access-token failure. It must
+	// beat both the token-window rule (the text has "token" and "limit") and
+	// the bare 403 auth rule, or valid credentials get blamed.
+	case isUsageLimit403(lower):
+		return ReasonAgentProviderQuotaLimit
+
 	// 1. Context / token window overflow. Checked early so "token
 	//    limit" doesn't get swallowed by the broader "limit" / "quota"
 	//    rule below.
@@ -102,8 +159,9 @@ func Classify(rawError string) Reason {
 		return ReasonAgentMissingConfig
 
 	// 3. Auth / access. 401 / 403 / "Not logged in" / invalid token
-	//    / lacks access to the model. Status codes use a digit boundary
-	//    so "4030" / "1401ms" don't spuriously land here.
+	//    / lacks access to the model. Status codes use an alphanumeric
+	//    boundary so "4030" / "1401ms" / a hex ID containing "401"
+	//    don't spuriously land here.
 	case httpAuthCodeRe.MatchString(lower),
 		containsAny(lower,
 			"unauthorized",
@@ -178,8 +236,8 @@ func Classify(rawError string) Reason {
 	//    Note this only catches deadlines that arrive as a bare string;
 	//    callers holding the error value should classify structurally
 	//    instead (see taskRunFailureReason in daemon/daemon.go).
-	//    "opencode stream ended" is the shared prefix of every failure the
-	//    OpenCode terminal-signal guard raises (pkg/agent/opencode.go): a step
+	//    The OpenCode/CodeArts "stream ended" prefixes cover every failure the
+	//    shared terminal-signal guard raises (pkg/agent/opencode.go): a step
 	//    left open at EOF, a continuation that never started, and a run that
 	//    ended on a step with no text, no tool call and no reported usage.
 	//    All three mean the same thing — the provider stream died and
@@ -190,22 +248,34 @@ func Classify(rawError string) Reason {
 	//    matching rule 13 by accident) and agent_error.unknown respectively;
 	//    neither is on the retry allowlist, so a transient cut ended the task
 	//    outright and max_attempts never applied (#6522).
-	//    Mirror these substrings into the MUL-1949 offline backfill SQL.
-	case containsAny(lower,
-		"stream disconnected",
-		opencodeStreamEndedPrefix,
-		"connection closed",
-		"mid-response",
-		"error sending request",
-		"unable to connect",
-		"dial tcp",
-		"connection refused",
-		"connectionrefused",
-		"dns",
-		"i/o timeout",
-		"deadline exceeded",
-		"timeout exceeded while awaiting",
-	):
+	//    Pi's OpenAI-compatible SDK surfaces a dropped LiteLLM/OpenAI call as
+	//    the bare strings "Connection error." and "Request timed out." on
+	//    turn_end.errorMessage (then exits 1). Those used to fall through to
+	//    process_failure via "exit status 1" and terminate the task with no
+	//    retry (BHD-135). isPiProviderNetworkError matches only the exact bare
+	//    messages and the stable Pi/OMP exit composite, rather than treating
+	//    the same broad substrings from local tools or MCP servers as retryable.
+	//    Mirror these Pi message shapes into the MUL-1949 offline backfill SQL.
+	//    Cursor reports connect ETIMEDOUT and mid-stream RetriableError:
+	//    Connection stalled failures. Keep those failed resumes network-safe
+	//    instead of letting the exit-status wrapper trigger a fresh-session retry.
+	case isPiProviderNetworkError(lower), isCursorProviderNetworkError(lower),
+		containsAny(lower,
+			"stream disconnected",
+			opencodeStreamEndedPrefix,
+			codeartsStreamEndedPrefix,
+			"connection closed",
+			"mid-response",
+			"error sending request",
+			"unable to connect",
+			"dial tcp",
+			"connection refused",
+			"connectionrefused",
+			"dns",
+			"i/o timeout",
+			"deadline exceeded",
+			"timeout exceeded while awaiting",
+		):
 		return ReasonAgentProviderNetwork
 
 	// 8. Model not found / unavailable. The SQL uses `%model%not%found%`,
@@ -397,11 +467,103 @@ var legacyOpenclawCLITimeoutReasons = map[string]bool{
 	"agent_error":                      true,
 }
 
+// legacyEnvironmentPrepareWitnesses are the two wrappers the daemon puts on a
+// failed execenv.Prepare / execenv.Reuse. Each opens the error at character
+// zero, and no other code path emits them, so the prefix alone establishes
+// that the run died setting up its workspace directory and never reached an
+// agent.
+var legacyEnvironmentPrepareWitnesses = []string{
+	"prepare execution environment:",
+	"reuse execution environment:",
+}
+
+// isCursorProviderNetworkError recognizes captured Cursor provider errors,
+// bare or in the adapter's exit/prompt-write wrapper. Do not match transport
+// phrases globally: local tool or MCP failures are not provider evidence.
+func isCursorProviderNetworkError(lower string) bool {
+	if stderr, wrapped := cursorProviderStderr(lower); wrapped {
+		lower = stderr
+	}
+	if strings.HasPrefix(lower, "error: [unavailable] connect etimedout ") {
+		return true
+	}
+	// Node may append a stack trace. Match the exact first-line message, not
+	// an arbitrary RetriableError or a substring quoted by another tool.
+	firstLine, _, _ := strings.Cut(lower, "\n")
+	switch strings.TrimSpace(firstLine) {
+	case "retriableerror: connection stalled", "retriableerror: connection stalled repeatedly":
+		return true
+	}
+	return false
+}
+
+func cursorProviderStderr(lower string) (string, bool) {
+	if !strings.HasPrefix(lower, "cursor-agent exited with error: ") &&
+		!strings.HasPrefix(lower, "cursor-agent prompt write failed: ") {
+		return "", false
+	}
+	_, stderr, ok := strings.Cut(lower, "; cursor stderr: ")
+	return strings.TrimSpace(stderr), ok
+}
+
+func cursorStackFrame(line string) bool {
+	return (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) &&
+		strings.HasPrefix(strings.TrimSpace(line), "at ")
+}
+
+// Refined status buckets can also be stale when an old daemon matched a count
+// or stack location. Require the same classification from that diagnostic text;
+// a plain transport message or a genuinely refined reason stays intact.
+func cursorDiagnosticReason(reason, lower string) bool {
+	switch Reason(reason) {
+	case ReasonAgentProviderAuthOrAccess, ReasonAgentProviderQuotaLimit,
+		ReasonAgentProviderCapacityOrRateLimit, ReasonAgentProviderServerError:
+	default:
+		return false
+	}
+	var diagnostics []string
+	if _, wrapped := cursorProviderStderr(lower); wrapped {
+		header, _, _ := strings.Cut(lower, "; cursor stderr: ")
+		if strings.Contains(header, " (result_seen=false, ") {
+			diagnostics = append(diagnostics, header)
+		}
+	}
+	for _, line := range strings.Split(lower, "\n") {
+		if cursorStackFrame(line) {
+			diagnostics = append(diagnostics, line)
+		}
+	}
+	return len(diagnostics) > 0 && Classify(strings.Join(diagnostics, "\n")) == Reason(reason)
+}
+
+// Older daemons report these Cursor transport failures as process_failure
+// (wrapped exit), unknown (bare stderr), or the coarse agent_error bucket.
+// Preserve more specific reasons such as auth, quota, and hard timeouts.
+var legacyCursorProviderNetworkReasons = map[string]bool{
+	string(ReasonAgentProcessFailure): true,
+	string(ReasonAgentUnknown):        true,
+	"agent_error":                     true,
+}
+
+func isPiProviderNetworkError(lower string) bool {
+	for _, message := range []string{"connection error.", "request timed out."} {
+		if lower == message ||
+			strings.HasPrefix(lower, message+"; pi exited with error: ") ||
+			strings.HasPrefix(lower, message+"; omp exited with error: ") {
+			return true
+		}
+	}
+	return false
+}
+
 // opencodeStreamEndedPrefix opens every failure the OpenCode terminal-signal
 // guard raises (pkg/agent/opencode.go). Exactly one code path emits it, and it
 // is a PREFIX of the whole error rather than a phrase somewhere inside it, so
 // its presence identifies the failure outright.
-const opencodeStreamEndedPrefix = "opencode stream ended"
+const (
+	opencodeStreamEndedPrefix = "opencode stream ended"
+	codeartsStreamEndedPrefix = "codearts stream ended"
+)
 
 // legacyOpencodeStreamEndedReasons are the buckets a daemon predating rule 7's
 // entry lands these errors in: process_failure for the two "terminal signal"
@@ -420,6 +582,27 @@ var legacyOpencodeStreamEndedReasons = map[string]bool{
 	"agent_error":                     true,
 }
 
+// legacyConcurrentRequestLimitReasons are the stale buckets emitted by daemons
+// whose classifiers let a generic token/context or HTTP 403 rule win over this
+// more specific wire shape. The raw witness keeps the upgrade narrow; unrelated
+// context overflows and authentication failures retain their original reason.
+var legacyConcurrentRequestLimitReasons = map[string]bool{
+	string(ReasonAgentContextOverflow):      true,
+	string(ReasonAgentProviderAuthOrAccess): true,
+	string(ReasonAgentUnknown):              true,
+	"agent_error":                           true,
+}
+
+// legacyUsageLimit403Reasons are the stale buckets an older daemon lands a
+// 403 usage-limit rejection in: the bare 403 auth rule, the token-window rule
+// when an access-token prefix is present, or the catchalls.
+var legacyUsageLimit403Reasons = map[string]bool{
+	string(ReasonAgentContextOverflow):      true,
+	string(ReasonAgentProviderAuthOrAccess): true,
+	string(ReasonAgentUnknown):              true,
+	"agent_error":                           true,
+}
+
 // NormalizeDaemonReason upgrades a failure_reason reported by an older daemon
 // onto the taxonomy this server understands, using the raw error text as the
 // witness. It returns the reason unchanged when nothing applies.
@@ -436,6 +619,13 @@ var legacyOpencodeStreamEndedReasons = map[string]bool{
 // can be deleted once no daemon old enough to produce its wire shape is still
 // reporting.
 func NormalizeDaemonReason(reason, rawError string) Reason {
+	if legacyConcurrentRequestLimitReasons[reason] &&
+		strings.Contains(strings.ToLower(rawError), concurrentRequestLimitWitness) {
+		return ReasonAgentProviderCapacityOrRateLimit
+	}
+	if legacyUsageLimit403Reasons[reason] && isUsageLimit403(strings.ToLower(rawError)) {
+		return ReasonAgentProviderQuotaLimit
+	}
 	if legacySkillBundleReasons[reason] &&
 		strings.HasPrefix(strings.TrimSpace(rawError), legacySkillBundlePrefix) {
 		return ReasonSkillBundleUnavailable
@@ -460,8 +650,17 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 	// allowlist on exactly the un-upgraded hosts most likely to be hitting a
 	// flaky provider. Upgrading here makes the retry work the moment the server
 	// deploys, without waiting on the daemon fleet.
+	lowerError := strings.ToLower(strings.TrimSpace(rawError))
+	// Normalize before retry eligibility is evaluated so installed daemons
+	// receive the same bounded, resume-safe recovery as current ones. Retain
+	// Classify's precedence if a more specific provider failure is present.
+	if (legacyCursorProviderNetworkReasons[reason] || cursorDiagnosticReason(reason, lowerError)) &&
+		isCursorProviderNetworkError(lowerError) && Classify(rawError) == ReasonAgentProviderNetwork {
+		return ReasonAgentProviderNetwork
+	}
 	if legacyOpencodeStreamEndedReasons[reason] &&
-		strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawError)), opencodeStreamEndedPrefix) {
+		(strings.HasPrefix(lowerError, opencodeStreamEndedPrefix) ||
+			strings.HasPrefix(lowerError, codeartsStreamEndedPrefix)) {
 		return ReasonAgentProviderNetwork
 	}
 	// #7112: same mixed-version gap. A daemon predating the OpenClaw CLI
@@ -471,6 +670,19 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 	if legacyOpenclawCLITimeoutReasons[reason] &&
 		containsAll(strings.ToLower(rawError), legacyOpenclawCLITimeoutWitnesses...) {
 		return ReasonRuntimeCLITimeout
+	}
+	// #7913: the same mixed-version gap on environment preparation. A daemon
+	// predating the structural tag classifies the host's own filesystem error
+	// from its text and reports some agent_error.* value — the catchall today,
+	// provider_server_error on the report that opened the issue. Every one of
+	// them is wrong by construction: the prefix proves the task died before an
+	// agent process existed, so the whole agent_error.* namespace is upgraded
+	// here rather than an enumerated subset of it.
+	//
+	// Last, so the openclaw rule above keeps its own preparation failure: that
+	// one names a specific cause inside this same phase and says strictly more.
+	if isAgentSideReason(reason) && hasAnyPrefix(lowerError, legacyEnvironmentPrepareWitnesses...) {
+		return ReasonEnvironmentPrepareFailed
 	}
 	return Reason(reason)
 }
@@ -486,6 +698,28 @@ func containsAll(s string, subs ...string) bool {
 		}
 	}
 	return len(subs) > 0
+}
+
+// hasAnyPrefix reports whether s starts with any of the supplied prefixes.
+// Used where the witness is the wrapper opening an error rather than a phrase
+// somewhere inside it, which is what makes it unambiguous. Caller
+// pre-lowercases s, same contract as containsAny.
+func hasAnyPrefix(s string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAgentSideReason reports whether a wire value blames the agent process —
+// any refined agent_error.* sub-reason, or the pre-MUL-1949 coarse bucket they
+// were split out of. Used by normalization rules whose witness proves the run
+// never reached an agent, so that every such label is known to be wrong
+// without enumerating them.
+func isAgentSideReason(reason string) bool {
+	return Reason(reason).IsAgentError() || reason == "agent_error"
 }
 
 // containsAny reports whether s contains any of the supplied substrings.

@@ -68,9 +68,11 @@ function listResult(models: RuntimeModel[]): RuntimeModelListRequest {
 }
 
 const baseDraft: AgentDraft = {
+  qoderAgentId: "",
   name: "Fast Codex",
   description: "",
   instructions: "",
+  conversationStarters: [],
   avatarUrl: null,
   runtimeId: "runtime-1",
   model: "gpt-5.6-sol",

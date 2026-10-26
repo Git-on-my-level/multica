@@ -20,8 +20,8 @@ func setupDirectChatSession(t *testing.T, ctx context.Context, title string) (ag
 	t.Helper()
 	agentID, runtimeID, daemonID = createRuntimeGuardAgent(t, ctx)
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO chat_session (workspace_id, agent_id, creator_id, title)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO chat_session (workspace_id, agent_id, creator_id, title, explicitly_created_at)
+		VALUES ($1, $2, $3, $4, now())
 		RETURNING id
 	`, testWorkspaceID, agentID, testUserID, title).Scan(&sessionID); err != nil {
 		t.Fatalf("setup: create chat session: %v", err)
@@ -457,12 +457,15 @@ func TestCompleteTask_ChatCallbackIdempotent(t *testing.T) {
 	if _, err := testHandler.TaskService.CompleteTask(ctx, parseUUID(taskID), res, "", "", "", false, "", ""); err != nil {
 		t.Fatalf("first complete: %v", err)
 	}
-	// Replay: the status CAS fails, so this is an idempotent no-op success.
-	if _, err := testHandler.TaskService.CompleteTask(ctx, parseUUID(taskID), res, "", "", "", false, "", ""); err != nil {
+	// Replay with conflicting content: the status CAS fails, so this is an
+	// idempotent no-op success and the first terminal payload remains final.
+	if _, err := testHandler.TaskService.CompleteTask(ctx, parseUUID(taskID), completeResult(t, "conflicting replay"), "", "", "", false, "", ""); err != nil {
 		t.Fatalf("replayed complete must be idempotent success, got %v", err)
 	}
 	if rows := assistantRows(t, ctx, sessionID); len(rows) != 1 {
 		t.Fatalf("expected exactly one assistant outcome after replay, got %d", len(rows))
+	} else if rows[0].Content != "reply" {
+		t.Fatalf("replayed completion replaced the first outcome with %q", rows[0].Content)
 	}
 }
 

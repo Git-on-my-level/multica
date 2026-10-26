@@ -7,9 +7,9 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/issueworkflow"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
-	agentver "github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -73,14 +73,15 @@ func (h *Handler) shouldSuppressActiveSelfAssignment(ctx context.Context, actorT
 	if actorType != "agent" || actorID == "" || actorID != uuidToString(targetAgentID) {
 		return false
 	}
-	active, err := h.hasActiveTaskForIssueAndAgent(ctx, issueID, targetAgentID)
+	active, err := h.Queries.HasActiveTaskForIssueAndAgent(ctx, db.HasActiveTaskForIssueAndAgentParams{IssueID: issueID, AgentID: targetAgentID})
 	return active || err != nil
 }
 
 // dispatchIssueRun executes the enqueue side effect for a decision produced by
-// WillEnqueueRun, carrying an optional handoff note into the run's opening
-// context. The squad path still flows through enqueueSquadLeaderTask so the
-// leader access gate and pending dedup stay in one place.
+// WillEnqueueRun. handoffNote is a legacy API input retained for installed
+// clients and travels only with a run that actually starts. The squad path
+// still flows through enqueueSquadLeaderTask so the leader access gate and
+// pending dedup stay in one place.
 func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger service.IssueRunTrigger, actorType, actorID, handoffNote string) {
 	switch trigger.AssigneeType {
 	case "agent":
@@ -120,18 +121,17 @@ type IssueTriggerPreviewRequest struct {
 	AssigneeType *string `json:"assignee_type"`
 	AssigneeID   *string `json:"assignee_id"`
 	Status       *string `json:"status"`
+	// ProjectID places a create preview in a project, so its workflow's
+	// starting status and starting-step handoff apply. (MUL-7420)
+	ProjectID *string `json:"project_id,omitempty"`
 }
 
 // IssueTriggerPreviewItem is one issue that WILL start a run under the
 // prospective write. AgentID is the runnable agent (squad leader for squads).
-// HandoffSupported is the soft-gate signal: false when the target runtime's
-// daemon is too old to render a handoff note, so the UI can gray out the note
-// box rather than silently drop the text. The assignment itself still works.
 type IssueTriggerPreviewItem struct {
-	IssueID          string `json:"issue_id"`
-	AgentID          string `json:"agent_id"`
-	Source           string `json:"source"`
-	HandoffSupported bool   `json:"handoff_supported"`
+	IssueID string `json:"issue_id"`
+	AgentID string `json:"agent_id"`
+	Source  string `json:"source"`
 }
 
 // IssueTriggerPreviewResponse lists every issue that will enqueue plus a total
@@ -192,10 +192,9 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 		probe := h.issueTriggerPreviewProbe(r, actorType, actorID, workspaceID, issue)
 		if trigger, ok := h.IssueService.WillEnqueueRun(r.Context(), in, probe); ok {
 			resp.Triggers = append(resp.Triggers, IssueTriggerPreviewItem{
-				IssueID:          uuidToString(trigger.IssueID),
-				AgentID:          uuidToString(trigger.AgentID),
-				Source:           string(trigger.Source),
-				HandoffSupported: h.runtimeSupportsHandoff(r.Context(), trigger.AgentID),
+				IssueID: uuidToString(trigger.IssueID),
+				AgentID: uuidToString(trigger.AgentID),
+				Source:  string(trigger.Source),
 			})
 		}
 	}
@@ -215,6 +214,20 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 			Status:       status,
 			AssigneeType: newAssigneeType,
 			AssigneeID:   newAssigneeID,
+		}
+		// Mirror CreateIssue's workflow handling: the starting column's
+		// handoff when no assignee was picked. (MUL-7420)
+		if req.ProjectID != nil && *req.ProjectID != "" {
+			if projectUUID, err := util.ParseUUID(*req.ProjectID); err == nil {
+				if def, project, err := issueworkflow.ForProject(r.Context(), h.Queries, wsUUID, projectUUID); err == nil && def != nil {
+					if step, ok := def.Step(candidate.Status); ok && step.HandsOff() && !hasNewAssignee {
+						if t, id, ok := issueworkflow.ResolveHandler(step, project, actorType, parseUUID(actorID)); ok {
+							candidate.AssigneeType = pgtype.Text{String: t, Valid: true}
+							candidate.AssigneeID = id
+						}
+					}
+				}
+			}
 		}
 		appendTrigger(candidate, service.IssueTriggerInput{Issue: candidate, IsCreate: true})
 		resp.TotalCount = len(resp.Triggers)
@@ -246,6 +259,22 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 		if req.Status != nil && *req.Status != "" {
 			post.Status = *req.Status
 			in.StatusChanged = loaded.Status != *req.Status
+			// A status that enters a workflow handoff step reassigns the
+			// issue, exactly as UpdateIssue will. (MUL-7420)
+			if !hasNewAssignee {
+				params := db.UpdateIssueParams{
+					ProjectID:    loaded.ProjectID,
+					Status:       pgtype.Text{String: *req.Status, Valid: true},
+					AssigneeType: loaded.AssigneeType,
+					AssigneeID:   loaded.AssigneeID,
+				}
+				if hand, err := h.applyIssueWorkflow(r.Context(), loaded, &params, true, false, false, nil); err == nil && hand != nil {
+					post.AssigneeType = params.AssigneeType
+					post.AssigneeID = params.AssigneeID
+					in.AssigneeChanged = true
+					in.EnteredHandoffStep = true
+				}
+			}
 		}
 		in.Issue = post
 		appendTrigger(post, in)
@@ -253,19 +282,4 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 
 	resp.TotalCount = len(resp.Triggers)
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// runtimeSupportsHandoff reports whether the agent's bound runtime reports a
-// CLI version new enough to render handoff notes. Drives the preview's
-// handoff_supported soft-gate signal. Any resolution failure → false (degrade).
-func (h *Handler) runtimeSupportsHandoff(ctx context.Context, agentID pgtype.UUID) bool {
-	agent, err := h.Queries.GetAgent(ctx, agentID)
-	if err != nil || !agent.RuntimeID.Valid {
-		return false
-	}
-	rt, err := h.Queries.GetAgentRuntime(ctx, agent.RuntimeID)
-	if err != nil {
-		return false
-	}
-	return agentver.HandoffSupported(readRuntimeCLIVersion(rt.Metadata))
 }

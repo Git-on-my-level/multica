@@ -11,6 +11,87 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireChannelReplyDelivery = `-- name: AcquireChannelReplyDelivery :one
+INSERT INTO channel_reply_delivery (
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, owner_token, owner_expires_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, 'none', $9, now() + make_interval(secs => $10::double precision)
+)
+ON CONFLICT (turn_id) DO UPDATE
+SET task_id = EXCLUDED.task_id,
+    attempt_depth = EXCLUDED.attempt_depth,
+    phase = CASE WHEN EXCLUDED.phase = 'terminal' THEN 'terminal' ELSE channel_reply_delivery.phase END,
+    owner_token = EXCLUDED.owner_token,
+    owner_expires_at = EXCLUDED.owner_expires_at,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  AND NOT (EXCLUDED.phase = 'streaming' AND channel_reply_delivery.phase = 'terminal')
+  -- An attempt the retry chain has already moved past may not take the turn
+  -- back: its late frames would rewrite what the user is reading with content
+  -- from a run that was superseded.
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth
+`
+
+type AcquireChannelReplyDeliveryParams struct {
+	TurnID         pgtype.UUID `json:"turn_id"`
+	TaskID         pgtype.UUID `json:"task_id"`
+	AttemptDepth   int32       `json:"attempt_depth"`
+	BindingID      pgtype.UUID `json:"binding_id"`
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ChannelType    string      `json:"channel_type"`
+	ChatID         string      `json:"chat_id"`
+	Phase          string      `json:"phase"`
+	OwnerToken     pgtype.UUID `json:"owner_token"`
+	LeaseSeconds   float64     `json:"lease_seconds"`
+}
+
+// Take the turn's delivery lease, creating the row on first use. Returns no
+// row when the turn is settled, when a live owner holds it, or when a
+// streaming path asks for a reply the final answer has taken over — the three
+// cases where this caller must not touch the provider.
+//
+// An expired lease is a process that died mid-delivery. Its successor gets the
+// turn, but never a clean slate: send_state survives, so an outstanding send
+// stays outstanding rather than being silently retried.
+func (q *Queries) AcquireChannelReplyDelivery(ctx context.Context, arg AcquireChannelReplyDeliveryParams) (ChannelReplyDelivery, error) {
+	row := q.db.QueryRow(ctx, acquireChannelReplyDelivery,
+		arg.TurnID,
+		arg.TaskID,
+		arg.AttemptDepth,
+		arg.BindingID,
+		arg.InstallationID,
+		arg.ChannelType,
+		arg.ChatID,
+		arg.Phase,
+		arg.OwnerToken,
+		arg.LeaseSeconds,
+	)
+	var i ChannelReplyDelivery
+	err := row.Scan(
+		&i.TurnID,
+		&i.TaskID,
+		&i.BindingID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChatID,
+		&i.Phase,
+		&i.SendState,
+		&i.MessageID,
+		&i.ChunksSent,
+		&i.OwnerToken,
+		&i.OwnerExpiresAt,
+		&i.SettledReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AttemptDepth,
+	)
+	return i, err
+}
+
 const acquireChannelWSLease = `-- name: AcquireChannelWSLease :one
 UPDATE channel_installation
 SET ws_lease_token       = $1,
@@ -66,7 +147,7 @@ WITH closed AS (
         pending_fresh = TRUE
     WHERE binding.chat_session_id = $2
       AND binding.context_revision = $3
-    RETURNING binding.id, binding.chat_session_id, binding.installation_id, binding.channel_type, binding.channel_chat_id, binding.chat_type, binding.last_message_id, binding.last_thread_id, binding.config, binding.created_at, binding.pending_fresh, binding.context_revision
+    RETURNING binding.id, binding.chat_session_id, binding.installation_id, binding.channel_type, binding.channel_chat_id, binding.chat_type, binding.last_message_id, binding.last_thread_id, binding.config, binding.created_at, binding.pending_fresh, binding.context_revision, binding.route_revision, binding.retired_at, binding.history_start_message_id, binding.history_end_message_id, binding.history_boundary_pending
 ), opened AS (
     INSERT INTO channel_chat_context_generation (
         chat_session_id, revision, history_start_message_id,
@@ -77,9 +158,9 @@ WITH closed AS (
            NOT $4::boolean,
            TRUE
     FROM advanced
-    RETURNING chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at
+    RETURNING chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at, last_message_id, last_thread_id, last_sender_id
 )
-SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at FROM opened
+SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at, last_message_id, last_thread_id, last_sender_id FROM opened
 `
 
 type AdvanceChannelChatContextGenerationParams struct {
@@ -98,6 +179,9 @@ type AdvanceChannelChatContextGenerationRow struct {
 	PendingFresh           bool               `json:"pending_fresh"`
 	InitiatorUserID        pgtype.UUID        `json:"initiator_user_id"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	LastMessageID          pgtype.Text        `json:"last_message_id"`
+	LastThreadID           pgtype.Text        `json:"last_thread_id"`
+	LastSenderID           pgtype.Text        `json:"last_sender_id"`
 }
 
 // Opens a new agent-visible context while retaining the same Multica Chat.
@@ -120,6 +204,9 @@ func (q *Queries) AdvanceChannelChatContextGeneration(ctx context.Context, arg A
 		&i.PendingFresh,
 		&i.InitiatorUserID,
 		&i.CreatedAt,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.LastSenderID,
 	)
 	return i, err
 }
@@ -358,6 +445,174 @@ func (q *Queries) ClearChannelChatSessionPendingFreshForRevision(ctx context.Con
 	return err
 }
 
+const clearChannelInstallationBotScopedRows = `-- name: ClearChannelInstallationBotScopedRows :one
+WITH cleared_chat_sessions AS (
+    DELETE FROM channel_chat_session_binding AS binding
+    WHERE binding.installation_id = $1
+    RETURNING binding.chat_session_id
+),
+cleared_outbound_cards AS (
+    DELETE FROM channel_outbound_card_message AS card
+    WHERE card.chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+    RETURNING card.id
+),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery
+    WHERE delivery.installation_id = $1
+    RETURNING delivery.task_id
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message AS outbound
+    WHERE outbound.installation_id = $1
+    RETURNING outbound.channel_message_id
+),
+cleared_binding_tokens AS (
+    DELETE FROM channel_binding_token AS token
+    WHERE token.installation_id = $1
+    RETURNING token.token_hash
+),
+cleared_inbound_dedup AS (
+    DELETE FROM channel_inbound_message_dedup AS dedup
+    WHERE dedup.installation_id = $1
+    RETURNING dedup.message_id
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding AS user_binding
+    WHERE user_binding.installation_id = $1
+    RETURNING user_binding.id
+)
+SELECT
+    (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
+    (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries,
+    (SELECT count(*) FROM cleared_outbound_messages)::bigint AS outbound_messages
+`
+
+type ClearChannelInstallationBotScopedRowsRow struct {
+	UserBindings        int64 `json:"user_bindings"`
+	ChatSessionBindings int64 `json:"chat_session_bindings"`
+	TaskDeliveries      int64 `json:"task_deliveries"`
+	OutboundMessages    int64 `json:"outbound_messages"`
+}
+
+// Bot-swap cleanup. Pointing an existing installation at a DIFFERENT bot keeps
+// the installation row and its id — UpsertChannelInstallation conflicts on
+// (workspace_id, agent_id, channel_type) and only rewrites config — so every
+// dependent row keyed on installation_id survives into a bot it does not belong
+// to. This clears the ones that are scoped to the OLD bot (#6547).
+//
+// Why they are invalid rather than merely stale: a WeCom aibot userid is
+// anonymized per (bot, user), so a carried-over channel_user_binding addresses
+// the new bot with an id from a namespace it does not share — Outbound's inbox
+// push resolves the sender by installation_id (reused, hence the LIVE new bot)
+// and then sends to the OLD bot's userid. The same reasoning covers a p2p chat
+// binding, whose channel_chat_id IS that userid, and every queued outbound row
+// carrying one.
+//
+// The installation itself, and the audit trail beneath it, deliberately stay:
+// the row is the same connection under new credentials, and a channel_inbound_
+// audit row still records something an operator can act on. Reclaim DETACHes
+// audit only because the installation is going away, which here it is not.
+//
+// chat_session is likewise NOT touched. Deleting the binding detaches the WeCom
+// route from the Chat, the same shape a disconnect leaves behind; the Chat and
+// its history are the user's work product and outlive whichever bot carried
+// them. channel_outbound_card_message has no installation_id and no FK, so it
+// is reached through the just-removed bindings — the only link back — and goes
+// because the platform message ids on it belong to the old bot.
+//
+// Returns what it removed. A queued channel_task_delivery is a RUNNING task's
+// answer: processEvent finds no row and returns nil, so the answer is dropped
+// with no counter and no log line of its own. Deleting it is still right — the
+// address on it is the old bot's userid and unreachable either way — but
+// whoever is waiting for that answer deserves one line saying where it went.
+// channel_outbound_message is counted for the same reason and not because it is
+// expected to be non-zero: a dropped queued send is a reply that never arrives,
+// and a count nobody has to read costs nothing next to guessing later.
+func (q *Queries) ClearChannelInstallationBotScopedRows(ctx context.Context, installationID pgtype.UUID) (ClearChannelInstallationBotScopedRowsRow, error) {
+	row := q.db.QueryRow(ctx, clearChannelInstallationBotScopedRows, installationID)
+	var i ClearChannelInstallationBotScopedRowsRow
+	err := row.Scan(
+		&i.UserBindings,
+		&i.ChatSessionBindings,
+		&i.TaskDeliveries,
+		&i.OutboundMessages,
+	)
+	return i, err
+}
+
+const closeChannelReplyDeliveryTurn = `-- name: CloseChannelReplyDeliveryTurn :one
+INSERT INTO channel_reply_delivery (
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, settled_reason
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    'settled', 'none', $8
+)
+ON CONFLICT (turn_id) DO UPDATE
+SET phase = 'settled',
+    settled_reason = $8,
+    owner_token = NULL,
+    owner_expires_at = NULL,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  -- Same one-way rule the claim follows. A cancellation or empty completion
+  -- belonging to an attempt the retry chain has moved past must not end the
+  -- turn: the attempt that superseded it is still delivering, and its answer
+  -- would be dropped as "already settled".
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth
+`
+
+type CloseChannelReplyDeliveryTurnParams struct {
+	TurnID         pgtype.UUID `json:"turn_id"`
+	TaskID         pgtype.UUID `json:"task_id"`
+	AttemptDepth   int32       `json:"attempt_depth"`
+	BindingID      pgtype.UUID `json:"binding_id"`
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ChannelType    string      `json:"channel_type"`
+	ChatID         string      `json:"chat_id"`
+	SettledReason  string      `json:"settled_reason"`
+}
+
+// End a turn that has no answer to deliver — cancelled, or completed empty —
+// creating the row when the turn never reached the provider at all. Without
+// the insert, a first text frame arriving after the cancellation would find
+// nothing, open a placeholder, and leave it there forever.
+func (q *Queries) CloseChannelReplyDeliveryTurn(ctx context.Context, arg CloseChannelReplyDeliveryTurnParams) (ChannelReplyDelivery, error) {
+	row := q.db.QueryRow(ctx, closeChannelReplyDeliveryTurn,
+		arg.TurnID,
+		arg.TaskID,
+		arg.AttemptDepth,
+		arg.BindingID,
+		arg.InstallationID,
+		arg.ChannelType,
+		arg.ChatID,
+		arg.SettledReason,
+	)
+	var i ChannelReplyDelivery
+	err := row.Scan(
+		&i.TurnID,
+		&i.TaskID,
+		&i.BindingID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChatID,
+		&i.Phase,
+		&i.SendState,
+		&i.MessageID,
+		&i.ChunksSent,
+		&i.OwnerToken,
+		&i.OwnerExpiresAt,
+		&i.SettledReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AttemptDepth,
+	)
+	return i, err
+}
+
 const consumeChannelBindingToken = `-- name: ConsumeChannelBindingToken :one
 UPDATE channel_binding_token
 SET consumed_at = now()
@@ -385,26 +640,26 @@ func (q *Queries) ConsumeChannelBindingToken(ctx context.Context, tokenHash stri
 	return i, err
 }
 
-const countChannelMediaPendingObjects = `-- name: CountChannelMediaPendingObjects :one
+const copyChannelTaskDelivery = `-- name: CopyChannelTaskDelivery :exec
+INSERT INTO channel_task_delivery (
+    task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type,
+    channel_message_id, channel_thread_id, channel_sender_id, route_revision, config
+)
 SELECT
-    count(*) FILTER (WHERE state <> 'tombstoned') AS pending_objects,
-    count(*) FILTER (WHERE state = 'tombstoned') AS tombstoned_objects
-FROM channel_media_pending_object
+    $1, delivery.binding_id, delivery.installation_id, delivery.channel_type, delivery.channel_chat_id, delivery.chat_type,
+    delivery.channel_message_id, delivery.channel_thread_id, delivery.channel_sender_id, delivery.route_revision, delivery.config
+FROM channel_task_delivery AS delivery
+WHERE delivery.task_id = $2
 `
 
-type CountChannelMediaPendingObjectsRow struct {
-	PendingObjects    int64 `json:"pending_objects"`
-	TombstonedObjects int64 `json:"tombstoned_objects"`
+type CopyChannelTaskDeliveryParams struct {
+	ChildTaskID  pgtype.UUID `json:"child_task_id"`
+	ParentTaskID pgtype.UUID `json:"parent_task_id"`
 }
 
-// Ledger backlog gauge for the reconciler's observability. Tombstones are
-// reported separately: they are bounded bookkeeping for already-deleted
-// objects, not a backlog of objects awaiting reclaim.
-func (q *Queries) CountChannelMediaPendingObjects(ctx context.Context) (CountChannelMediaPendingObjectsRow, error) {
-	row := q.db.QueryRow(ctx, countChannelMediaPendingObjects)
-	var i CountChannelMediaPendingObjectsRow
-	err := row.Scan(&i.PendingObjects, &i.TombstonedObjects)
-	return i, err
+func (q *Queries) CopyChannelTaskDelivery(ctx context.Context, arg CopyChannelTaskDeliveryParams) error {
+	_, err := q.db.Exec(ctx, copyChannelTaskDelivery, arg.ChildTaskID, arg.ParentTaskID)
+	return err
 }
 
 const createChannelBindingToken = `-- name: CreateChannelBindingToken :one
@@ -461,18 +716,23 @@ func (q *Queries) CreateChannelBindingToken(ctx context.Context, arg CreateChann
 
 const createChannelChatSessionBinding = `-- name: CreateChannelChatSessionBinding :one
 
-WITH binding AS (
+WITH next_route AS (
+    SELECT COALESCE(MAX(route_revision) + 1, 1)::bigint AS route_revision
+    FROM channel_chat_session_binding AS existing
+    WHERE existing.installation_id = $2 AND existing.channel_chat_id = $4
+), binding AS (
 INSERT INTO channel_chat_session_binding (
-    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config
-) VALUES (
-    $1, $2, $3, $4, $5, $6
+    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type,
+    config, route_revision
 )
-RETURNING id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision
+SELECT $1, $2, $3, $4, $5, $6, next_route.route_revision
+FROM next_route
+RETURNING id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending
 ), generation AS (
     INSERT INTO channel_chat_context_generation (chat_session_id, revision)
     SELECT chat_session_id, context_revision FROM binding
 )
-SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision FROM binding
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM binding
 `
 
 type CreateChannelChatSessionBindingParams struct {
@@ -485,18 +745,23 @@ type CreateChannelChatSessionBindingParams struct {
 }
 
 type CreateChannelChatSessionBindingRow struct {
-	ID              pgtype.UUID        `json:"id"`
-	ChatSessionID   pgtype.UUID        `json:"chat_session_id"`
-	InstallationID  pgtype.UUID        `json:"installation_id"`
-	ChannelType     string             `json:"channel_type"`
-	ChannelChatID   string             `json:"channel_chat_id"`
-	ChatType        string             `json:"chat_type"`
-	LastMessageID   pgtype.Text        `json:"last_message_id"`
-	LastThreadID    pgtype.Text        `json:"last_thread_id"`
-	Config          []byte             `json:"config"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	PendingFresh    bool               `json:"pending_fresh"`
-	ContextRevision int64              `json:"context_revision"`
+	ID                     pgtype.UUID        `json:"id"`
+	ChatSessionID          pgtype.UUID        `json:"chat_session_id"`
+	InstallationID         pgtype.UUID        `json:"installation_id"`
+	ChannelType            string             `json:"channel_type"`
+	ChannelChatID          string             `json:"channel_chat_id"`
+	ChatType               string             `json:"chat_type"`
+	LastMessageID          pgtype.Text        `json:"last_message_id"`
+	LastThreadID           pgtype.Text        `json:"last_thread_id"`
+	Config                 []byte             `json:"config"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	PendingFresh           bool               `json:"pending_fresh"`
+	ContextRevision        int64              `json:"context_revision"`
+	RouteRevision          int64              `json:"route_revision"`
+	RetiredAt              pgtype.Timestamptz `json:"retired_at"`
+	HistoryStartMessageID  pgtype.Text        `json:"history_start_message_id"`
+	HistoryEndMessageID    pgtype.Text        `json:"history_end_message_id"`
+	HistoryBoundaryPending bool               `json:"history_boundary_pending"`
 }
 
 // =====================
@@ -531,6 +796,106 @@ func (q *Queries) CreateChannelChatSessionBinding(ctx context.Context, arg Creat
 		&i.CreatedAt,
 		&i.PendingFresh,
 		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
+	)
+	return i, err
+}
+
+const createChannelChatSessionBindingGeneration = `-- name: CreateChannelChatSessionBindingGeneration :one
+WITH next_route AS (
+    SELECT GREATEST(
+        $1::bigint,
+        COALESCE(MAX(route_revision) + 1, 1)::bigint
+    ) AS route_revision
+    FROM channel_chat_session_binding AS existing
+    WHERE existing.installation_id = $2
+      AND existing.channel_chat_id = $3
+), binding AS (
+INSERT INTO channel_chat_session_binding (
+    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type,
+    config, route_revision, history_start_message_id, history_boundary_pending
+) SELECT
+    $4, $2, $5, $3, $6,
+    $7, next_route.route_revision, $8, $9
+FROM next_route
+RETURNING id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending
+), generation AS (
+    INSERT INTO channel_chat_context_generation (
+        chat_session_id, revision, history_start_message_id, history_boundary_pending
+    )
+    SELECT chat_session_id, context_revision, history_start_message_id, history_boundary_pending
+    FROM binding
+)
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM binding
+`
+
+type CreateChannelChatSessionBindingGenerationParams struct {
+	RouteRevision          int64       `json:"route_revision"`
+	InstallationID         pgtype.UUID `json:"installation_id"`
+	ChannelChatID          string      `json:"channel_chat_id"`
+	ChatSessionID          pgtype.UUID `json:"chat_session_id"`
+	ChannelType            string      `json:"channel_type"`
+	ChatType               string      `json:"chat_type"`
+	Config                 []byte      `json:"config"`
+	HistoryStartMessageID  pgtype.Text `json:"history_start_message_id"`
+	HistoryBoundaryPending bool        `json:"history_boundary_pending"`
+}
+
+type CreateChannelChatSessionBindingGenerationRow struct {
+	ID                     pgtype.UUID        `json:"id"`
+	ChatSessionID          pgtype.UUID        `json:"chat_session_id"`
+	InstallationID         pgtype.UUID        `json:"installation_id"`
+	ChannelType            string             `json:"channel_type"`
+	ChannelChatID          string             `json:"channel_chat_id"`
+	ChatType               string             `json:"chat_type"`
+	LastMessageID          pgtype.Text        `json:"last_message_id"`
+	LastThreadID           pgtype.Text        `json:"last_thread_id"`
+	Config                 []byte             `json:"config"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	PendingFresh           bool               `json:"pending_fresh"`
+	ContextRevision        int64              `json:"context_revision"`
+	RouteRevision          int64              `json:"route_revision"`
+	RetiredAt              pgtype.Timestamptz `json:"retired_at"`
+	HistoryStartMessageID  pgtype.Text        `json:"history_start_message_id"`
+	HistoryEndMessageID    pgtype.Text        `json:"history_end_message_id"`
+	HistoryBoundaryPending bool               `json:"history_boundary_pending"`
+}
+
+func (q *Queries) CreateChannelChatSessionBindingGeneration(ctx context.Context, arg CreateChannelChatSessionBindingGenerationParams) (CreateChannelChatSessionBindingGenerationRow, error) {
+	row := q.db.QueryRow(ctx, createChannelChatSessionBindingGeneration,
+		arg.RouteRevision,
+		arg.InstallationID,
+		arg.ChannelChatID,
+		arg.ChatSessionID,
+		arg.ChannelType,
+		arg.ChatType,
+		arg.Config,
+		arg.HistoryStartMessageID,
+		arg.HistoryBoundaryPending,
+	)
+	var i CreateChannelChatSessionBindingGenerationRow
+	err := row.Scan(
+		&i.ID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.Config,
+		&i.CreatedAt,
+		&i.PendingFresh,
+		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
 	)
 	return i, err
 }
@@ -578,6 +943,101 @@ func (q *Queries) CreateChannelOutboundCardMessage(ctx context.Context, arg Crea
 		&i.Status,
 		&i.LastPatchedAt,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createChannelTaskDeliveryFromSession = `-- name: CreateChannelTaskDeliveryFromSession :one
+
+INSERT INTO channel_task_delivery (
+    task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type,
+    channel_message_id, channel_thread_id, channel_sender_id, route_revision, config
+)
+SELECT
+    $1, binding.id, binding.installation_id, binding.channel_type,
+    binding.channel_chat_id, binding.chat_type,
+    generation.last_message_id,
+    CASE
+        -- This generation recorded a trigger, so its thread is authoritative —
+        -- including when it is legitimately empty, which is how a Slack DM
+        -- answered at top level is distinguished from one answered inside a
+        -- thread.
+        WHEN generation.last_message_id IS NOT NULL THEN generation.last_thread_id
+        -- No trigger: pre-migration, or a generation whose only messages were
+        -- channel commands. Recover the thread ONLY for a thread-isolated
+        -- binding, where it is a stable property of the session rather than a
+        -- moving cursor. Such a binding is exactly the one whose key is the
+        -- composite "chat:thread", which is why it carries the real chat id in
+        -- its config — the marker every adapter writes (larkSessionRouting,
+        -- slackSessionRouting, telegramSessionRouting). Without this, a
+        -- recovered pre-migration run in a Slack channel thread or a Telegram
+        -- forum topic would answer in the parent conversation.
+        WHEN COALESCE(binding.config ->> 'chat_id', binding.config ->> 'channel_id', '')
+             NOT IN ('', binding.channel_chat_id) THEN binding.last_thread_id
+        -- A non-isolated binding's cursor names whichever thread spoke last,
+        -- which is not this run's. Nothing we can justify.
+        ELSE NULL
+    END,
+    generation.last_sender_id,
+    binding.route_revision, binding.config
+FROM channel_chat_session_binding AS binding
+JOIN channel_chat_context_generation AS generation
+  ON generation.chat_session_id = binding.chat_session_id
+ AND generation.revision = $2
+WHERE binding.chat_session_id = $3
+RETURNING task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type, channel_message_id, channel_thread_id, route_revision, config, created_at, channel_sender_id
+`
+
+type CreateChannelTaskDeliveryFromSessionParams struct {
+	TaskID          pgtype.UUID `json:"task_id"`
+	ContextRevision int64       `json:"context_revision"`
+	ChatSessionID   pgtype.UUID `json:"chat_session_id"`
+}
+
+// =====================
+// channel_task_delivery
+// =====================
+// Freezes one task's outbound delivery, from two different sources on purpose.
+//
+// ROUTE — chat, type, config, revision — comes from the session binding. It is
+// a property of the session and does not vary by generation.
+//
+// TRIGGER — the message an answer quotes, the thread it replies into, and the
+// account it @-mentions — comes from the generation this task answers, NOT
+// from the binding's latest-trigger cursor, which a newer generation may
+// already have advanced past.
+//
+// The thread sits with the trigger rather than the route deliberately. For a
+// thread-isolated session (Lark topic, Slack channel thread) the two coincide,
+// so it is easy to mistake the thread for route data — but Slack DMs keep ONE
+// binding per channel while replying into whichever thread the member used
+// (slackSessionRouting), so the binding cursor there names the latest thread,
+// not this run's. Taking it from the generation is correct for both shapes.
+//
+// The one exception is the CASE below: when a generation recorded no trigger
+// at all, a thread-isolated binding can still say which thread the session
+// lives in, and must, or the answer surfaces in the parent channel.
+//
+// A NULL trigger means "we cannot attribute this run": callers reply without a
+// quote or mention rather than inventing one. INNER JOIN on the generation: a
+// task whose generation row is missing entirely has no context to deliver
+// against at all.
+func (q *Queries) CreateChannelTaskDeliveryFromSession(ctx context.Context, arg CreateChannelTaskDeliveryFromSessionParams) (ChannelTaskDelivery, error) {
+	row := q.db.QueryRow(ctx, createChannelTaskDeliveryFromSession, arg.TaskID, arg.ContextRevision, arg.ChatSessionID)
+	var i ChannelTaskDelivery
+	err := row.Scan(
+		&i.TaskID,
+		&i.BindingID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.ChannelMessageID,
+		&i.ChannelThreadID,
+		&i.RouteRevision,
+		&i.Config,
+		&i.CreatedAt,
+		&i.ChannelSenderID,
 	)
 	return i, err
 }
@@ -661,22 +1121,44 @@ func (q *Queries) DeleteChannelBindingTokensByInstallation(ctx context.Context, 
 }
 
 const deleteChannelChatSessionBindingBySession = `-- name: DeleteChannelChatSessionBindingBySession :exec
-WITH deleted_binding AS (
-    DELETE FROM channel_chat_session_binding AS binding
+WITH target AS (
+    SELECT binding.id FROM channel_chat_session_binding AS binding
     WHERE binding.chat_session_id = $1
+), cleared_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery WHERE delivery.binding_id IN (SELECT id FROM target)
+), cleared_outbound AS (
+    DELETE FROM channel_outbound_message AS outbound WHERE outbound.binding_id IN (SELECT id FROM target)
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply WHERE reply.binding_id IN (SELECT id FROM target)
+), deleted_binding AS (
+    DELETE FROM channel_chat_session_binding AS binding WHERE binding.id IN (SELECT id FROM target)
 )
 DELETE FROM channel_chat_context_generation AS generation
 WHERE generation.chat_session_id = $1
 `
 
 // Application-layer integrity (replaces the old chat_session-FK ON DELETE
-// CASCADE): drop the binding when its chat_session is deleted.
+// CASCADE): drop the binding, its immutable delivery/history dependents,
+// and the Chat's context generations.
 func (q *Queries) DeleteChannelChatSessionBindingBySession(ctx context.Context, chatSessionID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteChannelChatSessionBindingBySession, chatSessionID)
 	return err
 }
 
 const deleteChannelChatSessionBindingsByInstallation = `-- name: DeleteChannelChatSessionBindingsByInstallation :exec
+WITH cleared_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery
+    WHERE delivery.installation_id = $1
+      AND delivery.channel_type = $2
+), cleared_outbound AS (
+    DELETE FROM channel_outbound_message AS outbound
+    WHERE outbound.installation_id = $1
+      AND outbound.channel_type = $2
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply
+    WHERE reply.installation_id = $1
+      AND reply.channel_type = $2
+)
 DELETE FROM channel_chat_session_binding AS binding
 WHERE binding.installation_id = $1
   AND binding.channel_type = $2
@@ -722,6 +1204,15 @@ cleared_dingtalk_bot_identity AS (
 ),
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message WHERE installation_id IN (SELECT id FROM doomed)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding WHERE installation_id IN (SELECT id FROM doomed)
@@ -849,24 +1340,6 @@ func (q *Queries) DeleteChannelUserBindingsByWorkspaceMember(ctx context.Context
 	return err
 }
 
-const ensureChannelChatContextGeneration = `-- name: EnsureChannelChatContextGeneration :exec
-INSERT INTO channel_chat_context_generation (
-    chat_session_id, revision
-)
-SELECT binding.chat_session_id, binding.context_revision
-FROM channel_chat_session_binding AS binding
-WHERE binding.chat_session_id = $1
-ON CONFLICT (chat_session_id, revision) DO NOTHING
-`
-
-// Rolling-deploy repair: an older server can create a binding after the schema
-// migration but before every process is upgraded. Materialize its generation
-// lazily before a new server attempts to lock it.
-func (q *Queries) EnsureChannelChatContextGeneration(ctx context.Context, chatSessionID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, ensureChannelChatContextGeneration, chatSessionID)
-	return err
-}
-
 const findChannelBindingForMember = `-- name: FindChannelBindingForMember :one
 SELECT b.id, b.workspace_id, b.multica_user_id, b.installation_id, b.channel_type, b.channel_user_id, b.config, b.bound_at FROM channel_user_binding b
 JOIN channel_installation ci ON ci.id = b.installation_id
@@ -895,6 +1368,68 @@ type FindChannelBindingForMemberParams struct {
 // FindReusableChannelUserBinding's tiebreak so the two lookups agree.
 func (q *Queries) FindChannelBindingForMember(ctx context.Context, arg FindChannelBindingForMemberParams) (ChannelUserBinding, error) {
 	row := q.db.QueryRow(ctx, findChannelBindingForMember, arg.WorkspaceID, arg.MulticaUserID, arg.ChannelType)
+	var i ChannelUserBinding
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.MulticaUserID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelUserID,
+		&i.Config,
+		&i.BoundAt,
+	)
+	return i, err
+}
+
+const findChannelBindingForMemberOnAgentInstallation = `-- name: FindChannelBindingForMemberOnAgentInstallation :one
+SELECT b.id, b.workspace_id, b.multica_user_id, b.installation_id, b.channel_type, b.channel_user_id, b.config, b.bound_at FROM channel_user_binding b
+JOIN channel_installation ci ON ci.id = b.installation_id
+WHERE b.workspace_id = $1
+  AND b.multica_user_id = $2
+  AND b.channel_type = $3
+  AND ci.channel_type = $3
+  AND ci.agent_id = $4
+  AND ci.status = 'active'
+ORDER BY b.bound_at DESC
+LIMIT 1
+`
+
+type FindChannelBindingForMemberOnAgentInstallationParams struct {
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	MulticaUserID pgtype.UUID `json:"multica_user_id"`
+	ChannelType   string      `json:"channel_type"`
+	AgentID       pgtype.UUID `json:"agent_id"`
+}
+
+// Agent-attributed notification lookup: the same member lookup as
+// FindChannelBindingForMember, pinned to the ONE installation the agent whose
+// activity raised the notification owns.
+//
+// Why this exists. FindChannelBindingForMember answers by the
+// RECIPIENT alone, so in a multi-bot org — one bot per agent, several of them
+// bound by the same person — every notification a member receives is pushed
+// through whichever bot they bound most recently, no matter which agent the
+// notification is about. The recipient reads three agents' activity as if it
+// all came from one of them. Pinning the lookup to the acting agent's bot is
+// what makes the notification follow the bot↔agent mapping the sender is
+// reading.
+//
+// The tiebreak stays for the case where one member holds two channel users on
+// the same bot (two WeCom accounts, one Multica account): both rows answer,
+// and `:one` cannot take more than one, so the newest binding wins here
+// exactly as it does in the recipient-wide lookup.
+//
+// channel_type is named once and used for both columns: the installation's
+// own discriminator and the binding's must agree, or installs of two
+// platforms could cross-answer here.
+func (q *Queries) FindChannelBindingForMemberOnAgentInstallation(ctx context.Context, arg FindChannelBindingForMemberOnAgentInstallationParams) (ChannelUserBinding, error) {
+	row := q.db.QueryRow(ctx, findChannelBindingForMemberOnAgentInstallation,
+		arg.WorkspaceID,
+		arg.MulticaUserID,
+		arg.ChannelType,
+		arg.AgentID,
+	)
 	var i ChannelUserBinding
 	err := row.Scan(
 		&i.ID,
@@ -1023,7 +1558,7 @@ func (q *Queries) FindReusableChannelUserBinding(ctx context.Context, arg FindRe
 }
 
 const getChannelChatContextGeneration = `-- name: GetChannelChatContextGeneration :one
-SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at FROM channel_chat_context_generation
+SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at, last_message_id, last_thread_id, last_sender_id FROM channel_chat_context_generation
 WHERE chat_session_id = $1
   AND revision = $2
 `
@@ -1045,13 +1580,16 @@ func (q *Queries) GetChannelChatContextGeneration(ctx context.Context, arg GetCh
 		&i.PendingFresh,
 		&i.InitiatorUserID,
 		&i.CreatedAt,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.LastSenderID,
 	)
 	return i, err
 }
 
 const getChannelChatSessionBinding = `-- name: GetChannelChatSessionBinding :one
-SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision FROM channel_chat_session_binding
-WHERE installation_id = $1 AND channel_chat_id = $2
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
+WHERE installation_id = $1 AND channel_chat_id = $2 AND retired_at IS NULL
 `
 
 type GetChannelChatSessionBindingParams struct {
@@ -1077,12 +1615,17 @@ func (q *Queries) GetChannelChatSessionBinding(ctx context.Context, arg GetChann
 		&i.CreatedAt,
 		&i.PendingFresh,
 		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
 	)
 	return i, err
 }
 
 const getChannelChatSessionBindingBySession = `-- name: GetChannelChatSessionBindingBySession :one
-SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision FROM channel_chat_session_binding
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
 WHERE chat_session_id = $1
   AND channel_type = $2
 `
@@ -1112,12 +1655,17 @@ func (q *Queries) GetChannelChatSessionBindingBySession(ctx context.Context, arg
 		&i.CreatedAt,
 		&i.PendingFresh,
 		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
 	)
 	return i, err
 }
 
 const getChannelChatSessionBindingBySessionAny = `-- name: GetChannelChatSessionBindingBySessionAny :one
-SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision FROM channel_chat_session_binding
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
 WHERE chat_session_id = $1
 `
 
@@ -1143,6 +1691,11 @@ func (q *Queries) GetChannelChatSessionBindingBySessionAny(ctx context.Context, 
 		&i.CreatedAt,
 		&i.PendingFresh,
 		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
 	)
 	return i, err
 }
@@ -1372,6 +1925,100 @@ func (q *Queries) GetChannelOutboundCardByTask(ctx context.Context, arg GetChann
 	return i, err
 }
 
+const getChannelReplyDelivery = `-- name: GetChannelReplyDelivery :one
+SELECT turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth FROM channel_reply_delivery WHERE turn_id = $1
+`
+
+// Read without taking the lease, so a caller that lost the race can tell
+// "someone else is working on it" from "this turn is finished".
+func (q *Queries) GetChannelReplyDelivery(ctx context.Context, turnID pgtype.UUID) (ChannelReplyDelivery, error) {
+	row := q.db.QueryRow(ctx, getChannelReplyDelivery, turnID)
+	var i ChannelReplyDelivery
+	err := row.Scan(
+		&i.TurnID,
+		&i.TaskID,
+		&i.BindingID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChatID,
+		&i.Phase,
+		&i.SendState,
+		&i.MessageID,
+		&i.ChunksSent,
+		&i.OwnerToken,
+		&i.OwnerExpiresAt,
+		&i.SettledReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AttemptDepth,
+	)
+	return i, err
+}
+
+const getChannelReplyTurn = `-- name: GetChannelReplyTurn :one
+
+WITH RECURSIVE chain(task_id, parent_task_id, depth) AS (
+    SELECT attempt.id, attempt.retry_of_task_id, 0
+    FROM agent_task_queue attempt
+    WHERE attempt.id = $1
+    UNION ALL
+    SELECT parent.id, parent.retry_of_task_id, chain.depth + 1
+    FROM agent_task_queue parent
+    JOIN chain ON parent.id = chain.parent_task_id
+)
+SELECT
+    (SELECT root.task_id FROM chain root WHERE root.parent_task_id IS NULL LIMIT 1) AS turn_id,
+    (SELECT COALESCE(MAX(step.depth), 0) FROM chain step)::int AS attempt_depth
+`
+
+type GetChannelReplyTurnRow struct {
+	TurnID       pgtype.UUID `json:"turn_id"`
+	AttemptDepth int32       `json:"attempt_depth"`
+}
+
+// ---------------------------------------------------------------------------
+// Reply delivery ownership (channel_reply_delivery).
+//
+// One user turn, one owner, one reply. Every path that can put a message in a
+// chat proves it holds the turn's lease before it calls the provider, and
+// proves it still holds the lease when it records what happened.
+// ---------------------------------------------------------------------------
+// The root of a task's automatic-retry chain — the user turn all its attempts
+// belong to — and how far down the chain this attempt sits. A retry runs under
+// a new task id and must finish the reply its previous attempt started, so
+// ownership is keyed by the root; depth is what stops an earlier attempt's late
+// frame from taking the turn back off the retry that superseded it.
+func (q *Queries) GetChannelReplyTurn(ctx context.Context, id pgtype.UUID) (GetChannelReplyTurnRow, error) {
+	row := q.db.QueryRow(ctx, getChannelReplyTurn, id)
+	var i GetChannelReplyTurnRow
+	err := row.Scan(&i.TurnID, &i.AttemptDepth)
+	return i, err
+}
+
+const getChannelTaskDelivery = `-- name: GetChannelTaskDelivery :one
+SELECT task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type, channel_message_id, channel_thread_id, route_revision, config, created_at, channel_sender_id FROM channel_task_delivery WHERE task_id = $1
+`
+
+func (q *Queries) GetChannelTaskDelivery(ctx context.Context, taskID pgtype.UUID) (ChannelTaskDelivery, error) {
+	row := q.db.QueryRow(ctx, getChannelTaskDelivery, taskID)
+	var i ChannelTaskDelivery
+	err := row.Scan(
+		&i.TaskID,
+		&i.BindingID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.ChannelMessageID,
+		&i.ChannelThreadID,
+		&i.RouteRevision,
+		&i.Config,
+		&i.CreatedAt,
+		&i.ChannelSenderID,
+	)
+	return i, err
+}
+
 const getChannelUserBindingByUserID = `-- name: GetChannelUserBindingByUserID :one
 SELECT id, workspace_id, multica_user_id, installation_id, channel_type, channel_user_id, config, bound_at FROM channel_user_binding
 WHERE installation_id = $1 AND channel_user_id = $2
@@ -1400,6 +2047,59 @@ func (q *Queries) GetChannelUserBindingByUserID(ctx context.Context, arg GetChan
 		&i.BoundAt,
 	)
 	return i, err
+}
+
+const isChannelMessageTypingActive = `-- name: IsChannelMessageTypingActive :one
+SELECT EXISTS (
+    SELECT 1 FROM chat_message AS message
+    JOIN chat_session AS session ON session.id = message.chat_session_id
+    JOIN channel_chat_session_binding AS binding ON binding.chat_session_id = session.id
+    JOIN channel_installation AS installation ON installation.id = binding.installation_id
+    LEFT JOIN agent_task_queue AS task ON task.id = message.task_id
+    LEFT JOIN agent AS task_agent ON task_agent.id = task.agent_id
+    WHERE message.id = $1
+      AND session.id = $2
+      AND session.workspace_id = $3
+      AND installation.workspace_id = $3
+      AND installation.id = $4
+      AND installation.channel_type = $5
+      AND binding.channel_type = $5
+      AND installation.status = 'active'
+      AND session.status = 'active'
+      AND binding.retired_at IS NULL
+      AND message.role = 'user'
+      AND message.channel_ingested
+      AND NOT message.channel_typing_settled
+      AND (message.task_id IS NULL OR (
+          task_agent.workspace_id = $3
+          AND task.chat_session_id = session.id
+          AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+      ))
+)
+`
+
+type IsChannelMessageTypingActiveParams struct {
+	MessageID      pgtype.UUID `json:"message_id"`
+	ChatSessionID  pgtype.UUID `json:"chat_session_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ChannelType    string      `json:"channel_type"`
+}
+
+// Revalidate the exact input after a remote reaction Add. A pending debounce
+// input has no task yet; a sealed input follows its immutable owning task.
+// Do not use the binding's latest message or another turn's active task.
+func (q *Queries) IsChannelMessageTypingActive(ctx context.Context, arg IsChannelMessageTypingActiveParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isChannelMessageTypingActive,
+		arg.MessageID,
+		arg.ChatSessionID,
+		arg.WorkspaceID,
+		arg.InstallationID,
+		arg.ChannelType,
+	)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const listActiveChannelInstallations = `-- name: ListActiveChannelInstallations :many
@@ -1506,6 +2206,52 @@ func (q *Queries) ListAllActiveChannelInstallations(ctx context.Context) ([]Chan
 	return items, nil
 }
 
+const listChannelChatSessionBindingsBySessions = `-- name: ListChannelChatSessionBindingsBySessions :many
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
+WHERE chat_session_id = ANY($1::uuid[])
+`
+
+// Batch projection for Chat list responses. Historical bindings are retained,
+// so retired Chats keep their channel source while only the active generation
+// reports itself as the current route.
+func (q *Queries) ListChannelChatSessionBindingsBySessions(ctx context.Context, chatSessionIds []pgtype.UUID) ([]ChannelChatSessionBinding, error) {
+	rows, err := q.db.Query(ctx, listChannelChatSessionBindingsBySessions, chatSessionIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ChannelChatSessionBinding{}
+	for rows.Next() {
+		var i ChannelChatSessionBinding
+		if err := rows.Scan(
+			&i.ID,
+			&i.ChatSessionID,
+			&i.InstallationID,
+			&i.ChannelType,
+			&i.ChannelChatID,
+			&i.ChatType,
+			&i.LastMessageID,
+			&i.LastThreadID,
+			&i.Config,
+			&i.CreatedAt,
+			&i.PendingFresh,
+			&i.ContextRevision,
+			&i.RouteRevision,
+			&i.RetiredAt,
+			&i.HistoryStartMessageID,
+			&i.HistoryEndMessageID,
+			&i.HistoryBoundaryPending,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listChannelInboundAuditByInstallation = `-- name: ListChannelInboundAuditByInstallation :many
 SELECT id, installation_id, channel_type, channel_chat_id, event_type, channel_event_id, channel_message_id, drop_reason, received_at FROM channel_inbound_audit
 WHERE installation_id = $1
@@ -1596,8 +2342,74 @@ func (q *Queries) ListChannelInstallationsByWorkspace(ctx context.Context, arg L
 	return items, nil
 }
 
+const listChannelOutboundMessageIDsForBinding = `-- name: ListChannelOutboundMessageIDsForBinding :many
+SELECT outbound.channel_message_id FROM channel_outbound_message AS outbound
+WHERE outbound.binding_id = $1
+ORDER BY outbound.created_at ASC
+`
+
+func (q *Queries) ListChannelOutboundMessageIDsForBinding(ctx context.Context, bindingID pgtype.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listChannelOutboundMessageIDsForBinding, bindingID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var channel_message_id string
+		if err := rows.Scan(&channel_message_id); err != nil {
+			return nil, err
+		}
+		items = append(items, channel_message_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listChannelOutboundMessagesByIDs = `-- name: ListChannelOutboundMessagesByIDs :many
+SELECT outbound.installation_id, outbound.channel_type, outbound.channel_message_id, outbound.binding_id, outbound.route_revision, outbound.task_id, outbound.outbound_kind, outbound.created_at FROM channel_outbound_message AS outbound
+WHERE outbound.installation_id = $1
+  AND outbound.channel_message_id = ANY($2::text[])
+`
+
+type ListChannelOutboundMessagesByIDsParams struct {
+	InstallationID    pgtype.UUID `json:"installation_id"`
+	ChannelMessageIds []string    `json:"channel_message_ids"`
+}
+
+func (q *Queries) ListChannelOutboundMessagesByIDs(ctx context.Context, arg ListChannelOutboundMessagesByIDsParams) ([]ChannelOutboundMessage, error) {
+	rows, err := q.db.Query(ctx, listChannelOutboundMessagesByIDs, arg.InstallationID, arg.ChannelMessageIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ChannelOutboundMessage{}
+	for rows.Next() {
+		var i ChannelOutboundMessage
+		if err := rows.Scan(
+			&i.InstallationID,
+			&i.ChannelType,
+			&i.ChannelMessageID,
+			&i.BindingID,
+			&i.RouteRevision,
+			&i.TaskID,
+			&i.OutboundKind,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockChannelChatContextGenerationByRevision = `-- name: LockChannelChatContextGenerationByRevision :one
-SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at FROM channel_chat_context_generation
+SELECT chat_session_id, revision, history_start_message_id, history_end_message_id, history_boundary_pending, pending_fresh, initiator_user_id, created_at, last_message_id, last_thread_id, last_sender_id FROM channel_chat_context_generation
 WHERE chat_session_id = $1
   AND revision = $2
 FOR UPDATE
@@ -1620,19 +2432,22 @@ func (q *Queries) LockChannelChatContextGenerationByRevision(ctx context.Context
 		&i.PendingFresh,
 		&i.InitiatorUserID,
 		&i.CreatedAt,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.LastSenderID,
 	)
 	return i, err
 }
 
 const lockChannelChatSessionBindingForContext = `-- name: LockChannelChatSessionBindingForContext :one
-SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision FROM channel_chat_session_binding
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
 WHERE chat_session_id = $1
 FOR UPDATE
 `
 
 // Context mutations acquire this row after chat_session and before any
 // channel_chat_context_generation row. Keeping the statements separate makes
-// the lock order explicit and identical for append, /new, and task enqueue.
+// the lock order explicit and identical for append, /clear, and task enqueue.
 func (q *Queries) LockChannelChatSessionBindingForContext(ctx context.Context, chatSessionID pgtype.UUID) (ChannelChatSessionBinding, error) {
 	row := q.db.QueryRow(ctx, lockChannelChatSessionBindingForContext, chatSessionID)
 	var i ChannelChatSessionBinding
@@ -1649,6 +2464,11 @@ func (q *Queries) LockChannelChatSessionBindingForContext(ctx context.Context, c
 		&i.CreatedAt,
 		&i.PendingFresh,
 		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
 	)
 	return i, err
 }
@@ -1660,7 +2480,7 @@ FOR UPDATE
 `
 
 // EnqueueChatTask reads this under the same row lock and transaction that
-// creates the task. A concurrent `/new` therefore lands either before this
+// creates the task. A concurrent `/clear` therefore lands either before this
 // task and is consumed by it, or after this task and remains for the next one.
 func (q *Queries) LockChannelChatSessionPendingFresh(ctx context.Context, chatSessionID pgtype.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, lockChannelChatSessionPendingFresh, chatSessionID)
@@ -1698,14 +2518,85 @@ func (q *Queries) LockChannelInstallationAppIDSlot(ctx context.Context, arg Lock
 	return err
 }
 
+const lockCurrentChannelChatSessionBinding = `-- name: LockCurrentChannelChatSessionBinding :one
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
+WHERE installation_id = $1 AND channel_chat_id = $2 AND retired_at IS NULL
+FOR UPDATE
+`
+
+type LockCurrentChannelChatSessionBindingParams struct {
+	InstallationID pgtype.UUID `json:"installation_id"`
+	ChannelChatID  string      `json:"channel_chat_id"`
+}
+
+func (q *Queries) LockCurrentChannelChatSessionBinding(ctx context.Context, arg LockCurrentChannelChatSessionBindingParams) (ChannelChatSessionBinding, error) {
+	row := q.db.QueryRow(ctx, lockCurrentChannelChatSessionBinding, arg.InstallationID, arg.ChannelChatID)
+	var i ChannelChatSessionBinding
+	err := row.Scan(
+		&i.ID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.Config,
+		&i.CreatedAt,
+		&i.PendingFresh,
+		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
+	)
+	return i, err
+}
+
+const lockCurrentChannelChatSessionBindingBySession = `-- name: LockCurrentChannelChatSessionBindingBySession :one
+SELECT id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending FROM channel_chat_session_binding
+WHERE chat_session_id = $1 AND retired_at IS NULL
+FOR UPDATE
+`
+
+// Shared append fence. A message may have resolved a Chat immediately before
+// /new retired it; locking only chat_session would then let the stale append
+// land after the route switch. Requiring the binding to remain current makes
+// every adapter retry against the winning generation.
+func (q *Queries) LockCurrentChannelChatSessionBindingBySession(ctx context.Context, chatSessionID pgtype.UUID) (ChannelChatSessionBinding, error) {
+	row := q.db.QueryRow(ctx, lockCurrentChannelChatSessionBindingBySession, chatSessionID)
+	var i ChannelChatSessionBinding
+	err := row.Scan(
+		&i.ID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.Config,
+		&i.CreatedAt,
+		&i.PendingFresh,
+		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
+	)
+	return i, err
+}
+
 const markChannelChatSessionPendingFresh = `-- name: MarkChannelChatSessionPendingFresh :one
 UPDATE channel_chat_session_binding
 SET pending_fresh = TRUE
-WHERE chat_session_id = $1
+WHERE chat_session_id = $1 AND retired_at IS NULL
 RETURNING pending_fresh
 `
 
-// Persists a channel `/new` intent until the next chat task is successfully
+// Persists a channel `/clear` intent until the next chat task is successfully
 // created. RETURNING makes a missing binding an error instead of silently
 // acknowledging a fresh start that was never stored.
 func (q *Queries) MarkChannelChatSessionPendingFresh(ctx context.Context, chatSessionID pgtype.UUID) (bool, error) {
@@ -1736,6 +2627,46 @@ type MarkChannelInboundDedupProcessedParams struct {
 // zero rows (a reclaim happened); the caller rolls back its in-tx write.
 func (q *Queries) MarkChannelInboundDedupProcessed(ctx context.Context, arg MarkChannelInboundDedupProcessedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, markChannelInboundDedupProcessed, arg.InstallationID, arg.MessageID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markChannelReplyDeliverySendUnknown = `-- name: MarkChannelReplyDeliverySendUnknown :execrows
+UPDATE channel_reply_delivery
+SET send_state = 'unknown', updated_at = now()
+WHERE turn_id = $1 AND send_state = 'in_flight'
+`
+
+// The response was lost. Recorded without the owner check: this is the write
+// that must survive a caller whose lease expired while its own request hung,
+// because the alternative is a successor assuming nothing was ever sent.
+func (q *Queries) MarkChannelReplyDeliverySendUnknown(ctx context.Context, turnID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markChannelReplyDeliverySendUnknown, turnID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markChannelReplyDeliverySending = `-- name: MarkChannelReplyDeliverySending :execrows
+UPDATE channel_reply_delivery
+SET send_state = 'in_flight', updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state NOT IN ('in_flight', 'unknown')
+`
+
+type MarkChannelReplyDeliverySendingParams struct {
+	TurnID     pgtype.UUID `json:"turn_id"`
+	OwnerToken pgtype.UUID `json:"owner_token"`
+}
+
+// Publish a send before making it, so any other process reads "a send is
+// outstanding" rather than "nothing has been sent". A resolved earlier send
+// does not block the next part of a multi-part answer; an unresolved one does,
+// because that is the case where nobody knows what is already in the chat.
+func (q *Queries) MarkChannelReplyDeliverySending(ctx context.Context, arg MarkChannelReplyDeliverySendingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markChannelReplyDeliverySending, arg.TurnID, arg.OwnerToken)
 	if err != nil {
 		return 0, err
 	}
@@ -1802,6 +2733,15 @@ cleared_dingtalk_bot_identity AS (
 ),
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM dead)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
@@ -1994,6 +2934,99 @@ func (q *Queries) RecordChannelMediaPendingObject(ctx context.Context, arg Recor
 	return storage_key, err
 }
 
+const recordChannelOutboundMessage = `-- name: RecordChannelOutboundMessage :exec
+
+INSERT INTO channel_outbound_message (
+    installation_id, channel_type, channel_message_id, binding_id,
+    route_revision, task_id, outbound_kind
+) VALUES (
+    $1, $2,
+    $3, $4,
+    $5, $6,
+    $7
+)
+ON CONFLICT (installation_id, channel_message_id) DO NOTHING
+`
+
+type RecordChannelOutboundMessageParams struct {
+	OutboundInstallationID pgtype.UUID `json:"outbound_installation_id"`
+	OutboundChannelType    string      `json:"outbound_channel_type"`
+	OutboundMessageID      string      `json:"outbound_message_id"`
+	OutboundBindingID      pgtype.UUID `json:"outbound_binding_id"`
+	OutboundRouteRevision  int64       `json:"outbound_route_revision"`
+	OutboundTaskID         pgtype.UUID `json:"outbound_task_id"`
+	OutboundKind           string      `json:"outbound_kind"`
+}
+
+// =====================
+// channel_outbound_message
+// =====================
+func (q *Queries) RecordChannelOutboundMessage(ctx context.Context, arg RecordChannelOutboundMessageParams) error {
+	_, err := q.db.Exec(ctx, recordChannelOutboundMessage,
+		arg.OutboundInstallationID,
+		arg.OutboundChannelType,
+		arg.OutboundMessageID,
+		arg.OutboundBindingID,
+		arg.OutboundRouteRevision,
+		arg.OutboundTaskID,
+		arg.OutboundKind,
+	)
+	return err
+}
+
+const recordChannelReplyDeliveryChunk = `-- name: RecordChannelReplyDeliveryChunk :execrows
+UPDATE channel_reply_delivery
+SET send_state = 'known',
+    message_id = CASE WHEN message_id = '' THEN $1::text ELSE message_id END,
+    chunks_sent = GREATEST(chunks_sent, $2::int),
+    updated_at = now()
+WHERE turn_id = $3 AND owner_token = $4
+`
+
+type RecordChannelReplyDeliveryChunkParams struct {
+	MessageID  string      `json:"message_id"`
+	ChunksSent int32       `json:"chunks_sent"`
+	TurnID     pgtype.UUID `json:"turn_id"`
+	OwnerToken pgtype.UUID `json:"owner_token"`
+}
+
+// A part of the final answer landed. message_id is only adopted when the turn
+// has no editable message yet, so later parts never retarget the first one.
+func (q *Queries) RecordChannelReplyDeliveryChunk(ctx context.Context, arg RecordChannelReplyDeliveryChunkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordChannelReplyDeliveryChunk,
+		arg.MessageID,
+		arg.ChunksSent,
+		arg.TurnID,
+		arg.OwnerToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordChannelReplyDeliveryPlaceholder = `-- name: RecordChannelReplyDeliveryPlaceholder :execrows
+UPDATE channel_reply_delivery
+SET send_state = 'known', message_id = $3, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight'
+`
+
+type RecordChannelReplyDeliveryPlaceholderParams struct {
+	TurnID     pgtype.UUID `json:"turn_id"`
+	OwnerToken pgtype.UUID `json:"owner_token"`
+	MessageID  string      `json:"message_id"`
+}
+
+// The placeholder landed. It gives the turn an editable message; it delivers
+// no part of the final answer, so chunks_sent stays where it is.
+func (q *Queries) RecordChannelReplyDeliveryPlaceholder(ctx context.Context, arg RecordChannelReplyDeliveryPlaceholderParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordChannelReplyDeliveryPlaceholder, arg.TurnID, arg.OwnerToken, arg.MessageID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const releaseChannelInboundDedup = `-- name: ReleaseChannelInboundDedup :execrows
 DELETE FROM channel_inbound_message_dedup
 WHERE installation_id = $1
@@ -2054,6 +3087,26 @@ func (q *Queries) ReleaseChannelMediaPendingObject(ctx context.Context, arg Rele
 	return err
 }
 
+const releaseChannelReplyDelivery = `-- name: ReleaseChannelReplyDelivery :execrows
+UPDATE channel_reply_delivery
+SET owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2
+`
+
+type ReleaseChannelReplyDeliveryParams struct {
+	TurnID     pgtype.UUID `json:"turn_id"`
+	OwnerToken pgtype.UUID `json:"owner_token"`
+}
+
+// Hand the turn back so the next path does not wait out the lease.
+func (q *Queries) ReleaseChannelReplyDelivery(ctx context.Context, arg ReleaseChannelReplyDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseChannelReplyDelivery, arg.TurnID, arg.OwnerToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const releaseChannelWSLease = `-- name: ReleaseChannelWSLease :exec
 UPDATE channel_installation
 SET ws_lease_token      = NULL,
@@ -2074,6 +3127,52 @@ func (q *Queries) ReleaseChannelWSLease(ctx context.Context, arg ReleaseChannelW
 	return err
 }
 
+const renewChannelReplyDelivery = `-- name: RenewChannelReplyDelivery :execrows
+UPDATE channel_reply_delivery
+SET owner_expires_at = now() + make_interval(secs => $1::double precision), updated_at = now()
+WHERE turn_id = $2 AND owner_token = $3 AND phase <> 'settled'
+`
+
+type RenewChannelReplyDeliveryParams struct {
+	LeaseSeconds float64     `json:"lease_seconds"`
+	TurnID       pgtype.UUID `json:"turn_id"`
+	OwnerToken   pgtype.UUID `json:"owner_token"`
+}
+
+// Prove the turn is still ours and push the lease out. Terminal delivery holds
+// a turn across several scheduler rounds — edit pacing, a 429 backoff — so it
+// re-proves ownership before each Telegram call rather than trusting a lease
+// taken minutes earlier. No rows means another process took the turn over, and
+// this one must stop.
+func (q *Queries) RenewChannelReplyDelivery(ctx context.Context, arg RenewChannelReplyDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renewChannelReplyDelivery, arg.LeaseSeconds, arg.TurnID, arg.OwnerToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resetChannelReplyDeliverySend = `-- name: ResetChannelReplyDeliverySend :execrows
+UPDATE channel_reply_delivery
+SET send_state = CASE WHEN message_id = '' THEN 'none' ELSE 'known' END, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight'
+`
+
+type ResetChannelReplyDeliverySendParams struct {
+	TurnID     pgtype.UUID `json:"turn_id"`
+	OwnerToken pgtype.UUID `json:"owner_token"`
+}
+
+// The provider answered and refused: nothing is in the chat, so the turn may
+// be attempted again.
+func (q *Queries) ResetChannelReplyDeliverySend(ctx context.Context, arg ResetChannelReplyDeliverySendParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resetChannelReplyDeliverySend, arg.TurnID, arg.OwnerToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const resolveChannelChatContextHistoryStart = `-- name: ResolveChannelChatContextHistoryStart :exec
 UPDATE channel_chat_context_generation
 SET history_start_message_id = $1,
@@ -2092,6 +3191,44 @@ type ResolveChannelChatContextHistoryStartParams struct {
 func (q *Queries) ResolveChannelChatContextHistoryStart(ctx context.Context, arg ResolveChannelChatContextHistoryStartParams) error {
 	_, err := q.db.Exec(ctx, resolveChannelChatContextHistoryStart, arg.HistoryStartMessageID, arg.ChatSessionID, arg.Revision)
 	return err
+}
+
+const retireChannelChatSessionBinding = `-- name: RetireChannelChatSessionBinding :one
+UPDATE channel_chat_session_binding
+SET retired_at = now(),
+    history_end_message_id = $1
+WHERE id = $2 AND retired_at IS NULL
+RETURNING id, chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, last_message_id, last_thread_id, config, created_at, pending_fresh, context_revision, route_revision, retired_at, history_start_message_id, history_end_message_id, history_boundary_pending
+`
+
+type RetireChannelChatSessionBindingParams struct {
+	HistoryEndMessageID pgtype.Text `json:"history_end_message_id"`
+	ID                  pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) RetireChannelChatSessionBinding(ctx context.Context, arg RetireChannelChatSessionBindingParams) (ChannelChatSessionBinding, error) {
+	row := q.db.QueryRow(ctx, retireChannelChatSessionBinding, arg.HistoryEndMessageID, arg.ID)
+	var i ChannelChatSessionBinding
+	err := row.Scan(
+		&i.ID,
+		&i.ChatSessionID,
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelChatID,
+		&i.ChatType,
+		&i.LastMessageID,
+		&i.LastThreadID,
+		&i.Config,
+		&i.CreatedAt,
+		&i.PendingFresh,
+		&i.ContextRevision,
+		&i.RouteRevision,
+		&i.RetiredAt,
+		&i.HistoryStartMessageID,
+		&i.HistoryEndMessageID,
+		&i.HistoryBoundaryPending,
+	)
+	return i, err
 }
 
 const setChannelChatContextInitiator = `-- name: SetChannelChatContextInitiator :one
@@ -2116,6 +3253,44 @@ func (q *Queries) SetChannelChatContextInitiator(ctx context.Context, arg SetCha
 	var initiator_user_id pgtype.UUID
 	err := row.Scan(&initiator_user_id)
 	return initiator_user_id, err
+}
+
+const setChannelChatContextReplyTarget = `-- name: SetChannelChatContextReplyTarget :exec
+UPDATE channel_chat_context_generation
+SET last_message_id = $1,
+    last_thread_id  = $2,
+    last_sender_id  = $3
+WHERE chat_session_id = $4
+  AND revision = $5
+`
+
+type SetChannelChatContextReplyTargetParams struct {
+	LastMessageID pgtype.Text `json:"last_message_id"`
+	LastThreadID  pgtype.Text `json:"last_thread_id"`
+	LastSenderID  pgtype.Text `json:"last_sender_id"`
+	ChatSessionID pgtype.UUID `json:"chat_session_id"`
+	Revision      int64       `json:"revision"`
+}
+
+// Snapshots the trigger this generation will be answered on: the message an
+// outbound reply targets, its thread, and the channel-native id of whoever
+// sent it. The sibling of SetChannelChatContextInitiator, and load-bearing for
+// the same reason — a debounced run flushes against ITS generation, which may
+// no longer be the session's newest, so reading the trigger from the session
+// would answer one member's question quoting and @-mentioning another's.
+//
+// All three move together in one statement: a sender or thread that described
+// a different message than the reply targets is precisely the cross-attribution
+// this exists to prevent.
+func (q *Queries) SetChannelChatContextReplyTarget(ctx context.Context, arg SetChannelChatContextReplyTargetParams) error {
+	_, err := q.db.Exec(ctx, setChannelChatContextReplyTarget,
+		arg.LastMessageID,
+		arg.LastThreadID,
+		arg.LastSenderID,
+		arg.ChatSessionID,
+		arg.Revision,
+	)
+	return err
 }
 
 const setChannelInstallationConfig = `-- name: SetChannelInstallationConfig :exec
@@ -2151,6 +3326,27 @@ type SetChannelInstallationStatusParams struct {
 func (q *Queries) SetChannelInstallationStatus(ctx context.Context, arg SetChannelInstallationStatusParams) error {
 	_, err := q.db.Exec(ctx, setChannelInstallationStatus, arg.ID, arg.Status)
 	return err
+}
+
+const settleChannelReplyDelivery = `-- name: SettleChannelReplyDelivery :execrows
+UPDATE channel_reply_delivery
+SET phase = 'settled', settled_reason = $3, owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND phase <> 'settled'
+`
+
+type SettleChannelReplyDeliveryParams struct {
+	TurnID        pgtype.UUID `json:"turn_id"`
+	OwnerToken    pgtype.UUID `json:"owner_token"`
+	SettledReason string      `json:"settled_reason"`
+}
+
+// Delivery is over. Nothing sends or edits for this turn afterwards.
+func (q *Queries) SettleChannelReplyDelivery(ctx context.Context, arg SettleChannelReplyDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleChannelReplyDelivery, arg.TurnID, arg.OwnerToken, arg.SettledReason)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const tombstoneChannelMediaPendingObject = `-- name: TombstoneChannelMediaPendingObject :execrows
@@ -2203,22 +3399,56 @@ func (q *Queries) TombstoneChannelMediaPendingObject(ctx context.Context, arg To
 }
 
 const updateChannelChatSessionBindingReplyTarget = `-- name: UpdateChannelChatSessionBindingReplyTarget :exec
-UPDATE channel_chat_session_binding
-SET last_message_id = $2,
-    last_thread_id  = $3
-WHERE chat_session_id = $1
+WITH current_route AS (
+    SELECT current_binding.id, current_binding.chat_session_id, current_binding.installation_id, current_binding.channel_type, current_binding.channel_chat_id, current_binding.chat_type, current_binding.last_message_id, current_binding.last_thread_id, current_binding.config, current_binding.created_at, current_binding.pending_fresh, current_binding.context_revision, current_binding.route_revision, current_binding.retired_at, current_binding.history_start_message_id, current_binding.history_end_message_id, current_binding.history_boundary_pending
+    FROM channel_chat_session_binding AS current_binding
+    WHERE current_binding.chat_session_id = $3
+    FOR UPDATE OF current_binding
+), closed_previous AS (
+    UPDATE channel_chat_session_binding AS previous
+    SET history_end_message_id = $1
+    FROM current_route AS current
+    WHERE current.history_boundary_pending
+      AND $1::text IS NOT NULL
+      AND previous.installation_id = current.installation_id
+      AND previous.channel_chat_id = current.channel_chat_id
+      -- Multiple native Slack /new commands can rotate through empty
+      -- generations before another public message supplies a platform cursor.
+      -- That cursor closes every still-open retired generation.
+      AND previous.route_revision < current.route_revision
+      AND previous.retired_at IS NOT NULL
+      AND previous.history_end_message_id IS NULL
+)
+UPDATE channel_chat_session_binding AS binding
+SET last_message_id = $1,
+    last_thread_id  = $2,
+    history_start_message_id = CASE
+        WHEN binding.history_boundary_pending
+          AND $1::text IS NOT NULL
+        THEN $1
+        ELSE binding.history_start_message_id
+    END,
+    history_boundary_pending = CASE
+        WHEN $1::text IS NOT NULL THEN FALSE
+        ELSE binding.history_boundary_pending
+    END
+FROM current_route
+WHERE binding.id = current_route.id
 `
 
 type UpdateChannelChatSessionBindingReplyTargetParams struct {
-	ChatSessionID pgtype.UUID `json:"chat_session_id"`
-	LastMessageID pgtype.Text `json:"last_message_id"`
-	LastThreadID  pgtype.Text `json:"last_thread_id"`
+	LastMessageID      pgtype.Text `json:"last_message_id"`
+	LastThreadID       pgtype.Text `json:"last_thread_id"`
+	ReplyChatSessionID pgtype.UUID `json:"reply_chat_session_id"`
 }
 
-// Records the most recent inbound trigger message + thread so the decoupled
-// outbound patcher can thread its reply back into the originating topic.
+// Advances the session's latest-trigger cursor, which drives the history
+// boundary bookkeeping below. NOT the outbound reply target: that is frozen
+// per context generation (SetChannelChatContextReplyTarget), because this row
+// only ever remembers the newest trigger and a debounced run can be enqueued
+// after a later generation has already moved it.
 func (q *Queries) UpdateChannelChatSessionBindingReplyTarget(ctx context.Context, arg UpdateChannelChatSessionBindingReplyTargetParams) error {
-	_, err := q.db.Exec(ctx, updateChannelChatSessionBindingReplyTarget, arg.ChatSessionID, arg.LastMessageID, arg.LastThreadID)
+	_, err := q.db.Exec(ctx, updateChannelChatSessionBindingReplyTarget, arg.LastMessageID, arg.LastThreadID, arg.ReplyChatSessionID)
 	return err
 }
 

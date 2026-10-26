@@ -34,6 +34,7 @@ const (
 	agentOfflineText        = "⚠️ The agent is offline, so this message won't be processed automatically."
 	agentArchivedText       = "⚠️ This agent has been archived and can't respond. Please contact your workspace admin."
 	freshPendingText        = "✅ Fresh start ready. Your next chat message will run without previous context."
+	chatStartedText         = "✅ Started a new Multica chat. Your next message will enter it."
 	issueUsageText          = "Please include an issue title. Use:\n\n`/issue <title>`\n\n`[description]` (optional)"
 	issueUsageWithMediaText = "Please add a title and resend with the image (*image can come before or after the command*):\n\n`/issue <title>`\n\n`[description]` (optional)"
 	// Refusals for dropped /issue commands, carried over from the deleted
@@ -107,6 +108,14 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 // Reply routes each outcome to its user-visible message. Errors are logged, not
 // propagated: the replier runs detached from the inbound ACK path.
 func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) {
+	// These notices may refer to recovered pending input. The live callback can
+	// belong to another generation, so use only its stable conversation route.
+	if res.Outcome == engine.OutcomeAgentOffline || res.Outcome == engine.OutcomeAgentArchived {
+		msg = channel.InboundMessage{Source: msg.Source}
+		if msg.Source.ChatType == channel.ChatTypeGroup {
+			msg.Source.SenderID = ""
+		}
+	}
 	switch res.Outcome {
 	case engine.OutcomeNeedsBinding:
 		if err := r.sendBindingPrompt(ctx, inst, msg, res); err != nil {
@@ -128,6 +137,10 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 			r.logger.WarnContext(ctx, "dingtalk replier: fresh-start confirmation failed",
 				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
+	case engine.OutcomeChatStarted:
+		if err := r.post(ctx, inst, msg, chatStartedText); err != nil {
+			r.logger.WarnContext(ctx, "dingtalk replier: new-chat confirmation failed", "installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
 	case engine.OutcomeIssueUsage:
 		text := issueUsageText
 		if res.IssueUsageHadMedia {
@@ -139,9 +152,9 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 		}
 	case engine.OutcomeIngested:
 		if res.IssueID.Valid {
-			text := issueCreatedText(res)
+			text := issueCreatedText(res, r.appURL)
 			if res.IssueDuplicate {
-				text = issueDuplicateText(res)
+				text = issueDuplicateText(res, r.appURL)
 			}
 			if err := r.post(ctx, inst, msg, text); err != nil {
 				r.logger.WarnContext(ctx, "dingtalk replier: issue outcome reply failed",
@@ -222,7 +235,28 @@ func sendInstallationText(ctx context.Context, client *Client, decrypt Decrypter
 // routing identity (used for the immediate binding/status replies, before any
 // chat binding exists).
 func targetFromMessage(msg channel.InboundMessage) sendTarget {
-	t := sendTarget{ConversationType: convTypeGroup, ConversationID: msg.Source.ChatID}
+	t := sendTarget{
+		ConversationType: convTypeGroup,
+		ConversationID:   msg.Source.ChatID,
+		QuoteText:        dingtalkVisibleQuoteText(msg),
+	}
+	if msg.Source.ChatType == channel.ChatTypeP2P {
+		t.ConversationType = convTypeP2P
+		t.StaffID = msg.Source.SenderID
+		t.QuoteText = ""
+	}
+	return t
+}
+
+// reactionTargetFromMessage addresses the source message itself. DingTalk's
+// built-in emoji reactions support both group and 1:1 messages and only need
+// the callback's conversation and message IDs.
+func reactionTargetFromMessage(msg channel.InboundMessage) sendTarget {
+	t := sendTarget{
+		ConversationType: convTypeGroup,
+		ConversationID:   msg.Source.ChatID,
+		SourceMessageID:  msg.MessageID,
+	}
 	if msg.Source.ChatType == channel.ChatTypeP2P {
 		t.ConversationType = convTypeP2P
 		t.StaffID = msg.Source.SenderID
@@ -261,20 +295,40 @@ func droppedReplyText(res engine.Result, msg channel.InboundMessage) string {
 	}
 }
 
-func issueCreatedText(res engine.Result) string {
-	identifier := issueResultIdentifier(res)
+func issueCreatedText(res engine.Result, appURL string) string {
+	identifier := issueMarkdownIdentifier(res, appURL)
 	if res.IssueTitle == "" {
 		return "✅ Created " + identifier
 	}
 	return "✅ Created " + identifier + " — " + res.IssueTitle
 }
 
-func issueDuplicateText(res engine.Result) string {
-	identifier := issueResultIdentifier(res)
+func issueDuplicateText(res engine.Result, appURL string) string {
+	identifier := issueMarkdownIdentifier(res, appURL)
 	if res.IssueTitle == "" {
 		return "⚠️ Not created — active issue " + identifier + " already exists."
 	}
 	return "⚠️ Not created — active issue " + identifier + " already exists: " + res.IssueTitle
+}
+
+// Link the displayed issue key to its stable UUID within the installation's
+// workspace. Legacy /issues/{key} URLs depend on the reader's last workspace,
+// and a bare #number is not a routable issue identifier.
+func issueMarkdownIdentifier(res engine.Result, appURL string) string {
+	identifier := issueResultIdentifier(res)
+	workspaceSlug := strings.TrimSpace(res.IssueWorkspaceSlug)
+	if !res.IssueID.Valid || workspaceSlug == "" {
+		return identifier
+	}
+	base, err := url.Parse(strings.TrimSpace(appURL))
+	if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		return identifier
+	}
+	href := channel.IssueWebLink(base.String(), workspaceSlug, util.UUIDToString(res.IssueID))
+	// Parentheses in an application's base path must not terminate the Markdown
+	// link destination, even when they are valid URL path characters.
+	href = strings.NewReplacer("(", "%28", ")", "%29").Replace(href)
+	return "[" + escapeMarkdownLinkLabel(identifier) + "](" + href + ")"
 }
 
 func issueResultIdentifier(res engine.Result) string {

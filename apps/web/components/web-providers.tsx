@@ -4,7 +4,6 @@ import { useMemo } from "react";
 import { CoreProvider } from "@multica/core/platform";
 import { createBrowserCookieLocaleAdapter } from "@multica/core/i18n/browser";
 import type { LocaleResources, SupportedLocale } from "@multica/core/i18n";
-import { useWelcomeStore } from "@multica/core/onboarding";
 import packageJson from "../package.json";
 import { WebNavigationProvider } from "@/platform/navigation";
 import { WebScrollRestorationProvider } from "@/platform/scroll-restoration";
@@ -13,6 +12,7 @@ import {
   clearLoggedInCookie,
 } from "@/features/auth/auth-cookie";
 import { detectWebOS } from "@/platform/client-os";
+import { useUserLocaleSyncEnabled } from "@/platform/user-locale-sync";
 
 // Legacy token in localStorage → keep this session in token mode so users who
 // logged in before the cookie-auth migration stay authed. They migrate to
@@ -58,6 +58,7 @@ export function WebProviders({
   wsUrl?: string;
 }) {
   const cookieAuth = !hasLegacyToken();
+  const syncUserLocale = useUserLocaleSyncEnabled();
   // Stable identity reference so downstream effects keyed on it don't see a
   // new object on every parent render.
   const identity = useMemo(
@@ -71,20 +72,12 @@ export function WebProviders({
       wsUrl={wsUrl || deriveWsUrl()}
       cookieAuth={cookieAuth}
       onLogin={setLoggedInCookie}
-      onLogout={() => {
-        // welcome-store holds the transient post-onboarding signal. Must
-        // clear on logout so user B logging into the same browser doesn't
-        // inherit user A's signal and have <WelcomeAfterOnboarding /> fire
-        // listAgents / createIssue against a workspace user B doesn't even
-        // belong to. The store's own docstring promises this reset; this
-        // is where it gets wired.
-        useWelcomeStore.getState().reset();
-        clearLoggedInCookie();
-      }}
+      onLogout={clearLoggedInCookie}
       identity={identity}
       locale={locale}
       resources={resources}
       localeAdapter={localeAdapter}
+      syncUserLocale={syncUserLocale}
     >
       <WebNavigationProvider>
         <WebScrollRestorationProvider>{children}</WebScrollRestorationProvider>

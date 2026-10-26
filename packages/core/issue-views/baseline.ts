@@ -1,6 +1,8 @@
 import type { ActorFilterValue, FilterSnapshot } from "../issues/stores/view-store";
-import type { IssuePriority, IssueStatus } from "../types";
+import type { IssuePriority, IssueStatus, ProjectStatus, PropertyFilterValue } from "../types";
+import { isKnownPropertyFilterOp, isPropertyOperatorFilter, propertyFilterValueKey } from "../types";
 import { PRIORITY_DISPLAY_ORDER } from "../issues/config";
+import { PROJECT_STATUS_ORDER } from "../projects/config";
 
 /**
  * The open saved view's query, normalized for two jobs:
@@ -20,8 +22,9 @@ export interface IssueViewBaseline {
   creator: Set<string>;
   project: Set<string>;
   includeNoProject: boolean;
+  projectStatus: Set<string>;
   label: Set<string>;
-  /** Property definition id → fixed option ids. */
+  /** Property definition id → fixed member keys (`propertyFilterValueKey`). */
   property: Map<string, Set<string>>;
   /** Enum-sanitized snapshot, safe to hand straight to `resetFiltersTo`. */
   raw: FilterSnapshot;
@@ -33,6 +36,22 @@ export function actorFilterKey(actor: ActorFilterValue): string {
 
 function stringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+/**
+ * Sanitize one property filter's member list. Strings pass through (equality,
+ * "true"/"false", "__none__"); operator objects must carry a known op and a
+ * string value. Anything else — a hand-edited blob or an operator a future
+ * client added — is dropped: a member the store cannot represent must not
+ * enter the snapshot (same rule as the enum filters above).
+ */
+function propertyFilterValueArray(v: unknown): PropertyFilterValue[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(
+    (x): x is PropertyFilterValue =>
+      typeof x === "string" ||
+      (isPropertyOperatorFilter(x) && isKnownPropertyFilterOp(x.op)),
+  );
 }
 
 function actorArray(v: unknown): ActorFilterValue[] {
@@ -61,20 +80,25 @@ export function baselineFromQuery(query: Record<string, unknown>): IssueViewBase
   const assigneeFilters = actorArray(query.assigneeFilters);
   const creatorFilters = actorArray(query.creatorFilters);
   const projectFilters = stringArray(query.projectFilters);
+  // A saved view predating this dimension has no key at all, and an unknown
+  // member cannot be represented in the store — both collapse to "no filter".
+  const projectStatusFilters = stringArray(query.projectStatusFilters).filter(
+    (s): s is ProjectStatus => (PROJECT_STATUS_ORDER as readonly string[]).includes(s),
+  );
   const labelFilters = stringArray(query.labelFilters);
   const includeNoAssignee = query.includeNoAssignee === true;
   const includeNoProject = query.includeNoProject === true;
 
-  const propertyFilters: Record<string, string[]> = {};
+  const propertyFilters: Record<string, PropertyFilterValue[]> = {};
   const property = new Map<string, Set<string>>();
   if (query.propertyFilters && typeof query.propertyFilters === "object") {
     for (const [id, selected] of Object.entries(
       query.propertyFilters as Record<string, unknown>,
     )) {
-      const values = stringArray(selected);
+      const values = propertyFilterValueArray(selected);
       if (values.length > 0) {
         propertyFilters[id] = values;
-        property.set(id, new Set(values));
+        property.set(id, new Set(values.map(propertyFilterValueKey)));
       }
     }
   }
@@ -87,6 +111,7 @@ export function baselineFromQuery(query: Record<string, unknown>): IssueViewBase
     creator: new Set(creatorFilters.map(actorFilterKey)),
     project: new Set(projectFilters),
     includeNoProject,
+    projectStatus: new Set(projectStatusFilters),
     label: new Set(labelFilters),
     property,
     raw: {
@@ -97,6 +122,7 @@ export function baselineFromQuery(query: Record<string, unknown>): IssueViewBase
       creatorFilters,
       projectFilters,
       includeNoProject,
+      projectStatusFilters,
       labelFilters,
       propertyFilters,
     },

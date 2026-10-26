@@ -105,7 +105,7 @@ func redisString(v any) string {
 	}
 }
 
-func deliverEnvelope(hub *Hub, daemonRuntime DaemonRuntimeDeliverer, ev envelope) {
+func deliverEnvelope(hub *Hub, daemonRuntime DaemonRuntimeDeliverer, wecomOutbound WecomOutboundDeliverer, ev envelope) {
 	if ev.PayloadJSON == "" {
 		return
 	}
@@ -114,6 +114,10 @@ func deliverEnvelope(hub *Hub, daemonRuntime DaemonRuntimeDeliverer, ev envelope
 	case ScopeDaemonRuntime:
 		if daemonRuntime != nil {
 			daemonRuntime.DeliverDaemonRuntime(ev.ScopeID, frame, ev.EventID)
+		}
+	case ScopeWecomOutbound:
+		if wecomOutbound != nil {
+			wecomOutbound.DeliverWecomOutbound(ev.ScopeID, frame, ev.EventID)
 		}
 	case "global":
 		hub.fanoutAllDedup(frame, "", ev.EventID)
@@ -129,8 +133,8 @@ func deliverEnvelope(hub *Hub, daemonRuntime DaemonRuntimeDeliverer, ev envelope
 // subscribers. Local fanout is delegated to the wrapped *Hub.
 type RedisRelay struct {
 	hub       *Hub
-	writeRDB  *redis.Client
-	readRDB   *redis.Client
+	writeRDB  redis.UniversalClient
+	readRDB   redis.UniversalClient
 	nodeID    string
 	retention StreamRetentionConfig
 	ttl       *streamTTLRefresher
@@ -147,6 +151,7 @@ type RedisRelay struct {
 	ttlScanSeen       map[string]struct{}
 
 	daemonRuntime DaemonRuntimeDeliverer
+	wecomOutbound WecomOutboundDeliverer
 }
 
 type scopeConsumer struct {
@@ -156,7 +161,7 @@ type scopeConsumer struct {
 
 // NewRedisRelay constructs a relay. The caller is responsible for invoking
 // Start before producing messages.
-func NewRedisRelay(hub *Hub, rdb *redis.Client) *RedisRelay {
+func NewRedisRelay(hub *Hub, rdb redis.UniversalClient) *RedisRelay {
 	return NewRedisRelayWithClients(hub, rdb, rdb)
 }
 
@@ -164,13 +169,13 @@ func NewRedisRelay(hub *Hub, rdb *redis.Client) *RedisRelay {
 // writes and blocking reads. The read client is reserved for XREADGROUP BLOCK
 // calls so long-polling stream consumers cannot exhaust the pool used by XADD,
 // heartbeats, acks, and other request-path Redis operations.
-func NewRedisRelayWithClients(hub *Hub, writeRDB, readRDB *redis.Client) *RedisRelay {
+func NewRedisRelayWithClients(hub *Hub, writeRDB, readRDB redis.UniversalClient) *RedisRelay {
 	return NewRedisRelayWithClientsAndConfig(hub, writeRDB, readRDB, DefaultStreamRetentionConfig())
 }
 
 // NewRedisRelayWithClientsAndConfig applies the same stream retention controls
 // used by sharded mode so legacy and dual-mode rollouts cannot silently diverge.
-func NewRedisRelayWithClientsAndConfig(hub *Hub, writeRDB, readRDB *redis.Client, retention StreamRetentionConfig) *RedisRelay {
+func NewRedisRelayWithClientsAndConfig(hub *Hub, writeRDB, readRDB redis.UniversalClient, retention StreamRetentionConfig) *RedisRelay {
 	if readRDB == nil {
 		readRDB = writeRDB
 	}
@@ -191,6 +196,10 @@ func NewRedisRelayWithClientsAndConfig(hub *Hub, writeRDB, readRDB *redis.Client
 
 // NodeID returns this relay's randomly-assigned node identifier.
 func (r *RedisRelay) NodeID() string { return r.nodeID }
+
+func (r *RedisRelay) SetWecomOutboundDeliverer(d WecomOutboundDeliverer) {
+	r.wecomOutbound = d
+}
 
 func (r *RedisRelay) SetDaemonRuntimeDeliverer(d DaemonRuntimeDeliverer) {
 	r.daemonRuntime = d
@@ -460,7 +469,7 @@ func (r *RedisRelay) deliverMessage(scopeType, scopeID string, msg redis.XMessag
 	if ev.ScopeID == "" {
 		ev.ScopeID = scopeID
 	}
-	deliverEnvelope(r.hub, r.daemonRuntime, ev)
+	deliverEnvelope(r.hub, r.daemonRuntime, r.wecomOutbound, ev)
 }
 
 // fanoutUser is implemented in hub.go.

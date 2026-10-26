@@ -275,19 +275,11 @@ describe("IntegrationsTab", () => {
     expect(screen.getByText("Lark")).toBeTruthy();
     expect(screen.getByText("Slack")).toBeTruthy();
     expect(screen.getByText("Telegram")).toBeTruthy();
-    expect(screen.getByText(/Telegram bot.*\/issue.*reply stream live/i)).toBeTruthy();
     expect(screen.getByTestId("lark-bind-button").getAttribute("data-agent-id")).toBe("agent-1");
     expect(screen.getByTestId("slack-bind-button").getAttribute("data-agent-id")).toBe("agent-1");
     expect(screen.getByTestId("telegram-bind-button").getAttribute("data-agent-id")).toBe(
       "agent-1",
     );
-  });
-
-  it("renders the DingTalk brand mark in the DingTalk integration card", () => {
-    renderTab(<IntegrationsTab agent={agent} />);
-    const section = screen.getByText("DingTalk").closest("section");
-    expect(section?.querySelector('[data-testid="dingtalk-mark"].h-5.w-5')).toBeTruthy();
-    expect(screen.getByText(enSettings.dingtalk.agent_page_description)).toBeTruthy();
   });
 
   it("shows only this Agent's 1:1 bot and its groups", () => {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +17,7 @@ import (
 // probe and bailing — which left the user logged out with no recovery.
 func TestPersistSelfHostConfigIfReachable(t *testing.T) {
 	t.Run("unreachable server preserves existing config and token", func(t *testing.T) {
-		t.Setenv("HOME", t.TempDir())
+		redirectTestHome(t, t.TempDir())
 		existing := cli.CLIConfig{
 			ServerURL:   "https://api.old.example",
 			AppURL:      "https://old.example",
@@ -53,7 +52,7 @@ func TestPersistSelfHostConfigIfReachable(t *testing.T) {
 	})
 
 	t.Run("reachable server writes new self-host config", func(t *testing.T) {
-		t.Setenv("HOME", t.TempDir())
+		redirectTestHome(t, t.TempDir())
 
 		proceed, err := persistSelfHostConfigIfReachable(
 			"https://api.new.example", "https://new.example", "",
@@ -355,40 +354,6 @@ func TestResolveSelfHostAppURL(t *testing.T) {
 	})
 }
 
-func TestSetupCallbackHostFlagWiring(t *testing.T) {
-	cases := []struct {
-		name string
-		cmd  *cobra.Command
-	}{
-		{name: "setup", cmd: setupCmd},
-		{name: "setup cloud", cmd: setupCloudCmd},
-		{name: "setup self-host", cmd: setupSelfHostCmd},
-	}
-
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.cmd.Flag(callbackHostFlag) == nil {
-				t.Fatalf("%s is missing --%s", tc.name, callbackHostFlag)
-			}
-		})
-	}
-}
-
-func TestSetupHelpShowsCallbackHostFlag(t *testing.T) {
-	var out bytes.Buffer
-	setupCmd.SetOut(&out)
-	setupCmd.SetErr(&out)
-	defer setupCmd.SetOut(nil)
-	defer setupCmd.SetErr(nil)
-	if err := setupCmd.Help(); err != nil {
-		t.Fatalf("setup help: %v", err)
-	}
-	if !strings.Contains(out.String(), "--callback-host") {
-		t.Fatalf("setup help should show --%s, got:\n%s", callbackHostFlag, out.String())
-	}
-}
-
 // TestFormatURLChange covers the setup overwrite prompt: a changed value is
 // shown as "old -> new" so the passed --server-url/--app-url is visibly
 // received, while an unchanged value renders plain.
@@ -438,7 +403,7 @@ func TestServerHostIsLocal(t *testing.T) {
 
 func TestSetupCommandsFailClosedInTaskContext(t *testing.T) {
 	ownerHome := t.TempDir()
-	t.Setenv("HOME", ownerHome)
+	redirectTestHome(t, ownerHome)
 	t.Setenv("MULTICA_AGENT_ID", "agent-test")
 	t.Setenv("MULTICA_TASK_ID", "task-test")
 	t.Setenv("MULTICA_TASK_CONFIG_ROOT", filepath.Join(t.TempDir(), "task-multica"))

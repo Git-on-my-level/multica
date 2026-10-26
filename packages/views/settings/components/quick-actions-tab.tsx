@@ -31,6 +31,7 @@ import type {
 } from "@multica/core/types";
 import { findQuickActionTemplateToken } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
+import { IconButton } from "@multica/ui/components/common/icon-button";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Input } from "@multica/ui/components/ui/input";
 import { Textarea } from "@multica/ui/components/ui/textarea";
@@ -61,7 +62,7 @@ import {
 } from "@multica/ui/components/ui/dropdown-menu";
 import { cn } from "@multica/ui/lib/utils";
 import { AgentPicker } from "../../autopilots/components/pickers/agent-picker";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 import { SettingsTab } from "./settings-layout";
 
 // Quick Actions catalog (MUL-5465).
@@ -138,6 +139,9 @@ function VisibilityBadge({ action, t }: { action: QuickAction; t: QuickActionsT 
  * failure is loud at click time, not silent).
  */
 function TargetLine({ action, t }: { action: QuickAction; t: QuickActionsT }) {
+  if (action.assignee_type === "") {
+    return <span>{t(($) => $.quick_actions.no_target)}</span>;
+  }
   if (action.target_missing === true) {
     return (
       <span className="inline-flex items-center gap-1 text-destructive">
@@ -159,7 +163,7 @@ function TargetLine({ action, t }: { action: QuickAction; t: QuickActionsT }) {
 interface FormState {
   name: string;
   description: string;
-  assigneeType: QuickActionAssigneeType;
+  assigneeType: Exclude<QuickActionAssigneeType, "">;
   assigneeId: string;
   prompt: string;
   visibility: QuickActionVisibility;
@@ -187,6 +191,7 @@ function toFormState(action: QuickAction): FormState {
 
 export function QuickActionsTab() {
   const { t } = useT("settings");
+  const locale = useLocale();
   const wsId = useWorkspaceId();
   const { data: actions = [], isLoading } = useQuery(quickActionListOptions(wsId, true));
 
@@ -247,6 +252,7 @@ export function QuickActionsTab() {
     <SettingsTab
       title={t(($) => $.quick_actions.title)}
       description={t(($) => $.quick_actions.description)}
+      scope="workspace"
     >
       <div className="space-y-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -331,18 +337,18 @@ export function QuickActionsTab() {
                         : t(($) => $.quick_actions.used_count, { count: action.use_count })}
                     </span>
                     <span className="text-caption text-muted-foreground">
-                      {new Date(action.updated_at).toLocaleDateString()}
+                      {new Date(action.updated_at).toLocaleDateString(locale)}
                     </span>
                     <DropdownMenu>
                       <DropdownMenuTrigger
                         render={
-                          <Button
+                          <IconButton
                             variant="ghost"
                             size="icon-sm"
-                            aria-label={t(($) => $.quick_actions.actions_open, { name: action.name })}
+                            label={t(($) => $.quick_actions.actions_open, { name: action.name })}
                           >
                             <MoreHorizontal className="size-4" />
-                          </Button>
+                          </IconButton>
                         }
                       />
                       <DropdownMenuContent align="end">
@@ -395,7 +401,7 @@ export function QuickActionsTab() {
               id: editing.id,
               name: form.name,
               description: form.description,
-              assignee_type: form.assigneeType,
+              assignee_type: form.assigneeId ? form.assigneeType : "",
               assignee_id: form.assigneeId,
               prompt: form.prompt,
               visibility: form.visibility,
@@ -404,7 +410,7 @@ export function QuickActionsTab() {
             await createMutation.mutateAsync({
               name: form.name,
               description: form.description,
-              assignee_type: form.assigneeType,
+              assignee_type: form.assigneeId ? form.assigneeType : "",
               assignee_id: form.assigneeId,
               prompt: form.prompt,
               visibility: form.visibility,
@@ -461,7 +467,6 @@ function QuickActionDialog({
   const canSave =
     form.name.trim().length > 0 &&
     form.prompt.trim().length > 0 &&
-    form.assigneeId.length > 0 &&
     templateToken === null;
 
   const handleSubmit = async () => {
@@ -544,17 +549,35 @@ function QuickActionDialog({
           </div>
 
           <div className="space-y-1.5">
-            <FieldLabel>{t(($) => $.quick_actions.field_target)}</FieldLabel>
+            <FieldLabel id="qa-target-label" htmlFor="qa-target">
+              {t(($) => $.quick_actions.field_target)}
+            </FieldLabel>
             <AgentPicker
               assignee={form.assigneeId ? { type: form.assigneeType, id: form.assigneeId } : null}
               onChange={(next) =>
                 setForm((f) => ({ ...f, assigneeType: next.type, assigneeId: next.id }))
               }
+              emptyOption={{
+                label: t(($) => $.quick_actions.no_target),
+                onSelect: () => setForm((f) => ({ ...f, assigneeId: "" })),
+              }}
+              triggerRender={
+                <Button
+                  id="qa-target"
+                  type="button"
+                  variant="outline"
+                  aria-labelledby="qa-target-label qa-target"
+                />
+              }
             />
             {/* Public promises "everyone can run this", so the server refuses a
                 target the team cannot invoke. Saying so here turns a 400 into
                 an expectation set before the user hits Save. */}
-            {form.visibility === "public" ? (
+            {!form.assigneeId ? (
+              <p className="text-caption text-muted-foreground">
+                {t(($) => $.quick_actions.no_target_hint)}
+              </p>
+            ) : form.visibility === "public" ? (
               <p className="text-caption text-muted-foreground">
                 {t(($) => $.quick_actions.public_target_hint)}
               </p>

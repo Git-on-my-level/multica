@@ -1,6 +1,7 @@
 agy
 claude
 codebuddy
+codearts
 codex
 copilot
 cursor-agent
@@ -13,6 +14,7 @@ hermes
 kimi
 kiro-cli
 mcode
+muse
 omp
 openclaw
 opencode
@@ -23,3 +25,4 @@ qwen
 qwenpaw
 reasonix
 traecli
+zeroclaw

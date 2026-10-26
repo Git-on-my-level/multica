@@ -30,7 +30,7 @@ Roles do not decide who can run an agent. Each agent has its own Access scope, a
 
 ![Member management: the invite form and the roster with roles](/images/docs/members-roster.webp)
 
-The invitee accepts by logging in with that email — no prior signup is needed. Invitations are valid for 7 days; resend after they expire. On self-hosted instances that restrict signup, invitees who do not yet have an account are still subject to the signup rules when registering — see [Auth setup](/auth-setup#invitations-and-signup-restrictions).
+The invitee accepts by logging in with that email — no prior signup is needed. Invitations are valid for 7 days; resend after they expire. On self-hosted instances that restrict signup, a live pending invitation allows that email to create an account without a separate allowlist entry — see [Auth setup](/auth-setup#invitations-and-signup-restrictions).
 
 The invitation link appears only in the email; there is no place in the product to view or copy it. If the email fails to send, the invitation record still exists — revoke it and send a new one.
 
@@ -45,7 +45,7 @@ Role changes take effect immediately.
 A removed member loses workspace access immediately. Issues, comments, and other collaboration records they created stay in the workspace.
 
 <Callout type="warning">
-Removing a member also deactivates the runtimes they own, archives the agents bound to them, and cancels tasks that have not finished. Grants the member received in agent Access scopes are cleared as well and are not restored automatically if they rejoin.
+Removing a member also deactivates the runtimes they own, archives the agents bound to them, and cancels runs that have not finished. Grants the member received in agent Access scopes are cleared as well and are not restored automatically if they rejoin.
 </Callout>
 
 ## Next steps

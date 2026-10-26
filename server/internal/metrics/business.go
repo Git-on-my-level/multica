@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"sync"
+	"time"
 
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,45 +12,82 @@ var taskDurationBuckets = []float64{1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200, 
 
 var chatClaimResumeQueryDurationBuckets = []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
 
+var runtimeSweepStageDurationBuckets = []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60}
+
+const (
+	RuntimeSweepStageLiveness                 = "runtime_liveness"
+	RuntimeSweepStageOfflineTasks             = "offline_runtime_tasks"
+	RuntimeSweepStageReconnectRetries         = "runtime_reconnect_retries"
+	RuntimeSweepStageStaleTasks               = "stale_tasks"
+	RuntimeSweepStageQueuedExpiry             = "queued_task_expiry"
+	RuntimeSweepStageDelegatedFailureRecovery = "delegated_failure_recovery"
+	RuntimeSweepStageDeferredChatFinalization = "deferred_chat_finalize"
+	RuntimeSweepStageGC                       = "runtime_gc"
+
+	RuntimeGCSkipEligibilityChanged = "eligibility_changed"
+	RuntimeGCSkipNonTerminalTask    = "non_terminal_task"
+	RuntimeGCSkipWorkspaceMismatch  = "workspace_mismatch"
+)
+
 type activeTaskLabels struct {
 	source      string
 	runtimeMode string
 }
 
 type BusinessMetrics struct {
-	taskEnqueued     *prometheus.CounterVec
-	taskDispatched   *prometheus.CounterVec
-	taskStarted      *prometheus.CounterVec
-	taskTerminal     *prometheus.CounterVec
-	taskFailed       *prometheus.CounterVec
-	taskQueueWait    *prometheus.HistogramVec
-	taskRunSeconds   *prometheus.HistogramVec
-	taskTotalSeconds *prometheus.HistogramVec
-	taskInProgress   *prometheus.GaugeVec
-	taskIterations   *prometheus.HistogramVec
+	taskEnqueued      *prometheus.CounterVec
+	taskDispatched    *prometheus.CounterVec
+	taskStarted       *prometheus.CounterVec
+	taskTerminal      *prometheus.CounterVec
+	taskFailed        *prometheus.CounterVec
+	taskQueueWait     *prometheus.HistogramVec
+	taskClaimableWait *prometheus.HistogramVec
+	taskRunSeconds    *prometheus.HistogramVec
+	taskTotalSeconds  *prometheus.HistogramVec
+	taskInProgress    *prometheus.GaugeVec
+	taskIterations    *prometheus.HistogramVec
+	// taskClaimDecision counts claim-path decisions by the poll path that
+	// made them, the outcome, and the reason; one increment per claim
+	// attempt or per poll-level decision that never enters a claim attempt.
+	// See the funnel in internal/service/task_claim_decision.go and the
+	// prewarm table below.
+	taskClaimDecision *prometheus.CounterVec
 
 	llmTokens         *prometheus.CounterVec
 	llmCostUSD        *prometheus.CounterVec
 	llmUnpricedTokens *prometheus.CounterVec
 	llmRequests       *prometheus.CounterVec
 
-	taskQueuedExpired                 *prometheus.CounterVec
-	taskLeaseExpired                  *prometheus.CounterVec
-	chatClaimSessionFallbackNeeded    prometheus.Counter
-	chatClaimSessionFallbackResult    *prometheus.CounterVec
-	chatClaimResumeQueryDuration      *prometheus.HistogramVec
-	runtimeGCDeleted                  prometheus.Counter
-	runtimeGCFailed                   prometheus.Counter
-	runtimeGCBlocked                  prometheus.Gauge
-	runtimeGCBlockedObservationFailed prometheus.Counter
-	entitlementConfigError            prometheus.Counter
-	entitlementCache                  *prometheus.CounterVec
-	entitlementRefresh                *prometheus.CounterVec
-	entitlementRefreshDuration        *prometheus.HistogramVec
-	entitlementDecision               *prometheus.CounterVec
-	entitlementVersionRegression      *prometheus.CounterVec
-	autopilotQuotaDecision            *prometheus.CounterVec
-	issueWindowDecision               *prometheus.CounterVec
+	taskQueuedExpired              *prometheus.CounterVec
+	taskLeaseExpired               *prometheus.CounterVec
+	chatClaimSessionFallbackNeeded prometheus.Counter
+	chatClaimSessionFallbackResult *prometheus.CounterVec
+	chatClaimResumeQueryDuration   *prometheus.HistogramVec
+	runtimeSweepStageDuration      *prometheus.HistogramVec
+	runtimeSweepCandidateRows      *prometheus.CounterVec
+	runtimeSweepRowsChanged        *prometheus.CounterVec
+	runtimeGCDeleted               prometheus.Counter
+	runtimeGCFailed                prometheus.Counter
+	runtimeGCSkipped               *prometheus.CounterVec
+	entitlementConfigError         prometheus.Counter
+	entitlementCache               *prometheus.CounterVec
+	entitlementRefresh             *prometheus.CounterVec
+	entitlementRefreshDuration     *prometheus.HistogramVec
+	entitlementDecision            *prometheus.CounterVec
+	entitlementVersionRegression   prometheus.Counter
+	autopilotQuotaDecision         *prometheus.CounterVec
+
+	// agentRuntimeLookup counts logical agent_runtime lookups by product
+	// source — one increment per requested runtime id, whether that id was
+	// resolved by its own point read or as one element of a batch query, so
+	// the counter is a lookup rate and NOT a database-query QPS. Point reads
+	// share one SQL fingerprint and batch reads use another; this counter adds
+	// the product-source attribution that neither query shape exposes on its
+	// own, including daemon heartbeats, browser polling, and readiness gates.
+	// See labels.go for the closed enum.
+	agentRuntimeLookup            *prometheus.CounterVec
+	issueMetadataMutation         *prometheus.CounterVec
+	issueMetadataMutationDuration *prometheus.HistogramVec
 
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
@@ -99,6 +137,13 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Help:      "Time agent tasks spent queued before dispatch.",
 			Buckets:   taskDurationBuckets,
 		}, metricLabels("multica_agent_task_queue_wait_seconds")),
+		taskClaimableWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "multica",
+			Subsystem: "agent_task",
+			Name:      "claimable_wait_seconds",
+			Help:      "Time from an agent task's scheduled claimability (creation or fire_at) to dispatch.",
+			Buckets:   taskDurationBuckets,
+		}, metricLabels("multica_agent_task_claimable_wait_seconds")),
 		taskRunSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "multica",
 			Subsystem: "agent_task",
@@ -126,6 +171,12 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Help:      "Retry attempt count observed when an agent task reaches a terminal state.",
 			Buckets:   []float64{1, 2, 3, 4, 5, 10},
 		}, metricLabels("multica_agent_task_iteration_count")),
+		taskClaimDecision: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "agent_task",
+			Name:      "claim_decision_total",
+			Help:      "Claim decisions by claim path, outcome, and reason; one increment per claim attempt or per poll-level decision that never enters a claim attempt.",
+		}, metricLabels("multica_agent_task_claim_decision_total")),
 		llmTokens: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica",
 			Subsystem: "llm",
@@ -181,6 +232,25 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Help:      "Duration of chat-claim resume-history queries by fixed query name.",
 			Buckets:   chatClaimResumeQueryDurationBuckets,
 		}, metricLabels("multica_chat_claim_resume_query_duration_seconds")),
+		runtimeSweepStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "multica",
+			Subsystem: "runtime_sweeper",
+			Name:      "stage_duration_seconds",
+			Help:      "Duration of each runtime maintenance sweeper stage.",
+			Buckets:   runtimeSweepStageDurationBuckets,
+		}, metricLabels("multica_runtime_sweeper_stage_duration_seconds")),
+		runtimeSweepCandidateRows: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "runtime_sweeper",
+			Name:      "candidate_rows_total",
+			Help:      "Total candidate rows returned to or examined by the application in each runtime maintenance sweeper stage.",
+		}, metricLabels("multica_runtime_sweeper_candidate_rows_total")),
+		runtimeSweepRowsChanged: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "runtime_sweeper",
+			Name:      "rows_changed_total",
+			Help:      "Total rows whose persisted maintenance state changed in each runtime sweeper stage.",
+		}, metricLabels("multica_runtime_sweeper_rows_changed_total")),
 		runtimeGCDeleted: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica",
 			Subsystem: "runtime_gc",
@@ -193,21 +263,15 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Name:      "failed_total",
 			Help:      "Total runtime garbage-collection operations that failed.",
 		}),
-		runtimeGCBlocked: prometheus.NewGauge(prometheus.GaugeOpts{
+		runtimeGCSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica",
 			Subsystem: "runtime_gc",
-			Name:      "blocked_runtimes",
-			Help:      "Bounded count of stale offline runtimes blocked from garbage collection by non-terminal tasks.",
-		}),
-		runtimeGCBlockedObservationFailed: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "multica",
-			Subsystem: "runtime_gc",
-			Name:      "blocked_observation_failed_total",
-			Help:      "Total failures while observing stale runtimes blocked from garbage collection.",
-		}),
+			Name:      "skipped_total",
+			Help:      "Total runtime garbage-collection candidates safely skipped by reason.",
+		}, metricLabels("multica_runtime_gc_skipped_total")),
 		entitlementConfigError: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "config_error_total",
-			Help: "Total startup failures caused by explicitly enabled but invalid entitlement policy configuration.",
+			Help: "Total startup failures caused by a malformed Multica Cloud URL for entitlement policy.",
 		}),
 		entitlementCache: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "cache_total",
@@ -225,22 +289,43 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Namespace: "multica", Subsystem: "entitlement", Name: "decision_total",
 			Help: "Total entitlement decisions by bounded gate, action, and reason.",
 		}, metricLabels("multica_entitlement_decision_total")),
-		entitlementVersionRegression: prometheus.NewCounterVec(prometheus.CounterOpts{
+		entitlementVersionRegression: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "version_regression_total",
-			Help: "Total rejected entitlement version regressions.",
-		}, metricLabels("multica_entitlement_version_regression_total")),
+			Help: "Total rejected entitlement subscription-version regressions.",
+		}),
 		autopilotQuotaDecision: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "autopilot_quota", Name: "decision_total",
 			Help: "Total autopilot quota admission outcomes.",
 		}, metricLabels("multica_autopilot_quota_decision_total")),
-		issueWindowDecision: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "multica", Subsystem: "issue_window", Name: "decision_total",
-			Help: "Total recently-created issue window outcomes by request surface.",
-		}, metricLabels("multica_issue_window_decision_total")),
+		agentRuntimeLookup: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "agent_runtime", Name: "lookup_total",
+			Help: "Total logical agent_runtime lookups by product source and outcome (one per requested id, not per SQL query).",
+		}, metricLabels("multica_agent_runtime_lookup_total")),
+		issueMetadataMutation: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "issue_metadata", Name: "mutation_total",
+			Help: "Total issue metadata mutation attempts by operation and bounded result.",
+		}, metricLabels("multica_issue_metadata_mutation_total")),
+		issueMetadataMutationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "multica", Subsystem: "issue_metadata", Name: "mutation_duration_seconds",
+			Help: "Duration of issue metadata database work by operation and bounded result, including fallback reads after conditional no-ops.", Buckets: chatClaimResumeQueryDurationBuckets,
+		}, metricLabels("multica_issue_metadata_mutation_duration_seconds")),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
 	m.prewarmFailureReasons()
+	m.prewarmClaimDecisions()
+	for _, reason := range []string{RuntimeGCSkipEligibilityChanged, RuntimeGCSkipNonTerminalTask, RuntimeGCSkipWorkspaceMismatch} {
+		m.runtimeGCSkipped.WithLabelValues(reason).Add(0)
+	}
+	// Prewarm the full source x result grid (45 series) so a source that has
+	// not fired since this process started reads as zero rather than as a
+	// missing series — rate() over an absent series returns nothing, which on
+	// a dashboard is indistinguishable from "we never instrumented that path".
+	for _, source := range AllRuntimeLookupSources() {
+		for _, result := range AllRuntimeLookupResults() {
+			m.agentRuntimeLookup.WithLabelValues(source, result).Add(0)
+		}
+	}
 	return m
 }
 
@@ -252,10 +337,12 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.taskTerminal,
 		m.taskFailed,
 		m.taskQueueWait,
+		m.taskClaimableWait,
 		m.taskRunSeconds,
 		m.taskTotalSeconds,
 		m.taskInProgress,
 		m.taskIterations,
+		m.taskClaimDecision,
 		m.llmTokens,
 		m.llmCostUSD,
 		m.llmUnpricedTokens,
@@ -265,10 +352,12 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.chatClaimSessionFallbackNeeded,
 		m.chatClaimSessionFallbackResult,
 		m.chatClaimResumeQueryDuration,
+		m.runtimeSweepStageDuration,
+		m.runtimeSweepCandidateRows,
+		m.runtimeSweepRowsChanged,
 		m.runtimeGCDeleted,
 		m.runtimeGCFailed,
-		m.runtimeGCBlocked,
-		m.runtimeGCBlockedObservationFailed,
+		m.runtimeGCSkipped,
 		m.entitlementConfigError,
 		m.entitlementCache,
 		m.entitlementRefresh,
@@ -276,8 +365,32 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.entitlementDecision,
 		m.entitlementVersionRegression,
 		m.autopilotQuotaDecision,
-		m.issueWindowDecision,
+		m.agentRuntimeLookup,
+		m.issueMetadataMutation,
+		m.issueMetadataMutationDuration,
 	}, m.events.collectors()...)
+}
+
+// RecordIssueMetadataMutation records the UPDATE and, for a no-row result, its
+// fallback read. HTTP latency and pool acquisition pressure are exposed by the
+// existing HTTP and DB pool collectors, while these labels distinguish useful
+// writes from no-op load.
+func (m *BusinessMetrics) RecordIssueMetadataMutation(op, result string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	switch op {
+	case "set", "delete":
+	default:
+		op = "other"
+	}
+	switch result {
+	case "changed", "noop", "not_found", "error":
+	default:
+		result = "error"
+	}
+	m.issueMetadataMutation.WithLabelValues(op, result).Inc()
+	m.issueMetadataMutationDuration.WithLabelValues(op, result).Observe(duration.Seconds())
 }
 
 func (m *BusinessMetrics) RecordEntitlementConfigError() {
@@ -306,9 +419,39 @@ func (m *BusinessMetrics) RecordEntitlementDecision(gate, action, reason string)
 	}
 }
 
-func (m *BusinessMetrics) RecordEntitlementVersionRegression(source string) {
+// RecordClaimDecision counts one claim-path decision. Labels are normalized
+// upstream by the single funnel in internal/service/task_claim_decision.go;
+// this method deliberately does not re-normalize (same contract as
+// RecordEntitlementDecision).
+func (m *BusinessMetrics) RecordClaimDecision(claimPath, outcome, reason string) {
+	if m == nil {
+		return
+	}
+	m.taskClaimDecision.WithLabelValues(claimPath, outcome, reason).Inc()
+}
+
+// RecordAgentRuntimeLookup counts one logical agent_runtime lookup — one
+// requested runtime id resolved, whether by a point read or as one element of
+// a batch query. It is therefore a lookup rate, not a SQL-query count: a single
+// batch read that resolves N ids increments this N times.
+//
+// Call it from service.RuntimeLookup and nowhere else: the point of the metric
+// is that every read is attributed, and a second entry point is how a call site
+// ends up counted twice or not at all. Both labels are normalized here, so a
+// typo at a call site degrades to "other"/"error" instead of minting a series.
+func (m *BusinessMetrics) RecordAgentRuntimeLookup(source, result string) {
+	if m == nil {
+		return
+	}
+	m.agentRuntimeLookup.WithLabelValues(
+		NormalizeAgentRuntimeLookupSource(source),
+		NormalizeAgentRuntimeLookupResult(result),
+	).Inc()
+}
+
+func (m *BusinessMetrics) RecordEntitlementVersionRegression() {
 	if m != nil {
-		m.entitlementVersionRegression.WithLabelValues(source).Inc()
+		m.entitlementVersionRegression.Inc()
 	}
 }
 
@@ -322,18 +465,6 @@ func (m *BusinessMetrics) RecordAutopilotQuotaDecision(action, source, result st
 		source = "other"
 	}
 	m.autopilotQuotaDecision.WithLabelValues(action, source, result).Inc()
-}
-
-func (m *BusinessMetrics) RecordIssueWindowDecision(action, surface, result string) {
-	if m == nil {
-		return
-	}
-	switch surface {
-	case "direct", "list", "search", "grouped", "table", "children", "plugin", "inbox", "agent_context":
-	default:
-		surface = "other"
-	}
-	m.issueWindowDecision.WithLabelValues(action, surface, result).Inc()
 }
 
 func (m *BusinessMetrics) RecordRuntimeGCDeleted() {
@@ -350,18 +481,56 @@ func (m *BusinessMetrics) RecordRuntimeGCFailed() {
 	m.runtimeGCFailed.Inc()
 }
 
-func (m *BusinessMetrics) SetRuntimeGCBlocked(count int64) {
+func (m *BusinessMetrics) RecordRuntimeGCSkipped(reason string) {
 	if m == nil {
 		return
 	}
-	m.runtimeGCBlocked.Set(float64(count))
+	m.runtimeGCSkipped.WithLabelValues(normalizeRuntimeGCSkipReason(reason)).Inc()
 }
 
-func (m *BusinessMetrics) RecordRuntimeGCBlockedObservationFailed() {
+func normalizeRuntimeGCSkipReason(reason string) string {
+	switch reason {
+	case RuntimeGCSkipEligibilityChanged, RuntimeGCSkipNonTerminalTask, RuntimeGCSkipWorkspaceMismatch:
+		return reason
+	default:
+		return "unknown"
+	}
+}
+
+// ObserveRuntimeSweepStage records one bounded-cardinality maintenance stage.
+// candidates is the number of rows returned to or examined by the application,
+// not PostgreSQL executor rows; changed is the subset whose persisted
+// maintenance state changed.
+func (m *BusinessMetrics) ObserveRuntimeSweepStage(stage string, duration time.Duration, candidates, changed int) {
 	if m == nil {
 		return
 	}
-	m.runtimeGCBlockedObservationFailed.Inc()
+	stage = normalizeRuntimeSweepStage(stage)
+	if candidates < 0 {
+		candidates = 0
+	}
+	if changed < 0 {
+		changed = 0
+	}
+	m.runtimeSweepStageDuration.WithLabelValues(stage).Observe(duration.Seconds())
+	m.runtimeSweepCandidateRows.WithLabelValues(stage).Add(float64(candidates))
+	m.runtimeSweepRowsChanged.WithLabelValues(stage).Add(float64(changed))
+}
+
+func normalizeRuntimeSweepStage(stage string) string {
+	switch stage {
+	case RuntimeSweepStageLiveness,
+		RuntimeSweepStageOfflineTasks,
+		RuntimeSweepStageReconnectRetries,
+		RuntimeSweepStageStaleTasks,
+		RuntimeSweepStageQueuedExpiry,
+		RuntimeSweepStageDelegatedFailureRecovery,
+		RuntimeSweepStageDeferredChatFinalization,
+		RuntimeSweepStageGC:
+		return stage
+	default:
+		return "other"
+	}
 }
 
 func (m *BusinessMetrics) RecordTaskEnqueued(source, runtimeMode string) {
@@ -371,7 +540,7 @@ func (m *BusinessMetrics) RecordTaskEnqueued(source, runtimeMode string) {
 	m.taskEnqueued.WithLabelValues(NormalizeTaskSource(source), NormalizeRuntimeMode(runtimeMode)).Inc()
 }
 
-func (m *BusinessMetrics) RecordTaskDispatched(taskID, source, runtimeMode string, queueWaitSeconds float64) {
+func (m *BusinessMetrics) RecordTaskDispatched(taskID, source, runtimeMode string, queueWaitSeconds, claimableWaitSeconds float64) {
 	if m == nil {
 		return
 	}
@@ -380,6 +549,9 @@ func (m *BusinessMetrics) RecordTaskDispatched(taskID, source, runtimeMode strin
 	m.taskDispatched.WithLabelValues(source, runtimeMode).Inc()
 	if queueWaitSeconds >= 0 {
 		m.taskQueueWait.WithLabelValues(source, runtimeMode).Observe(queueWaitSeconds)
+	}
+	if claimableWaitSeconds >= 0 {
+		m.taskClaimableWait.WithLabelValues(source, runtimeMode).Observe(claimableWaitSeconds)
 	}
 	m.markTaskInProgress(taskID, source, runtimeMode)
 }
@@ -559,11 +731,11 @@ func distributeAuthoritativeCost(actual float64, estimated [4]float64) [4]float6
 }
 
 func (m *BusinessMetrics) recordPricedTokens(provider, model, tokenType, runtimeMode, source string, tokens int64, cost float64) {
-	if tokens <= 0 {
-		return
-	}
 	tokenType = NormalizeTokenType(tokenType)
-	m.llmTokens.WithLabelValues(provider, model, tokenType, runtimeMode, source).Add(float64(tokens))
+	if tokens > 0 {
+		m.llmTokens.WithLabelValues(provider, model, tokenType, runtimeMode, source).Add(float64(tokens))
+	}
+	// Provider-reported cost can exist without a token breakdown.
 	if cost > 0 {
 		m.llmCostUSD.WithLabelValues(provider, model, tokenType, runtimeMode, source).Add(cost)
 	}
@@ -613,4 +785,69 @@ func (m *BusinessMetrics) prewarmFailureReasons() {
 			}
 		}
 	}
+}
+
+// prewarmClaimDecisions seeds every (claim_path, outcome, reason) series the
+// claim paths can emit so an outcome that has not fired since this process
+// started reads as zero instead of as a missing series (same rationale as the
+// agent_runtime_lookup grid above). The table mirrors claimReasonFor in
+// internal/service/task_claim_decision.go; keep the two in sync when an
+// outcome is added.
+func (m *BusinessMetrics) prewarmClaimDecisions() {
+	for _, s := range claimDecisionSeries() {
+		m.taskClaimDecision.WithLabelValues(s.claimPath, s.outcome, s.reason).Add(0)
+	}
+}
+
+type claimDecisionSeriesKey struct{ claimPath, outcome, reason string }
+
+// claimDecisionSeries enumerates the closed set of legal label combinations:
+// the claimTask outcomes shared by every poll path, the no_tasks reason split
+// by whether the caller had a candidate list, and the poll exits (single
+// runtime and batch) that never enter claimTask. Values mirror the constants
+// in internal/service/task_claim_decision.go.
+func claimDecisionSeries() []claimDecisionSeriesKey {
+	claimTaskOutcomes := []claimDecisionSeriesKey{
+		{"", "claimed", "claimed"},
+		{"", "no_capacity", "agent_concurrency_cap"},
+		{"", "no_runtime", "agent_unbound"},
+		{"", "runtime_mismatch", "agent_rebound"},
+		{"", "error_get_agent", "error"},
+		{"", "error_count_running", "error"},
+		{"", "error_claim", "error"},
+		{"", "error_reanchor_chat_input", "error"},
+		{"", "error_transaction", "error"},
+	}
+	var series []claimDecisionSeriesKey
+	for _, claimPath := range []string{"agent", "runtime", "batch"} {
+		for _, o := range claimTaskOutcomes {
+			series = append(series, claimDecisionSeriesKey{claimPath, o.outcome, o.reason})
+		}
+	}
+	// The agent path has no candidate list, so its no_tasks can only say the
+	// cause is unknown; the runtime and batch paths see the candidate count.
+	series = append(series, claimDecisionSeriesKey{"agent", "no_tasks", "unknown_candidates"})
+	for _, claimPath := range []string{"runtime", "batch"} {
+		series = append(series,
+			claimDecisionSeriesKey{claimPath, "no_tasks", "candidates_unclaimed"},
+			claimDecisionSeriesKey{claimPath, "no_tasks", "no_visible_candidates"},
+		)
+	}
+	for _, s := range []claimDecisionSeriesKey{
+		{"runtime", "empty_cache_hit", "empty_cache"},
+		{"runtime", "empty_db", "no_visible_candidates"},
+		{"runtime", "reclaimed_dispatched", "stale_dispatch_recovered"},
+		{"runtime", "error_promote_deferred", "error"},
+		{"runtime", "error_reclaim_dispatched", "error"},
+		{"runtime", "error_list", "error"},
+		{"batch", "empty_cache_hit", "empty_cache"},
+		{"batch", "empty_db", "no_visible_candidates"},
+		{"batch", "reclaimed_dispatched", "stale_dispatch_recovered"},
+		{"batch", "error_promote_deferred", "error"},
+		{"batch", "error_reclaim_dispatched", "error"},
+		{"batch", "error_list", "error"},
+	} {
+		series = append(series, s)
+	}
+	return series
 }

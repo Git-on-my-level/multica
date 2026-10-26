@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +37,9 @@ func seedTestCatalog(t *testing.T) {
 // the test, so catalog state cannot leak between tests in the shared workspace.
 func createTestCustomStatus(t *testing.T, key, category string) db.IssueStatus {
 	t.Helper()
+	if normalized, ok := issuestatus.ParseCategory(category); ok {
+		category = normalized
+	}
 	seedTestCatalog(t)
 	entry, err := testHandler.Queries.CreateIssueStatusEntry(context.Background(), db.CreateIssueStatusEntryParams{
 		WorkspaceID: parseUUID(testWorkspaceID),
@@ -81,16 +86,16 @@ func TestEnsureIsIdempotent(t *testing.T) {
 	// Every built-in must be its own category's canonical — the invariant that
 	// makes Effective an identity function on built-in keys.
 	for key, entry := range systemByKey {
-		if entry.Category != key {
+		category, _ := issuestatus.CategoryForBehavior(key)
+		if entry.Category != category {
 			t.Errorf("built-in %q has category %q; a built-in must be its own category's canonical", key, entry.Category)
 		}
 	}
 }
 
-// TestCatalogOrderMatchesHistoricalStatusOrder pins the default board order.
-// A workspace with no custom statuses must list exactly as it did before this
-// feature, or every existing user's board silently rearranges.
-func TestCatalogOrderMatchesHistoricalStatusOrder(t *testing.T) {
+// TestCatalogOrderMatchesLifecycleGroups pins the concrete status order within
+// the four lifecycle groups.
+func TestCatalogOrderMatchesLifecycleGroups(t *testing.T) {
 	seedTestCatalog(t)
 	entries, err := testHandler.Queries.ListIssueStatusEntries(context.Background(), db.ListIssueStatusEntriesParams{
 		WorkspaceID: parseUUID(testWorkspaceID),
@@ -105,10 +110,51 @@ func TestCatalogOrderMatchesHistoricalStatusOrder(t *testing.T) {
 			gotSystem = append(gotSystem, e.Key)
 		}
 	}
-	want := []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
+	want := []string{"backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"}
 	for i := range want {
 		if i >= len(gotSystem) || gotSystem[i] != want[i] {
 			t.Fatalf("built-in order = %v, want %v (frontend STATUS_ORDER)", gotSystem, want)
+		}
+	}
+}
+
+func TestListIssueStatusesPreservesLegacyWireCategories(t *testing.T) {
+	seedTestCatalog(t)
+	rec := httptest.NewRecorder()
+	testHandler.ListIssueStatuses(rec, newRequest(http.MethodGet, "/api/issue-statuses", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Statuses   []IssueStatusResponse `json:"statuses"`
+		Categories []string              `json:"categories"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantCategories := issuestatus.Canonical()
+	if !slices.Equal(resp.Categories, wantCategories) {
+		t.Fatalf("categories = %v, want %v", resp.Categories, wantCategories)
+	}
+
+	wantSystemCategories := map[string]string{
+		"backlog": "backlog", "todo": "todo",
+		"in_progress": "in_progress", "in_review": "in_review", "blocked": "blocked",
+		"done": "done", "cancelled": "cancelled",
+	}
+	gotSystemCategories := make(map[string]string, len(wantSystemCategories))
+	for _, status := range resp.Statuses {
+		if status.IsSystem {
+			gotSystemCategories[status.Key] = status.Category
+		}
+	}
+	if len(gotSystemCategories) != len(wantSystemCategories) {
+		t.Fatalf("system statuses = %v, want exactly seven", gotSystemCategories)
+	}
+	for key, want := range wantSystemCategories {
+		if got := gotSystemCategories[key]; got != want {
+			t.Errorf("status %q category = %q, want %q", key, got, want)
 		}
 	}
 }
@@ -165,8 +211,12 @@ func TestCustomStatusInheritsItsCategoryBehavior(t *testing.T) {
 	for _, tc := range cases {
 		createTestCustomStatus(t, tc.key, tc.category)
 		got := issuestatus.Effective(ctx, testHandler.Queries, parseUUID(testWorkspaceID), tc.key)
-		if got != tc.category {
-			t.Errorf("Effective(%q) = %q, want %q", tc.key, got, tc.category)
+		want := tc.key
+		if tc.category == issuestatus.Done {
+			want = issuestatus.Done
+		}
+		if got != want {
+			t.Errorf("Effective(%q) = %q, want %q", tc.key, got, want)
 		}
 	}
 }
@@ -288,17 +338,43 @@ func TestBuiltInStatusesAreImmutable(t *testing.T) {
 	})
 }
 
-// TestArchiveRetiresStatusWithoutTouchingExistingIssues pins the archive rule:
-// archiving retires a status from FUTURE use only. Issues already on it keep it
-// and keep behaving as their category prescribes — retiring a label must not
-// rewrite history.
-func TestArchiveRetiresStatusWithoutTouchingExistingIssues(t *testing.T) {
+// In-use statuses cannot be archived, including successful and canceled work.
+func TestArchiveRequiresMovingExistingIssues(t *testing.T) {
+	for _, category := range issuestatus.Categories() {
+		t.Run(category, func(t *testing.T) {
+			entry := createTestCustomStatus(t, "archive_used_"+category, category)
+			issueID := dbfx.Issue(t, "archive occupied", testutil.Cols{"status": entry.Key})
+			req := withURLParam(newRequest(http.MethodDelete, "/api/issue-statuses/"+uuidToString(entry.ID), nil), "id", uuidToString(entry.ID))
+			var conflict struct {
+				Code  string `json:"code"`
+				Count int64  `json:"issue_count"`
+			}
+			testutil.Call(t, testHandler.ArchiveIssueStatus, req).Want(http.StatusConflict).JSON(&conflict)
+			if conflict.Code != "issue_status_in_use" || conflict.Count != 1 {
+				t.Fatalf("unexpected conflict: %+v", conflict)
+			}
+			var archived bool
+			if err := testPool.QueryRow(context.Background(), "SELECT archived_at IS NOT NULL FROM issue_status WHERE id = $1", entry.ID).Scan(&archived); err != nil || archived {
+				t.Fatalf("in-use status archived: %v, %v", archived, err)
+			}
+			// Move through the public update path, preserving the lifecycle category.
+			target := map[string]string{"unstarted": "todo", "started": "in_progress", "done": "done", "closed": "cancelled"}[category]
+			move := withURLParam(newRequest(http.MethodPatch, "/api/issues/"+issueID, map[string]any{"status": target}), "id", issueID)
+			testutil.Call(t, testHandler.UpdateIssue, move).Want(http.StatusOK)
+			testutil.Call(t, testHandler.ArchiveIssueStatus, req).Want(http.StatusOK)
+			testutil.Call(t, testHandler.ArchiveIssueStatus, req).Want(http.StatusOK)
+		})
+	}
+}
+
+// Historical archived entries remain resolvable even under the new empty-only rule.
+func TestPreviouslyArchivedStatusRemainsReadable(t *testing.T) {
 	ctx := context.Background()
 	entry := createTestCustomStatus(t, "in_use_a", issuestatus.InProgress)
 	issueID := mustCreateIssue(t, "occupies the status", "in_use_a")
 
-	if code := archiveStatusVia(t, entry); code != http.StatusOK {
-		t.Fatalf("archiving an in-use status should succeed, got %d", code)
+	if _, err := testHandler.Queries.ArchiveIssueStatusEntry(ctx, db.ArchiveIssueStatusEntryParams{ID: entry.ID, WorkspaceID: entry.WorkspaceID}); err != nil {
+		t.Fatal(err)
 	}
 
 	// The existing issue keeps the archived status verbatim.
@@ -312,8 +388,8 @@ func TestArchiveRetiresStatusWithoutTouchingExistingIssues(t *testing.T) {
 
 	// And it still resolves to its category, so its platform behavior is
 	// unchanged — Effective deliberately ignores archived_at.
-	if got := issuestatus.Effective(ctx, testHandler.Queries, parseUUID(testWorkspaceID), "in_use_a"); got != issuestatus.InProgress {
-		t.Errorf("Effective on an archived status = %q, want %q", got, issuestatus.InProgress)
+	if got := issuestatus.Effective(ctx, testHandler.Queries, parseUUID(testWorkspaceID), "in_use_a"); got != "in_use_a" {
+		t.Errorf("Effective on an archived status = %q, want in_use_a", got)
 	}
 
 	// But nothing NEW can be assigned to it.
@@ -329,19 +405,18 @@ func TestArchiveRetiresStatusWithoutTouchingExistingIssues(t *testing.T) {
 // TestCreateIssueStatusValidation covers the reserved-key and category rules.
 func TestCreateIssueStatusValidation(t *testing.T) {
 	seedTestCatalog(t)
-	withCustomIssueStatusesFlag(t, testHandler, true)
 
 	cases := []struct {
 		name string
 		body map[string]any
 		want int
 	}{
-		{"reserved built-in key", map[string]any{"name": "Mine", "key": "in_review", "category": "in_review", "color": "#123456"}, http.StatusBadRequest},
-		{"name slugifying onto a built-in", map[string]any{"name": "In Review", "category": "in_review", "color": "#123456"}, http.StatusBadRequest},
-		{"unknown category", map[string]any{"name": "Weird", "category": "started", "color": "#123456"}, http.StatusBadRequest},
+		{"reserved built-in key", map[string]any{"name": "Mine", "key": "in_review", "category": "started", "color": "#123456"}, http.StatusBadRequest},
+		{"name slugifying onto a built-in", map[string]any{"name": "In Review", "category": "started", "color": "#123456"}, http.StatusBadRequest},
+		{"unknown category", map[string]any{"name": "Weird", "category": "not_a_category", "color": "#123456"}, http.StatusBadRequest},
 		{"missing category", map[string]any{"name": "Weird2", "color": "#123456"}, http.StatusBadRequest},
-		{"bad color", map[string]any{"name": "Weird3", "category": "todo", "color": "red"}, http.StatusBadRequest},
-		{"empty name", map[string]any{"name": "  ", "category": "todo", "color": "#123456"}, http.StatusBadRequest},
+		{"bad color", map[string]any{"name": "Weird3", "category": "unstarted", "color": "red"}, http.StatusBadRequest},
+		{"empty name", map[string]any{"name": "  ", "category": "unstarted", "color": "#123456"}, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -354,27 +429,20 @@ func TestCreateIssueStatusValidation(t *testing.T) {
 	}
 }
 
-// TestCreateIssueStatusIsGatedOnRollout pins the rollout gate. Creating the
-// first custom status mints a value older pods cannot interpret, so it must be
-// impossible until the whole fleet is on this code. Reads stay open.
-func TestCreateIssueStatusIsGatedOnRollout(t *testing.T) {
+// TestCreateIssueStatusIsNotGatedOnRollout pins the removal of the rollout gate
+// (MUL-6643). Creation used to 403 unless a feature flag was flipped on, because
+// the first custom status minted a value older pods could not interpret. Every
+// pod resolves categories now, so an unset flag must not be able to take the
+// feature away again — creation answers to workspace role alone.
+func TestCreateIssueStatusIsNotGatedOnRollout(t *testing.T) {
 	seedTestCatalog(t)
-	withCustomIssueStatusesFlag(t, testHandler, false)
 
-	rec := httptest.NewRecorder()
-	testHandler.CreateIssueStatus(rec, newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
-		"name": "Human Review", "category": "in_review", "color": "#123456",
-	}))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 while the rollout gate is closed, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	// Reading the catalog is never gated — clients need it to render statuses.
-	listRec := httptest.NewRecorder()
-	testHandler.ListIssueStatuses(listRec, newRequest(http.MethodGet, "/api/issue-statuses", nil))
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("listing must stay open while the gate is closed, got %d: %s", listRec.Code, listRec.Body.String())
-	}
+	var created IssueStatusResponse
+	testutil.Call(t, testHandler.CreateIssueStatus,
+		newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+			"name": "Human Review", "category": issuestatus.CategoryStarted, "color": "#123456",
+		})).Want(http.StatusCreated).JSON(&created)
+	dbfx.Cleanup(t, `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
 }
 
 // TestIssueWriteStoresCanonicalStatusKey guards the 500 found in review:
@@ -419,13 +487,31 @@ func TestIssueWriteStoresCanonicalStatusKey(t *testing.T) {
 }
 
 // TestCustomTerminalStatusCountsAsTerminalInSQL covers the SQL-side consumers
-// the Go resolver cannot reach. Before issue_effective_status existed, each of
-// these read the status literal, so a custom status in the `done` category
-// still counted as open for the duplicate guard and was missed by sub-issue and
-// project completion counts.
+// the Go resolver cannot reach. Terminal categories are expanded once into
+// concrete keys so custom done statuses preserve their behavior without a
+// per-row issue_effective_status call.
 func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
 	ctx := context.Background()
 	createTestCustomStatus(t, "gate_approved_s", issuestatus.Done)
+	createTestCustomStatus(t, "gate_archived_s", issuestatus.Done)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue_status
+		SET archived_at = now()
+		WHERE workspace_id = $1 AND key = 'gate_archived_s'`, parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("archive custom terminal status: %v", err)
+	}
+	terminalStatusKeys, err := issuestatus.ExpandCategories(
+		ctx,
+		testHandler.Queries,
+		parseUUID(testWorkspaceID),
+		[]string{issuestatus.CategoryDone, issuestatus.CategoryClosed},
+	)
+	if err != nil {
+		t.Fatalf("expand terminal status categories: %v", err)
+	}
+	if !slices.Contains(terminalStatusKeys, "gate_archived_s") {
+		t.Fatalf("expanded terminal keys %v do not include archived custom status", terminalStatusKeys)
+	}
 
 	mkIssue := func(title, status string) pgtype.UUID {
 		t.Helper()
@@ -449,10 +535,35 @@ func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
 		title := "sql terminal duplicate probe"
 		mkIssue(title, "gate_approved_s")
 		if _, err := testHandler.Queries.FindActiveDuplicateIssue(ctx, db.FindActiveDuplicateIssueParams{
-			WorkspaceID:     parseUUID(testWorkspaceID),
-			NormalizedTitle: title,
+			WorkspaceID:        parseUUID(testWorkspaceID),
+			TerminalStatusKeys: terminalStatusKeys,
+			NormalizedTitle:    title,
 		}); err == nil {
 			t.Error("an issue on a custom done status must not count as an active duplicate")
+		}
+	})
+
+	t.Run("open issue listing excludes it", func(t *testing.T) {
+		customDoneID := mkIssue("sql open-list custom done", "gate_approved_s")
+		openID := mkIssue("sql open-list active", "todo")
+		unknownID := parseUUID(dbfx.Issue(t, "sql open-list unknown legacy status", testutil.Cols{
+			"status": "legacy_unknown",
+		}))
+		rows, err := testHandler.Queries.ListOpenIssues(ctx, db.ListOpenIssuesParams{
+			WorkspaceID:        parseUUID(testWorkspaceID),
+			TerminalStatusKeys: terminalStatusKeys,
+		})
+		if err != nil {
+			t.Fatalf("ListOpenIssues: %v", err)
+		}
+		var sawCustomDone, sawOpen, sawUnknown bool
+		for _, row := range rows {
+			sawCustomDone = sawCustomDone || row.ID == customDoneID
+			sawOpen = sawOpen || row.ID == openID
+			sawUnknown = sawUnknown || row.ID == unknownID
+		}
+		if sawCustomDone || !sawOpen || !sawUnknown {
+			t.Fatalf("open listing customDone/open/unknown = %v/%v/%v, want false/true/true", sawCustomDone, sawOpen, sawUnknown)
 		}
 	})
 
@@ -473,8 +584,18 @@ func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
 				t.Fatalf("attach to project: %v", err)
 			}
 		}
+		foreignWorkspaceID := dbfx.Workspace(t, "Foreign project stats", fmt.Sprintf("foreign-project-stats-%d", time.Now().UnixNano()))
+		dbfx.Issue(t, "foreign workspace issue with mismatched project", testutil.Cols{
+			"workspace_id": foreignWorkspaceID,
+			"project_id":   uuidToString(projectID),
+			"status":       "todo",
+		})
 
-		stats, err := testHandler.Queries.GetProjectIssueStats(ctx, []pgtype.UUID{projectID})
+		stats, err := testHandler.Queries.GetProjectIssueStats(ctx, db.GetProjectIssueStatsParams{
+			WorkspaceID:        parseUUID(testWorkspaceID),
+			ProjectIds:         []pgtype.UUID{projectID},
+			TerminalStatusKeys: terminalStatusKeys,
+		})
 		if err != nil {
 			t.Fatalf("GetProjectIssueStats: %v", err)
 		}
@@ -498,7 +619,10 @@ func TestCustomTerminalStatusCountsAsTerminalInSQL(t *testing.T) {
 			}
 		}
 
-		rows, err := testHandler.Queries.ChildIssueProgress(ctx, parseUUID(testWorkspaceID))
+		rows, err := testHandler.Queries.ChildIssueProgress(ctx, db.ChildIssueProgressParams{
+			WorkspaceID:        parseUUID(testWorkspaceID),
+			TerminalStatusKeys: terminalStatusKeys,
+		})
 		if err != nil {
 			t.Fatalf("ChildIssueProgress: %v", err)
 		}
@@ -527,7 +651,7 @@ func archiveStatusVia(t *testing.T, entry db.IssueStatus) int {
 
 // holdExclusiveCatalogLock takes the archive side of the catalog lock and holds
 // it until the returned release func runs, so a test can pin one ordering.
-func holdExclusiveCatalogLock(t *testing.T) (release func()) {
+func holdExclusiveCatalogLock(t *testing.T) (holderPID int32, release func()) {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := testPool.Begin(ctx)
@@ -539,14 +663,51 @@ func holdExclusiveCatalogLock(t *testing.T) (release func()) {
 		parseUUID(testWorkspaceID)); err != nil {
 		t.Fatalf("take exclusive lock: %v", err)
 	}
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+		t.Fatalf("read lock-holder pid: %v", err)
+	}
 	released := false
-	return func() {
+	return holderPID, func() {
 		if released {
 			return
 		}
 		released = true
 		tx.Rollback(ctx)
 	}
+}
+
+// waitForCatalogLockWaiter observes a contender waiting on the exact advisory
+// lock held by holderPID. It replaces fixed sleeps in race tests with the state
+// transition those sleeps were trying to approximate.
+func waitForCatalogLockWaiter(t *testing.T, ctx context.Context, holderPID int32) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := testPool.QueryRow(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_locks AS held
+    JOIN pg_locks AS waiter
+      ON waiter.locktype = held.locktype
+     AND waiter.database IS NOT DISTINCT FROM held.database
+     AND waiter.classid IS NOT DISTINCT FROM held.classid
+     AND waiter.objid IS NOT DISTINCT FROM held.objid
+     AND waiter.objsubid IS NOT DISTINCT FROM held.objsubid
+    WHERE held.pid = $1
+      AND held.locktype = 'advisory'
+      AND held.granted
+      AND NOT waiter.granted
+)
+`, holderPID).Scan(&waiting); err != nil {
+			t.Fatalf("observe issue-status catalog-lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("writer never reached the held issue-status catalog lock")
 }
 
 // TestWritesRejectAnArchivedStatus covers the SEQUENTIAL case: the status is
@@ -637,12 +798,10 @@ func TestWritesRejectAnArchivedStatus(t *testing.T) {
 
 }
 
-// TestArchiveSucceedsAfterACommittedWrite is the other ordering: an issue
-// committed on the status does not block archiving it, because archiving only
-// retires it from future use.
-func TestArchiveSucceedsAfterACommittedWrite(t *testing.T) {
+// A committed writer must be counted by the archive's locked precondition.
+func TestArchiveRejectsAfterACommittedWrite(t *testing.T) {
 	ctx := context.Background()
-	t.Run("writer wins: archive still succeeds and leaves the issue alone", func(t *testing.T) {
+	t.Run("writer wins: archive is rejected and leaves the issue alone", func(t *testing.T) {
 		entry := createTestCustomStatus(t, "race_b_writer", issuestatus.InProgress)
 
 		rec := httptest.NewRecorder()
@@ -658,8 +817,8 @@ func TestArchiveSucceedsAfterACommittedWrite(t *testing.T) {
 		json.Unmarshal(rec.Body.Bytes(), &created)
 		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID)) })
 
-		if code := archiveStatusVia(t, entry); code != http.StatusOK {
-			t.Fatalf("archive after a committed write = %d, want 200", code)
+		if code := archiveStatusVia(t, entry); code != http.StatusConflict {
+			t.Fatalf("archive after a committed write = %d, want 409", code)
 		}
 		var status string
 		if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`,
@@ -676,7 +835,7 @@ func TestArchiveSucceedsAfterACommittedWrite(t *testing.T) {
 	// closed by luck.
 	t.Run("writer blocks while archive holds the exclusive lock", func(t *testing.T) {
 		createTestCustomStatus(t, "race_block", issuestatus.InProgress)
-		release := holdExclusiveCatalogLock(t)
+		holderPID, release := holdExclusiveCatalogLock(t)
 		defer release()
 
 		done := make(chan int, 1)
@@ -688,11 +847,11 @@ func TestArchiveSucceedsAfterACommittedWrite(t *testing.T) {
 			done <- rec.Code
 		}()
 
+		waitForCatalogLockWaiter(t, ctx, holderPID)
 		select {
 		case code := <-done:
 			t.Fatalf("write completed (%d) while the archive lock was held", code)
-		case <-time.After(400 * time.Millisecond):
-			// Blocked as required.
+		default:
 		}
 
 		release()
@@ -824,15 +983,19 @@ func TestArchiveCommitsInsideTheWriteRaceWindow(t *testing.T) {
 				parseUUID(testWorkspaceID)); err != nil {
 				t.Fatalf("take exclusive lock: %v", err)
 			}
+			var holderPID int32
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+				t.Fatalf("read lock-holder pid: %v", err)
+			}
 
 			done := make(chan int, 1)
 			go func() { done <- tc.write(t, tc.key, seedID) }()
 
+			waitForCatalogLockWaiter(t, ctx, holderPID)
 			select {
 			case code := <-done:
 				t.Fatalf("write completed (%d) before the archive released the lock", code)
-			case <-time.After(400 * time.Millisecond):
-				// Parked on the lock, as required.
+			default:
 			}
 
 			// Archive inside the held lock and commit: from the writer's point
@@ -888,10 +1051,9 @@ func mustCreateIssue(t *testing.T, title, status string) pgtype.UUID {
 }
 
 // TestBatchCustomTerminalStatusEntersStageBarrier is the regression guard for
-// the batch stage-barrier prefilter. It compared status literals, so a batch
-// that moved the last child onto a CUSTOM done status left childDoneCompleted
-// empty and skipped the parent notification entirely — the already-fixed
-// barrier logic downstream never ran.
+// the batch stage barrier with a custom closed status (MUL-6243): moving the
+// last child onto a CUSTOM done status must close the parent's barrier like
+// the built-in done status.
 func TestBatchCustomTerminalStatusEntersStageBarrier(t *testing.T) {
 	ctx := context.Background()
 	createTestCustomStatus(t, "batch_done_s", issuestatus.Done)
@@ -911,15 +1073,11 @@ func TestBatchCustomTerminalStatusEntersStageBarrier(t *testing.T) {
 		t.Fatalf("batch update: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// The observable effect of entering the barrier is the system comment on
-	// the parent. Without the fix the batch is silent.
-	var comments int
-	if err := testPool.QueryRow(ctx,
-		`SELECT count(*) FROM comment WHERE issue_id = $1`, parent).Scan(&comments); err != nil {
-		t.Fatalf("count parent comments: %v", err)
-	}
-	if comments == 0 {
-		t.Error("moving the last child to a custom done status did not close the stage barrier")
+	// The observable effect of closing the barrier is the rule's entry on the
+	// parent. Without the fix the batch is silent.
+	t.Cleanup(func() { cleanupChildDoneIssue(uuidToString(parent)) })
+	if entries := childDoneEntries(t, uuidToString(parent)); len(entries) != 1 {
+		t.Errorf("moving the last child to a custom done status did not close the stage barrier: %+v", entries)
 	}
 }
 
@@ -959,8 +1117,8 @@ func TestChildrenResponseCarriesStatusCategory(t *testing.T) {
 	if payload.Issues[0].Status != "children_done_s" {
 		t.Errorf("status = %q, want the custom key", payload.Issues[0].Status)
 	}
-	if payload.Issues[0].StatusCategory != "done" {
-		t.Errorf("status_category = %q, want %q", payload.Issues[0].StatusCategory, "done")
+	if payload.Issues[0].StatusCategory != issuestatus.CategoryDone {
+		t.Errorf("status_category = %q, want %q", payload.Issues[0].StatusCategory, issuestatus.CategoryDone)
 	}
 }
 
@@ -974,20 +1132,21 @@ func TestCategoryFilterExpandsToIndexedStatusKeys(t *testing.T) {
 	seedTestCatalog(t)
 	ws := parseUUID(testWorkspaceID)
 
-	t.Run("built-in category expands to exactly its own key", func(t *testing.T) {
-		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"blocked"})
+	t.Run("started category expands to every built-in behavior", func(t *testing.T) {
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{issuestatus.CategoryStarted})
 		if err != nil {
 			t.Fatalf("expand: %v", err)
 		}
-		if len(keys) != 1 || keys[0] != "blocked" {
-			t.Errorf("expand(blocked) = %v, want exactly [blocked] — a workspace with no "+
-				"custom statuses must produce the pre-feature query", keys)
+		for _, key := range []string{issuestatus.InProgress, issuestatus.InReview, issuestatus.Blocked} {
+			if !slices.Contains(keys, key) {
+				t.Errorf("expand(started) = %v, want built-in %q", keys, key)
+			}
 		}
 	})
 
 	t.Run("category includes its custom statuses", func(t *testing.T) {
 		createTestCustomStatus(t, "human_review_x", issuestatus.InReview)
-		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"in_review"})
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{issuestatus.CategoryStarted})
 		if err != nil {
 			t.Fatalf("expand: %v", err)
 		}
@@ -1003,7 +1162,7 @@ func TestCategoryFilterExpandsToIndexedStatusKeys(t *testing.T) {
 		if code := archiveStatusVia(t, entry); code != http.StatusOK {
 			t.Fatalf("archive: %d", code)
 		}
-		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"done"})
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{issuestatus.CategoryDone})
 		if err != nil {
 			t.Fatalf("expand: %v", err)
 		}
@@ -1019,12 +1178,12 @@ func TestCategoryFilterExpandsToIndexedStatusKeys(t *testing.T) {
 			t.Fatalf("clear catalog: %v", err)
 		}
 		t.Cleanup(func() { seedTestCatalog(t) })
-		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{"todo", "done"})
+		keys, err := issuestatus.ExpandCategories(ctx, testHandler.Queries, ws, []string{issuestatus.CategoryUnstarted, issuestatus.CategoryDone})
 		if err != nil {
 			t.Fatalf("expand: %v", err)
 		}
-		if len(keys) != 2 || !slices.Contains(keys, "todo") || !slices.Contains(keys, "done") {
-			t.Errorf("expand on an unseeded workspace = %v, want [todo done]", keys)
+		if len(keys) != 3 || !slices.Contains(keys, "backlog") || !slices.Contains(keys, "todo") || !slices.Contains(keys, "done") {
+			t.Errorf("expand on an unseeded workspace = %v, want [backlog todo done]", keys)
 		}
 	})
 }
@@ -1039,7 +1198,7 @@ func TestListFilterByCategoryReturnsCustomStatusIssues(t *testing.T) {
 	_ = ctx
 
 	rec := httptest.NewRecorder()
-	testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=in_review&limit=100", nil))
+	testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=started&limit=100", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
 	}
@@ -1058,18 +1217,18 @@ func TestListFilterByCategoryReturnsCustomStatusIssues(t *testing.T) {
 		got[i.ID] = i.StatusCategory
 	}
 	if _, ok := got[uuidToString(customID)]; !ok {
-		t.Error("the in_review category must include issues on a custom in_review status")
+		t.Error("the started category must include issues on a custom review status")
 	}
 	if _, ok := got[uuidToString(builtinID)]; !ok {
-		t.Error("the in_review category must include issues on the built-in status")
+		t.Error("the started category must include issues on the built-in review status")
 	}
 	if _, ok := got[uuidToString(otherID)]; ok {
-		t.Error("the in_review category must not include a todo issue")
+		t.Error("the started category must not include a todo issue")
 	}
 	// Every row carries an authoritative category, custom statuses included —
 	// this is what the client buckets and caches by.
-	if c := got[uuidToString(customID)]; c != "in_review" {
-		t.Errorf("custom-status row status_category = %q, want %q", c, "in_review")
+	if c := got[uuidToString(customID)]; c != issuestatus.InProgress {
+		t.Errorf("custom-status row status_category = %q, want %q", c, issuestatus.InProgress)
 	}
 }
 
@@ -1103,8 +1262,8 @@ func TestCreateEventCarriesCustomStatusCategory(t *testing.T) {
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(created.ID))
 	})
-	if created.StatusCategory != "in_review" {
-		t.Errorf("HTTP response status_category = %q, want in_review", created.StatusCategory)
+	if created.StatusCategory != issuestatus.InProgress {
+		t.Errorf("HTTP response status_category = %q, want in_progress (wire)", created.StatusCategory)
 	}
 
 	select {
@@ -1117,8 +1276,8 @@ func TestCreateEventCarriesCustomStatusCategory(t *testing.T) {
 		if !ok {
 			t.Fatalf("event issue shape: %T", payload["issue"])
 		}
-		if issue.StatusCategory != "in_review" {
-			t.Errorf("event status_category = %q, want in_review — other tabs cannot "+
+		if issue.StatusCategory != issuestatus.InProgress {
+			t.Errorf("event status_category = %q, want in_progress (wire) — other tabs cannot "+
 				"bucket the new issue without it", issue.StatusCategory)
 		}
 	case <-time.After(3 * time.Second):
@@ -1138,7 +1297,7 @@ func TestListEndpointsCarryStatusCategory(t *testing.T) {
 
 	t.Run("list carries category for every custom row", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=in_review&limit=100", nil))
+		testHandler.ListIssues(rec, newRequest(http.MethodGet, "/api/issues?status_category=started&limit=100", nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
 		}
@@ -1153,13 +1312,13 @@ func TestListEndpointsCarryStatusCategory(t *testing.T) {
 		for _, i := range payload.Issues {
 			if i.Status == "human_review_n" {
 				seen++
-				if i.StatusCategory != "in_review" {
-					t.Errorf("custom row status_category = %q, want in_review", i.StatusCategory)
+				if i.StatusCategory != issuestatus.InProgress {
+					t.Errorf("custom row status_category = %q, want in_progress (wire)", i.StatusCategory)
 				}
 			}
 		}
 		if seen < 3 {
-			t.Errorf("expected the 3 custom-status rows in the in_review category, saw %d", seen)
+			t.Errorf("expected the 3 custom-status rows in the started category, saw %d", seen)
 		}
 	})
 
@@ -1178,8 +1337,8 @@ func TestListEndpointsCarryStatusCategory(t *testing.T) {
 		r := issuestatus.NewResolver(parseUUID(testWorkspaceID))
 		ctx := context.Background()
 		for range 10 {
-			if got := r.Effective(ctx, testHandler.Queries, "human_review_n"); got != "in_review" {
-				t.Fatalf("Effective = %q, want in_review", got)
+			if got := r.Effective(ctx, testHandler.Queries, "human_review_n"); got != "human_review_n" {
+				t.Fatalf("Effective = %q, want human_review_n", got)
 			}
 		}
 	})
@@ -1196,15 +1355,15 @@ func TestListEndpointsCarryStatusCategory(t *testing.T) {
 			StatusCategory string `json:"status_category"`
 		}
 		json.Unmarshal(rec.Body.Bytes(), &got)
-		if got.StatusCategory != "in_review" {
-			t.Errorf("GetIssue status_category = %q, want in_review", got.StatusCategory)
+		if got.StatusCategory != issuestatus.InProgress {
+			t.Errorf("GetIssue status_category = %q, want in_progress (wire)", got.StatusCategory)
 		}
 	})
 }
 
 // TestBackgroundEventCarriesCustomStatusCategory pins the background-event
 // payload. IssueToMap fills a category only for built-ins; the publishers that
-// can emit a CUSTOM status go through IssueToMapWithCategory so clients receive
+// can emit a CUSTOM status go through IssueToMapResolved so clients receive
 // an authoritative one instead of a blank they would have to refetch to resolve.
 func TestBackgroundEventCarriesCustomStatusCategory(t *testing.T) {
 	ctx := context.Background()
@@ -1224,9 +1383,9 @@ func TestBackgroundEventCarriesCustomStatusCategory(t *testing.T) {
 			plain["status_category"])
 	}
 
-	authoritative := service.IssueToMapWithCategory(ctx, testHandler.Queries, issue, "MUL")
-	if authoritative["status_category"] != "in_review" {
-		t.Errorf("IssueToMapWithCategory status_category = %v, want in_review",
+	authoritative := service.IssueToMapResolved(ctx, testHandler.Queries, issue, "MUL")
+	if authoritative["status_category"] != issuestatus.InProgress {
+		t.Errorf("IssueToMapResolved status_category = %v, want in_progress (wire)",
 			authoritative["status_category"])
 	}
 	if authoritative["status"] != "human_review_bg" {
@@ -1246,7 +1405,6 @@ func TestBackgroundEventCarriesCustomStatusCategory(t *testing.T) {
 func TestCatalogWritesAnnounceThemselves(t *testing.T) {
 	ctx := context.Background()
 	seedTestCatalog(t)
-	withCustomIssueStatusesFlag(t, testHandler, true)
 
 	changes := make(chan events.Event, 8)
 	testHandler.Bus.Subscribe(protocol.EventIssueStatusChanged, func(e events.Event) {
@@ -1284,14 +1442,16 @@ func TestCatalogWritesAnnounceThemselves(t *testing.T) {
 		select {
 		case e := <-changes:
 			t.Fatalf("unexpected issue_status:changed event: %v", e.Payload)
-		case <-time.After(300 * time.Millisecond):
+		default:
+			// Bus.Publish is synchronous and the handler publishes before it
+			// returns, so an event from the no-op would already be buffered.
 		}
 	}
 
 	var created IssueStatusResponse
 	testutil.Call(t, testHandler.CreateIssueStatus,
 		newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
-			"name": "Realtime Gate", "category": issuestatus.InReview, "color": "#123456",
+			"name": "Realtime Gate", "category": issuestatus.CategoryStarted, "color": "#123456",
 		})).Want(http.StatusCreated).JSON(&created)
 	dbfx.Cleanup(t, `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
 	expectChange(t, "created")
@@ -1306,7 +1466,7 @@ func TestCatalogWritesAnnounceThemselves(t *testing.T) {
 	// another test would otherwise turn this into a 409.
 	active, err := testHandler.Queries.ListActiveCustomIssueStatusEntries(ctx, db.ListActiveCustomIssueStatusEntriesParams{
 		WorkspaceID: parseUUID(testWorkspaceID),
-		Category:    issuestatus.InReview,
+		Category:    issuestatus.CategoryStarted,
 	})
 	if err != nil {
 		t.Fatalf("list active custom statuses: %v", err)
@@ -1315,7 +1475,7 @@ func TestCatalogWritesAnnounceThemselves(t *testing.T) {
 	for i, entry := range active {
 		ids[i] = uuidToString(entry.ID)
 	}
-	if code := reorderVia(t, issuestatus.InReview, ids).Code; code != http.StatusOK {
+	if code := reorderVia(t, issuestatus.CategoryStarted, ids).Code; code != http.StatusOK {
 		t.Fatalf("reorder: %d", code)
 	}
 	expectChange(t, "reordered")
@@ -1338,4 +1498,455 @@ func TestCatalogWritesAnnounceThemselves(t *testing.T) {
 		t.Fatalf("second archive: %d", code)
 	}
 	expectNoChange(t)
+}
+
+// TestCreateIssueStatusAcceptsANonLatinName is the regression for MUL-6749 /
+// GitHub #7627. A display name written entirely in a non-Latin script has no
+// characters in the key alphabet, so key derivation used to fail the create
+// outright — and the settings form has no field for an explicit key, which left
+// no way to create the status at all.
+func TestCreateIssueStatusAcceptsANonLatinName(t *testing.T) {
+	seedTestCatalog(t)
+
+	create := func(t *testing.T, name, category string) IssueStatusResponse {
+		t.Helper()
+		var created IssueStatusResponse
+		testutil.Call(t, testHandler.CreateIssueStatus,
+			newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+				"name": name, "category": category, "color": "#123456",
+			})).Want(http.StatusCreated).JSON(&created)
+		t.Cleanup(func() {
+			testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+		})
+		return created
+	}
+
+	first := create(t, "客户确认", issuestatus.CategoryStarted)
+	if first.Key != "started_2" {
+		t.Errorf("derived key = %q, want %q", first.Key, "started_2")
+	}
+	if first.Name != "客户确认" {
+		t.Errorf("display name = %q, want it stored verbatim", first.Name)
+	}
+
+	// A second one in the same category takes the next ordinal instead of
+	// colliding with the first.
+	second := create(t, "供应商确认", issuestatus.CategoryStarted)
+	if second.Key != "started_3" {
+		t.Errorf("second derived key = %q, want %q", second.Key, "started_3")
+	}
+
+	// A name that CAN be slugged is untouched by the fallback.
+	english := create(t, "Human Review Zh", issuestatus.CategoryStarted)
+	if english.Key != "human_review_zh" {
+		t.Errorf("sluggable name derived %q, want %q", english.Key, "human_review_zh")
+	}
+}
+
+// TestCreateIssueStatusDisambiguatesCollidingSlugs covers the sharper half of
+// #7627. The bug report's suggested workaround was to mix ASCII into the
+// display name, but the non-ASCII part is dropped, so two DIFFERENT names
+// collapse onto one key — and the second create used to fail with a conflict
+// that blamed a display name nobody had taken.
+func TestCreateIssueStatusDisambiguatesCollidingSlugs(t *testing.T) {
+	seedTestCatalog(t)
+
+	create := func(t *testing.T, name string) IssueStatusResponse {
+		t.Helper()
+		var created IssueStatusResponse
+		testutil.Call(t, testHandler.CreateIssueStatus,
+			newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+				"name": name, "category": issuestatus.CategoryUnstarted, "color": "#123456",
+			})).Want(http.StatusCreated).JSON(&created)
+		t.Cleanup(func() {
+			testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+		})
+		return created
+	}
+
+	if got := create(t, "待客户 Zzreview").Key; got != "zzreview" {
+		t.Fatalf("first key = %q, want %q", got, "zzreview")
+	}
+	if got := create(t, "待供应商 Zzreview").Key; got != "zzreview_2" {
+		t.Errorf("colliding key = %q, want %q", got, "zzreview_2")
+	}
+}
+
+// TestDerivedKeyAvoidsAnArchivedKey pins the storage constraint that makes the
+// "taken" set wider than the visible catalog: idx_issue_status_workspace_key is
+// NOT partial, so an archived status still owns its key and handing it out
+// again would fail on insert.
+func TestDerivedKeyAvoidsAnArchivedKey(t *testing.T) {
+	entry := createTestCustomStatus(t, "zzarchived", issuestatus.Todo)
+	if _, err := testHandler.Queries.ArchiveIssueStatusEntry(context.Background(), db.ArchiveIssueStatusEntryParams{
+		ID:          entry.ID,
+		WorkspaceID: parseUUID(testWorkspaceID),
+	}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	var created IssueStatusResponse
+	testutil.Call(t, testHandler.CreateIssueStatus,
+		newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+			"name": "Zzarchived", "category": issuestatus.CategoryUnstarted, "color": "#123456",
+		})).Want(http.StatusCreated).JSON(&created)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+	})
+
+	if created.Key == "zzarchived" {
+		t.Fatal("derivation reused an archived status's key")
+	}
+	if created.Key != "zzarchived_2" {
+		t.Errorf("derived key = %q, want %q", created.Key, "zzarchived_2")
+	}
+}
+
+// TestUnknownStatusErrorNamesCustomStatuses covers the other half of what makes
+// a derived key usable: on its own `in_review_2` says nothing, so the error a
+// caller gets after writing a bad status has to carry the display name or there
+// is no way to find the status they were told to use. (MUL-6749)
+func TestUnknownStatusErrorNamesCustomStatuses(t *testing.T) {
+	seedTestCatalog(t)
+	entry, err := testHandler.Queries.CreateIssueStatusEntry(context.Background(), db.CreateIssueStatusEntryParams{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		Key:         "in_review_9",
+		Name:        "客户确认",
+		Description: "",
+		Category:    issuestatus.CategoryStarted,
+		Color:       "#123456",
+	})
+	if err != nil {
+		t.Fatalf("create custom status: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, entry.ID)
+	})
+
+	rec := httptest.NewRecorder()
+	testHandler.CreateIssue(rec, newRequest(http.MethodPost, "/api/issues", map[string]any{
+		"title":  "unknown status error body",
+		"status": "not_a_status",
+	}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "in_review_9 (客户确认)") {
+		t.Errorf("error body does not pair the key with its name: %s", body)
+	}
+	// Built-ins stay bare — clients localize those from the key, so echoing the
+	// seeded English name would be the one string a Chinese workspace ignores.
+	if strings.Contains(body, "todo (Todo)") {
+		t.Errorf("built-in statuses should be listed as bare keys: %s", body)
+	}
+}
+
+// TestIssueResponseCarriesCustomStatusName pins the field an agent reads an
+// issue through. `status` alone is a bare handle, and a derived key carries no
+// meaning, so the display name travels beside it. (MUL-6749)
+func TestIssueResponseCarriesCustomStatusName(t *testing.T) {
+	seedTestCatalog(t)
+	entry, err := testHandler.Queries.CreateIssueStatusEntry(context.Background(), db.CreateIssueStatusEntryParams{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		Key:         "in_review_8",
+		Name:        "客户确认",
+		Description: "",
+		Category:    issuestatus.CategoryStarted,
+		Color:       "#123456",
+	})
+	if err != nil {
+		t.Fatalf("create custom status: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, entry.ID)
+	})
+
+	var custom IssueResponse
+	testutil.Call(t, testHandler.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": "custom status name", "status": "in_review_8",
+		})).Want(http.StatusCreated).JSON(&custom)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(custom.ID))
+	})
+	if custom.StatusName != "客户确认" {
+		t.Errorf("status_name = %q, want %q", custom.StatusName, "客户确认")
+	}
+	if custom.StatusCategory != issuestatus.InProgress {
+		t.Errorf("status_category = %q, want %q", custom.StatusCategory, issuestatus.InProgress)
+	}
+
+	// A built-in carries no name: every client renders those from the key
+	// through i18n, so the seeded English one would be noise at best.
+	var builtIn IssueResponse
+	testutil.Call(t, testHandler.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": "built-in status name", "status": issuestatus.Todo,
+		})).Want(http.StatusCreated).JSON(&builtIn)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(builtIn.ID))
+	})
+	if builtIn.StatusName != "" {
+		t.Errorf("built-in status_name = %q, want it empty", builtIn.StatusName)
+	}
+}
+
+// TestExplicitKeyCreateAlsoTakesTheCatalogLock closes the half-open race found
+// in review of MUL-6749. Derivation reads the catalog and then inserts; if a
+// create that supplies its OWN key were allowed to skip the lock, it could land
+// on the key the derive just chose in exactly that gap. The derive would then
+// fail on the unique index and return 409 to a settings form that has no key
+// field — the same dead end this issue exists to remove.
+//
+// The assertion is that an explicit-key create PARKS while the lock is held.
+// Before the fix it completed immediately.
+func TestExplicitKeyCreateAlsoTakesTheCatalogLock(t *testing.T) {
+	seedTestCatalog(t)
+	ctx := context.Background()
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':issue_status', 0))`,
+		parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("take exclusive lock: %v", err)
+	}
+	var holderPID int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+		t.Fatalf("read lock-holder pid: %v", err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		testHandler.CreateIssueStatus(rec, newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+			"name": "Zzlockprobe", "key": "zzlockprobe", "category": issuestatus.CategoryUnstarted, "color": "#123456",
+		}))
+		done <- rec
+	}()
+
+	// Parked on the lock, which is the point.
+	waitForCatalogLockWaiter(t, ctx, holderPID)
+	select {
+	case rec := <-done:
+		t.Fatalf("an explicit-key create completed (%d) while the catalog lock was held; "+
+			"it can still insert between a derived create's catalog read and its insert", rec.Code)
+	default:
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("explicit-key create after the lock released: %d %s", rec.Code, rec.Body.String())
+		}
+		var created IssueStatusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		t.Cleanup(func() {
+			testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+		})
+	case <-time.After(10 * time.Second):
+		t.Fatal("explicit-key create never completed after the lock released")
+	}
+}
+
+// TestConcurrentDerivedCreatesNeverConflict is the behavioral half of the same
+// fix: whatever else is writing the catalog, a create that supplied no key must
+// never come back 409. A caller who typed a key CAN legitimately be told it is
+// taken; a caller who typed only a display name has nothing to correct.
+//
+// Every result carries WHICH kind of writer produced it. Counting successes
+// without that — the first version of this test did — lets an explicit writer's
+// 201 stand in for a derived writer's 409 and passes on exactly the regression
+// it exists to catch.
+//
+// This is a probabilistic net, not a proof: the window it hunts for is the few
+// microseconds between a derive's catalog read and its insert, and in-process
+// it does not reliably open. TestExplicitKeyCreateAlsoTakesTheCatalogLock is
+// the deterministic guard on the lock itself — this one guards the OUTCOME, so
+// that any future path which lets a keyless create conflict shows up here even
+// if the lock is still nominally taken. Do not delete one for the other.
+func TestConcurrentDerivedCreatesNeverConflict(t *testing.T) {
+	seedTestCatalog(t)
+
+	const derivedWriters = 6
+	const rounds = 4
+	type result struct {
+		derived bool
+		label   string
+		code    int
+		key     string
+		body    string
+	}
+
+	// Every derived name must be ALL non-ASCII, or it slugs to something and
+	// never reaches the fallback the test is about: "客户确认0-1" keeps its ASCII
+	// digits and derives `0_1`, which contends with nothing. Uniqueness comes
+	// from a distinct base per writer and a repeated character per round, so the
+	// names stay collision-free without smuggling in a digit.
+	bases := []string{"客户确认", "供应商确认", "财务确认", "法务确认", "安全确认", "运营确认"}
+	if len(bases) != derivedWriters {
+		t.Fatalf("need one non-ASCII base per derived writer, got %d for %d", len(bases), derivedWriters)
+	}
+
+	for round := range rounds {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			results := make(chan result, derivedWriters+2)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+
+			post := func(derived bool, label string, body map[string]any) {
+				defer wg.Done()
+				<-start
+				rec := httptest.NewRecorder()
+				testHandler.CreateIssueStatus(rec, newRequest(http.MethodPost, "/api/issue-statuses", body))
+				var created IssueStatusResponse
+				json.Unmarshal(rec.Body.Bytes(), &created)
+				results <- result{derived, label, rec.Code, created.Key, rec.Body.String()}
+			}
+
+			// Admins naming a status in a non-Latin script, all in one category,
+			// so every one of them derives from the same base.
+			for i := range derivedWriters {
+				name := bases[i] + strings.Repeat("确", round+1)
+				wg.Add(1)
+				go post(true, name, map[string]any{
+					"name": name, "category": issuestatus.CategoryStarted, "color": "#123456",
+				})
+			}
+			// Explicit writers aiming straight at the ordinals the derives want.
+			for _, key := range []string{"started_2", "started_3"} {
+				wg.Add(1)
+				go post(false, key, map[string]any{
+					"name": fmt.Sprintf("Zz %s %d", key, round), "key": key,
+					"category": issuestatus.CategoryStarted, "color": "#123456",
+				})
+			}
+
+			close(start)
+			wg.Wait()
+			close(results)
+
+			t.Cleanup(func() {
+				testPool.Exec(context.Background(),
+					`DELETE FROM issue_status WHERE workspace_id = $1 AND category = 'started' AND is_system = FALSE`,
+					parseUUID(testWorkspaceID))
+			})
+
+			seen := map[string]bool{}
+			derivedSucceeded := 0
+			for r := range results {
+				switch {
+				case r.derived && r.code != http.StatusCreated:
+					// The regression this test exists for: a writer with no key
+					// field to correct was told to correct one.
+					t.Errorf("derived create %q returned %d, want 201 — a create with no key must never conflict: %s",
+						r.label, r.code, r.body)
+					continue
+				case !r.derived && r.code != http.StatusCreated && r.code != http.StatusConflict:
+					t.Errorf("explicit create %q returned %d, want 201 or 409: %s", r.label, r.code, r.body)
+					continue
+				case r.code == http.StatusConflict:
+					// Only reachable for an explicit writer, by the branch above.
+					if !strings.Contains(r.body, "already exists") {
+						t.Errorf("unexpected 409 body for %q: %s", r.label, r.body)
+					}
+					continue
+				}
+				if seen[r.key] {
+					t.Errorf("two statuses were created with the same key %q", r.key)
+				}
+				seen[r.key] = true
+				if issuestatus.IsBuiltIn(r.key) {
+					t.Errorf("a custom status shadowed the built-in key %q", r.key)
+				}
+				if r.derived {
+					// Pins the PREMISE: a derived name that slugs to anything at
+					// all takes the slug path and contends with nothing, which
+					// would leave this test green while exercising nothing.
+					if !strings.HasPrefix(r.key, issuestatus.CategoryStarted+"_") {
+						t.Errorf("derived create %q produced key %q; the name must slug to nothing "+
+							"so it lands on the <category>_<n> fallback these writers contend for",
+							r.label, r.key)
+					}
+					derivedSucceeded++
+				}
+			}
+			if derivedSucceeded != derivedWriters {
+				t.Errorf("%d of %d DERIVED creates succeeded", derivedSucceeded, derivedWriters)
+			}
+		})
+	}
+}
+
+// TestCustomStatusPayloadsAgreeAcrossRenderings pins the contract
+// TestIssueToMap_KeysMatchIssueResponse cannot reach with a built-in fixture:
+// an issue on a CUSTOM status must describe itself identically whether it
+// arrives over HTTP or on a background event. A field present in one and blank
+// in the other reads back undefined depending on which entry point produced the
+// issue. (MUL-6749)
+func TestCustomStatusPayloadsAgreeAcrossRenderings(t *testing.T) {
+	ctx := context.Background()
+	seedTestCatalog(t)
+	entry, err := testHandler.Queries.CreateIssueStatusEntry(ctx, db.CreateIssueStatusEntryParams{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		Key:         "in_review_7",
+		Name:        "客户确认",
+		Description: "",
+		Category:    issuestatus.CategoryStarted,
+		Color:       "#123456",
+	})
+	if err != nil {
+		t.Fatalf("create custom status: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_status WHERE id = $1`, entry.ID)
+	})
+
+	var fromHTTP IssueResponse
+	testutil.Call(t, testHandler.CreateIssue,
+		newRequest(http.MethodPost, "/api/issues", map[string]any{
+			"title": "payload parity", "status": "in_review_7",
+		})).Want(http.StatusCreated).JSON(&fromHTTP)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parseUUID(fromHTTP.ID))
+	})
+
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(fromHTTP.ID))
+	if err != nil {
+		t.Fatalf("reload issue: %v", err)
+	}
+	fromEvent := service.IssueToMapResolved(ctx, testHandler.Queries, issue, "MUL")
+
+	for field, want := range map[string]string{
+		"status":          "in_review_7",
+		"status_category": issuestatus.InProgress,
+		"status_name":     "客户确认",
+	} {
+		got, ok := fromEvent[field].(string)
+		if !ok {
+			t.Errorf("event payload is missing %q; clients treat it as a complete issue", field)
+			continue
+		}
+		if got != want {
+			t.Errorf("event %s = %q, want %q", field, got, want)
+		}
+	}
+	if fromHTTP.StatusName != fromEvent["status_name"] {
+		t.Errorf("status_name differs by entry point: HTTP %q, event %q",
+			fromHTTP.StatusName, fromEvent["status_name"])
+	}
+	if fromHTTP.StatusCategory != fromEvent["status_category"] {
+		t.Errorf("status_category differs by entry point: HTTP %q, event %q",
+			fromHTTP.StatusCategory, fromEvent["status_category"])
+	}
 }

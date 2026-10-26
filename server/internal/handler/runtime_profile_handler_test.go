@@ -105,7 +105,10 @@ VALUES ($1, $2, 'feishu', 'oc_rp', 'p2p')`, rpChat, rpInstallID); err != nil {
 	w := httptest.NewRecorder()
 	req := newRequest("DELETE", "/api/workspaces/"+testWorkspaceID+"/runtime-profiles/"+profileID, nil)
 	req = withURLParams(req, "id", testWorkspaceID, "profileId", profileID)
-	testHandler.DeleteRuntimeProfile(w, req)
+	notifier := &recordingRuntimeGoneNotifier{}
+	h := *testHandler
+	h.DaemonRuntimeGone = notifier
+	h.DeleteRuntimeProfile(w, req)
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
@@ -152,6 +155,9 @@ VALUES ($1, $2, 'feishu', 'oc_rp', 'p2p')`, rpChat, rpInstallID); err != nil {
 	if bindingRows != 1 {
 		t.Fatalf("surviving installation's chat-session binding was swept: %d rows", bindingRows)
 	}
+	if len(notifier.runtimeIDs) != 1 || notifier.runtimeIDs[0] != runtimeID {
+		t.Fatalf("runtime-gone notifications = %v, want [%s]", notifier.runtimeIDs, runtimeID)
+	}
 }
 
 // TestDeleteRuntimeProfile_ActiveAgentBlocks confirms the guard still refuses
@@ -170,7 +176,10 @@ func TestDeleteRuntimeProfile_ActiveAgentBlocks(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("DELETE", "/api/workspaces/"+testWorkspaceID+"/runtime-profiles/"+profileID, nil)
 	req = withURLParams(req, "id", testWorkspaceID, "profileId", profileID)
-	testHandler.DeleteRuntimeProfile(w, req)
+	notifier := &recordingRuntimeGoneNotifier{}
+	h := *testHandler
+	h.DaemonRuntimeGone = notifier
+	h.DeleteRuntimeProfile(w, req)
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
@@ -188,6 +197,52 @@ func TestDeleteRuntimeProfile_ActiveAgentBlocks(t *testing.T) {
 	}
 	if rtRows != 1 {
 		t.Fatalf("expected runtime to survive 409, found %d", rtRows)
+	}
+	if len(notifier.runtimeIDs) != 0 {
+		t.Fatalf("rollback/refusal emitted runtime-gone notifications: %v", notifier.runtimeIDs)
+	}
+}
+
+func TestDeleteRuntimeProfile_WorkspaceMismatchReturnsStructuredConflict(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	profileID := insertRuntimeProfileFixture(t, ctx, "Workspace Mismatch Profile", "codex", "workspace-mismatch-codex")
+	runtimeID := insertProfileRuntimeFixture(t, ctx, profileID, "Workspace Mismatch Runtime", "codex")
+	agentID := createArchivedWorkspaceMismatchedAgent(t, runtimeID, "Profile Workspace Mismatch Agent")
+
+	w := httptest.NewRecorder()
+	req := newRequest("DELETE", "/api/workspaces/"+testWorkspaceID+"/runtime-profiles/"+profileID, nil)
+	req = withURLParams(req, "id", testWorkspaceID, "profileId", profileID)
+	testHandler.DeleteRuntimeProfile(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Code != "runtime_delete_workspace_mismatch" {
+		t.Fatalf("code = %q, want runtime_delete_workspace_mismatch", body.Code)
+	}
+
+	var profileRows, runtimeRows int
+	var boundRuntime string
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM runtime_profile WHERE id = $1`, profileID).Scan(&profileRows); err != nil {
+		t.Fatalf("count profile rows: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&runtimeRows); err != nil {
+		t.Fatalf("count runtime rows: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id::text FROM agent WHERE id = $1`, agentID).Scan(&boundRuntime); err != nil {
+		t.Fatalf("read mismatched agent binding: %v", err)
+	}
+	if profileRows != 1 || runtimeRows != 1 || boundRuntime != runtimeID {
+		t.Fatalf("workspace mismatch mutated data: profile rows=%d runtime rows=%d agent runtime=%q", profileRows, runtimeRows, boundRuntime)
 	}
 }
 
@@ -381,5 +436,66 @@ func TestCreateRuntimeProfile_ValidatesCommandAndFixedArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCreateRuntimeProfile_RuntimeIdentity(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	for _, tc := range []struct {
+		name, target, family string
+		status               int
+	}{
+		{"omp", "omp", "", http.StatusCreated},
+		{"legacy pi", "", "pi", http.StatusCreated},
+		{"mismatch", "omp", "codex", http.StatusBadRequest},
+		{"unknown", "unknown", "", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := withURLParam(newRequest("POST", "/", map[string]any{
+				"display_name": "Identity " + tc.name, "runtime_type": tc.target,
+				"protocol_family": tc.family, "command_name": "wrapper", "fixed_args": []string{"launch"},
+			}), "id", testWorkspaceID)
+			w := httptest.NewRecorder()
+			testHandler.CreateRuntimeProfile(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			if tc.status != http.StatusCreated {
+				return
+			}
+			var resp RuntimeProfileResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM runtime_profile WHERE id = $1`, resp.ID) })
+			want := tc.target
+			if want == "" {
+				want = tc.family
+			}
+			if resp.RuntimeType != want || resp.ProtocolFamily != "pi" || resp.CommandName != "wrapper" || len(resp.FixedArgs) != 1 {
+				t.Fatalf("incorrect identity: %+v", resp)
+			}
+		})
+	}
+}
+
+func TestUpdateRuntimeProfile_RejectsIdentityChange(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	id := insertRuntimeProfileFixture(t, context.Background(), "Immutable Pi", "pi", "wrapper")
+	for _, field := range []string{"runtime_type", "protocol_family"} {
+		// withURLParams, not two nested withURLParam calls: the singular helper
+		// installs a fresh chi route context each time, so the outer call would
+		// drop "id" and the handler would reject on workspace id before ever
+		// reaching the immutability check this test exists for.
+		req := withURLParams(newRequest("PATCH", "/", map[string]any{field: "omp"}), "id", testWorkspaceID, "profileId", id)
+		w := httptest.NewRecorder()
+		testHandler.UpdateRuntimeProfile(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "immutable") {
+			t.Fatalf("identity update: %d %s", w.Code, w.Body.String())
+		}
 	}
 }

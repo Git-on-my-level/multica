@@ -73,9 +73,7 @@ import { useT } from "../../i18n";
 import { formatSchedulePartialFailureToast } from "./autopilot-dialog-toast";
 import type { WebhookEventFilter } from "@multica/core/types";
 
-// ---------------------------------------------------------------------------
 // Types
-// ---------------------------------------------------------------------------
 
 export interface AutopilotInitial {
   title: string;
@@ -106,9 +104,7 @@ export type AutopilotDialogProps =
       canManageAccess: boolean;
     };
 
-// ---------------------------------------------------------------------------
 // Static schema-level data (not user-visible)
-// ---------------------------------------------------------------------------
 
 const OUTPUT_MODE_KEYS: AutopilotExecutionMode[] = ["create_issue", "run_only"];
 
@@ -117,9 +113,7 @@ const OUTPUT_MODE_ICONS: Record<AutopilotExecutionMode, typeof FilePlus2> = {
   run_only: Play,
 };
 
-// ---------------------------------------------------------------------------
 // Webhook event-filter dirty detection
-// ---------------------------------------------------------------------------
 
 // serializeEventFilters returns a stable JSON string so the edit-mode dirty
 // check can compare the current filters against the snapshot taken on open
@@ -131,9 +125,7 @@ function serializeEventFilters(filters: WebhookEventFilter[]): string {
   );
 }
 
-// ---------------------------------------------------------------------------
 // AutopilotDialog
-// ---------------------------------------------------------------------------
 
 export function AutopilotDialog(props: AutopilotDialogProps) {
   const { t } = useT("autopilots");
@@ -227,14 +219,22 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   // above. Null means there is none to patch, so the write creates one.
   const scheduleTriggerIdRef = useRef(existingSchedule?.id ?? null);
 
-  const triggerCount = isCreate ? 0 : props.triggers.length;
-  const schedulePillDisabled = !isCreate && triggerCount >= 2;
+  // Only SCHEDULE rows can make this panel ambiguous, so only they are counted.
+  // Counting every kind locked a 1 schedule + 1 webhook autopilot (MUL-7478),
+  // where `existingSchedule` above names exactly one row and the write below
+  // has nowhere else to land. Two schedules is the real ambiguity: this editor
+  // holds one `ScheduleConfig`, so it would show the first row as if it were
+  // the whole story and save would silently rewrite that one alone.
+  const scheduleTriggerCount = isCreate
+    ? 0
+    : props.triggers.filter((trig) => trig.kind === "schedule").length;
+  const schedulePillDisabled = !isCreate && scheduleTriggerCount >= 2;
 
   // The manual-autopilot empty state, and the only path to a first schedule
-  // from this dialog. Skipped when the panel is locked (2+ triggers), which
-  // keeps that case rendering exactly the disabled editor it always has.
+  // from this dialog. A locked panel never reaches it: locking means two
+  // schedules exist, so `existingSchedule` is non-null whenever it is true.
   const showScheduleEmptyState =
-    !isCreate && existingSchedule === null && !scheduleAdded && !schedulePillDisabled;
+    !isCreate && existingSchedule === null && !scheduleAdded;
 
   const selectedAssignee = useMemo(() => {
     if (!assigneeId) return null;
@@ -315,7 +315,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
         const autopilot = await createAutopilot.mutateAsync({
           title: title.trim(),
           description: description.trim() || undefined,
-          project_id: executionMode === "create_issue" ? projectId : null,
+          project_id: projectId,
           assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
@@ -368,7 +368,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
           id: props.autopilotId,
           title: title.trim(),
           description: description.trim() || null,
-          project_id: executionMode === "create_issue" ? projectId : null,
+          project_id: projectId,
           assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
@@ -621,13 +621,19 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
 
             <OutputModeSection mode={executionMode} onChange={setExecutionMode} />
 
-            {executionMode === "create_issue" && (
-              <ProjectSection
-                projectId={projectId}
-                selectedProject={selectedProject}
-                onChange={setProjectId}
-              />
-            )}
+            {/* Shown for BOTH output modes (MUL-6681). The project is not only
+                issue routing: for a run_only autopilot it is the ONLY source of
+                project context the daemon has (there is no issue to inherit it
+                from), so it decides whether the run gets the project's
+                repository / local_directory — and with it worktree isolation —
+                or a bare workdir. Hiding it here left run_only autopilots with
+                no way to bind one, and the save below used to send null for
+                run_only, silently clearing a binding made via the CLI. */}
+            <ProjectSection
+              projectId={projectId}
+              selectedProject={selectedProject}
+              onChange={setProjectId}
+            />
 
             {executionMode === "create_issue" && (
               <SubscribersSection
@@ -643,7 +649,9 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
             {triggerKind === "schedule" ? (
               <div>
                 <SectionLabel>{t(($) => $.dialog.section_schedule)}</SectionLabel>
-                {showScheduleEmptyState ? (
+                {schedulePillDisabled ? (
+                  <ScheduleMultipleNotice count={scheduleTriggerCount} />
+                ) : showScheduleEmptyState ? (
                   <ScheduleEmptyState onAdd={() => setScheduleAdded(true)} />
                 ) : (
                   /* No `onValidityChange` / `clearRejection` here, unlike the
@@ -660,12 +668,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                     // over the network and then writes the schedule it read before
                     // that round trip, so an edit made in between would be dropped
                     // on the floor with a success toast over it.
-                    disabled={schedulePillDisabled || submitting}
-                    disabledReason={
-                      schedulePillDisabled
-                        ? t(($) => $.dialog.schedule_disabled_reason)
-                        : undefined
-                    }
+                    disabled={submitting}
                   />
                 )}
               </div>
@@ -726,9 +729,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Right column sections
-// ---------------------------------------------------------------------------
 
 function SectionLabel({
   children,
@@ -902,6 +903,9 @@ function ProjectSection({
   return (
     <div>
       <SectionLabel>{t(($) => $.dialog.section_project)}</SectionLabel>
+      <p className="mb-2 text-micro text-muted-foreground">
+        {t(($) => $.dialog.project_hint)}
+      </p>
       <ProjectPicker
         projectId={projectId}
         onUpdate={(updates) => onChange(updates.project_id ?? null)}
@@ -955,6 +959,22 @@ function SubscribersSection({
 }
 
 
+// The panel cannot speak for two schedules, and a disabled editor showing the
+// first of them is still half a truth — the one the reader would set their
+// clock by. It says what it cannot do and where the reader can: this dialog
+// only ever opens from the detail page, so the Triggers list is already on
+// screen behind it.
+function ScheduleMultipleNotice({ count }: { count: number }) {
+  const { t } = useT("autopilots");
+  return (
+    <div className="rounded-md border border-dashed p-3">
+      <p className="text-caption text-muted-foreground">
+        {t(($) => $.dialog.schedule_multiple_notice, { count })}
+      </p>
+    </div>
+  );
+}
+
 // The schedule section of an autopilot that has none. Mirrors the detail
 // page's trigger empty state — a dashed card that states the autopilot is
 // manual — so the two surfaces agree on what "no schedule" looks like instead
@@ -975,9 +995,7 @@ function ScheduleEmptyState({ onAdd }: { onAdd: () => void }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Trigger kind segmented control + webhook help section
-// ---------------------------------------------------------------------------
 
 function TriggerKindSection({
   kind,
@@ -1043,10 +1061,8 @@ function WebhookSection({
   );
 }
 
-// ---------------------------------------------------------------------------
 // Post-create state for webhook autopilots: shows the freshly minted URL
 // inline so the user can copy it without leaving the dialog.
-// ---------------------------------------------------------------------------
 
 function WebhookCreatedPanel({
   trigger,

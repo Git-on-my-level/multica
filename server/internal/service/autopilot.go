@@ -18,6 +18,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/dispatch"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/inbox"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issueposition"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -124,20 +125,33 @@ func (s *AutopilotService) DispatchAutopilot(
 	payload []byte,
 ) (*db.AutopilotRun, error) {
 	// No member actor on this entry point (schedule / webhook / api, or a manual
-	// trigger without a resolved member): attribution resolves rule_owner. These
-	// callers don't surface a per-run reason code to a human, so it is dropped.
+	// trigger without a resolved member): the run acts as the trigger's persisted
+	// created_by principal (trigger_owner; legacy semantics in
+	// ResolveAutopilotTriggerPrincipal), degrading to the audit-only rule_owner when
+	// the trigger has none — in which case it carries no authorization at all
+	// (MUL-6951).
+	// These callers don't surface a per-run reason code to a human, so it is
+	// dropped.
 	// webhookDeliveryID is invalid here — durable webhook deliveries admit through
 	// AdmitAutopilotWebhookDelivery instead of this entry point.
 	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, pgtype.Timestamptz{}, pgtype.UUID{}, pgtype.UUID{}, source+":"+newAutopilotIdempotencyKey())
 	return run, err
 }
 
-// DispatchAutopilotManual is the "run now" entry point for a member manually
-// triggering an autopilot. Unlike scheduled / webhook / api dispatch (no human in
-// the loop → rule_owner), a manual trigger is a direct human action: the run is
-// attributed direct_human to actorUserID, which becomes BOTH its originator
-// (authorization) and accountable human (MUL-4302 §4), across both execution modes.
-// An invalid actorUserID behaves exactly like DispatchAutopilot(source="manual").
+// DispatchAutopilotManual is the "run now" entry point for a manual trigger.
+// Scheduled / webhook / api dispatch acts as the firing trigger's created_by
+// principal (MUL-6951); a manual trigger is a direct human action by the human who ORDERED
+// it instead, so it need not consult the trigger at all: the run is attributed
+// direct_human to actorUserID, which becomes BOTH its originator (authorization)
+// and accountable human (MUL-4302 §4), across both execution modes.
+//
+// actorUserID is that ordering human — the clicking member, or, when an agent
+// triggers on someone's behalf, the originator it acts for. The HTTP entry point
+// resolves and authorizes it (handler.requireAutopilotTriggerInvoker) and refuses
+// the request outright when no human resolves, so a manual dispatch reaching here
+// with an invalid actorUserID has no principal at all. It then behaves exactly
+// like DispatchAutopilot(source="manual") and, having no trigger to fall back to,
+// is refused by the admission gate (#8078).
 func (s *AutopilotService) DispatchAutopilotManual(
 	ctx context.Context,
 	autopilot db.Autopilot,
@@ -189,9 +203,10 @@ func (s *AutopilotService) AdmitAutopilotWebhookDelivery(
 		return nil, fmt.Errorf("admit webhook delivery: lookup existing run: %w", err)
 	}
 
-	// Webhook admission has no member actor → automation principal (rule_owner);
-	// the per-run reason code is not surfaced to a human here, so it is dropped.
-	if reason, _, skip := s.shouldSkipDispatch(ctx, autopilot, pgtype.UUID{}); skip {
+	// Webhook admission has no member actor → the automation principal is this
+	// trigger's created_by (MUL-6951; see ResolveAutopilotTriggerPrincipal); the
+	// per-run reason code is not surfaced to a human here, so it is dropped.
+	if reason, _, skip := s.shouldSkipDispatch(ctx, autopilot, pgtype.UUID{}, triggerID); skip {
 		run, err := s.recordSkippedRun(
 			ctx,
 			autopilot,
@@ -307,18 +322,44 @@ func (s *AutopilotService) DispatchAutopilotForWebhookDelivery(
 // moved downstream; otherwise enqueue exactly the same assignee path used by
 // the original dispatch.
 func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, autopilot db.Autopilot, run db.AutopilotRun) error {
-	tasks, err := s.Queries.ListTasksByIssue(ctx, run.IssueID)
+	hasTasks, err := s.Queries.HasTaskForIssue(ctx, run.IssueID)
 	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: inspect issue tasks: %w", err)
 	}
-	if len(tasks) > 0 {
+	if hasTasks {
 		return nil
 	}
 	issue, err := s.Queries.GetIssue(ctx, run.IssueID)
 	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: load linked issue: %w", err)
 	}
-	if effective := issuestatus.Effective(ctx, s.Queries, issue.WorkspaceID, issue.Status); effective != "todo" && effective != "in_progress" {
+	// Repair only work that is still waiting to be picked up. Decided on
+	// lifecycle plus the two exact keys whose behavior does not generalize,
+	// the split MUL-7364 established (MUL-7379):
+	//
+	//   - the fixed in_progress key means an agent is already working, so the
+	//     lost task is still the right thing to create;
+	//   - an unstarted status other than the fixed backlog key is queued work.
+	//     Backlog is parked, and only the literal key parks — a custom
+	//     unstarted status does not inherit parking, exactly as WillEnqueueRun
+	//     treats it;
+	//   - anything else — in_review, blocked, a CUSTOM started status, or a
+	//     terminal one — means a human took the issue over during the crash
+	//     window. Starting an agent on it then is the surprise this guard
+	//     exists to prevent.
+	//
+	// Before MUL-7240 this read Effective() and compared against todo /
+	// in_progress, which also matched custom statuses because every one of them
+	// projected onto a built-in key. Collapsing to four categories left those
+	// custom keys raw, so the guard silently stopped repairing any workspace
+	// with a custom status and the run sat in issue_created with no task.
+	category, err := issuestatus.CategoryWithError(ctx, s.Queries, issue.WorkspaceID, issue.Status)
+	if err != nil {
+		return fmt.Errorf("dispatch for webhook delivery: resolve issue lifecycle: %w", err)
+	}
+	runnable := issue.Status == issuestatus.InProgress ||
+		(category == issuestatus.CategoryUnstarted && issue.Status != issuestatus.Backlog)
+	if !runnable {
 		return nil
 	}
 	if autopilot.AssigneeType == "squad" {
@@ -326,14 +367,18 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 		if err != nil {
 			return fmt.Errorf("dispatch for webhook delivery: resolve squad leader: %w", err)
 		}
-		if _, err := s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, autopilot.AssigneeID, pgtype.UUID{}); err != nil {
+		task, err := s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, autopilot.AssigneeID, pgtype.UUID{}, OriginDerived)
+		if err != nil {
 			return fmt.Errorf("dispatch for webhook delivery: repair squad task: %w", err)
 		}
+		s.linkDispatchTask(ctx, &run, task)
 		return nil
 	}
-	if _, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
+	task, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue)
+	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: repair issue task: %w", err)
 	}
+	s.linkDispatchTask(ctx, &run, task)
 	return nil
 }
 
@@ -463,9 +508,9 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 		return nil, fmt.Errorf("dispatch for plan: lookup existing run: %w", err)
 	}
 
-	// Scheduled dispatch has no member actor → rule_owner attribution, and no
-	// human surface for a per-run reason code, so it is dropped. No webhook
-	// delivery on the scheduled-plan path.
+	// Scheduled dispatch has no member actor → it acts as the trigger's created_by
+	// principal (trigger_owner, MUL-6951), and has no human surface for a per-run reason
+	// code, so it is dropped. No webhook delivery on the scheduled-plan path.
 	key := "schedule:" + util.UUIDToString(triggerID) + ":" + plannedAt.UTC().Format(time.RFC3339Nano)
 	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, plannedTS, pgtype.UUID{}, pgtype.UUID{}, key)
 	return run, err
@@ -522,7 +567,7 @@ func (s *AutopilotService) dispatchAutopilot(
 	actorUserID pgtype.UUID,
 	idempotencyKey string,
 ) (*db.AutopilotRun, dispatch.ReasonCode, error) {
-	if reason, code, skip := s.shouldSkipDispatch(ctx, autopilot, actorUserID); skip {
+	if reason, code, skip := s.shouldSkipDispatch(ctx, autopilot, actorUserID, triggerID); skip {
 		run, err := s.recordSkippedRun(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, reason)
 		return run, code, err
 	}
@@ -643,6 +688,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	if err != nil {
 		return fmt.Errorf("resolve leader: %w", err)
 	}
+	issueCountPolicy := ResolveIssueCountPolicy(ctx, s.Entitlements, ap.WorkspaceID)
 
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
@@ -674,9 +720,16 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
 	}
 
-	issueNumber, err := qtx.IncrementIssueCounter(ctx, ap.WorkspaceID)
+	issueNumber, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, issueCountPolicy)
 	if err != nil {
-		return fmt.Errorf("increment issue counter: %w", err)
+		var limitErr *IssueLimitReachedError
+		if errors.As(err, &limitErr) {
+			return &errDispatchSkipped{
+				reason: "workspace has reached its issue limit",
+				code:   dispatch.ReasonIssueLimitReached,
+			}
+		}
+		return fmt.Errorf("allocate issue number: %w", err)
 	}
 
 	newPosition, err := issueposition.NextTopPosition(ctx, tx, ap.WorkspaceID, "todo")
@@ -763,7 +816,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		ActorType:   "agent",
 		ActorID:     util.UUIDToString(leader.ID),
 		Payload: map[string]any{
-			"issue": IssueToMapWithCategory(ctx, s.Queries, issue, prefix),
+			"issue": IssueToMapResolved(ctx, s.Queries, issue, prefix),
 		},
 	})
 	s.captureIssueCreatedFromAutopilot(ap, run, issue, leader.ID)
@@ -787,30 +840,32 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	// actor-carrying entry points so attribution resolves direct_human to the
 	// triggering member (originator == accountable == actor, MUL-4302 §4). Schedule /
 	// webhook dispatch has no actor and takes the plain entry points, where the
-	// autopilot-origin issue resolves to rule_owner. The *WithHandoff variants are
-	// the existing actor-carrying enqueue methods; the handoff note is empty here.
+	// autopilot-origin issue resolves to the trigger's created_by principal
+	// (MUL-6951). The *ByActor variants are the actor-carrying enqueue methods.
+	var dispatchTask db.AgentTaskQueue
 	if ap.AssigneeType == "squad" {
 		// Fail-closed invocation gate: verify the admission principal (manual
-		// clicker, else creator — see autopilotAdmitInvoke) may still invoke the
-		// leader. Catches configs that predate the save-time gate, and configs
-		// that no longer pass (MUL-3963 / MUL-4525).
-		if !s.autopilotAdmitInvoke(ctx, ap, leader, actorUserID) {
+		// clicker, else the trigger's created_by — see autopilotAdmitInvoke) may
+		// still invoke the leader. Catches configs that predate the save-time
+		// gate, and configs that no longer pass (MUL-3963 / MUL-4525).
+		if !s.autopilotAdmitInvoke(ctx, ap, leader, actorUserID, run.TriggerID) {
 			return fmt.Errorf("not allowed to invoke private squad leader")
 		}
 		if actorUserID.Valid {
-			if _, err := s.TaskSvc.EnqueueTaskForSquadLeaderWithHandoff(ctx, issue, leader.ID, ap.AssigneeID, "", actorUserID); err != nil {
+			if dispatchTask, err = s.TaskSvc.EnqueueTaskForSquadLeaderByActor(ctx, issue, leader.ID, ap.AssigneeID, actorUserID); err != nil {
 				return fmt.Errorf("enqueue squad leader task: %w", err)
 			}
-		} else if _, err := s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, ap.AssigneeID, pgtype.UUID{}); err != nil {
+		} else if dispatchTask, err = s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, ap.AssigneeID, pgtype.UUID{}, OriginDerived); err != nil {
 			return fmt.Errorf("enqueue squad leader task: %w", err)
 		}
 	} else if actorUserID.Valid {
-		if _, err := s.TaskSvc.EnqueueTaskForIssueWithHandoff(ctx, issue, "", actorUserID); err != nil {
+		if dispatchTask, err = s.TaskSvc.EnqueueTaskForIssueByActor(ctx, issue, actorUserID); err != nil {
 			return fmt.Errorf("enqueue task for issue: %w", err)
 		}
-	} else if _, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
+	} else if dispatchTask, err = s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
 		return fmt.Errorf("enqueue task for issue: %w", err)
 	}
+	s.linkDispatchTask(ctx, run, dispatchTask)
 
 	slog.Info("autopilot dispatched (create_issue)",
 		"autopilot_id", util.UUIDToString(ap.ID),
@@ -850,7 +905,7 @@ func (s *AutopilotService) notifyAutopilotSubscribersOnCreate(
 		if sub.UserType != "member" {
 			continue
 		}
-		item, err := s.Queries.CreateInboxItem(ctx, db.CreateInboxItemParams{
+		item, inserted, err := inbox.CreateIfEligible(ctx, s.Queries, db.CreateInboxItemParams{
 			ID:            dbid.NewV7(),
 			WorkspaceID:   ap.WorkspaceID,
 			RecipientType: "member",
@@ -871,6 +926,9 @@ func (s *AutopilotService) notifyAutopilotSubscribersOnCreate(
 				"recipient_id", util.UUIDToString(sub.UserID),
 				"error", err,
 			)
+			continue
+		}
+		if !inserted {
 			continue
 		}
 		s.Bus.Publish(events.Event{
@@ -941,7 +999,7 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		}
 		return fmt.Errorf("resolve leader: %w", err)
 	}
-	verdict, err := AgentReadiness(ctx, s.Queries, agent)
+	verdict, err := AgentReadiness(ctx, s.runtimeLookup(), agent)
 	if err != nil {
 		return fmt.Errorf("check agent readiness: %w", err)
 	}
@@ -950,21 +1008,25 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 	}
 
 	// Fail-closed invocation gate for squad autopilots (admission principal =
-	// manual clicker, else creator — see autopilotAdmitInvoke).
-	if ap.AssigneeType == "squad" && !s.autopilotAdmitInvoke(ctx, ap, agent, actorUserID) {
+	// manual clicker, else the trigger's created_by — see autopilotAdmitInvoke).
+	if ap.AssigneeType == "squad" && !s.autopilotAdmitInvoke(ctx, ap, agent, actorUserID, run.TriggerID) {
 		return &errDispatchSkipped{reason: formatAdmissionReason(ap, "not allowed to invoke private squad leader"), code: dispatch.ReasonInvocationNotAllowed}
 	}
 
-	// Attribution splits on the trigger. A MANUAL trigger is a direct human action:
-	// the triggering member is direct_human and becomes BOTH originator (so the run
-	// carries their authorization context) and accountable (MUL-4302 §4). A
-	// schedule / webhook trigger has no human — originator_user_id stays NULL and
-	// the audit-accountable human is the member currently RESPONSIBLE for the firing
-	// trigger's effective config (its creator, then whoever last substantively edited
-	// it) — trigger_owner, resolved from run.TriggerID (MUL-4302; Elon must-fix) —
-	// degrading to the rule version publisher (rule_owner) when no such member is
-	// recoverable, then to unattributed. Either way evidence points at the autopilot
-	// run and the row is never a NULL-source bypass.
+	// Attribution splits on the trigger only to pick WHICH human and which source
+	// label; both branches now produce a real originator. A MANUAL trigger is a
+	// direct human action: the triggering member is direct_human (MUL-4302 §4). A
+	// schedule / webhook trigger resolves the firing trigger's created_by principal —
+	// trigger_owner, from run.TriggerID (MUL-4302; MUL-6951; for a legacy trigger a
+	// backfilled inference, see ResolveAutopilotTriggerPrincipal) — degrading to the
+	// rule version publisher (rule_owner, audit-only) when it has none, then to
+	// unattributed. An edit of the trigger does NOT move this: published_by
+	// transfers, created_by does not. Since MUL-6951 that human is the originator
+	// too, so an armed autopilot runs with its created_by principal's authorization
+	// instead of borrowing narrowly-scoped capabilities per surface; the source
+	// label is what keeps "fired on a schedule" distinguishable from "a human
+	// clicked run". Either way evidence points at the autopilot run and the row is
+	// never a NULL-source bypass.
 	var autopilotAttr attribution.Result
 	if actorUserID.Valid {
 		autopilotAttr = attribution.DirectHumanRun(actorUserID, attribution.EvidenceAutopilotRun, run.ID)
@@ -1002,6 +1064,8 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 	if err != nil {
 		return fmt.Errorf("create autopilot task: %w", err)
 	}
+	// Only a manual "run now" carries HumanAction; schedule/webhook fires do not.
+	s.TaskSvc.RecordHumanDelegation(ctx, autopilotAttr)
 
 	// Update run with task reference.
 	updatedRun, err := s.Queries.UpdateAutopilotRunRunning(ctx, db.UpdateAutopilotRunRunningParams{
@@ -1029,7 +1093,26 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 	return nil
 }
 
-// SyncRunFromIssue updates the autopilot run when its linked issue reaches a terminal status.
+// SyncRunFromIssue updates the autopilot run when its linked issue reaches a
+// status that settles the run without a task outcome.
+//
+// For create_issue runs, the run tracks the autopilot's own execution, not the
+// business outcome of the issue: the first agent task finishing cleanly
+// completes the run (SyncRunFromLinkedIssueTask). `blocked` is therefore no
+// longer a run failure — a review that blocks the issue is a normal result,
+// not an autopilot fault, and counting it as one also skewed the failure-rate
+// auto-pause. Only two issue transitions still settle an active run here:
+//   - done / in_review: the work was delivered. While the run's dispatch
+//     task is in flight (or not yet enqueued) this waits; once it is terminal
+//     its completed/failed outcome decides. Only an issue no agent will be
+//     dispatched to (reassigned to a member / unassigned) or a cancelled
+//     dispatch completes from the issue status.
+//   - cancelled: someone cancelled the issue before any task finished, so the
+//     run fails with "issue cancelled" instead of hanging forever.
+//
+// Both only apply while the run is still active (GetAutopilotRunByIssue
+// filters on issue_created/running), so a run already completed by its task
+// is never reopened or flipped by later issue status changes. (MUL-8200)
 func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue) {
 	if !issue.OriginType.Valid || issue.OriginType.String != "autopilot" {
 		return
@@ -1046,9 +1129,8 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 
 	wsID := util.UUIDToString(issue.WorkspaceID)
 
-	// A custom status finalizes the run exactly like the canonical status it
-	// inherits. Built-in keys resolve to themselves without a query, so this
-	// is a no-op for every workspace that has not defined a custom status.
+	// Custom statuses only finalize terminal lifecycle (done/closed). Review
+	// completion remains exclusive to the fixed built-in key.
 	// The failure reason below deliberately keeps issue.Status, not the
 	// normalized key, so the audit trail names the status a human actually
 	// chose. (MUL-6243)
@@ -1056,6 +1138,34 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 
 	switch effectiveStatus {
 	case "done", "in_review":
+		// The run's own dispatch decides the run. While it (or its
+		// auto-retry) is still in flight, an early delivery status — often
+		// set by the agent itself mid-run — must not complete the run. Once
+		// it is terminal, its outcome wins over the issue status: a failure
+		// committed before its task:failed event is processed must not be
+		// masked as success. The delivery status only completes runs with no
+		// dispatch task (e.g. a member assignee) or a dispatch that ended
+		// cancelled.
+		chain, err := s.loadDispatchChain(ctx, run)
+		if err != nil {
+			slog.Warn("failed to load autopilot dispatch chain", "run_id", util.UUIDToString(run.ID), "error", err)
+			return
+		}
+		if chain.active() {
+			return
+		}
+		last, ok := chain.last()
+		if ok && (last.Status == "completed" || last.Status == "failed") {
+			s.settleRunFromDispatchTask(ctx, run, last)
+			return
+		}
+		if !ok && issueAwaitsAgentDispatch(issue) {
+			// No dispatch task exists yet but the issue is still assigned to
+			// an agent/squad: the dispatch enqueue is pending (issue:created
+			// fires before the enqueue) or being repaired. Its task outcome
+			// settles the run; do not treat "not yet dispatched" as success.
+			return
+		}
 		updatedRun, err := s.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID: run.ID,
 		})
@@ -1065,7 +1175,7 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 		}
 		s.captureAutopilotRunCompleted(autopilot, updatedRun)
 		s.publishRunDone(wsID, updatedRun, "completed")
-	case "cancelled", "blocked":
+	case "cancelled":
 		reason := "issue " + issue.Status
 		updatedRun, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
@@ -1110,13 +1220,10 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 		s.captureAutopilotRunCompleted(autopilot, updatedRun)
 		s.publishRunDone(wsID, updatedRun, "completed")
 	case "failed", "cancelled":
-		reason := "task " + task.Status
-		if task.Error.Valid {
-			reason = task.Error.String
-		}
+		reason := taskFailureReasonForAutopilotRun(task)
 		updatedRun, err := s.failAutopilotRun(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
-			FailureReason: pgtype.Text{String: reason, Valid: true},
+			FailureReason: pgtype.Text{String: reason, Valid: reason != ""},
 		})
 		if err != nil {
 			slog.Warn("failed to fail autopilot run from task", "run_id", util.UUIDToString(run.ID), "error", err)
@@ -1127,9 +1234,18 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 	}
 }
 
-// SyncRunFromLinkedIssueTask fails a create_issue autopilot run when its
-// linked issue task fails terminally before the issue itself reaches a
-// terminal status. create_issue tasks are linked through issue_id rather than
+// SyncRunFromLinkedIssueTask settles a create_issue autopilot run from the
+// outcome of its linked issue's agent task.
+//
+// A completed task completes the run: the autopilot created the issue and the
+// agent ran to the end without error, which is what run success means. Any
+// later issue status change (blocked, cancelled, ...) no longer touches the
+// run. (MUL-8200)
+//
+// Only the run's dispatch chain counts (see loadDispatchChain): tasks
+// started by @mentions or comments on the same issue are ignored.
+//
+// A task that fails terminally before the run is settled fails the run. create_issue tasks are linked through issue_id rather than
 // autopilot_run_id, so SyncRunFromTask cannot see them directly. Without this
 // the run would hang in `issue_created` forever — and because the failure-rate
 // auto-pause monitor excludes issue_created/running runs, a consistently
@@ -1142,7 +1258,10 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 // failing the run prematurely. Once retries are exhausted (or the failure was
 // never retryable in the first place), the run fails carrying the task's reason.
 func (s *AutopilotService) SyncRunFromLinkedIssueTask(ctx context.Context, task db.AgentTaskQueue) {
-	if task.AutopilotRunID.Valid || !task.IssueID.Valid || task.Status != "failed" {
+	if task.AutopilotRunID.Valid || !task.IssueID.Valid {
+		return
+	}
+	if task.Status != "completed" && task.Status != "failed" {
 		return
 	}
 	// Only create_issue runs link through issue_id (and their linked issue is
@@ -1153,18 +1272,37 @@ func (s *AutopilotService) SyncRunFromLinkedIssueTask(ctx context.Context, task 
 	if err != nil {
 		return // no active run linked to this issue
 	}
-	// A still-active task — typically the auto-retry FailTask just enqueued —
-	// means the dispatch isn't terminal yet; wait for the final attempt.
-	hasActive, err := s.Queries.HasActiveTaskForIssue(ctx, task.IssueID)
+	// Only the autopilot's own dispatch (and its auto-retries) settles the
+	// run. Other tasks on the issue — an @mention, a comment reply — say
+	// nothing about whether the autopilot's execution succeeded.
+	chain, err := s.loadDispatchChain(ctx, run)
 	if err != nil {
-		slog.Warn("failed to check active tasks for autopilot issue failure",
+		slog.Warn("failed to load autopilot dispatch chain",
 			"issue_id", util.UUIDToString(task.IssueID),
 			"task_id", util.UUIDToString(task.ID),
 			"error", err,
 		)
 		return
 	}
-	if hasActive {
+	if !chain.contains(task.ID) {
+		return
+	}
+	if task.Status == "failed" && chain.active() {
+		// A still-active attempt — typically the auto-retry FailTask just
+		// enqueued — means the dispatch isn't terminal yet; wait for it.
+		return
+	}
+	s.settleRunFromDispatchTask(ctx, run, task)
+}
+
+// settleRunFromDispatchTask completes or fails an active create_issue run from
+// a terminal attempt of its dispatch chain.
+func (s *AutopilotService) settleRunFromDispatchTask(ctx context.Context, run db.AutopilotRun, task db.AgentTaskQueue) {
+	if task.Status == "completed" {
+		s.completeRunFromLinkedIssueTask(ctx, run, task)
+		return
+	}
+	if task.Status != "failed" {
 		return
 	}
 	autopilot, err := s.Queries.GetAutopilot(ctx, run.AutopilotID)
@@ -1188,6 +1326,150 @@ func (s *AutopilotService) SyncRunFromLinkedIssueTask(ctx context.Context, task 
 	}
 	s.captureAutopilotRunFailed(autopilot, updatedRun, updatedRun.Source, reason)
 	s.publishRunDone(util.UUIDToString(autopilot.WorkspaceID), updatedRun, "failed")
+}
+
+// completeRunFromLinkedIssueTask marks a create_issue run completed once its
+// linked issue's agent task finishes successfully. The run keeps no result
+// payload: create_issue runs surface the linked issue, not task output.
+func (s *AutopilotService) completeRunFromLinkedIssueTask(ctx context.Context, run db.AutopilotRun, task db.AgentTaskQueue) {
+	autopilot, err := s.Queries.GetAutopilot(ctx, run.AutopilotID)
+	if err != nil {
+		return
+	}
+	updatedRun, err := s.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{
+		ID: run.ID,
+	})
+	if err != nil {
+		slog.Warn("failed to complete autopilot run from linked issue task",
+			"run_id", util.UUIDToString(run.ID),
+			"issue_id", util.UUIDToString(task.IssueID),
+			"task_id", util.UUIDToString(task.ID),
+			"error", err,
+		)
+		return
+	}
+	s.captureAutopilotRunCompleted(autopilot, updatedRun)
+	s.publishRunDone(util.UUIDToString(autopilot.WorkspaceID), updatedRun, "completed")
+}
+
+// autopilotDispatchChain is the create_issue run's own dispatch: the task
+// recorded in autopilot_run.task_id at dispatch time plus its auto-retry
+// descendants (retry_of_task_id lineage), oldest first.
+type autopilotDispatchChain struct {
+	tasks []db.AgentTaskQueue
+}
+
+func (c autopilotDispatchChain) contains(id pgtype.UUID) bool {
+	for _, t := range c.tasks {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// active reports whether any attempt in the chain is not yet terminal.
+func (c autopilotDispatchChain) active() bool {
+	for _, t := range c.tasks {
+		switch t.Status {
+		case "completed", "failed", "cancelled":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// last returns the newest attempt in the chain.
+func (c autopilotDispatchChain) last() (db.AgentTaskQueue, bool) {
+	if len(c.tasks) == 0 {
+		return db.AgentTaskQueue{}, false
+	}
+	return c.tasks[len(c.tasks)-1], true
+}
+
+// loadDispatchChain returns the dispatch chain of a create_issue run.
+//
+// The root is the task dispatchCreateIssue recorded on the run. The link is
+// written after the enqueue (the task is already visible and announced by
+// then), and runs dispatched before the link existed or repaired after a
+// webhook-worker crash may have none. In that case the root falls back to the
+// oldest non-retry task owned by the dispatch agent — the issue's creator,
+// which dispatchCreateIssue sets to the executing agent/squad leader — and is
+// persisted on the run so later lookups are stable. Tasks of other agents
+// (e.g. a mention enqueued between issue:created and the dispatch enqueue)
+// are never the root. An empty chain means no dispatch task exists yet.
+func (s *AutopilotService) loadDispatchChain(ctx context.Context, run db.AutopilotRun) (autopilotDispatchChain, error) {
+	if !run.IssueID.Valid {
+		return autopilotDispatchChain{}, nil
+	}
+	tasks, err := s.Queries.ListTasksByIssue(ctx, run.IssueID)
+	if err != nil {
+		return autopilotDispatchChain{}, err
+	}
+	rootID := run.TaskID
+	if !rootID.Valid {
+		issue, err := s.Queries.GetIssue(ctx, run.IssueID)
+		if err != nil {
+			return autopilotDispatchChain{}, err
+		}
+		// ListTasksByIssue is newest first; the last match is the oldest.
+		for _, t := range tasks {
+			if !t.RetryOfTaskID.Valid && issue.CreatorType == "agent" && t.AgentID == issue.CreatorID {
+				rootID = t.ID
+			}
+		}
+		if !rootID.Valid {
+			return autopilotDispatchChain{}, nil
+		}
+		if _, err := s.Queries.SetAutopilotRunDispatchTask(ctx, db.SetAutopilotRunDispatchTaskParams{ID: run.ID, TaskID: rootID}); err != nil {
+			slog.Warn("failed to backfill autopilot dispatch task",
+				"run_id", util.UUIDToString(run.ID),
+				"task_id", util.UUIDToString(rootID),
+				"error", err,
+			)
+		}
+	}
+	// Walk oldest first so each retry's parent is seen before the retry.
+	inChain := map[pgtype.UUID]bool{}
+	var chain autopilotDispatchChain
+	for i := len(tasks) - 1; i >= 0; i-- {
+		t := tasks[i]
+		if t.ID != rootID && !(t.RetryOfTaskID.Valid && inChain[t.RetryOfTaskID]) {
+			continue
+		}
+		inChain[t.ID] = true
+		chain.tasks = append(chain.tasks, t)
+	}
+	return chain, nil
+}
+
+// issueAwaitsAgentDispatch reports whether the linked issue is still assigned
+// to an agent or squad, i.e. an autopilot dispatch task is expected for it.
+func issueAwaitsAgentDispatch(issue db.Issue) bool {
+	return issue.AssigneeType.Valid && (issue.AssigneeType.String == "agent" || issue.AssigneeType.String == "squad")
+}
+
+// linkDispatchTask records the task a create_issue dispatch enqueued on its
+// run. It is best effort: until it lands, loadDispatchChain resolves the same
+// task through its dispatch-agent fallback, so task events that arrive before
+// the link still settle the run.
+func (s *AutopilotService) linkDispatchTask(ctx context.Context, run *db.AutopilotRun, task db.AgentTaskQueue) {
+	if !task.ID.Valid {
+		return
+	}
+	n, err := s.Queries.SetAutopilotRunDispatchTask(ctx, db.SetAutopilotRunDispatchTaskParams{ID: run.ID, TaskID: task.ID})
+	if err != nil {
+		slog.Warn("failed to link autopilot dispatch task",
+			"run_id", util.UUIDToString(run.ID),
+			"task_id", util.UUIDToString(task.ID),
+			"error", err,
+		)
+		return
+	}
+	if n > 0 {
+		run.TaskID = task.ID
+	}
 }
 
 func taskFailureReasonForAutopilotRun(task db.AgentTaskQueue) string {
@@ -1267,7 +1549,7 @@ func (s *AutopilotService) failRun(ctx context.Context, runID pgtype.UUID, reaso
 //     scheduled run. Migration 096 removed the agent FK on autopilot, so an
 //     agent assignee being missing is now a real condition the gate must
 //     handle (previously cascade-deleted).
-func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopilot, actorUserID pgtype.UUID) (string, dispatch.ReasonCode, bool) {
+func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopilot, actorUserID, triggerID pgtype.UUID) (string, dispatch.ReasonCode, bool) {
 	if !ap.AssigneeID.Valid {
 		return "autopilot has no assignee", dispatch.ReasonTargetUnavailable, true
 	}
@@ -1305,7 +1587,7 @@ func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopil
 		// chance to succeed.
 		return "", "", false
 	}
-	verdict, err := AgentReadiness(ctx, s.Queries, agent)
+	verdict, err := AgentReadiness(ctx, s.runtimeLookup(), agent)
 	if err != nil {
 		slog.Warn("autopilot admission: failed to load runtime",
 			"autopilot_id", util.UUIDToString(ap.ID),
@@ -1331,18 +1613,28 @@ func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopil
 	}
 	// Invocation gate at the autopilot layer (MUL-3963 / MUL-4525). The
 	// admission principal depends on how the dispatch was triggered: a MANUAL
-	// "run now" (actorUserID valid) is a direct human action gated by the
-	// current CLICKER's access — not the autopilot creator's — so admission and
-	// attribution credit the same member and never fork. Automation (schedule /
-	// webhook / api, actorUserID invalid) has no human in the loop and falls
-	// back to the creator. Admins do NOT bypass a private agent they do not own;
-	// agent-created autopilots are judged as workspace principals. For squad
+	// "run now" (actorUserID valid) is a direct human action gated by the human
+	// who ORDERED it — the clicking member, or the originator an agent acts for,
+	// resolved by the handler (requireAutopilotTriggerInvoker) — not the
+	// autopilot creator's, so admission and attribution credit the same human and
+	// never fork. Automation (schedule / webhook, actorUserID invalid) preserves
+	// that same property by resolving the trigger's created_by principal
+	// (ResolveAutopilotTriggerPrincipal), which is also the human the run will act
+	// as (MUL-6951). Admins do NOT bypass a private agent
+	// they do not own, and no branch admits a principal-less dispatch. For squad
 	// autopilots the gate runs against the resolved leader.
-	if !s.autopilotAdmitInvoke(ctx, ap, agent, actorUserID) {
+	if !s.autopilotAdmitInvoke(ctx, ap, agent, actorUserID, triggerID) {
 		if actorUserID.Valid {
 			return "you are not allowed to trigger this autopilot's assignee agent", dispatch.ReasonInvocationNotAllowed, true
 		}
-		return "autopilot creator lacks access to private assignee agent", dispatch.ReasonInvocationNotAllowed, true
+		if !triggerID.Valid {
+			// No actor AND no trigger: there is no trigger row whose owner could be
+			// at fault, so the trigger phrasing below would name a thing that does
+			// not exist. That message on the manual path is what sent #8078 hunting
+			// for a broken trigger owner for a day.
+			return "this dispatch resolved no authorizing human and carries no trigger to resolve one from", dispatch.ReasonInvocationNotAllowed, true
+		}
+		return "this trigger's owner lacks access to the private assignee agent, or the trigger records no owner", dispatch.ReasonInvocationNotAllowed, true
 	}
 	return "", "", false
 }
@@ -1834,27 +2126,29 @@ func (s *AutopilotService) getIssuePrefix(workspaceID pgtype.UUID) string {
 	return ws.IssuePrefix
 }
 
-// canCreatorInvokeAgent checks whether the autopilot's creator may invoke the
-// target agent under the invocation-permission model (MUL-3963). It mirrors
-// handler.canInvokeAgent with the autopilot creator as the effective user:
-//   - member creator who owns the agent -> always
-//   - private agent -> only the owner (NO admin bypass, NO agent-created bypass)
-//   - public_to agent -> workspace target admits any workspace-member creator
-//     (and agent-created autopilots as workspace principals); member target
-//     admits the matching creator; team targets are inert.
-//
-// Fail-closed on any lookup error.
 // autopilotAdmitInvoke decides whether the dispatch's admission principal may
 // invoke the target agent (MUL-4525). A MANUAL "run now" (actorUserID valid) is
 // a direct human action gated by the CURRENT clicker's access, so admission and
 // attribution credit the same member. Automation (schedule / webhook / api,
-// actorUserID invalid) has no human in the loop and falls back to the autopilot
-// creator. Both branches fail closed and never grant an admin bypass.
-func (s *AutopilotService) autopilotAdmitInvoke(ctx context.Context, ap db.Autopilot, agent db.Agent, actorUserID pgtype.UUID) bool {
+// actorUserID invalid) resolves the trigger's created_by principal — the same
+// human the run itself will act as (MUL-6951; legacy semantics in
+// ResolveAutopilotTriggerPrincipal). Both branches fail closed and never grant an
+// admin bypass.
+func (s *AutopilotService) autopilotAdmitInvoke(ctx context.Context, ap db.Autopilot, agent db.Agent, actorUserID, triggerID pgtype.UUID) bool {
 	if actorUserID.Valid {
 		return s.canMemberInvokeAgent(ctx, agent, actorUserID, ap.WorkspaceID)
 	}
-	return s.canCreatorInvokeAgent(ctx, ap, agent)
+	// Automation admits as the SAME human the run will act as (MUL-6951). Before
+	// that, admission used the autopilot CREATOR while the run took its identity
+	// from the trigger, so A creating an autopilot over A's private agent and B
+	// owning the trigger produced a dispatch admitted as A but running as B —
+	// rights neither of them holds alone. Resolving both from
+	// ResolveAutopilotTriggerPrincipal makes that fork unrepresentable.
+	principal := ResolveAutopilotTriggerPrincipal(ctx, s.Queries, triggerID, ap.ID, ap.WorkspaceID)
+	if !principal.Valid {
+		return false
+	}
+	return s.canMemberInvokeAgent(ctx, agent, principal, ap.WorkspaceID)
 }
 
 // canMemberInvokeAgent checks whether a specific member may invoke the agent
@@ -1863,79 +2157,5 @@ func (s *AutopilotService) autopilotAdmitInvoke(ctx context.Context, ap db.Autop
 // autopilot "run now" where the clicker, not the creator, is the admission
 // principal. Fail-closed on any lookup error; no admin bypass.
 func (s *AutopilotService) canMemberInvokeAgent(ctx context.Context, agent db.Agent, memberUserID pgtype.UUID, workspaceID pgtype.UUID) bool {
-	userID := util.UUIDToString(memberUserID)
-	if userID == "" {
-		return false
-	}
-	if util.UUIDToString(agent.OwnerID) == userID {
-		return true
-	}
-	if agent.PermissionMode != "public_to" {
-		return false
-	}
-	targets, err := s.Queries.ListAgentInvocationTargets(ctx, agent.ID)
-	if err != nil {
-		return false
-	}
-	isWorkspaceMember := false
-	if _, err := s.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
-		UserID:      memberUserID,
-		WorkspaceID: workspaceID,
-	}); err == nil {
-		isWorkspaceMember = true
-	}
-	for _, t := range targets {
-		switch t.TargetType {
-		case "workspace":
-			if isWorkspaceMember {
-				return true
-			}
-		case "member":
-			if util.UUIDToString(t.TargetID) == userID {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *AutopilotService) canCreatorInvokeAgent(ctx context.Context, ap db.Autopilot, agent db.Agent) bool {
-	creatorID := util.UUIDToString(ap.CreatedByID)
-	if ap.CreatedByType == "member" && util.UUIDToString(agent.OwnerID) == creatorID {
-		return true
-	}
-	if agent.PermissionMode != "public_to" {
-		// private (or unknown mode): deny-by-default; only the owner branch
-		// above passes. Admins and agent-created autopilots do not bypass.
-		return false
-	}
-	targets, err := s.Queries.ListAgentInvocationTargets(ctx, agent.ID)
-	if err != nil {
-		return false
-	}
-	// Agent-created autopilots are workspace-internal principals: a workspace
-	// target admits them. Member creators must be workspace members.
-	workspaceBroad := ap.CreatedByType == "agent"
-	isWorkspaceMember := false
-	if ap.CreatedByType == "member" {
-		if _, err := s.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
-			UserID:      ap.CreatedByID,
-			WorkspaceID: ap.WorkspaceID,
-		}); err == nil {
-			isWorkspaceMember = true
-		}
-	}
-	for _, t := range targets {
-		switch t.TargetType {
-		case "workspace":
-			if isWorkspaceMember || workspaceBroad {
-				return true
-			}
-		case "member":
-			if ap.CreatedByType == "member" && util.UUIDToString(t.TargetID) == creatorID {
-				return true
-			}
-		}
-	}
-	return false
+	return CanMemberInvokeAgent(ctx, s.Queries, agent, memberUserID, workspaceID)
 }

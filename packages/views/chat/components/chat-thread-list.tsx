@@ -28,6 +28,7 @@ import {
 import { useChatStore } from "@multica/core/chat";
 import type { Agent, ChatSession, PendingChatTasksResponse } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { DeferredTooltip } from "../../common/deferred-tooltip";
 import {
   RowActionsMenu,
   handleRowActivationKey,
@@ -36,21 +37,21 @@ import {
 import { resolveClickIntent, useOptionalNavigation } from "../../navigation";
 import { createLogger } from "@multica/core/logger";
 import { removeChatMessageFromCaches } from "@multica/core/realtime";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 
 const apiLogger = createLogger("chat.api");
 
 // IM-style timestamp: today → clock, this year → M/D, else full date.
-function formatChatTime(dateStr: string): string {
+function formatChatTime(dateStr: string, locale: string): string {
   const d = new Date(dateStr);
   const now = new Date();
   if (d.toDateString() === now.toDateString()) {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
   }
   if (d.getFullYear() === now.getFullYear()) {
-    return d.toLocaleDateString([], { month: "numeric", day: "numeric" });
+    return d.toLocaleDateString(locale, { month: "numeric", day: "numeric" });
   }
-  return d.toLocaleDateString();
+  return d.toLocaleDateString(locale);
 }
 
 // Collapse a (possibly markdown / multi-line) message into a one-line preview.
@@ -95,6 +96,7 @@ export function ChatThreadList({
   onArchive: (session: ChatSession) => void;
 }) {
   const { t } = useT("chat");
+  const locale = useLocale();
   const wsId = useWorkspaceId();
   // Null-safe slug (not useWorkspacePaths, which throws): the list renders in
   // tests outside a workspace route; without a slug the web modifier-click
@@ -220,7 +222,9 @@ export function ChatThreadList({
     const isConfirmingAction = isConfirmingDelete || isConfirmingStop;
     const titleText = session.title?.trim() || t(($) => $.window.untitled);
     const last = session.last_message ?? null;
-    const timeText = last ? formatChatTime(last.created_at) : formatChatTime(session.updated_at);
+    const timeText = last
+      ? formatChatTime(last.created_at, locale)
+      : formatChatTime(session.updated_at, locale);
 
     // The second line: typing/waiting → failed → preview.
     let previewNode: React.ReactNode;
@@ -542,28 +546,32 @@ function RowAction({
   danger?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onPointerDown={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-      }}
-      onClick={(e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        onClick();
-      }}
-      className={cn(
-        "inline-flex size-7 items-center justify-center rounded text-muted-foreground transition-colors focus-visible:outline-none",
-        danger
-          ? "hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
-          : "hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
-      )}
-    >
-      {icon}
-    </button>
+    <DeferredTooltip
+      content={label}
+      trigger={
+        <button
+          type="button"
+          aria-label={label}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            onClick();
+          }}
+          className={cn(
+            "inline-flex size-7 items-center justify-center rounded-xs text-muted-foreground transition-colors focus-visible:outline-none",
+            danger
+              ? "hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
+              : "hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground",
+          )}
+        >
+          {icon}
+        </button>
+      }
+    />
   );
 }
 
@@ -598,7 +606,7 @@ function ConfirmRow({
             onCancel();
           }}
           disabled={pending}
-          className="inline-flex h-6 items-center rounded px-2 text-micro font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+          className="inline-flex h-6 items-center rounded-xs px-2 text-micro font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
         >
           {cancelText}
         </button>
@@ -614,7 +622,7 @@ function ConfirmRow({
             onConfirm();
           }}
           disabled={pending}
-          className="inline-flex h-6 items-center rounded px-2 text-micro font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+          className="inline-flex h-6 items-center rounded-xs px-2 text-micro font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
         >
           {confirmText}
         </button>

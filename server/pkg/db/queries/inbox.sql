@@ -1,6 +1,7 @@
 -- name: ListInboxItems :many
 SELECT i.*,
-       iss.status as issue_status
+       iss.status AS issue_status,
+       iss.priority AS issue_priority
 FROM inbox_item i
 LEFT JOIN issue iss ON iss.id = i.issue_id
 WHERE i.workspace_id = $1 AND i.recipient_type = $2 AND i.recipient_id = $3 AND i.archived = false
@@ -73,7 +74,8 @@ WITH eligible_archived AS MATERIALIZED (
     SELECT id FROM comment_anchors
 )
 SELECT i.*,
-       iss.status as issue_status
+       iss.status AS issue_status,
+       iss.priority AS issue_priority
 FROM inbox_item i
 JOIN selected_ids selected ON selected.id = i.id
 LEFT JOIN issue iss ON iss.id = i.issue_id
@@ -88,11 +90,19 @@ SELECT * FROM inbox_item
 WHERE id = $1 AND workspace_id = $2;
 
 -- name: CreateInboxItem :one
+-- A missing recipient is a quiet skip (pgx.ErrNoRows), not a delivery failure.
+-- Check the insertion snapshot without adding recipient row locks.
 INSERT INTO inbox_item (
     workspace_id, recipient_type, recipient_id,
     type, severity, issue_id, title, body,
     actor_type, actor_id, details, id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE(sqlc.narg('id')::uuid, gen_random_uuid()))
+)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
+WHERE ($2::text = 'member' AND EXISTS (
+    SELECT 1 FROM member WHERE workspace_id = $1 AND user_id = $3
+)) OR ($2::text = 'agent' AND EXISTS (
+    SELECT 1 FROM agent WHERE workspace_id = $1 AND id = $3
+))
 RETURNING *;
 
 -- name: MarkInboxRead :one
@@ -212,5 +222,5 @@ WHERE i.workspace_id = $1 AND i.recipient_type = 'member' AND i.recipient_id = $
   AND i.issue_id IN (
     SELECT id FROM issue
     WHERE workspace_id = $1
-      AND issue_effective_status(workspace_id, status) IN ('done', 'cancelled')
+      AND status = ANY(sqlc.arg('terminal_status_keys')::text[])
   );

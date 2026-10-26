@@ -5,7 +5,6 @@ import {
   Trash2,
   ChevronRight,
   Cpu,
-  Globe,
   Lock,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -19,9 +18,9 @@ import type {
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
-import { useUpdateRuntime } from "@multica/core/runtimes/mutations";
 import {
   deriveRuntimeHealth,
+  isRuntimeUsableForUser,
   runtimeDisplayName,
   runtimeProfileListOptions,
 } from "@multica/core/runtimes";
@@ -44,6 +43,7 @@ import { HealthBadge } from "./shared";
 import { ProviderLogo } from "./provider-logo";
 import { UsageSection } from "./usage-section";
 import { DeleteRuntimeDialog } from "./delete-runtime-dialog";
+import { RuntimeAccessEditor, RuntimeAccessReadout } from "./runtime-access-editor";
 import { DeleteRuntimeProfileDialog } from "./delete-runtime-profile-dialog";
 import { runtimeRowLabel } from "./runtime-machines";
 import { useT, useTimeAgo } from "../../i18n";
@@ -66,7 +66,7 @@ function shortDaemonId(id: string | null): string | null {
 }
 
 // 30s tick keeps derived runtime health honest as time-based windows
-// (recently_lost → offline → about_to_gc) cross thresholds without any new
+// (recently_lost → offline → long_offline) cross thresholds without any new
 // query data arriving. Agent presence has no time windows anymore, so it
 // doesn't need this — but useWorkspacePresenceMap is the dependency we
 // already mounted on this page, and that's wired to query data, not `now`.
@@ -119,6 +119,7 @@ export function RuntimeDetail({
     : false;
   const isRuntimeOwner = user && runtime.owner_id === user.id;
   const canEditRuntime = isAdmin || isRuntimeOwner;
+  const canReadRuntime = isRuntimeUsableForUser(runtime, user?.id ?? null);
   const runtimeProfile: RuntimeProfile | null = runtime.profile_id
     ? profiles.find((p) => p.id === runtime.profile_id) ?? null
     : null;
@@ -193,7 +194,7 @@ export function RuntimeDetail({
               cliVersion={cliVersion}
               daemonShort={daemonShort}
             />
-            <UsageSection runtime={runtime} />
+            {canReadRuntime && <UsageSection runtime={runtime} />}
           </div>
 
           {/* Right rail: serving agents + diagnostics */}
@@ -392,7 +393,7 @@ function Fact({
   );
 }
 
-function ServingAgentsCard({
+export function ServingAgentsCard({
   agents,
   presenceMap,
   agentHref,
@@ -501,9 +502,9 @@ function DiagnosticsCard({
             {t(($) => $.detail.diagnostics_visibility)}
           </div>
           {canEditVisibility ? (
-            <VisibilityEditor runtime={runtime} />
+            <RuntimeAccessEditor runtime={runtime} />
           ) : (
-            <VisibilityReadout runtime={runtime} />
+            <RuntimeAccessReadout runtime={runtime} />
           )}
         </div>
         {canDelete && (
@@ -527,128 +528,5 @@ function DiagnosticsCard({
         )}
       </div>
     </div>
-  );
-}
-
-// VisibilityReadout renders a static "Private" / "Public" pill for everyone
-// who is not the runtime owner — workspace admins included (MUL-6126). Its
-// tooltip is phrased in the third person for that reason; the editor's own
-// hints stay in the second person. The description used to sit under the
-// chip; it now lives in the hover tooltip so the Diagnostics column stays
-// compact and matches the surrounding sections. Older backends that omit the
-// field render as "Private" to match the strict default.
-function VisibilityReadout({ runtime }: { runtime: AgentRuntime }) {
-  const { t } = useT("runtimes");
-  const visibility = runtime.visibility === "public" ? "public" : "private";
-  const Icon = visibility === "public" ? Globe : Lock;
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span className="inline-flex items-center gap-1.5 rounded-md border bg-muted/30 px-2 py-1.5 text-caption">
-            <Icon className="h-3 w-3 text-muted-foreground" />
-            <span className="font-medium">
-              {t(($) => $.detail.visibility_label[visibility])}
-            </span>
-          </span>
-        }
-      />
-      <TooltipContent>
-        {t(($) => $.detail.visibility_hint_readonly[visibility])}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-// VisibilityEditor lets the runtime owner flip public↔private. Owner only —
-// the PATCH endpoint refuses a workspace admin here (canSetRuntimeVisibility);
-// this is a UI gate, not a security boundary. Per-choice description text lives in the hover
-// tooltip so the two buttons stay a tight icon+label pair instead of the
-// previous two-line block that competed with the surrounding cards.
-function VisibilityEditor({ runtime }: { runtime: AgentRuntime }) {
-  const { t } = useT("runtimes");
-  const wsId = useWorkspaceId();
-  const updateRuntime = useUpdateRuntime(wsId);
-  const current = runtime.visibility === "public" ? "public" : "private";
-
-  const flip = (next: "private" | "public") => {
-    if (next === current) return;
-    updateRuntime.mutate(
-      { runtimeId: runtime.id, patch: { visibility: next } },
-      {
-        onSuccess: () =>
-          toast.success(
-            t(($) => $.detail.visibility_toast_updated, {
-              visibility: t(($) => $.detail.visibility_label[next]),
-            }),
-          ),
-        onError: (err) =>
-          toast.error(
-            err instanceof Error && err.message
-              ? err.message
-              : t(($) => $.detail.visibility_toast_failed),
-          ),
-      },
-    );
-  };
-
-  return (
-    <div className="inline-flex items-center gap-0.5 rounded-md bg-muted p-0.5">
-      <VisibilityChoice
-        active={current === "private"}
-        icon={<Lock className="h-3 w-3" />}
-        label={t(($) => $.detail.visibility_label.private)}
-        tooltip={t(($) => $.detail.visibility_hint.private)}
-        disabled={updateRuntime.isPending}
-        onClick={() => flip("private")}
-      />
-      <VisibilityChoice
-        active={current === "public"}
-        icon={<Globe className="h-3 w-3" />}
-        label={t(($) => $.detail.visibility_label.public)}
-        tooltip={t(($) => $.detail.visibility_hint.public)}
-        disabled={updateRuntime.isPending}
-        onClick={() => flip("public")}
-      />
-    </div>
-  );
-}
-
-function VisibilityChoice({
-  active,
-  icon,
-  label,
-  tooltip,
-  disabled,
-  onClick,
-}: {
-  active: boolean;
-  icon: React.ReactNode;
-  label: string;
-  tooltip: string;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <button
-            type="button"
-            onClick={onClick}
-            disabled={disabled}
-            className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-caption font-medium transition-colors ${
-              active
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
-            } ${disabled ? "cursor-not-allowed opacity-60" : ""}`}
-          >
-            <span className="shrink-0">{icon}</span>
-            <span>{label}</span>
-          </button>
-        }
-      />
-      <TooltipContent>{tooltip}</TooltipContent>
-    </Tooltip>
   );
 }

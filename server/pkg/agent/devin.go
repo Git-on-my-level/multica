@@ -1,12 +1,13 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -38,15 +39,15 @@ var devinBlockedArgs = map[string]blockedArgMode{
 // Devin CLI is host-local ACP (`devin acp`) — not cloud Devin VMs / Playbooks /
 // Secrets. It does not take a root `--permission-mode`; auto-approve via ACP
 // session/request_permission. Launched via `devin acp`, it implements
-// `initialize`, `session/new`, `session/load`, `session/resume`,
-// `session/set_model`, `session/prompt`, the `session/update` notification
-// family, `session/request_permission`, and `mcpServers`. It advertises
-// `loadSession` and returns its model catalog from `session/new`, so the
-// existing Hermes/Kimi/Kiro/Qoder/Traecli ACP client (hermesClient) drives it
-// with only provider-specific launch args and tool-name normalization.
+// `initialize`, `session/new`, `session/load`, `session/set_config_option`,
+// and `session/prompt`. Model selection is confirmed against the session's
+// configOptions, because --model may silently fall back to the CLI default.
 type devinBackend struct {
 	cfg Config
 }
+
+// Match the shared ACP backends' bound for trailing notifications and pipes.
+var devinReaderDrainGrace = 2 * time.Second
 
 func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
 	execPath := b.cfg.ExecutablePath
@@ -55,6 +56,14 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	if _, err := exec.LookPath(execPath); err != nil {
 		return nil, fmt.Errorf("devin executable not found at %q: %w", execPath, err)
+	}
+	cwd := opts.Cwd
+	if cwd == "" {
+		cwd = "."
+	}
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("devin working directory: %w", err)
 	}
 
 	// Translate the agent's mcp_config (Claude-style object of objects) into
@@ -73,13 +82,13 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	if model := strings.TrimSpace(opts.Model); model != "" {
 		devinArgs = append(devinArgs, "--model", model)
 	}
+	devinArgs = append(devinArgs, filterCustomArgs(opts.ExtraArgs, devinBlockedArgs, b.cfg.Logger)...)
 	devinArgs = append(devinArgs, filterCustomArgs(opts.CustomArgs, devinBlockedArgs, b.cfg.Logger)...)
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, devinArgs...)
 	hideAgentWindow(cmd)
+	cmd.WaitDelay = devinReaderDrainGrace
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(devinArgs, trustAgentCommandPositional(0, "acp")))
-	if opts.Cwd != "" {
-		cmd.Dir = opts.Cwd
-	}
+	cmd.Dir = cwd
 	cmd.Env = buildEnv(b.cfg.Env)
 
 	stdout, err := cmd.StdoutPipe()
@@ -103,7 +112,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		return nil, fmt.Errorf("devin stderr pipe: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start devin: %w", err)
 	}
@@ -120,9 +129,9 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 
-	var outputMu sync.Mutex
-	var output strings.Builder
+	var deliverable acpDeliverableTracker
 	var streamingCurrentTurn atomic.Bool
+	activity := make(chan struct{}, 1)
 
 	promptDone := make(chan hermesPromptResult, 1)
 
@@ -134,6 +143,12 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
+		onActivity: func() {
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
+		},
 		onMessage: func(msg Message) {
 			if !streamingCurrentTurn.Load() {
 				return
@@ -141,11 +156,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			if msg.Type == MessageToolUse {
 				msg.Tool = kimiToolNameFromTitle(msg.Tool)
 			}
-			if msg.Type == MessageText {
-				outputMu.Lock()
-				output.WriteString(msg.Content)
-				outputMu.Unlock()
-			}
+			deliverable.observe(msg)
 			trySend(msgCh, msg)
 		},
 		onPromptDone: func(result hermesPromptResult) {
@@ -162,8 +173,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+		scanner := newAgentStreamScanner(stdout)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -174,20 +184,31 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		c.closeAllPending(fmt.Errorf("devin process exited"))
 	}()
 
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			_ = stdin.Close()
+			// Cancel before Wait: the child may ignore EOF. Wait closes our pipe
+			// ends, releasing readers even if an escaped descendant holds them.
+			cancel()
+			_ = cmd.Wait()
+			<-readerDone
+			<-stderrDone
+			releaseProcessGroup(cmd)
+		})
+	}
+
 	go func() {
-		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
-		defer func() {
-			stdin.Close()
-			_ = cmd.Wait()
-		}()
+		defer stop()
 
 		startTime := time.Now()
 		finalStatus := "completed"
 		var finalError string
 		var sessionID string
-		effectiveModel := strings.TrimSpace(opts.Model)
+		var resumeRejected bool
+		var sessionResult json.RawMessage
 
 		initResult, err := c.request(runCtx, "initialize", map[string]any{
 			"protocolVersion": 1,
@@ -198,8 +219,7 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			"clientCapabilities": map[string]any{},
 		})
 		if err != nil {
-			finalStatus = "failed"
-			finalError = fmt.Sprintf("devin initialize failed: %v", err)
+			finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "initialize", err, timeout, b.cfg.Logger)
 			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 			return
 		}
@@ -209,10 +229,8 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		// unsupported transport tanks the whole session/new.
 		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "devin", b.cfg)
 
-		// When initialize advertises authMethods, the ACP host must send
-		// authenticate before session/new. Desktop-spawned `devin acp` ignores
-		// local `devin auth` and waits for this. Standalone often advertises
-		// nothing (empty = skip).
+		// Browser authentication cannot run headlessly; standalone Devin uses
+		// stored CLI credentials unless a supported noninteractive method is offered.
 		if methodID, authErr := selectDevinAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(cmd.Env, "WINDSURF_API_KEY")); authErr != nil {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("devin authentication setup failed: %v", authErr)
@@ -224,30 +242,28 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				authParams["_meta"] = map[string]any{"headless": true}
 			}
 			if _, err := c.request(runCtx, "authenticate", authParams); err != nil {
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("devin authenticate (%s) failed: %v — run `devin auth login` or set WINDSURF_API_KEY", methodID, err)
+				finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "authenticate", err, timeout, b.cfg.Logger)
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
 			b.cfg.Logger.Info("devin authenticated", "method", methodID)
 		}
 
-		cwd := opts.Cwd
-		if cwd == "" {
-			cwd = "."
-		}
-
 		if opts.ResumeSessionID != "" {
-			// Devin advertises loadSession; resume uses ACP session/load.
+			if !devinLoadSessionSupported(initResult) {
+				finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "session/load", fmt.Errorf("runtime does not support session loading"), timeout, b.cfg.Logger)
+				resumeRejected = runCtx.Err() == nil
+				resCh <- Result{Status: finalStatus, Error: finalError, ResumeRejected: resumeRejected, DurationMs: time.Since(startTime).Milliseconds()}
+				return
+			}
 			result, err := c.request(runCtx, "session/load", map[string]any{
 				"cwd":        cwd,
 				"sessionId":  opts.ResumeSessionID,
 				"mcpServers": mcpServers,
 			})
 			if err != nil {
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("devin session/load failed: %v", err)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				finalStatus, finalError, resumeRejected = classifyACPResumeFailure(runCtx, "devin", "session/load", err, timeout, b.cfg.Logger)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
 				return
 			}
 			var changed bool
@@ -259,17 +275,14 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					"actual", sessionID,
 				)
 			}
-			if effectiveModel == "" {
-				effectiveModel = extractACPCurrentModelID(result)
-			}
+			sessionResult = result
 		} else {
 			result, err := c.request(runCtx, "session/new", map[string]any{
 				"cwd":        cwd,
 				"mcpServers": mcpServers,
 			})
 			if err != nil {
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("devin session/new failed: %v", err)
+				finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "session/new", err, timeout, b.cfg.Logger)
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
@@ -280,21 +293,24 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
-			if effectiveModel == "" {
-				effectiveModel = extractACPCurrentModelID(result)
-			}
+			sessionResult = result
 		}
 
 		c.sessionID = sessionID
+		effectiveModel, err := confirmDevinModel(runCtx, c.request, sessionID, opts.Model, sessionResult)
+		if err != nil {
+			finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "model selection", err, timeout, b.cfg.Logger)
+			resumeRejected = runCtx.Err() == nil && opts.ResumeSessionID != "" && devinSessionNotFound(err)
+			if setupFailureWithholdsSessionID(opts) || resumeRejected {
+				sessionID = ""
+			}
+			resCh <- Result{Status: finalStatus, Error: finalError, SessionID: sessionID, ResumeRejected: resumeRejected, DurationMs: time.Since(startTime).Milliseconds()}
+			return
+		}
 		b.cfg.Logger.Info("devin session created", "session_id", sessionID)
-		// Surface the session id on the message bus immediately so the daemon
-		// can PinTaskSession mid-flight. Without this, a daemon restart during
-		// a long Devin turn loses the resume pointer.
+		// Pin only after model setup succeeds, so a never-prompted session
+		// cannot leave a dead resume pointer behind on the task row.
 		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
-
-		// Model is set at launch via `devin acp --model`. Live CLI 3000.5.20
-		// accepts that flag on the acp subcommand. Do not use OMP's
-		// session/set_config_option.
 
 		userText := prompt
 		if opts.SystemPrompt != "" {
@@ -318,18 +334,13 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			} else {
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("devin session/prompt failed: %v", err)
-				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
-					// See the hermes backend: the runtime may echo the
-					// requested id back from session/load even when the
-					// session is gone, so the stale id only fails here, at
-					// prompt time. Empty SessionID lets the daemon's
-					// resume-failure fallback retry fresh and store the
-					// replacement id.
+				if opts.ResumeSessionID != "" && devinSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "devin",
 						"session_id", sessionID,
 					)
 					sessionID = ""
+					resumeRejected = true
 				}
 			}
 		} else {
@@ -339,35 +350,31 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					finalStatus = "aborted"
 					finalError = "devin cancelled the prompt"
 				}
-				c.usageMu.Lock()
-				c.usage.InputTokens += pr.usage.InputTokens
-				c.usage.OutputTokens += pr.usage.OutputTokens
-				c.usage.CacheReadTokens += pr.usage.CacheReadTokens
-				c.usage.CacheWriteTokens += pr.usage.CacheWriteTokens
-				c.usageMu.Unlock()
+				c.mergeUsage(pr.usage)
+				if pr.modelID != "" {
+					effectiveModel = pr.modelID
+				}
 			default:
 			}
+			waitForACPNotificationQuiescence(runCtx, activity, readerDone, acpNotificationQuietTime, devinReaderDrainGrace)
 		}
 
 		duration := time.Since(startTime)
 		b.cfg.Logger.Info("devin finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		stdin.Close()
-		cancel()
-
-		<-readerDone
-		// Ensure the stderr copier has drained before consulting the
-		// provider-error sniffer; see hermes.go for the failure mode.
-		<-stderrDone
-
-		outputMu.Lock()
-		finalOutput := output.String()
-		outputMu.Unlock()
+		_ = stdin.Close()
+		if runCtx.Err() == nil {
+			waitForHermesPipeDrain(readerDone, stderrDone, devinReaderDrainGrace)
+		}
+		stop()
+		streamingCurrentTurn.Store(false)
+		providerErr.Finalize()
+		finalOutput, fullOutput := deliverable.result()
 
 		// Promote completed→failed when stderr or the agent text stream show a
 		// terminal upstream-LLM failure (HTTP 4xx / rate-limit / expired
 		// token). Mirrors hermes/kimi/kiro/qoder/traecli.
-		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, finalOutput, providerErr)
+		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, fullOutput, providerErr)
 
 		u := c.accumulatedUsage()
 
@@ -381,22 +388,34 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		resCh <- Result{
-			Status:     finalStatus,
-			Output:     finalOutput,
-			Error:      finalError,
-			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
-			Usage:      usageMap,
+			Status:         finalStatus,
+			Output:         finalOutput,
+			Error:          finalError,
+			DurationMs:     duration.Milliseconds(),
+			SessionID:      sessionID,
+			Usage:          usageMap,
+			ResumeRejected: resumeRejected,
 		}
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-func (b *devinBackend) applyBuiltinRuntimeOverrides(desc BuiltinRuntime) {
-	if desc.DefaultExecutable != "" && b.cfg.ExecutablePath == "" {
-		b.cfg.ExecutablePath = desc.DefaultExecutable
+func devinLoadSessionSupported(raw json.RawMessage) bool {
+	var init struct {
+		Capabilities struct {
+			LoadSession bool `json:"loadSession"`
+		} `json:"agentCapabilities"`
 	}
+	return json.Unmarshal(raw, &init) == nil && init.Capabilities.LoadSession
+}
+
+func devinSessionNotFound(err error) bool {
+	var rpcErr *acpRPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == -32016 {
+		return acpSessionNotFoundWording(strings.ToLower(rpcErr.Message + " " + rpcErr.Data))
+	}
+	return isACPSessionNotFound(err)
 }
 
 const (
@@ -456,9 +475,9 @@ func discoverDevinModels(ctx context.Context, runtimeCmd Command) ([]Model, erro
 	defer cancel()
 	cmd := runtimeCmd.exec(runCtx, "models", "list", "--format", "json")
 	hideAgentWindow(cmd)
-	stdout, err := cmd.Output()
-	if err != nil || len(stdout) == 0 {
-		return []Model{}, nil
+	stdout, err := outputOwned(cmd, runtimeCmd.logger)
+	if err != nil {
+		return nil, fmt.Errorf("devin model discovery: %w", err)
 	}
 	return parseDevinModels(stdout)
 }

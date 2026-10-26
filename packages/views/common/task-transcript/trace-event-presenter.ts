@@ -12,6 +12,8 @@
 // This module owns no React and no fetching, so it is unit-testable in
 // isolation and independent of whichever list shell renders the events.
 
+import { truncateWithEllipsis } from "@multica/core/utils";
+
 export interface TraceEvent {
   seq?: number;
   type: string;
@@ -89,7 +91,10 @@ export function stripShellWrapper(command: string): string {
 }
 
 function clip(value: string, max: number): string {
-  return value.length > max ? value.slice(0, max) + "..." : value;
+  // Delegate to the shared helper so truncation is code-point-safe and uses the
+  // standard single-character ellipsis. `max` here is a content-character budget,
+  // so pass `max + 1` — the helper counts the ellipsis toward its own budget.
+  return truncateWithEllipsis(value, max + 1);
 }
 
 /**
@@ -99,6 +104,8 @@ function clip(value: string, max: number): string {
  * keeps the fallback safe rather than blank.
  */
 export interface TraceSummaryLabels {
+  /** Resolve known entity IDs before a summary is clipped; evidence stays raw. */
+  formatText?: (text: string) => string;
   /**
    * Phrase a multi-file patch, e.g. `src/a.go +2 more`.
    *
@@ -119,7 +126,7 @@ export function traceToolArgSummary(
   labels?: TraceSummaryLabels,
 ): string {
   if (!input) return "";
-  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const str = (v: unknown): string => (typeof v === "string" ? labels?.formatText?.(v) ?? v : "");
   if (str(input.query)) return str(input.query);
   // A multi-file patch has no single path field; without this the row's
   // summary would fall through to the generic scan and come back empty.
@@ -129,11 +136,12 @@ export function traceToolArgSummary(
   if (str(input.path)) return shortenTracePath(str(input.path));
   if (str(input.pattern)) return str(input.pattern);
   if (str(input.description)) return str(input.description);
-  if (str(input.command)) return clip(stripShellWrapper(str(input.command)), 120);
+  const command = str(input.command) || str(input.cmd);
+  if (command) return clip(stripShellWrapper(command), 120);
   if (str(input.prompt)) return clip(str(input.prompt), 120);
   if (str(input.skill)) return str(input.skill);
   for (const v of Object.values(input)) {
-    if (typeof v === "string" && v.length > 0 && v.length < 120) return v;
+    if (typeof v === "string" && v.length > 0 && str(v).length < 120) return str(v);
   }
   return "";
 }
@@ -161,7 +169,7 @@ export function traceEventSummary(event: TraceEvent, labels?: TraceSummaryLabels
     case "tool_result":
       // Unwrap first: the collapsed row is the one people read without
       // clicking, so it must not show transport escaping.
-      return clip(collapseWhitespace(unwrapToolOutput(event.output ?? "")), 200);
+      return clip(collapseWhitespace(labels?.formatText?.(unwrapToolOutput(event.output ?? "")) ?? unwrapToolOutput(event.output ?? "")), 200);
     default:
       return firstLine(event.content ?? event.output);
   }

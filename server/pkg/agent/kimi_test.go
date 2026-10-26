@@ -12,18 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-)
 
-func TestNewReturnsKimiBackend(t *testing.T) {
-	t.Parallel()
-	b, err := New("kimi", Config{ExecutablePath: "/nonexistent/kimi"})
-	if err != nil {
-		t.Fatalf("New(kimi) error: %v", err)
-	}
-	if _, ok := b.(*kimiBackend); !ok {
-		t.Fatalf("expected *kimiBackend, got %T", b)
-	}
-}
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
+)
 
 func TestKimiToolNameFromTitle(t *testing.T) {
 	t.Parallel()
@@ -144,8 +135,13 @@ func TestKimiBackendSetModelFailureFailsTask(t *testing.T) {
 		if !strings.Contains(result.Error, "model not available") {
 			t.Errorf("expected error to surface upstream message, got %q", result.Error)
 		}
-		if result.SessionID != "ses_fake" {
-			t.Errorf("expected session id to be preserved on failure, got %q", result.SessionID)
+		// A fresh session that never reached session/prompt must NOT be
+		// published as a resume pointer: the runtime may never have persisted
+		// it, and a pointer to a session that does not exist wedges the whole
+		// conversation forever (GH #8116). There is no transcript behind an id
+		// that never ran a prompt, so nothing is lost by withholding it.
+		if result.SessionID != "" {
+			t.Errorf("expected the never-prompted session id to be withheld, got %q", result.SessionID)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")
@@ -673,6 +669,13 @@ func TestKimiFreshSessionIncludesMcpServers(t *testing.T) {
 		t.Fatal("timeout waiting for result")
 	}
 
+	initFrame := findRecordedFrame(t, recordPath, "initialize")
+	initParams := initFrame["params"].(map[string]any)
+	capabilities := initParams["clientCapabilities"].(map[string]any)
+	if capabilities["terminal"] != true {
+		t.Fatalf("initialize.clientCapabilities.terminal = %#v, want true", capabilities["terminal"])
+	}
+
 	frame := findRecordedFrame(t, recordPath, "session/new")
 	params := frame["params"].(map[string]any)
 	servers, ok := params["mcpServers"].([]any)
@@ -685,6 +688,314 @@ func TestKimiFreshSessionIncludesMcpServers(t *testing.T) {
 	entry := servers[0].(map[string]any)
 	if entry["name"] != "fetch" || entry["command"] != "uvx" {
 		t.Fatalf("session/new.mcpServers[0]: got %v, want {name:fetch,command:uvx,...}", entry)
+	}
+}
+
+// fakeKimiPoisonedHistoryScript mimics the kimi CLI when asked to resume a
+// session whose conversation history contains an empty assistant message. The
+// adapter emits the "provider.api_error: 400 … role 'assistant' must not be
+// empty" line to stderr and returns a completed (end_turn) JSON-RPC response —
+// matching the real kimi adapter behaviour that prompted MUL-5154.
+func fakeKimiPoisonedHistoryScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_poison"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "error: failed to run prompt: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty" >&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestKimiBackendPoisonedHistorySetsResumeRejected verifies that when the kimi
+// backend receives the "assistant must not be empty" 400 error while resuming
+// a session, it sets ResumeRejected=true so the daemon clears the broken
+// session pointer and starts fresh on the next task.
+func TestKimiBackendPoisonedHistorySetsResumeRejected(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	writeTestExecutable(t, fakePath, []byte(fakeKimiPoisonedHistoryScript()))
+
+	backend, err := New("kimi", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_poison",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed for poisoned history, got %q", result.Status)
+		}
+		if !result.ResumeRejected {
+			t.Error("expected ResumeRejected=true so the daemon clears the broken session")
+		}
+		if !strings.Contains(result.Error, "must not be empty") {
+			t.Errorf("expected error to mention the poisoned-history detail, got %q", result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// TestKimiBackendPoisonedHistoryFreshRunNoResumeRejected verifies that when
+// the same poisoned-history error occurs on a FRESH run (ResumeSessionID==""),
+// ResumeRejected must stay false. A fresh run cannot inherit a broken history,
+// so flagging it would incorrectly prevent the next task from resuming a good
+// session.
+func TestKimiBackendPoisonedHistoryFreshRunNoResumeRejected(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_fresh"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "error: failed to run prompt: provider.api_error: 400 the message at position 1 with role 'assistant' must not be empty" >&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("kimi", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if result.ResumeRejected {
+			t.Error("ResumeRejected must be false on a fresh run (no ResumeSessionID)")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// TestKimiBackendPoisonedHistoryTwoLineFormat verifies that the two-line kimi
+// stderr format (status on one line, detail on the next) is correctly detected
+// as a poisoned session. Both isPoisonedHistory and classifyPoisonedError must
+// fire even when "provider.api_error: 400" and "must not be empty" arrive on
+// separate lines.
+func TestKimiBackendPoisonedHistoryTwoLineFormat(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_poison_2line"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "error: failed to run prompt: provider.api_error: 400" >&2
+      printf '%s\n' "detail: messages[43].content: content must not be empty" >&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("kimi", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_poison_2line",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("two-line: expected status=failed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !result.ResumeRejected {
+			t.Error("two-line: expected ResumeRejected=true — isPoisonedHistory must detect across stderr lines")
+		}
+		if !strings.Contains(result.Error, "provider.api_error: 400") {
+			t.Errorf("two-line: expected error to contain provider.api_error: 400, got %q", result.Error)
+		}
+		if !strings.Contains(result.Error, "must not be empty") {
+			t.Errorf("two-line: expected error to contain must not be empty, got %q", result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// TestKimiPoisonedHistorySurfacedErrorIsUnresumable pins the cross-package
+// contract this PR exists to satisfy: the Result.Error string the kimi sniffer
+// surfaces must be recognized by taskfailure.UnresumableHistory, the daemon's
+// backend-agnostic predicate (#6083) that retires the session so a later issue
+// mention or chat cannot resume the poisoned transcript. isPoisonedHistory now
+// delegates to that same predicate, but the daemon classifies the surfaced
+// string independently of ResumeRejected — via shouldRetryWithFreshSession and
+// GetLastTaskSession / GetLastChatTaskSession — so the string itself must carry
+// the emptiness complaint and the message locator through the sniffer's
+// extraction, for both Kimi stderr shapes. A regression that only checked
+// ResumeRejected would not catch a messageLocked change that dropped the
+// locator and silently broke the daemon-side exclusion.
+func TestKimiPoisonedHistorySurfacedErrorIsUnresumable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		script     string
+		resumeID   string
+		wantLocate string // a token the surfaced error must retain
+	}{
+		{
+			name:       "single-line",
+			script:     fakeKimiPoisonedHistoryScript(),
+			resumeID:   "ses_poison",
+			wantLocate: "message at position",
+		},
+		{
+			name: "two-line",
+			script: `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_poison_2line"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "error: failed to run prompt: provider.api_error: 400" >&2
+      printf '%s\n' "detail: messages[43].content: content must not be empty" >&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`,
+			resumeID:   "ses_poison_2line",
+			wantLocate: "messages[43",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fakePath := filepath.Join(t.TempDir(), "kimi")
+			writeTestExecutable(t, fakePath, []byte(tc.script))
+
+			backend, err := New("kimi", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+			if err != nil {
+				t.Fatalf("new kimi backend: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+				Timeout:         5 * time.Second,
+				ResumeSessionID: tc.resumeID,
+			})
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			go func() {
+				for range session.Messages {
+				}
+			}()
+
+			select {
+			case result, ok := <-session.Result:
+				if !ok {
+					t.Fatal("result channel closed without a value")
+				}
+				if !strings.Contains(result.Error, tc.wantLocate) {
+					t.Errorf("surfaced error dropped the history locator %q: %q", tc.wantLocate, result.Error)
+				}
+				if !taskfailure.UnresumableHistory(result.Error) {
+					t.Errorf("taskfailure.UnresumableHistory(%q) = false; the daemon would not retire the poisoned session", result.Error)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("timeout waiting for result")
+			}
+		})
 	}
 }
 
@@ -1274,5 +1585,368 @@ func TestKimiSessionWireLogsRejectsTraversal(t *testing.T) {
 		if got := kimiSessionWireLogs(root, id); got != nil {
 			t.Errorf("sessionID %q should be rejected, got %v", id, got)
 		}
+	}
+}
+
+// kimiWireTurnEndedLine builds an `agent.turn.ended` wire record like the ones
+// kimi-code appends to agents/main/wire.jsonl when a turn terminates.
+func kimiWireTurnEndedLine(outcome, errorMessage string, at time.Time) string {
+	return fmt.Sprintf(`{"turnId":0,"outcome":%q,"errorMessage":%q,"type":"agent.turn.ended","time":%d,"kind":"event"}`,
+		outcome, errorMessage, at.UnixMilli())
+}
+
+// TestScanKimiMainTurnFailureFlipsOnFailedTerminalEvent covers #9054: kimi's
+// ACP adapter answered session/prompt successfully while its own wire log
+// recorded the main turn as failed (a bare OAuthConnectionError no stderr
+// sniffer signature matches). The persisted outcome is authoritative.
+func TestScanKimiMainTurnFailureFlipsOnFailedTerminalEvent(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+	writeKimiWireLog(t, home, "session_kf", "main",
+		`{"type":"metadata","protocol_version":"1"}`,
+		kimiWireTurnEndedLine("failed",
+			"OAuthConnectionError: OAuth request to https://auth.kimi.com/api/oauth/token failed: fetch failed: Connect Timeout Error",
+			now),
+	)
+
+	detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: now.Add(-time.Minute), kimiHome: home,
+		sessionID: "session_kf", fallbackModel: "unknown",
+	})
+	if !failed {
+		t.Fatal("expected the failed main-agent terminal event to be reported")
+	}
+	if !strings.Contains(detail, "OAuthConnectionError") {
+		t.Errorf("detail should carry kimi's diagnostic, got %q", detail)
+	}
+}
+
+// TestScanKimiMainTurnFailureSanitizesWireDiagnostic covers the review on
+// #9057: kimi's diagnostic is provider-authored text, and a JSON credential
+// embedded in it (request={"api_key":...}) survives both the raw string and
+// the shared redact.Text — the diagnostic must take the same
+// sanitizeAgentDiagnostic pass as every child-process diagnostic that
+// reaches Result.Error.
+func TestScanKimiMainTurnFailureSanitizesWireDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+	const fakeSecret = "review-only-fake-secret"
+	writeKimiWireLog(t, home, "session_secret", "main",
+		kimiWireTurnEndedLine("failed",
+			`request={"api_key":"`+fakeSecret+`"} while calling https://api.kimi.com`,
+			now),
+	)
+
+	detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: now.Add(-time.Minute), kimiHome: home,
+		sessionID: "session_secret", fallbackModel: "unknown",
+	})
+	if !failed {
+		t.Fatal("expected the failed main-agent terminal event to be reported")
+	}
+	if strings.Contains(detail, fakeSecret) {
+		t.Errorf("secret leaked through the wire diagnostic: %q", detail)
+	}
+	if !strings.Contains(detail, `api_key":"[REDACTED]"`) {
+		t.Errorf("expected the JSON secret field redacted, got %q", detail)
+	}
+}
+
+func TestScanKimiMainTurnFailureErrorMessageFormats(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "string", raw: `"Connection error."`, want: "Connection error."},
+		{name: "opaque string", raw: `" [object Object] "`},
+		{name: "empty string", raw: `""`},
+		{name: "null", raw: `null`},
+		{name: "object", raw: `{"code":"provider.failure","message":"Connection error.","details":"private-details","retryable":true}`, want: "[provider.failure] Connection error."},
+		{name: "message only", raw: `{"message":"Connection error."}`, want: "Connection error."},
+		{name: "code only", raw: `{"code":"provider.failure","message":"[object Object]"}`, want: "[provider.failure]"},
+		{name: "invalid code", raw: `{"code":{},"message":"Connection error."}`, want: "Connection error."},
+		{name: "empty object", raw: `{}`},
+		{name: "invalid message", raw: `{"message":{"secret":"private-details"}}`},
+		{name: "array", raw: `["private-details"]`},
+		{name: "number", raw: `42`},
+		{name: "boolean", raw: `true`},
+		{name: "redacted object", raw: `{"code":"provider.failure","message":"api_key=fixture-secret","details":"private-details"}`, want: "[provider.failure] [REDACTED CREDENTIAL]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			now := time.Now()
+			line := fmt.Sprintf(`{"type":"agent.turn.ended","outcome":"failed","time":%d,"errorMessage":%s}`, now.UnixMilli(), tc.raw)
+			writeKimiWireLog(t, home, "session_formats", "main", line)
+			detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+				startTime: now.Add(-time.Minute), kimiHome: home, sessionID: "session_formats",
+			})
+			if !failed {
+				t.Fatal("errorMessage shape must not hide the failed terminal event")
+			}
+			if detail != tc.want {
+				t.Errorf("detail = %q, want %q", detail, tc.want)
+			}
+		})
+	}
+}
+
+// TestScanKimiMainTurnFailureIgnoresHealthyStaleAndDelegated guards the flip
+// against false positives: a successful main turn stays completed, a failed
+// record from a previous task on a resumed session is outside the turn
+// boundary, and a delegated agent's failure is that agent's own task path —
+// only the main agent's terminal event fails the run.
+func TestScanKimiMainTurnFailureIgnoresHealthyStaleAndDelegated(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+
+	writeKimiWireLog(t, home, "session_ok", "main", kimiWireTurnEndedLine("success", "", now))
+	writeKimiWireLog(t, home, "session_del", "main", kimiWireTurnEndedLine("success", "", now))
+	writeKimiWireLog(t, home, "session_del", "researcher", kimiWireTurnEndedLine("failed", "delegated boom", now))
+	writeKimiWireLog(t, home, "session_stale", "main", kimiWireTurnEndedLine("failed", "stale boom", now.Add(-time.Hour)))
+
+	for _, tc := range []struct {
+		sessionID string
+		resumed   bool
+	}{
+		{sessionID: "session_ok"},
+		{sessionID: "session_del"},
+		{sessionID: "session_stale", resumed: true},
+	} {
+		if _, failed := scanKimiMainTurnFailure(kimiUsageScan{
+			startTime: now.Add(-time.Minute), kimiHome: home,
+			sessionID: tc.sessionID, resumed: tc.resumed, fallbackModel: "unknown",
+		}); failed {
+			t.Errorf("session %q: expected no main-turn failure", tc.sessionID)
+		}
+	}
+}
+
+// TestScanKimiMainTurnFailureReadsPastOversizedRecord covers the review on
+// #9057: newAgentStreamScanner stops for good at a line beyond
+// agentStreamMaxLineBytes and the old scan loop never checked scanner.Err(),
+// so a valid but oversized context.append record ahead of the terminal event
+// hid the failed outcome and kept the run completed. The scan must discard
+// the oversized record and keep reading.
+func TestScanKimiMainTurnFailureReadsPastOversizedRecord(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+	oversized := `{"type":"context.append","content":"` + strings.Repeat("x", agentStreamMaxLineBytes) + `"}`
+	writeKimiWireLog(t, home, "session_big", "main",
+		oversized,
+		kimiWireTurnEndedLine("failed", "boom after the oversized record", now),
+	)
+
+	detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: now.Add(-time.Minute), kimiHome: home,
+		sessionID: "session_big", fallbackModel: "unknown",
+	})
+	if !failed {
+		t.Fatal("expected the failed terminal event past the oversized record to be reported")
+	}
+	if !strings.Contains(detail, "boom after the oversized record") {
+		t.Errorf("detail should carry the diagnostic, got %q", detail)
+	}
+}
+
+// TestScanKimiMainTurnFailureWithoutWireLog: no session directory (scan ran
+// before kimi wrote anything, or the home is unset) must be a no-op.
+func TestScanKimiMainTurnFailureWithoutWireLog(t *testing.T) {
+	t.Parallel()
+
+	if _, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: time.Now().Add(-time.Minute), kimiHome: t.TempDir(),
+		sessionID: "session_absent", fallbackModel: "unknown",
+	}); failed {
+		t.Fatal("expected no failure without a wire log")
+	}
+}
+
+// fakeKimiWireTurnFailureScript mimics the #9054 incident shape: the ACP
+// layer answers session/prompt successfully (end_turn) after emitting real
+// narration, while kimi's own wire log records the main turn as failed with
+// a bare OAuthConnectionError that matches no stderr sniffer signature.
+func fakeKimiWireTurnFailureScript(sessionID string) string {
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_wirefail"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_wirefail","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial narration before the failure"}}}}\n'
+      dir="$KIMI_CODE_HOME/sessions/wd_test_abc123/ses_wirefail/agents/main"
+      mkdir -p "$dir"
+      # time:0 = untimed record; kimiWireRecordInTurn counts those on fresh
+      # runs, and a shell cannot produce millisecond timestamps portably.
+      printf '{"turnId":0,"outcome":"failed","errorMessage":"OAuthConnectionError: OAuth request to https://auth.kimi.com/api/oauth/token failed: fetch failed: Connect Timeout Error","type":"agent.turn.ended","time":0,"kind":"event"}\n' >> "$dir/wire.jsonl"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+	return strings.ReplaceAll(script, "ses_wirefail", sessionID)
+}
+
+// TestKimiBackendWireTurnFailureFailsCompletedRun is the end-to-end guard for
+// #9054: a successful ACP prompt response with nonempty narration must not
+// publish the run as completed when kimi's wire log says the main turn
+// failed. The partial narration stays in the transcript; the status and the
+// sanitized diagnostic must reach the daemon so retry policy sees the truth.
+func TestKimiBackendWireTurnFailureFailsCompletedRun(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	writeTestExecutable(t, fakePath, []byte(fakeKimiWireTurnFailureScript("ses_wirefail")))
+
+	backend, err := New("kimi", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"KIMI_CODE_HOME": home},
+	})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed from the wire turn outcome, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, "OAuthConnectionError") {
+			t.Errorf("expected kimi's diagnostic in the error, got %q", result.Error)
+		}
+		if !strings.Contains(result.Output, "partial narration") {
+			t.Errorf("partial narration should stay in the transcript, got %q", result.Output)
+		}
+		if result.ResumeRejected {
+			t.Error("an OAuth transport failure is not a poisoned history; ResumeRejected must stay false")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestKimiBackendWireTurnFailureDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "opaque", raw: `"[object Object]"`, want: "kimi turn failed: runtime did not record error details (error category unknown)"},
+		{name: "empty", raw: `""`, want: "kimi turn failed: runtime did not record error details (error category unknown)"},
+		{name: "object", raw: `{"code":"provider.failure","message":"Unspecified failure","details":"private-details"}`, want: "kimi turn failed: [provider.failure] Unspecified failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			fakePath := filepath.Join(t.TempDir(), "kimi")
+			script := fakeKimiWireTurnFailureScript("ses_diagnostic")
+			script = strings.Replace(script,
+				`"OAuthConnectionError: OAuth request to https://auth.kimi.com/api/oauth/token failed: fetch failed: Connect Timeout Error"`, tc.raw, 1)
+			writeTestExecutable(t, fakePath, []byte(script))
+			result := runKimiThinkingTest(t, fakePath, map[string]string{"KIMI_CODE_HOME": home}, ExecOptions{})
+			if result.Status != "failed" || result.Error != tc.want {
+				t.Fatalf("status=%q error=%q, want failed with %q", result.Status, result.Error, tc.want)
+			}
+			if !strings.Contains(result.Output, "partial narration") || result.ResumeRejected {
+				t.Errorf("partial output or session state changed: output=%q resumeRejected=%v", result.Output, result.ResumeRejected)
+			}
+			if got := taskfailure.Classify(result.Error); got != taskfailure.ReasonAgentUnknown {
+				t.Errorf("unspecified failure classified as %q, want unknown", got)
+			}
+		})
+	}
+}
+
+// TestKimiBackendWireTurnFailurePastOversizedRecord reproduces the review's
+// offline repro on #9057: a valid context.append record at the scan's 32 MiB
+// bound sits ahead of the failed agent.turn.ended record. With the old
+// scanner loop — which stops for good at an over-bound line and never checks
+// scanner.Err() — the backend reported Status="completed", Error="".
+func TestKimiBackendWireTurnFailurePastOversizedRecord(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "wd_test_abc123", "ses_big", "agents", "main")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir wire log dir: %v", err)
+	}
+	oversized := `{"type":"context.append","content":"` + strings.Repeat("x", agentStreamMaxLineBytes) + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "wire.jsonl"), []byte(oversized+"\n"), 0o644); err != nil {
+		t.Fatalf("write oversized record: %v", err)
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	writeTestExecutable(t, fakePath, []byte(fakeKimiWireTurnFailureScript("ses_big")))
+
+	backend, err := New("kimi", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"KIMI_CODE_HOME": home},
+	})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed past the oversized record, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, "OAuthConnectionError") {
+			t.Errorf("expected kimi's diagnostic in the error, got %q", result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
 	}
 }

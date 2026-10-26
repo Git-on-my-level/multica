@@ -60,7 +60,7 @@ func NewResolverSet(
 	set := engine.ResolverSet{
 		Installation: &installationResolver{store: store},
 		Identity:     &identityResolver{store: store},
-		Dedup:        &deduper{store: store},
+		Dedup:        NewDeduper(store),
 		Session:      &sessionBinder{session: session},
 		Audit:        &auditor{store: store},
 		OriginType:   originWecomChat,
@@ -84,9 +84,26 @@ func NewResolverSet(
 // production value.
 type engineSessionBinder interface {
 	EnsureSession(ctx context.Context, in engine.EnsureSessionInput) (pgtype.UUID, error)
+	StartSession(ctx context.Context, in engine.StartSessionInput) (engine.StartSessionResult, error)
 	MarkPendingFresh(ctx context.Context, sessionID pgtype.UUID, messageID string) error
 	AppendUserMessage(ctx context.Context, in engine.AppendInput) (engine.AppendResult, error)
 	BindMediaRefs(ctx context.Context, in engine.BindMediaInput) error
+}
+
+func (r *sessionBinder) StartSession(ctx context.Context, p engine.StartSessionParams) (engine.StartSessionResult, error) {
+	result, err := r.session.StartSession(ctx, engine.StartSessionInput{
+		EnsureSessionInput: engine.EnsureSessionInput{
+			WorkspaceID: p.Installation.WorkspaceID, AgentID: p.Installation.AgentID,
+			InstallationID: p.Installation.ID, Sender: p.Creator,
+			BindingKey: p.Message.Source.ChatID, ChatType: p.Message.Source.ChatType,
+		},
+		Initiator: p.Sender,
+		Body:      p.Message.Text, CommandText: p.Message.CommandText, MessageID: p.Message.MessageID,
+		ClaimToken: p.ClaimToken, MediaPendingSeconds: p.MediaPendingSeconds,
+		PersistMessage: p.PersistMessage, HistoryBoundaryPending: p.HistoryBoundaryPending,
+		BeforeCommit: p.BeforeCommit,
+	})
+	return engine.StartSessionResult{SessionID: result.SessionID, BindingID: result.BindingID, RouteRevision: result.RouteRevision, Append: result.Append}, err
 }
 
 // ---- installation routing ----
@@ -170,6 +187,11 @@ func (r *identityResolver) ResolveSender(ctx context.Context, inst engine.Resolv
 }
 
 // ---- dedup ----
+
+// NewDeduper builds the claim store the Router and the adapter share. Both must
+// go through it: they claim the same (installation, message) key on the same
+// table, which is what keeps one message from being answered in both places.
+func NewDeduper(store *Store) engine.Deduper { return &deduper{store: store} }
 
 // deduper is the wecom Deduper. It uses the shared channel_inbound_message_dedup
 // sqlc queries — the same table Feishu / Slack use — so the two-phase
@@ -267,8 +289,8 @@ func (r *sessionBinder) AppendMessage(ctx context.Context, p engine.AppendParams
 // rather than to the chat message that created it; the other issue fields are
 // what let the description reference them. Feishu passes all of them
 // (lark/feishu_resolvers.go:223).
-func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams) error {
-	return r.session.BindMediaRefs(ctx, engine.BindMediaInput{
+func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams) (engine.BindMediaResult, error) {
+	in := engine.BindMediaInput{
 		MessageID:            p.MessageID,
 		SessionID:            p.SessionID,
 		WorkspaceID:          p.WorkspaceID,
@@ -278,7 +300,13 @@ func (r *sessionBinder) BindMedia(ctx context.Context, p engine.BindMediaParams)
 		IssueCommandText:     p.IssueCommandText,
 		Body:                 p.Body,
 		MediaRefs:            p.MediaRefs,
-	})
+	}
+	if richer, ok := r.session.(interface {
+		BindMediaRefsWithResult(context.Context, engine.BindMediaInput) (engine.BindMediaResult, error)
+	}); ok {
+		return richer.BindMediaRefsWithResult(ctx, in)
+	}
+	return engine.BindMediaResult{}, r.session.BindMediaRefs(ctx, in)
 }
 
 // ---- audit ----

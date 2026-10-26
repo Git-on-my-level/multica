@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
@@ -214,6 +216,25 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Self-host allowlist (#9400): when WORKSPACE_CREATION_ALLOWED_EMAILS is
+	// set, only those accounts may create workspaces. The UI does not hide
+	// the entry points for other users; this 403 is the enforcement point.
+	if len(h.cfg.WorkspaceCreationAllowedEmails) > 0 {
+		user, err := h.Queries.GetUser(r.Context(), parseUUID(userID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusUnauthorized, "user not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to load user")
+			return
+		}
+		if !contains(h.cfg.WorkspaceCreationAllowedEmails, strings.TrimSpace(user.Email)) {
+			writeError(w, http.StatusForbidden, "workspace creation is restricted to selected users on this instance")
+			return
+		}
+	}
+
 	var req CreateWorkspaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -270,7 +291,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "workspace slug already exists")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to create workspace: "+err.Error())
+		slog.Warn("create workspace failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to create workspace")
 		return
 	}
 
@@ -280,7 +302,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		Role:        "owner",
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to add owner: "+err.Error())
+		slog.Warn("add owner failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to add owner")
 		return
 	}
 
@@ -288,7 +311,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// workspace is never visible without its status catalog — an issue cannot
 	// be created before its status can be resolved. (MUL-6243)
 	if err := issuestatus.Ensure(r.Context(), qtx, ws.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to seed issue statuses: "+err.Error())
+		slog.Warn("seed issue statuses failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to seed issue statuses")
 		return
 	}
 
@@ -400,6 +424,17 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 		params.Context = pgtype.Text{String: *req.Context, Valid: true}
 	}
 	if req.Settings != nil {
+		if incoming, ok := req.Settings.(map[string]any); ok {
+			// Only an old client's flip of the retired PR switch needs the
+			// stored value; see reconcilePRMergeSettings.
+			var stored map[string]any
+			if _, sent := incoming[prAutoCompleteLegacyKey]; sent {
+				if existing, err := h.Queries.GetWorkspace(r.Context(), idUUID); err == nil {
+					_ = json.Unmarshal(existing.Settings, &stored)
+				}
+			}
+			reconcilePRMergeSettings(stored, incoming)
+		}
 		s, _ := json.Marshal(req.Settings)
 		params.Settings = s
 	}
@@ -439,14 +474,18 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 	ws, err := h.Queries.UpdateWorkspace(r.Context(), params)
 	if err != nil {
 		slog.Warn("update workspace failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", id)...)
-		writeError(w, http.StatusInternalServerError, "failed to update workspace: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to update workspace")
 		return
 	}
 
 	slog.Info("workspace updated", append(logger.RequestAttrs(r), "workspace_id", id)...)
 	userID := requestUserID(r)
 	h.publish(protocol.EventWorkspaceUpdated, uuidToString(ws.ID), "member", userID, map[string]any{"workspace": h.workspaceToResponse(ws)})
-	if req.Name != nil {
+	// A rename changes what daemons display; a settings edit changes how they
+	// behave — the GitHub master switch and the Co-authored-by toggle are read
+	// from this JSONB. Daemons cache settings and have no other way to learn
+	// they moved, so both edits have to wake every member's daemons.
+	if req.Name != nil || req.Settings != nil {
 		if members, err := h.Queries.ListMembers(r.Context(), ws.ID); err == nil {
 			userIDs := make([]string, 0, len(members))
 			for _, member := range members {
@@ -551,80 +590,6 @@ func normalizeMemberRole(role string) (string, bool) {
 	default:
 		return "", false
 	}
-}
-
-func (h *Handler) CreateMember(w http.ResponseWriter, r *http.Request) {
-	workspaceID := workspaceIDFromURL(r, "id")
-	requester, ok := h.workspaceMember(w, r, workspaceID)
-	if !ok {
-		return
-	}
-
-	var req CreateMemberRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	email := strings.ToLower(strings.TrimSpace(req.Email))
-	if email == "" {
-		writeError(w, http.StatusBadRequest, "email is required")
-		return
-	}
-
-	role, valid := normalizeMemberRole(req.Role)
-	if !valid {
-		writeError(w, http.StatusBadRequest, "invalid member role")
-		return
-	}
-	if role == "owner" && requester.Role != "owner" {
-		writeError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	user, err := h.Queries.GetUserByEmail(r.Context(), email)
-	if err != nil {
-		if isNotFound(err) {
-			// Auto-create user with email so they can be invited before signing up
-			user, err = h.Queries.CreateUser(r.Context(), db.CreateUserParams{
-				Name:  email,
-				Email: email,
-			})
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to create user")
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to load user")
-			return
-		}
-	}
-
-	member, err := h.Queries.CreateMember(r.Context(), db.CreateMemberParams{
-		WorkspaceID: requester.WorkspaceID,
-		UserID:      user.ID,
-		Role:        role,
-	})
-	if err != nil {
-		if isUniqueViolation(err) {
-			writeError(w, http.StatusConflict, "user is already a member")
-			return
-		}
-		slog.Warn("create member failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID, "email", email)...)
-		writeError(w, http.StatusInternalServerError, "failed to create member")
-		return
-	}
-
-	slog.Info("member added", append(logger.RequestAttrs(r), "member_id", uuidToString(member.ID), "workspace_id", workspaceID, "email", email, "role", role)...)
-	userID := requestUserID(r)
-	eventPayload := map[string]any{"member": h.memberWithUserResponse(member, user)}
-	if ws, err := h.Queries.GetWorkspace(r.Context(), requester.WorkspaceID); err == nil {
-		eventPayload["workspace_name"] = ws.Name
-	}
-	h.publish(protocol.EventMemberAdded, uuidToString(requester.WorkspaceID), "member", userID, eventPayload)
-	h.notifyDaemonWorkspacesChanged(uuidToString(user.ID))
-
-	writeJSON(w, http.StatusCreated, h.memberWithUserResponse(member, user))
 }
 
 type UpdateMemberRequest struct {
@@ -749,6 +714,8 @@ func (h *Handler) DeleteMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete member")
 		return
 	}
+	h.Hub.DisconnectMember(uuidToString(target.WorkspaceID), uuidToString(target.UserID), uuidToString(target.ID))
+	h.settleMemberCapacityRelease(r.Context(), uuid.UUID(target.WorkspaceID.Bytes), uuid.UUID(target.ID.Bytes))
 
 	h.MembershipCache.Invalidate(r.Context(), uuidToString(target.UserID), workspaceID)
 
@@ -792,6 +759,8 @@ func (h *Handler) LeaveWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to leave workspace")
 		return
 	}
+	h.Hub.DisconnectMember(uuidToString(member.WorkspaceID), uuidToString(member.UserID), uuidToString(member.ID))
+	h.settleMemberCapacityRelease(r.Context(), uuid.UUID(member.WorkspaceID.Bytes), uuid.UUID(member.ID.Bytes))
 
 	h.MembershipCache.Invalidate(r.Context(), uuidToString(member.UserID), workspaceID)
 
@@ -881,12 +850,16 @@ func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, st
 // DELETE. A whole workspace's task set is not bounded by anything — one busy
 // agent can own millions of historical rows — so it must never be materialized at
 // once (MUL-5999 review).
-const workspaceDeleteTaskPageSize = 1000
+//
+// This and workspaceDeleteOwnerPageSize are variables only so the paging tests
+// can cross a page boundary without seeding thousands of rows; nothing outside
+// tests assigns them.
+var workspaceDeleteTaskPageSize int32 = 1000
 
 // workspaceDeleteOwnerPageSize bounds owner enumeration the same way. A workspace
 // with a very large agent or issue set must not have its whole id list held here
 // either.
-const workspaceDeleteOwnerPageSize = 500
+var workspaceDeleteOwnerPageSize int32 = 500
 
 // workspaceDeleteVerifyPasses caps how many times a single owner may be swept.
 //
@@ -1135,6 +1108,13 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stop remote work before deleting the only durable session journal.
+	// A pending step/cancellation leaves the workspace intact for a safe retry.
+	if err := h.prepareQoderWorkspaceDeletion(r.Context(), uuidToString(requester.WorkspaceID)); err != nil {
+		writeError(w, http.StatusConflict, "Qoder cleanup is pending; retry workspace deletion shortly")
+		return
+	}
+
 	// Invalidate membership cache for all workspace members before deletion.
 	// After CASCADE deletes the member rows, cache entries become harmless
 	// orphans (downstream lookups for the deleted workspace will fail), but
@@ -1171,6 +1151,8 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	qtx := h.Queries.WithTx(tx)
+	var sourceContextAttachmentURLs []string
+	var sourceContextIntentURLs []string
 
 	// SET LOCAL is transaction-scoped, so pgxpool hands this connection back
 	// out with the default (unbounded) lock_timeout after COMMIT / ROLLBACK.
@@ -1186,9 +1168,26 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		failWorkspaceDelete(w, r, workspaceID, "lock workspace", err)
 		return
 	}
+	// Take a best-effort snapshot for post-commit daemon invalidation. Runtime
+	// registration does not participate in the workspace delete lock protocol,
+	// so PR1 retains the heartbeat lookup as the correctness fallback for a
+	// registration that races this snapshot.
+	runtimeIDs, err := qtx.ListAgentRuntimeIDsByWorkspace(r.Context(), requester.WorkspaceID)
+	if err != nil {
+		failWorkspaceDelete(w, r, workspaceID, "list runtimes", err)
+		return
+	}
 
 	if _, err := qtx.LockChatSessionsByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
 		failWorkspaceDelete(w, r, workspaceID, "lock chat sessions", err)
+		return
+	}
+	if sourceContextAttachmentURLs, err = qtx.ListSourceContextAttachmentURLsByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
+		failWorkspaceDelete(w, r, workspaceID, "list source context attachment objects", err)
+		return
+	}
+	if sourceContextIntentURLs, err = qtx.ListSourceContextObjectIntentURLsByWorkspace(r.Context(), requester.WorkspaceID); err != nil {
+		failWorkspaceDelete(w, r, workspaceID, "list source context pending objects", err)
 		return
 	}
 
@@ -1216,6 +1215,27 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.PrepareWorkspaceDeletionLinks(ctx, requester.WorkspaceID) },
 		},
 		{
+			// These FK-free intents deliberately survive the transaction so the
+			// worker can release every invitation/member seat after local rows
+			// disappear. Skipped for self-hosted/unmanaged deployments.
+			name: "prepare seat capacity release",
+			run: func() error {
+				if !h.seatCapacityEnabled() {
+					return nil
+				}
+				if err := qtx.DeleteSeatCapacityConfirmIntentsForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.PrepareSeatCapacityOperationReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				if err := qtx.PrepareSeatCapacityInvitationReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID); err != nil {
+					return err
+				}
+				return qtx.PrepareSeatCapacityMemberReleasesForWorkspaceDeletion(ctx, requester.WorkspaceID)
+			},
+		},
+		{
 			name: "delete chat pins",
 			run:  func() error { return qtx.DeleteChatPinnedAgentsByWorkspace(ctx, requester.WorkspaceID) },
 		},
@@ -1234,6 +1254,16 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			// data statement and the separate whole-workspace task delete.
 			name: "delete tasks",
 			run:  func() error { return deleteWorkspaceTasks(ctx, qtx, requester.WorkspaceID) },
+		},
+		{
+			name: "delete QCA connection",
+			run: func() error {
+				if _, err := tx.Exec(ctx, `DELETE FROM daemon_token WHERE id IN (SELECT token_id FROM cloud_agent_connection WHERE provider='qoder_cloud' AND workspace_id=$1)`, requester.WorkspaceID); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, `DELETE FROM cloud_agent_connection WHERE provider='qoder_cloud' AND workspace_id=$1`, requester.WorkspaceID)
+				return err
+			},
 		},
 		{
 			name: "delete leaf data",
@@ -1264,6 +1294,29 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspaceComments(ctx, requester.WorkspaceID) },
 		},
 		{
+			// Teardown mode keeps the triggers from logging the deletes above
+			// and below; this clears what normal writes logged before.
+			name: "delete search index changes",
+			run:  func() error { return qtx.DeleteWorkspaceSearchIndexChanges(ctx, requester.WorkspaceID) },
+		},
+		// Keep source-context object intents after the workspace row is gone.
+		// They are the durable retry ledger for an upload that began before the
+		// workspace lock but completed after this transaction's immediate object
+		// deletion pass. With no attachment left, the reconciler will delete the
+		// object and then the intent; deleting the ledger here would make that
+		// crash window permanently leak the late object.
+		{
+			name: "delete source context attachments",
+			run:  func() error { return qtx.DeleteSourceContextAttachmentsByWorkspace(ctx, requester.WorkspaceID) },
+		},
+		{
+			name: "delete source contexts",
+			run: func() error {
+				_, err := qtx.DeleteIssueSourceContextsForWorkspace(ctx, requester.WorkspaceID)
+				return err
+			},
+		},
+		{
 			name: "delete issue roots",
 			run:  func() error { return qtx.DeleteWorkspaceIssueRoots(ctx, requester.WorkspaceID) },
 		},
@@ -1275,6 +1328,14 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			name: "delete issue statuses",
 			run: func() error {
 				return qtx.DeleteIssueStatusEntriesForWorkspace(ctx, requester.WorkspaceID)
+			},
+		},
+		{
+			// issue_workflow references the status catalog and projects by
+			// value only, so it is swept alongside the catalog. (MUL-7420)
+			name: "delete issue workflows",
+			run: func() error {
+				return qtx.DeleteIssueWorkflowsForWorkspace(ctx, requester.WorkspaceID)
 			},
 		},
 		{
@@ -1333,6 +1394,10 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 		return
 	}
+	for _, runtimeID := range runtimeIDs {
+		h.NotifyRuntimeGone(uuidToString(runtimeID))
+	}
+	h.deleteS3Objects(r.Context(), append(sourceContextAttachmentURLs, sourceContextIntentURLs...))
 
 	slog.Info("workspace deleted", append(logger.RequestAttrs(r), "workspace_id", workspaceID)...)
 	h.publish(protocol.EventWorkspaceDeleted, workspaceID, "member", requestUserID(r), map[string]any{

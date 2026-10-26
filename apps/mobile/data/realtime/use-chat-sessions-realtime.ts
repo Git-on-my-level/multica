@@ -33,9 +33,15 @@ export function useChatSessionsRealtime() {
         // Cancellation may delete a queued prompt or append "Stopped.", both
         // of which change the session preview.
         ws.on("task:cancelled", invalidateSessions),
+        ws.on("chat:cancel_finalized", invalidateSessions),
         // chat:session_read clears the unread flag (could be triggered from
         // web/desktop on the same account).
         ws.on("chat:session_read", invalidateSessions),
+        // A channel /new creates a visible session without navigating this
+        // device; refresh the list and leave the current screen untouched.
+        ws.on("chat:session_created", (payload) => {
+          if (payload.workspace_id === wsId) invalidateSessions();
+        }),
         // chat:session_updated has no formal payload type yet — server
         // emits {chat_session_id, title?, updated_at?}. Narrow inline.
         ws.on("chat:session_updated", (p) => {

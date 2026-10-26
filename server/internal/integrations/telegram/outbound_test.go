@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
@@ -24,28 +25,46 @@ import (
 )
 
 type fakeTelegramOutboundQueries struct {
-	task          db.AgentTaskQueue
-	taskErr       error
+	// Routing is faked; reply-delivery ownership is not. Every query the
+	// ownership state machine runs is the real generated one, against the test
+	// database. An in-memory stand-in for that state machine is a second
+	// implementation of it: the first version of this feature had one, it
+	// disagreed with the SQL about a single column, and the whole suite passed
+	// while the final answer never reached Telegram.
+	*db.Queries
+
+	deliveryErr   error
 	channelOrigin bool
-	originErr     error
 	binding       db.ChannelChatSessionBinding
 	bindings      map[[16]byte]db.ChannelChatSessionBinding
 	installation  db.ChannelInstallation
+	// attachments is what the reply's assistant message has bound to it; the
+	// attachment hop reads it instead of the real attachment table.
+	attachments []db.Attachment
 }
 
-func (f *fakeTelegramOutboundQueries) GetAgentTask(context.Context, pgtype.UUID) (db.AgentTaskQueue, error) {
-	return f.task, f.taskErr
+func (f *fakeTelegramOutboundQueries) ListAttachmentsByChatMessage(context.Context, db.ListAttachmentsByChatMessageParams) ([]db.Attachment, error) {
+	return f.attachments, nil
 }
 
-func (f *fakeTelegramOutboundQueries) TaskHasChannelIngestedMessages(context.Context, pgtype.UUID) (bool, error) {
-	return f.channelOrigin, f.originErr
-}
-
-func (f *fakeTelegramOutboundQueries) GetChannelChatSessionBindingBySession(_ context.Context, arg db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error) {
-	if binding, ok := f.bindings[arg.ChatSessionID.Bytes]; ok {
-		return binding, nil
+func (f *fakeTelegramOutboundQueries) GetChannelTaskDelivery(_ context.Context, taskID pgtype.UUID) (db.ChannelTaskDelivery, error) {
+	if f.deliveryErr != nil {
+		return db.ChannelTaskDelivery{}, f.deliveryErr
 	}
-	return f.binding, nil
+	if !f.channelOrigin {
+		return db.ChannelTaskDelivery{}, pgx.ErrNoRows
+	}
+	binding := f.binding
+	if mapped, ok := f.bindings[taskID.Bytes]; ok {
+		binding = mapped
+	}
+	return db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: binding.ID, InstallationID: binding.InstallationID,
+		ChannelType: string(TypeTelegram), ChannelChatID: binding.ChannelChatID,
+		ChatType: binding.ChatType, ChannelMessageID: binding.LastMessageID,
+		ChannelThreadID: binding.LastThreadID, RouteRevision: binding.RouteRevision,
+		Config: binding.Config,
+	}, nil
 }
 
 func (f *fakeTelegramOutboundQueries) GetChannelInstallation(context.Context, db.GetChannelInstallationParams) (db.ChannelInstallation, error) {
@@ -57,13 +76,6 @@ func telegramTestUUID(b byte) pgtype.UUID {
 	id.Bytes[0] = b
 	id.Valid = true
 	return id
-}
-
-func telegramTestTask() db.AgentTaskQueue {
-	return db.AgentTaskQueue{
-		ChatSessionID:   telegramTestUUID(3),
-		ChatInputTaskID: telegramTestUUID(4),
-	}
 }
 
 func telegramTestEvent() events.Event {
@@ -107,6 +119,7 @@ func sendTerminalReplySynchronouslyForTest(ctx context.Context, o *Outbound, e e
 
 func telegramTestBinding(chatID int64) db.ChannelChatSessionBinding {
 	return db.ChannelChatSessionBinding{
+		ID:             telegramTestUUID(byte(chatID)),
 		InstallationID: telegramTestUUID(1),
 		ChannelChatID:  strconv.FormatInt(chatID, 10),
 		Config:         []byte(fmt.Sprintf(`{"chat_id":"%d"}`, chatID)),
@@ -114,10 +127,23 @@ func telegramTestBinding(chatID int64) db.ChannelChatSessionBinding {
 	}
 }
 
-func newTelegramOutboundQueries() *fakeTelegramOutboundQueries {
+func newTelegramOutboundQueries(t *testing.T) *fakeTelegramOutboundQueries {
+	t.Helper()
+	if testPool == nil {
+		t.Skip("reply-delivery ownership runs real SQL; start this checkout's environment and run via make test")
+	}
+	// Cases in this package reuse fixed task ids, and a turn id is a task id,
+	// so rows left by an earlier case would collide. Scoped to this
+	// installation rather than the whole table: other packages run alongside
+	// this one against the same database.
+	if _, err := testPool.Exec(context.Background(),
+		`DELETE FROM channel_reply_delivery WHERE installation_id = $1`, telegramTestUUID(1)); err != nil {
+		t.Fatalf("reset channel_reply_delivery: %v", err)
+	}
 	return &fakeTelegramOutboundQueries{
-		task: telegramTestTask(),
+		Queries: db.New(testPool),
 		binding: db.ChannelChatSessionBinding{
+			ID:             telegramTestUUID(7),
 			InstallationID: telegramTestUUID(1),
 			ChannelChatID:  "42",
 			Config:         []byte(`{"chat_id":"42"}`),
@@ -131,9 +157,9 @@ func newTelegramOutboundQueries() *fakeTelegramOutboundQueries {
 	}
 }
 
-func TestResolveTargetFailsClosedWhenTaskLookupFails(t *testing.T) {
-	q := newTelegramOutboundQueries()
-	q.taskErr = errors.New("database unavailable")
+func TestResolveTargetFailsClosedWhenDeliveryLookupFails(t *testing.T) {
+	q := newTelegramOutboundQueries(t)
+	q.deliveryErr = errors.New("database unavailable")
 	o := NewOutbound(q, nil, "", nil, nil)
 
 	if _, err := o.resolveTarget(context.Background(), telegramTestEvent(), false); err == nil {
@@ -142,7 +168,7 @@ func TestResolveTargetFailsClosedWhenTaskLookupFails(t *testing.T) {
 }
 
 func TestResolveTargetSkipsDirectTaskOnBoundTelegramSession(t *testing.T) {
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	o := NewOutbound(q, nil, "", nil, nil)
 
 	target, err := o.resolveTarget(context.Background(), telegramTestEvent(), false)
@@ -155,7 +181,7 @@ func TestResolveTargetSkipsDirectTaskOnBoundTelegramSession(t *testing.T) {
 }
 
 func TestResolveTargetDeliversChannelTaskReply(t *testing.T) {
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, "", nil, nil)
 
@@ -169,7 +195,7 @@ func TestResolveTargetDeliversChannelTaskReply(t *testing.T) {
 }
 
 func TestResolveTargetIsolatesConcurrentTasksInOneSession(t *testing.T) {
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, "", nil, nil)
 
@@ -226,7 +252,7 @@ func TestOutboundStreamsBySendingThenEditingTheSameQuotedMessage(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	taskID := telegramTestEvent().TaskID
@@ -300,7 +326,7 @@ func TestOutboundThrottlesConcurrentTasksPerChat(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	first := telegramTestEvent().TaskID
@@ -323,7 +349,7 @@ func TestOutboundThrottlesConcurrentTasksPerChat(t *testing.T) {
 }
 
 func TestOutboundCancellationClearsStateAndKeepsPartialMessage(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	taskID := telegramTestEvent().TaskID
 	o.mu.Lock()
 	schedule := o.retainChatLocked("bot-a", 42)
@@ -345,7 +371,7 @@ func TestOutboundCancellationClearsStateAndKeepsPartialMessage(t *testing.T) {
 }
 
 func TestOutboundRetainsScheduleAcrossSequentialTasks(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -361,7 +387,7 @@ func TestOutboundRetainsScheduleAcrossSequentialTasks(t *testing.T) {
 }
 
 func TestOutboundExpiresIdleScheduleAfterTTL(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -378,7 +404,7 @@ func TestOutboundExpiresIdleScheduleAfterTTL(t *testing.T) {
 }
 
 func TestOutboundCancellationPreservesActiveRetryAfter(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 	taskID := telegramTestEvent().TaskID
@@ -405,7 +431,7 @@ func TestOutboundCancellationPreservesActiveRetryAfter(t *testing.T) {
 }
 
 func TestOutboundChatScheduleCacheIsBounded(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -422,7 +448,7 @@ func TestOutboundChatScheduleCacheIsBounded(t *testing.T) {
 }
 
 func TestOutboundIdleSchedulePreservesBackoffBeyondTTL(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -444,7 +470,7 @@ func TestOutboundIdleSchedulePreservesBackoffBeyondTTL(t *testing.T) {
 }
 
 func TestOutboundCapacityPruningPreservesActiveBackoff(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -501,7 +527,7 @@ func TestOutboundCapacityEvictionPreservesRecentChatCooldown(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+			o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 			candidateKey := chatScheduleKey{botKey: "bot-a", chatID: 1}
 			candidate := &chatSchedule{key: candidateKey, idleSince: current.Add(-tt.idleFor)}
 			if tt.backoffFor > 0 {
@@ -530,7 +556,7 @@ func TestOutboundCapacityEvictionPreservesRecentChatCooldown(t *testing.T) {
 }
 
 func TestOutboundManyActiveBackoffsKeepTotalScheduleCacheBounded(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 
@@ -563,7 +589,7 @@ func TestOutboundManyActiveBackoffsKeepTotalScheduleCacheBounded(t *testing.T) {
 }
 
 func TestOutboundCompressedChatInheritsBotFallback(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.now = func() time.Time { return current }
 	backoffTill := current.Add(time.Hour)
@@ -605,7 +631,7 @@ func TestOutboundCompressedChatInheritsBotFallback(t *testing.T) {
 }
 
 func TestOutboundExpiredBotFallbackIsRemoved(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.mu.Lock()
 	o.botFallbackBackoff["bot-a"] = current.Add(time.Minute)
@@ -624,7 +650,7 @@ func TestOutboundExpiredBotFallbackIsRemoved(t *testing.T) {
 }
 
 func TestOutboundBotFallbackDoesNotThrottleAnotherInstallation(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	o.mu.Lock()
 	o.botFallbackBackoff["bot-a"] = current.Add(time.Hour)
@@ -656,7 +682,7 @@ func TestOutboundCompletionWaitsForRetryAfterBackoff(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
@@ -701,7 +727,7 @@ func TestOutboundTerminalWorkerDeliversLongMultiChunkReply(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
@@ -744,7 +770,7 @@ func TestOutboundTerminalDeliveryHasNoFixedRetryAfterBudget(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
@@ -783,7 +809,7 @@ func TestOutboundChatDoneDoesNotBlockRealtimeFanout(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -861,11 +887,11 @@ func TestOutboundLegacyLaneCollisionDoesNotBlockAnotherSession(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	q.bindings = map[[16]byte]db.ChannelChatSessionBinding{
-		{15: 3}: telegramTestBinding(42),
-		{15: 7}: telegramTestBinding(43),
+		{15: 2}: telegramTestBinding(42),
+		{15: 5}: telegramTestBinding(43),
 	}
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -913,7 +939,7 @@ func TestOutboundSameSessionSecondReplyCannotOvertakeFirst(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -967,13 +993,13 @@ func TestOutboundBackoffSessionsDoNotExhaustWorkers(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	q.bindings = make(map[[16]byte]db.ChannelChatSessionBinding)
 	for i := byte(1); i <= terminalWorkerCount+2; i++ {
-		q.bindings[[16]byte{15: i}] = telegramTestBinding(100 + int64(i))
+		q.bindings[[16]byte{15: i + 30}] = telegramTestBinding(100 + int64(i))
 	}
-	q.bindings[[16]byte{15: 20}] = telegramTestBinding(200)
+	q.bindings[[16]byte{15: 60}] = telegramTestBinding(200)
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	o.Start(ctx)
@@ -1026,11 +1052,12 @@ func TestOutboundShutdownAbandonsQueuedRetryWaitingAndInflightJobs(t *testing.T)
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	q.bindings = map[[16]byte]db.ChannelChatSessionBinding{
-		{15: 3}: telegramTestBinding(42),
-		{15: 7}: telegramTestBinding(43),
+		{15: 2}: telegramTestBinding(42),
+		{15: 5}: telegramTestBinding(43),
+		{15: 6}: telegramTestBinding(43),
 	}
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1083,7 +1110,7 @@ func TestOutboundRetryResumesAtFailedChunkWithoutRepeatingSuccess(t *testing.T) 
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	current := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
@@ -1106,7 +1133,7 @@ func TestOutboundRetryResumesAtFailedChunkWithoutRepeatingSuccess(t *testing.T) 
 }
 
 func TestOutboundTerminalSchedulerPreservesSessionFIFO(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	first := telegramTestEvent()
 	second := telegramTestEvent()
 	second.TaskID = "00000000-0000-0000-0000-000000000005"
@@ -1129,7 +1156,7 @@ func TestOutboundTerminalSchedulerPreservesSessionFIFO(t *testing.T) {
 }
 
 func TestOutboundRejectsSixtyFifthQueuedTerminalReply(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	for i := byte(0); i < maxQueuedTerminalReplies; i++ {
 		sessionByte := i/byte(maxQueuedTerminalRepliesPerSession) + 1
 		o.enqueueTerminalReply(telegramTestEventFor(sessionByte, i+20, "queued"))
@@ -1147,7 +1174,7 @@ func TestOutboundRejectsSixtyFifthQueuedTerminalReply(t *testing.T) {
 }
 
 func TestOutboundRejectsNinthQueuedTerminalReplyInSession(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	for i := byte(0); i < maxQueuedTerminalRepliesPerSession; i++ {
 		o.enqueueTerminalReply(telegramTestEventFor(3, i+20, "queued"))
 	}
@@ -1163,7 +1190,7 @@ func TestOutboundRejectsNinthQueuedTerminalReplyInSession(t *testing.T) {
 }
 
 func TestOutboundRejectsTerminalReplyBeyondByteLimit(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	e := telegramTestEventFor(3, 2, strings.Repeat("x", maxQueuedTerminalReplyBytes+1))
 	o.enqueueTerminalReply(e)
 
@@ -1177,7 +1204,7 @@ func TestOutboundRejectsTerminalReplyBeyondByteLimit(t *testing.T) {
 }
 
 func TestOutboundCompletedTerminalReplyReleasesCapacityImmediately(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	e := telegramTestEventFor(3, 2, "reply")
 	o.enqueueTerminalReply(e)
 
@@ -1203,7 +1230,7 @@ func TestOutboundCompletedTerminalReplyReleasesCapacityImmediately(t *testing.T)
 }
 
 func TestOutboundShutdownClearsTerminalReplyCapacity(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	o.enqueueTerminalReply(telegramTestEventFor(3, 2, "first"))
 	o.enqueueTerminalReply(telegramTestEventFor(7, 5, "second"))
 	o.stopTerminalScheduler()
@@ -1221,7 +1248,7 @@ func TestOutboundShutdownClearsTerminalReplyCapacity(t *testing.T) {
 func TestOutboundRejectedTerminalReplyReleasesStreamSchedule(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, logger)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, logger)
 	e := telegramTestEventFor(3, 2, "rejected")
 	schedule := &chatSchedule{key: chatScheduleKey{botKey: "bot", chatID: 42}, refs: 1}
 	o.streams[e.TaskID] = &streamState{chatID: 42, schedule: schedule}
@@ -1242,30 +1269,50 @@ func TestOutboundRejectedTerminalReplyReleasesStreamSchedule(t *testing.T) {
 	}
 }
 
-func TestOutboundEmptyTerminalReplySkipsQueueAndClearsStream(t *testing.T) {
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, nil)
+// An empty completion has no answer to deliver, but it still ends the turn: it
+// releases local state at once and queues the close that stops a late text
+// frame from reopening the reply. The close is a database write, so it runs on
+// a worker rather than on the synchronous bus.
+func TestOutboundEmptyTerminalReplyClearsStreamAndQueuesTheClose(t *testing.T) {
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, nil)
 	e := telegramTestEventFor(3, 2, "")
 	schedule := &chatSchedule{key: chatScheduleKey{botKey: "bot", chatID: 42}, refs: 1}
 	o.streams[e.TaskID] = &streamState{chatID: 42, schedule: schedule}
 	o.chats[schedule.key] = schedule
 
 	o.enqueueTerminalReply(e)
-	o.terminalMu.Lock()
-	count := o.queuedTerminalReplyCount
-	o.terminalMu.Unlock()
 	o.mu.Lock()
 	_, streamExists := o.streams[e.TaskID]
 	refs := schedule.refs
 	o.mu.Unlock()
-	if count != 0 || streamExists || refs != 0 {
-		t.Fatalf("empty reply count=%d stream=%v schedule refs=%d", count, streamExists, refs)
+	if streamExists || refs != 0 {
+		t.Fatalf("empty reply left local state behind: stream=%v schedule refs=%d", streamExists, refs)
+	}
+
+	o.terminalMu.Lock()
+	queued := o.terminalSessions[e.ChatSessionID]
+	o.terminalMu.Unlock()
+	if queued == nil || len(queued.queue) != 1 {
+		t.Fatalf("empty reply did not queue its close: %+v", queued)
+	}
+	reply := queued.queue[0]
+	if reply.kind != terminalKindClose || reply.settleReason != "empty_reply" {
+		t.Fatalf("queued reply is not a close: kind=%v reason=%q", reply.kind, reply.settleReason)
+	}
+	if reply.byteSize != 0 {
+		t.Fatalf("empty reply charged %d bytes to the queue budget", reply.byteSize)
+	}
+
+	// The close must settle the reply without asking Telegram for anything.
+	if result := o.sendNextTerminalRequest(context.Background(), reply); !result.done || result.err != nil {
+		t.Fatalf("close did not settle: %+v", result)
 	}
 }
 
 func TestOutboundInvalidTerminalReplyIdentityFailsFast(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	o := NewOutbound(newTelegramOutboundQueries(), nil, "", nil, logger)
+	o := NewOutbound(newTelegramOutboundQueries(t), nil, "", nil, logger)
 	e := telegramTestEvent()
 	e.TaskID = "invalid-task"
 	e.ChatSessionID = "invalid-session"
@@ -1291,7 +1338,7 @@ func TestOutboundTerminalReplyUsesPayloadTaskIDFromProductionEvent(t *testing.T)
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1322,7 +1369,7 @@ func TestOutboundRetryPendingFailureCleansStreamWithoutNotice(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	taskID := telegramTestEvent().TaskID
@@ -1356,14 +1403,45 @@ func TestOutboundTerminalFailureSendsNotice(t *testing.T) {
 	}))
 	defer api.Close()
 
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, api.URL, api.Client(), nil)
 	e := telegramTestEvent()
 	e.Type = protocol.EventTaskFailed
 	e.Payload = map[string]any{"retry_pending": false}
 	o.handleTaskFailed(e)
+	// The notice is terminal work now: it waits for the turn's lease like the
+	// answer does, so it is delivered by the queue rather than inline.
+	drainTerminalQueueForTest(t, o, e.ChatSessionID)
 	if requests != 1 {
 		t.Fatalf("terminal failure requests = %d, want 1", requests)
+	}
+}
+
+// drainTerminalQueueForTest runs one session's queued terminal work to
+// completion, the way the workers would.
+func drainTerminalQueueForTest(t *testing.T, o *Outbound, sessionID string) {
+	t.Helper()
+	ctx := context.Background()
+	for {
+		o.terminalMu.Lock()
+		session := o.terminalSessions[sessionID]
+		if session == nil || len(session.queue) == 0 {
+			o.terminalMu.Unlock()
+			return
+		}
+		reply := session.queue[0]
+		session.queue = session.queue[1:]
+		o.terminalMu.Unlock()
+		for i := 0; i < 25; i++ {
+			result := o.sendNextTerminalRequest(ctx, reply)
+			if result.done {
+				o.cleanupTerminalReply(reply)
+				break
+			}
+			if d := result.retryAt.Sub(o.now()); d > 0 {
+				_ = o.wait(ctx, d)
+			}
+		}
 	}
 }

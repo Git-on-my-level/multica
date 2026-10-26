@@ -89,7 +89,7 @@
     },
     "load_failed": {
       "title": "Billing is temporarily unavailable",
-      "description": "We couldn't read a trustworthy subscription snapshot. Your plan has not been changed."
+      "description": "Couldn't load subscription details. Try again."
     },
     "actions": {
       "retry": "Retry",
@@ -97,28 +97,25 @@
       "upgrade": "Upgrade to Pro",
       "manage": "Manage billing",
       "add_seats": "Add seats",
-      "refresh_seats": "Refresh seats",
       "cancel": "Cancel",
       "continue_to_stripe": "Continue to Stripe"
     },
     "errors": {
       "action_title": "Billing action failed",
       "temporarily_unavailable": "Billing is temporarily unavailable. Retry in a moment.",
+      "not_enabled": "Workspace subscriptions are not enabled for this deployment. Contact your administrator.",
       "permission_changed": "Your workspace role no longer allows this action. Refresh the page to see your current access.",
       "checkout_response": "Checkout could not open because the server response was unreadable. Retry without changing your selected interval.",
       "already_subscribed": "This workspace already has a subscription. The current plan has been refreshed.",
       "checkout_failed": "Checkout could not be created. Retry in a moment.",
       "portal_response": "The Billing Portal could not open because the server response was unreadable.",
       "portal_unavailable": "The Billing Portal is not available for this workspace. The current plan has been refreshed.",
-      "portal_failed": "The Billing Portal could not be opened. Retry in a moment.",
-      "reconcile_response": "Seats were refreshed, but the result could not be read. Reload the page to confirm the current count.",
-      "reconcile_failed": "Seats could not be refreshed. Member changes are still saved and periodic reconciliation will retry."
+      "portal_failed": "The Billing Portal could not be opened. Retry in a moment."
     },
     "return": {
       "cancel_title": "Checkout canceled",
       "cancel_description": "No plan change was made.",
       "portal_title": "Billing details refreshed",
-      "portal_description": "The latest subscription snapshot is shown below.",
       "syncing_title": "Activating your subscription",
       "syncing_description": "Payment is complete. We're waiting for Stripe to confirm the plan change.",
       "timeout_description": "Payment was received, but the subscription is still syncing. Refresh this page in a moment.",
@@ -127,12 +124,12 @@
     },
     "past_due": {
       "title": "Payment needs attention",
-      "description": "Open the Billing Portal to update your payment method. The plan badge above shows the access currently available.",
+      "description": "Update your payment method in billing management.",
       "grace_description": "Update your payment method by {{date}} to keep Pro access."
     },
     "subscription_notice": {
       "canceling_title": "Cancellation is scheduled",
-      "canceling_description": "This subscription is scheduled to cancel on {{date}}. The plan badge above shows the access currently enforced.",
+      "canceling_description": "Your subscription will cancel on {{date}}.",
       "canceling_description_without_date": "This subscription is scheduled to cancel at the end of its current period.",
       "incomplete_title": "Subscription setup is incomplete",
       "incomplete_description": "Open billing management to finish or review the payment setup.",
@@ -142,25 +139,17 @@
       "paused_description": "Open billing management to review the pause and available recovery options.",
       "unpaid_title": "Subscription is unpaid",
       "unpaid_description": "Open billing management to resolve the unpaid balance.",
-      "canceled_title": "Subscription is canceled",
-      "canceled_description": "The entitlement badge above shows the plan currently enforced for this workspace."
-    },
-    "read_only": {
-      "title": "Read-only billing access",
-      "description": "You can view the workspace plan and limits. Only owners and admins can purchase or manage a subscription."
+      "canceled_title": "Subscription is canceled"
     },
     "current": {
       "title": "Current plan",
       "plan": "Workspace plan",
-      "plan_description": "The entitlement currently enforced for this workspace.",
       "members": "Human members",
       "members_description": "Agents and pending invitations are not counted as seats.",
       "member_count_one": "{{count}} member",
       "member_count_other": "{{count}} members",
       "billing_interval": "Billing interval",
-      "billing_interval_description": "The interval stored for the active subscription.",
-      "period_end": "Current period ends",
-      "period_end_description": "The date reported by the current subscription snapshot."
+      "period_end": "Current period ends"
     },
     "upgrade": {
       "title": "Upgrade to Pro",
@@ -172,26 +161,19 @@
       "pro_for_team_other": "Pro for {{count}} human seats",
       "price_loading": "Loading subscription prices",
       "unit_price": "{{price}} per human seat",
-      "estimated_monthly_total": "Estimated monthly total: {{price}}",
-      "estimated_yearly_total": "Estimated yearly total: {{price}}",
       "price_at_checkout": "The server re-counts human members before purchase. Stripe Checkout shows the authoritative per-seat price and total before you pay."
     },
     "management": {
       "title": "Subscription management",
-      "description": "Stripe securely manages payment methods, invoices, and cancellation.",
+      "description": "Payment methods, invoices, and cancellation.",
       "portal": "Stripe Billing Portal",
-      "portal_description": "Open Stripe to manage this workspace's subscription.",
       "portal_unavailable": "No Stripe Billing Portal is available for this workspace."
     },
     "limits": {
       "title": "Usage and limits",
-      "description": "Limits come from the current entitlement. Automation usage comes from server quota accounting.",
-      "issues": "Recent tasks",
-      "issues_description": "Free keeps the most recently active tasks available. Pro has no window limit.",
-      "autopilots": "Successful automations",
-      "autopilots_description": "The Free allowance resets each UTC calendar month. Pro is unlimited.",
+      "issues": "Issues",
+      "autopilots": "Automation runs",
       "unlimited": "Unlimited",
-      "unavailable": "Unavailable",
       "per_month": "{{count}} / month",
       "usage_loading": "Loading automation usage",
       "usage_label": "Automation quota usage",
@@ -206,15 +188,13 @@
       "title": "Seats",
       "description": "Purchased seats cover current human members and pending invitations. Agents never use a seat.",
       "human_members": "Used seats",
-      "human_members_description": "Confirmed human members consuming purchased capacity. Refresh after a membership change to reconcile the count.",
       "billed": "Purchased seats",
-      "billed_description": "The seat quantity currently purchased through Stripe.",
       "pending_invitations": "Pending invitations",
       "pending_invitations_description": "Live invitations reserve purchased seats until accepted or expired.",
       "available": "Available seats",
-      "available_description": "Purchased seats not used by members or reserved for invitations.",
+      "available_description": "Purchased seats minus members and reserved invitations.",
       "pending": "Scheduled seat quantity",
-      "pending_description": "A lower quantity that cloud billing reports for the next period.",
+      "pending_description": "Takes effect next billing period.",
       "seat_count_one": "{{count}} seat",
       "seat_count_other": "{{count}} seats",
       "pending_with_date_one": "{{count}} seat from {{date}}",
@@ -225,8 +205,11 @@
       "summary_loading": "Loading subscription seat details",
       "summary_unavailable_title": "Some seat details are unavailable",
       "summary_unavailable_description": "The current plan is still shown, but purchased and scheduled seat quantities could not be loaded.",
-      "updated": "Seats refreshed",
-      "reconciled": "Current members: {{actual}} · billed seats: {{billed}}"
+      "members_over_capacity_title": "Members exceed purchased seats",
+      "members_over_capacity_description": "This workspace has {{actual}} members but only {{purchased}} purchased seats. Add enough seats or remove members before sending more invitations.",
+      "occupancy_over_capacity_description": "This workspace occupies {{occupied}} of {{purchased}} purchased seats ({{members}} members and {{reserved}} pending invitations). Add seats, remove a member, or revoke a pending invitation before inviting someone else.",
+      "updated": "Seat purchase submitted",
+      "available_help": "How available seats are calculated"
     },
     "seat_purchase": {
       "title": "Add seats",
@@ -253,7 +236,7 @@
       "pending_description_other": "Stripe is confirming the subscription update to {{count}} seats.",
       "delayed_title": "Seat confirmation is taking longer than expected",
       "delayed_description": "Automatic checking has stopped. The purchase may still complete; check again later or contact support before starting another purchase.",
-      "delayed_description_with_expiry": "Automatic checking has stopped. If the attempt is still pending after {{date}}, refresh seats to release it and request a new quote; contact support before starting another purchase.",
+      "delayed_description_with_expiry": "Automatic checking has stopped. If the attempt is still pending after {{date}}, reload this page before requesting another quote; contact support if it remains pending.",
       "submitted_one": "A purchase for {{count}} seat was submitted. The new capacity appears after Stripe confirms it.",
       "submitted_other": "A purchase for {{count}} seats was submitted. The new capacity appears after Stripe confirms it.",
       "error_title": "Could not update the estimate"

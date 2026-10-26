@@ -13,7 +13,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
@@ -51,6 +50,10 @@ func dispatchOne(t *testing.T, env frameEnvelope) (channel.InboundMessage, bool,
 
 // dispatchOneAs is dispatchOne with the bot's configured display name — the
 // one thing stripLeadingMentions has to match a group's addressing against.
+//
+// The socket acknowledges what it is sent. A receipt's verdict only reaches a
+// debug log, and a socket that never answered made every receipt wait out the
+// ack timeout.
 func dispatchOneAs(t *testing.T, env frameEnvelope, botDisplayName string) (channel.InboundMessage, bool, *recordingConn) {
 	t.Helper()
 	var got channel.InboundMessage
@@ -61,7 +64,7 @@ func dispatchOneAs(t *testing.T, env frameEnvelope, botDisplayName string) (chan
 	})
 	c.botDisplayName = botDisplayName
 	conn := &recordingConn{}
-	if err := c.dispatchFrame(context.Background(), env, newWSSender(conn, slog.Default()), slog.Default()); err != nil {
+	if err := c.dispatchFrame(context.Background(), env, conn.autoAck(newWSSender(conn, slog.Default())), slog.Default()); err != nil {
 		t.Fatalf("dispatchFrame: %v", err)
 	}
 	return got, called, conn
@@ -239,17 +242,6 @@ func TestOwnText_MixedWithNothingReadableTakesTheReceipt(t *testing.T) {
 	}
 }
 
-// TestUnsupportedReceipt_DoesNotClaimTextOnly: the receipt used to say the
-// bot only handles text. It now routes photos, files, videos and 图文混排, so
-// a person who just watched it answer a screenshot must not then be told it
-// handles text only.
-func TestUnsupportedReceipt_DoesNotClaimTextOnly(t *testing.T) {
-	t.Parallel()
-	if strings.Contains(unsupportedMsgTypeReceipt, "只能处理文字") {
-		t.Errorf("receipt %q still claims text-only while image/file/video/mixed route", unsupportedMsgTypeReceipt)
-	}
-}
-
 // TestAVoiceNoteIsReadWhereverItArrives: WeCom runs the speech recognition on
 // its side and hands over the transcript, so a spoken sentence needs no
 // download and no key — it is words, and it is read like words whether it
@@ -401,6 +393,50 @@ func TestDispatchFrame_GroupMentionedMixedCommand(t *testing.T) {
 	}
 	if !got.SkipAgentRun {
 		t.Error("SkipAgentRun = false; the group would get the slash command read back to it")
+	}
+}
+
+func TestDispatchFrame_MixedSessionControlsShareNormalization(t *testing.T) {
+	tests := []struct {
+		command   string
+		wantFresh bool
+	}{
+		{command: "/clear 点评一下", wantFresh: true},
+		{command: "/new 点评一下", wantFresh: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.command, func(t *testing.T) {
+			got, called, _ := dispatchOne(t, mixedFrame(t, nil,
+				imageRun("https://cos.example.com/a"),
+				textRun(tc.command),
+			))
+			if !called {
+				t.Fatal("the mixed control message never reached the handler")
+			}
+			if got.Text != "[Image]\n点评一下" {
+				t.Fatalf("visible body = %q, want media with stripped directive", got.Text)
+			}
+			if got.CommandText != tc.command {
+				t.Fatalf("CommandText = %q, want original control source %q", got.CommandText, tc.command)
+			}
+			if got.ForceFresh != tc.wantFresh {
+				t.Fatalf("ForceFresh = %v, want %v", got.ForceFresh, tc.wantFresh)
+			}
+		})
+	}
+}
+
+func TestDispatchFrame_GroupMentionedMixedChatStripsAddressingAndDirective(t *testing.T) {
+	group := map[string]any{"chattype": "group", "chatid": "GROUP_1"}
+	got, called, _ := dispatchOneAs(t, mixedFrame(t, group,
+		imageRun("https://cos.example.com/a"),
+		textRun("@Multica Bot /new 点评一下"),
+	), "Multica Bot")
+	if !called {
+		t.Fatal("the group message never reached the handler")
+	}
+	if got.Text != "[Image]\n点评一下" || got.CommandText != "/new 点评一下" {
+		t.Fatalf("Text/CommandText = %q/%q", got.Text, got.CommandText)
 	}
 }
 

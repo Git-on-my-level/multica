@@ -42,10 +42,10 @@ func modelListPendingKey(runtimeID string) string { return modelListPendingPrefi
 // RedisModelListStore stores model list requests in Redis so every API node
 // agrees on the same pending / running / terminal state.
 type RedisModelListStore struct {
-	rdb *redis.Client
+	rdb redis.UniversalClient
 }
 
-func NewRedisModelListStore(rdb *redis.Client) *RedisModelListStore {
+func NewRedisModelListStore(rdb redis.UniversalClient) *RedisModelListStore {
 	return &RedisModelListStore{rdb: rdb}
 }
 
@@ -227,7 +227,7 @@ func (s *RedisModelListStore) PopPending(ctx context.Context, runtimeID string) 
 	return nil, nil
 }
 
-func (s *RedisModelListStore) Complete(ctx context.Context, id string, models []ModelEntry, supported bool) error {
+func (s *RedisModelListStore) Complete(ctx context.Context, id string, models []ModelEntry, unavailable []UnavailableModelEntry, supported bool) error {
 	req, err := s.loadRequest(ctx, id)
 	if err != nil {
 		return err
@@ -237,6 +237,7 @@ func (s *RedisModelListStore) Complete(ctx context.Context, id string, models []
 	}
 	req.Status = ModelListCompleted
 	req.Models = models
+	req.UnavailableModels = unavailable
 	req.Supported = supported
 	req.UpdatedAt = time.Now()
 	return s.persistRequest(ctx, req)

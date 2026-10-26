@@ -12,12 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // hermesBlockedArgs are flags hardcoded by the daemon that must not be
@@ -44,14 +47,15 @@ var hermesBlockedArgs = map[string]blockedArgMode{
 // validation lives in the daemon-side resolver (execenv.ResolveHermesProfile).
 var hermesArgProfileRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
-// hermesValueFlags and hermesOptionalValueFlags mirror the value-taking flags
-// Hermes skips while scanning argv for -p/--profile, so a value like the `coder`
-// in `-m coder -p research` is never misread as the profile. Kept in sync with
-// _apply_profile_override.value_flags / optional_value_flags.
+// hermesValueFlags and hermesOptionalValueFlags mirror Hermes' top-level
+// value-taking flags, which it skips while scanning argv for -p/--profile, so a
+// value like the `coder` in `-m coder -p research` is never misread as the
+// profile. Kept in sync with hermes_cli._parser.top_level_value_flag_sets
+// (formerly the literal _apply_profile_override.value_flags).
 var hermesValueFlags = map[string]struct{}{
 	"-z": {}, "--oneshot": {}, "-m": {}, "--model": {}, "--provider": {},
-	"-t": {}, "--toolsets": {}, "-r": {}, "--resume": {}, "-s": {},
-	"--skills": {}, "--usage-file": {},
+	"--reasoning": {}, "-t": {}, "--toolsets": {}, "-r": {}, "--resume": {},
+	"-s": {}, "--skills": {}, "--usage-file": {}, "--in": {},
 }
 var hermesOptionalValueFlags = map[string]struct{}{"-c": {}, "--continue": {}}
 
@@ -135,43 +139,222 @@ func hermesInsideMcpAdd(args []string, index int) bool {
 }
 
 // hermesACPSubcommand is the subcommand the backend always launches with. It
-// sits between the runtime's launch prefix and the agent's custom args, and it
 // is an ordinary argv token to Hermes' own parser — which is why the daemon
 // cannot reason about a profile selection without it.
 const hermesACPSubcommand = "acp"
 
+// hermesACPSubcommandFlags are the options Hermes' `acp` subparser declares
+// (hermes_cli/subcommands/acp.py, plus argparse's own -h/--help), all
+// value-less. Argparse accepts them only after the subcommand, so they keep
+// that position; every other custom arg is a global flag, which Hermes accepts
+// only before it.
+var hermesACPSubcommandFlags = map[string]struct{}{
+	"--accept-hooks": {}, "--version": {}, "--check": {}, "--setup": {},
+	"--setup-browser": {}, "--yes": {}, "-y": {}, "--help": {}, "-h": {},
+}
+
+// isHermesACPSubcommandFlag reports whether the `acp` subparser would read
+// token as one of its own options, so it must stay behind the subcommand.
+//
+// Matching follows argparse, not string equality: Hermes keeps allow_abbrev, so
+// behind `acp` a `--y` is `--yes` — while in front of it the root parser reads
+// the same token as `--yolo`. A long token is the subparser's whenever it
+// prefixes one of its options; an ambiguous prefix (`--se`) is a usage error
+// there, exactly as it was before global flags moved. A short token is the
+// subparser's when its flag letter is, since `-yh` bundles `-y` and `-h`.
+func isHermesACPSubcommandFlag(token string) bool {
+	arg := unshellQuoteArg(token)
+	if strings.HasPrefix(arg, "--") {
+		return hermesLongOptionPrefix(arg, hermesACPSubcommandFlags)
+	}
+	if len(arg) >= 2 && arg[0] == '-' {
+		_, ok := hermesACPSubcommandFlags[arg[:2]]
+		return ok
+	}
+	return false
+}
+
+// hermesLongOptionPrefix reports whether a `--name` token (any inline
+// `=value` ignored) names one of the long options in options the way argparse
+// resolves it: exactly, or as a prefix of it.
+func hermesLongOptionPrefix(arg string, options map[string]struct{}) bool {
+	name, _, _ := strings.Cut(arg, "=")
+	if len(name) <= len("--") || !strings.HasPrefix(name, "--") {
+		return false
+	}
+	for option := range options {
+		if strings.HasPrefix(option, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // hermesCLIArgsFrom assembles the argv the backend passes after the executable
 // and its launch prefix, from custom args that are already filtered.
 func hermesCLIArgsFrom(filteredCustomArgs []string) []string {
-	args := make([]string, 0, 1+len(filteredCustomArgs))
+	args, _ := hermesCLIArgsLayout(filteredCustomArgs)
+	return args
+}
+
+// hermesCLIArgsLayout places the filtered custom args around `acp` and reports,
+// for each returned token, the index of the custom arg it came from (-1 for
+// `acp` itself).
+//
+// Hermes splits its flags by position: global flags (`--provider`, `--yolo`,
+// `-m`, ...) parse only before the subcommand, the flags `acp` declares only
+// after it. Launching `hermes acp <custom args>` turned every global flag into
+// an argparse usage error that exits before the ACP handshake (GH #8878), so
+// global flags go in front — a value-taking flag keeping its value — and `acp`'s
+// own flags stay behind. jcode, the other CLI behind this protocol family,
+// declares its flags global, so it parses either position.
+func hermesCLIArgsLayout(filteredCustomArgs []string) (args []string, origin []int) {
+	args = make([]string, 0, len(filteredCustomArgs)+1)
+	origin = make([]int, 0, len(filteredCustomArgs)+1)
+	var subcommandFlags []int
+	for i := 0; i < len(filteredCustomArgs); {
+		if isHermesACPSubcommandFlag(filteredCustomArgs[i]) {
+			subcommandFlags = append(subcommandFlags, i)
+			i++
+			continue
+		}
+		n, _ := hermesValueTokens(filteredCustomArgs, i)
+		for end := i + n; i <= end; i++ {
+			args = append(args, filteredCustomArgs[i])
+			origin = append(origin, i)
+		}
+	}
 	args = append(args, hermesACPSubcommand)
-	return append(args, filteredCustomArgs...)
+	origin = append(origin, -1)
+	for _, i := range subcommandFlags {
+		args = append(args, filteredCustomArgs[i])
+		origin = append(origin, i)
+	}
+	return args, origin
+}
+
+// hermesACPIndex returns where `acp` sits in an argv built by hermesCLIArgsFrom:
+// only `acp`'s own flags follow it, so it is the last token that is not one.
+func hermesACPIndex(args []string) int {
+	i := len(args) - 1
+	for i > 0 {
+		if !isHermesACPSubcommandFlag(args[i]) {
+			break
+		}
+		i--
+	}
+	return i
 }
 
 // hermesCLIArgs is what hermesBackend.Execute passes to the launch boundary.
-func hermesCLIArgs(customArgs []string, logger *slog.Logger) []string {
-	return hermesCLIArgsFrom(filterCustomArgs(customArgs, hermesBlockedArgs, logger))
+func hermesCLIArgs(launchPrefix, customArgs []string, logger *slog.Logger) []string {
+	custom := filterCustomArgs(customArgs, hermesBlockedArgs, logger)
+	return hermesCLIArgsFrom(dropHermesSubcommandCapture(launchPrefix, custom, logger))
+}
+
+// dropHermesSubcommandCapture removes the custom arg that would take the
+// backend's `acp` token as its value.
+//
+// Global flags sit directly in front of the subcommand, so a value-taking flag
+// left without its value — a bare `--provider`, a bare `-p` — consumes `acp`
+// instead. Hermes then either selects a profile named `acp` or, with no
+// subcommand left, starts interactive chat on the daemon's pipe and never
+// answers the handshake, hanging the task until it times out. The flag has no
+// value to apply either way, so dropping it keeps the launch on ACP.
+//
+// The launch prefix is scanned too, so a custom arg that is itself the value
+// of a flag the prefix leaves open is paired the way Hermes pairs it.
+func dropHermesSubcommandCapture(launchPrefix, filteredCustomArgs []string, logger *slog.Logger) []string {
+	args, origin := hermesCLIArgsLayout(filteredCustomArgs)
+	acp := hermesACPIndex(args)
+	if acp == 0 || !hermesArgvAwaitsValue(Command{Prefix: launchPrefix}.Argv(args[:acp]...)) {
+		return filteredCustomArgs
+	}
+	drop := origin[acp-1]
+	if logger != nil {
+		logger.Warn("hermes: dropping custom arg with no value; it would consume the acp subcommand",
+			"flag", unshellQuoteArg(filteredCustomArgs[drop]))
+	}
+	return withoutIndices(filteredCustomArgs, []int{drop})
+}
+
+// hermesValueTokens reports how many tokens after args[i] Hermes reads as its
+// value, and whether args[i] is a value-taking flag with nothing left to take.
+// Beyond the exact names ParseHermesProfileArgs skips, it resolves long-flag
+// abbreviations the way argparse does (`--prov` is `--provider`), since those
+// consume the next token just the same.
+func hermesValueTokens(args []string, i int) (n int, open bool) {
+	arg := unshellQuoteArg(args[i])
+	rest := len(args) - i - 1
+	if arg == "--" {
+		return rest, false
+	}
+	takes := func(options map[string]struct{}) bool {
+		if _, ok := options[arg]; ok {
+			return true
+		}
+		return !strings.Contains(arg, "=") && hermesLongOptionPrefix(arg, options)
+	}
+	required, optional := takes(hermesValueFlags), takes(hermesOptionalValueFlags)
+	switch {
+	case required || arg == "-p" || arg == "--profile":
+		if rest == 0 {
+			return 0, true
+		}
+		return 1, false
+	case optional:
+		if rest == 0 {
+			return 0, true
+		}
+		if !strings.HasPrefix(unshellQuoteArg(args[i+1]), "-") {
+			return 1, false
+		}
+	}
+	return 0, false
+}
+
+// hermesArgvAwaitsValue reports whether args end on a value-taking flag whose
+// value slot is still open, so the next token would be consumed as its value.
+func hermesArgvAwaitsValue(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		n, open := hermesValueTokens(args, i)
+		if open {
+			return true
+		}
+		i += n
+	}
+	return false
+}
+
+// withoutIndices returns s minus the elements at the given indexes, in order.
+func withoutIndices(s []string, drop []int) []string {
+	out := make([]string, 0, len(s))
+	for i, v := range s {
+		if !slices.Contains(drop, i) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // HermesLaunchArgv returns the exact argv Hermes will parse: the runtime's
-// launch prefix, then `acp`, then the agent's custom args after the same
-// blocked-flag filtering the backend applies.
+// launch prefix, then the agent's custom args after the same filtering the
+// backend applies, placed around `acp` the way the backend places them.
 //
 // The daemon resolves the profile selection from this rather than from a
 // hand-assembled approximation. Concatenating prefix and custom args alone
 // silently disagrees with the real command line, because the `acp` token
-// participates in Hermes' scan: with fixed_args `--model` and custom_args
-// `-p research`, the approximation reads `-p` as `--model`'s value and finds
-// no selection, while the real `--model acp -p research` skips `--model acp`
-// and selects `research`. The overlay would then be seeded from the default
-// home while the process runs under a different profile's config.
+// participates in Hermes' scan: a launch prefix ending in a bare `-p`, with no
+// global custom arg after it, finds no selection in the approximation, while
+// the real `-p acp` selects a profile named `acp`. The overlay would then be
+// seeded from the default home while the process asks for a different profile.
 func HermesLaunchArgv(launchPrefix, customArgs []string, logger *slog.Logger) []string {
-	return Command{Prefix: launchPrefix}.Argv(hermesCLIArgs(customArgs, logger)...)
+	return Command{Prefix: launchPrefix}.Argv(hermesCLIArgs(launchPrefix, customArgs, logger)...)
 }
 
 // StripHermesProfileSelectors removes every profile selection from the argv
 // Hermes will parse and hands each surviving token back to the region it came
-// from — launch prefix or custom args.
+// from — launch prefix or custom args, the latter in their configured order.
 //
 // The daemon calls this only when it built the per-task overlay, where the
 // overlay's HERMES_HOME is authoritative and nothing on the command line may
@@ -181,8 +364,9 @@ func HermesLaunchArgv(launchPrefix, customArgs []string, logger *slog.Logger) []
 // reasons, both of which leave a live selector behind if ignored:
 //
 //   - A selection can straddle the boundary. A launch prefix ending in a bare
-//     `-p` takes the backend's own `acp` token as its value, and neither region
-//     contains a complete selection to strip.
+//     `-p` takes the first global custom arg — or, with none, the backend's own
+//     `acp` token — as its value, and neither region contains a complete
+//     selection to strip.
 //   - Removing one selection promotes the next. Hermes honours the first and
 //     ignores the rest, so a single pass can hand the job to a later
 //     occurrence — and with the prefix and custom args configured separately,
@@ -196,32 +380,29 @@ func StripHermesProfileSelectors(launchPrefix, customArgs []string, logger *slog
 	prefix := append([]string(nil), launchPrefix...)
 	custom := append([]string(nil), filterCustomArgs(customArgs, hermesBlockedArgs, logger)...)
 	for {
-		sel := ParseHermesProfileArgs(Command{Prefix: prefix}.Argv(hermesCLIArgsFrom(custom)...))
+		args, origin := hermesCLIArgsLayout(custom)
+		sel := ParseHermesProfileArgs(Command{Prefix: prefix}.Argv(args...))
 		if !sel.Found {
 			return prefix, custom
 		}
-		acpIndex := len(prefix)
-		removed := false
-		// Walk back to front so earlier indices stay valid as tokens go.
-		for i := sel.ArgFrom + sel.ArgLen - 1; i >= sel.ArgFrom; i-- {
+		var fromPrefix, fromCustom []int
+		for i := sel.ArgFrom; i < sel.ArgFrom+sel.ArgLen; i++ {
 			switch {
-			case i < acpIndex:
-				prefix = append(prefix[:i], prefix[i+1:]...)
-				removed = true
-			case i == acpIndex:
-				// Backend-owned; re-added at launch.
+			case i < len(prefix):
+				fromPrefix = append(fromPrefix, i)
+			case origin[i-len(prefix)] >= 0:
+				fromCustom = append(fromCustom, origin[i-len(prefix)])
 			default:
-				if j := i - acpIndex - 1; j < len(custom) {
-					custom = append(custom[:j], custom[j+1:]...)
-					removed = true
-				}
+				// `acp`: backend-owned; re-added at launch.
 			}
 		}
-		if !removed {
+		if len(fromPrefix)+len(fromCustom) == 0 {
 			// Defensive: a selection always contains a flag from one of the two
 			// regions, so this cannot loop forever. Bail rather than spin.
 			return prefix, custom
 		}
+		prefix = withoutIndices(prefix, fromPrefix)
+		custom = withoutIndices(custom, fromCustom)
 	}
 }
 
@@ -285,10 +466,18 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	// Same assembly HermesLaunchArgv reproduces for the daemon, so the profile
 	// the overlay is seeded from is the one this argv actually selects.
-	hermesArgs := hermesCLIArgs(opts.CustomArgs, b.cfg.Logger)
+	hermesArgs := hermesCLIArgs(b.cfg.LaunchPrefix, opts.CustomArgs, b.cfg.Logger)
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, hermesArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(hermesArgs, trustAgentCommandPositional(0, hermesACPSubcommand)))
+	// What makes the shutdown below bounded. Wait waits on the direct child, and
+	// a child that ignores the cancel would otherwise hold it forever; with a
+	// WaitDelay, a cancelled context makes Wait kill and reap within it. Wait
+	// returning is also what closes the parent ends of the pipes, which is the
+	// step that frees a reader an escaped descendant is holding — so bounding
+	// Wait is what lets the forced shutdown join its readers at all. Same 10s
+	// the claude, codearts and antigravity backends use.
+	cmd.WaitDelay = 10 * time.Second
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(hermesArgs, trustAgentCommandPositional(hermesACPIndex(hermesArgs), hermesACPSubcommand)))
 	agentsMDPresent := false
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -340,12 +529,15 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("hermes stderr pipe: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start hermes: %w", err)
 	}
 
-	stderrSink := io.MultiWriter(newLogWriter(b.cfg.Logger, "[hermes:stderr] "), providerErr)
+	// Surface a launch-time dependency reinstall (otherwise only visible at
+	// Debug through the forwarder above); see hermes_depsync.go / GH #9390.
+	depSync := newHermesDepSyncWatcher(b.cfg.Logger, b.cfg.Env["HERMES_HOME"])
+	stderrSink := io.MultiWriter(newLogWriter(b.cfg.Logger, "[hermes:stderr] "), providerErr, depSync)
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
@@ -425,6 +617,23 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		c.closeAllPending(fmt.Errorf("hermes process exited"))
 	}()
 
+	// reapProcess runs cmd.Wait() — which may only be called once — and returns
+	// when it has. Wait is what closes the parent ends of the stdout and stderr
+	// pipes, so it is also the only way to free a reader blocked on a pipe that
+	// a descendant outside the process group is still holding. Both the forced
+	// shutdown below and the deferred cleanup need it, in that order.
+	var waitOnce sync.Once
+	waitDone := make(chan struct{})
+	reapProcess := func() {
+		waitOnce.Do(func() {
+			go func() {
+				defer close(waitDone)
+				_ = cmd.Wait()
+			}()
+		})
+		<-waitDone
+	}
+
 	// Drive the ACP session lifecycle in a goroutine.
 	go func() {
 		defer close(msgCh)
@@ -436,7 +645,14 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// process alive; waiting first would then block until the overall
 			// task timeout and make a later deferred cancel ineffective.
 			cancel()
-			_ = cmd.Wait()
+			reapProcess()
+			// Wait has closed the pipes, so both readers are now guaranteed to
+			// reach EOF and return. Join them before the enclosing goroutine
+			// returns and closes msgCh: a reader that outlived that close would
+			// panic sending on it.
+			<-readerDone
+			<-stderrDone
+			releaseProcessGroup(cmd)
 		}()
 
 		startTime := time.Now()
@@ -474,6 +690,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			},
 			"clientCapabilities": map[string]any{},
 		})
+		depSync.Finish(err == nil)
 		if err != nil {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("hermes initialize failed: %v", err)
@@ -510,9 +727,13 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				"mcpServers": mcpServers,
 			})
 			if err != nil {
-				finalStatus = "failed"
-				finalError = fmt.Sprintf("hermes session/resume failed: %v", err)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				// A runtime that refuses the recorded id has to say so here:
+				// without ResumeRejected the daemon reads the bare failure as
+				// "checked, not a rejection", keeps the pointer and replays the
+				// same dead session on every later turn (GH #8116).
+				finalStatus, finalError, resumeRejected = classifyACPResumeFailure(
+					runCtx, "hermes", "session/resume", err, timeout, b.cfg.Logger)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
 				return
 			}
 			sessionResult = result
@@ -552,9 +773,6 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("hermes session created", "session_id", sessionID)
-		// Mid-flight pin: daemon PinTaskSession keys off MessageStatus+SessionID.
-		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
-
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask hermes to switch the session to it
 		// before we send any prompt. Hermes' _build_model_state
@@ -573,20 +791,34 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// downside. An empty sessionCurrentModel (older runtime or unparsable
 		// state) falls through and still sends set_model, preserving prior
 		// behaviour. See MUL-5029 / NousResearch/hermes-agent#59089.
-		if opts.Model != "" && effectiveModel == sessionCurrentModel {
+		//
+		// The comparison is provider-normalised (acpModelIDsEquivalent), not a
+		// raw string match: Hermes always reports its current model in the
+		// provider-encoded `provider:model` form, while agent.model is stored
+		// verbatim from the API and is routinely bare. A literal == therefore
+		// never matched for those agents, so the gate above was dead code and
+		// the MUL-5029 mis-routing hazard it exists to prevent stayed live for
+		// exactly the agents that hit it. See acpModelIDsEquivalent for the
+		// evidence and for what the redundant call actually costs.
+		effortStateIsCurrent := true
+		if opts.Model != "" && acpModelIDsEquivalent(effectiveModel, sessionCurrentModel) {
 			b.cfg.Logger.Info("hermes session already on requested model; skipping redundant set_model",
 				"model", opts.Model,
+				"session_model", sessionCurrentModel,
 				"session_id", sessionID,
 			)
 		} else if opts.Model != "" {
-			if _, err := c.request(runCtx, "session/set_model", map[string]any{
+			modelResult, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
-			}); err != nil {
+			})
+			if err != nil {
 				b.cfg.Logger.Warn("hermes set_session_model failed", "error", err, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("hermes could not switch to model %q: %v", opts.Model, err)
-				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
+				if setupFailureWithholdsSessionID(opts) {
+					sessionID = ""
+				} else if isACPSessionNotFound(err) {
 					// On a resumed session with a model override, the dead
 					// session surfaces here instead of at session/prompt.
 					// Same fix as the prompt path below: clear the id so
@@ -608,6 +840,21 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				return
 			}
 			b.cfg.Logger.Info("hermes session model set", "model", opts.Model)
+			// Effort options may depend on the model, so re-read them once
+			// the switch lands. A runtime that exposes no post-switch state
+			// leaves sessionResult describing the previous model; flag that
+			// so step 3b skips its local vocabulary check.
+			if opts.ThinkingLevel != "" {
+				options, err := acpOptionsAfterModelSwitch(runCtx, c.request, sessionID, opts.Model, sessionResult, modelResult)
+				if err != nil {
+					b.cfg.Logger.Warn("hermes could not refresh model options", "error", err, "requested_model", opts.Model)
+				}
+				if options != nil {
+					sessionResult = options
+				} else {
+					effortStateIsCurrent = false
+				}
+			}
 		}
 
 		// 3b. Apply a persisted thinking override through whichever effort
@@ -618,10 +865,11 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// above this must NOT fail the task — an effort we could not apply
 		// still runs the prompt at the runtime's own default.
 		//
-		// sessionResult stops describing the live session once set_model runs,
-		// because an ACP effort option may depend on the current model.
+		// sessionResult is the post-switch state when the runtime exposed one;
+		// otherwise effortStateIsCurrent is false and the helper lets the
+		// runtime validate the level itself.
 		applyACPEffortOption(runCtx, c.request, "hermes", b.cfg.Logger,
-			sessionID, sessionResult, opts.ThinkingLevel, opts.Model == "")
+			sessionID, sessionResult, opts.ThinkingLevel, effortStateIsCurrent)
 
 		// 4. Send the prompt and wait for PromptResponse.
 		//
@@ -633,6 +881,16 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// just before the request so any history replay flushed during
 		// initialize / session setup stays dropped, but every notification
 		// belonging to this turn is processed.
+		// Session pin for the daemon (PinTaskSession keys off
+		// MessageStatus+SessionID), deliberately sent only once setup has
+		// succeeded and the prompt is about to go out. Pinning right after
+		// session creation used to publish the id before set_model could fail,
+		// and FailAgentTask merges session_id with COALESCE — so a setup failure
+		// could no longer take the id back and left a ghost pointer on the task
+		// row for the next turn to resume forever (GH #8116). A cancel between
+		// here and the prompt response is still covered: this send happens first.
+		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
+
 		streamingCurrentTurn.Store(true)
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,
@@ -710,10 +968,29 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				"pid", cmd.Process.Pid,
 				"grace", hermesReaderDrainGrace.String(),
 			)
+			// Cancel kills the owned process tree, so every descendant in it
+			// releases the pipes and both readers reach EOF. A descendant
+			// outside that tree does not get the signal: on POSIX because it
+			// called setsid and left the process group, on Windows because
+			// startOwnedProcessTree failed open and the child runs unowned, so
+			// the kill reaches the leader alone. Joining the readers is then an
+			// unbounded wait — the turn hangs with no result until the user
+			// cancels by hand, which is the MUL-5241 report.
 			cancel()
+			// Reap here rather than leaving it to the deferred cleanup. Wait
+			// closes the pipes, which is what frees a reader the kill could not
+			// reach, and cmd.WaitDelay bounds Wait itself now that the context
+			// is cancelled. Both joins below therefore terminate, and they still
+			// run before the buffers are read: providerErr.Finalize requires a
+			// drained stderr pipe, and it is not safe to call while the copier
+			// can still write.
+			reapProcess()
 			<-readerDone
 			<-stderrDone
 		}
+		// Flush any partial stderr line that arrived without a trailing '\n'
+		// before the pipe closed (P1 from multica#5785 review Aug 10).
+		providerErr.Finalize()
 		streamingCurrentTurn.Store(false)
 
 		finalOutput, providerErrorOutput := deliverable.result()
@@ -760,6 +1037,17 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			sessionID = ""
 			resumeRejected = true
 		}
+		// A poisoned session history (400 "assistant must not be empty") is
+		// unresumable: every resume replays the identical body and reproduces
+		// the same 400. Signal the daemon to drop the old session so it can
+		// retry fresh via the tools==0 gate instead of re-submitting the broken
+		// transcript indefinitely. Guard on ResumeSessionID so a fresh run that
+		// somehow sees the same fingerprint is not misflagged. This is the
+		// positive backend signal; taskfailure.UnresumableHistory keys off the
+		// surfaced Result.Error string as the backend-agnostic path (#6083).
+		if finalStatus == "failed" && opts.ResumeSessionID != "" && providerErr.isPoisonedHistory() {
+			resumeRejected = true
+		}
 
 		// Build usage map.
 		u := c.accumulatedUsage()
@@ -799,7 +1087,9 @@ func waitForHermesNotificationQuiescence(ctx context.Context, activity <-chan st
 // before concluding an ACP agent has stopped emitting notifications. It is a
 // protocol-level heuristic rather than a per-backend trait, so backends that
 // have no reason to differ share it; the hard bound stays per-backend.
-const acpNotificationQuietTime = 250 * time.Millisecond
+// Package tests shorten it globally while keeping their late-output fixtures
+// inside the window; production never reassigns it.
+var acpNotificationQuietTime = 250 * time.Millisecond
 
 // waitForACPNotificationQuiescence gives the shared ACP stdout reader a
 // bounded chance to consume notifications a backend may emit just after its
@@ -925,6 +1215,17 @@ type hermesClient struct {
 
 	usageMu sync.Mutex
 	usage   acpUsageAccumulator
+
+	// terminalEnabled is only set for ACP runtimes whose client-side terminal
+	// calls are implemented below. Keeping it opt-in avoids advertising a
+	// capability to Hermes-family runtimes that do not need it.
+	terminalEnabled bool
+	terminalCtx     context.Context
+	terminalCwd     string
+	terminalEnv     []string
+	terminalMu      sync.Mutex
+	terminals       map[string]*acpTerminal
+	nextTerminalID  int
 }
 
 // pendingToolCall buffers state for a tool call while its arguments
@@ -948,6 +1249,14 @@ func (c *hermesClient) writeLine(data []byte) error {
 }
 
 func (c *hermesClient) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	return c.requestAndNotifySent(ctx, method, params, nil)
+}
+
+// requestAndNotifySent runs afterWrite once the complete request has been
+// written to the provider. Callers that expose a concurrent operation tied to
+// that request use it to avoid advertising readiness before the provider has
+// received the lifecycle-starting frame.
+func (c *hermesClient) requestAndNotifySent(ctx context.Context, method string, params any, afterWrite func()) (json.RawMessage, error) {
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++
@@ -974,6 +1283,9 @@ func (c *hermesClient) request(ctx context.Context, method string, params any) (
 		delete(c.pending, id)
 		c.mu.Unlock()
 		return nil, fmt.Errorf("write %s: %w", method, err)
+	}
+	if afterWrite != nil {
+		afterWrite()
 	}
 
 	select {
@@ -1031,11 +1343,11 @@ func (c *hermesClient) handleLine(line string) {
 }
 
 // handleAgentRequest replies to JSON-RPC requests the agent sends
-// us (agent → client direction). The only one we care about today is
-// `session/request_permission`: the daemon is headless and cannot
-// actually prompt a user, so we answer it ourselves — granting when a
-// safe option is offered, otherwise declining just this action or
-// failing closed (see below).
+// us (agent → client direction). Kimi's ACP terminal capability is
+// implemented here alongside the permission request handling: the daemon is
+// headless and cannot actually prompt a user, so we answer permission requests
+// ourselves — granting when a safe option is offered, otherwise declining
+// just this action or failing closed (see below).
 //
 // The reply MUST select one of the optionIds the agent actually
 // offered — the ACP permission contract is "pick from these options",
@@ -1057,9 +1369,86 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 	if !ok {
 		return
 	}
+	if method == "terminal/wait_for_exit" && c.terminalEnabled {
+		// wait_for_exit is intentionally long-lived. The ACP reader must remain
+		// available for the output polling and terminal/kill requests Kimi sends
+		// while this request is pending.
+		id := append(json.RawMessage(nil), rawID...)
+		params := append(json.RawMessage(nil), raw["params"]...)
+		go func() {
+			result, err := c.acpTerminalResponse(method, params)
+			if err != nil {
+				c.writeAgentRequestResponse(method, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"error": map[string]any{
+						"code":    -32602,
+						"message": err.Error(),
+					},
+				})
+				return
+			}
+			c.writeAgentRequestResponse(method, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result":  result,
+			})
+		}()
+		return
+	}
 
 	var resp map[string]any
 	switch method {
+	case "terminal/create":
+		if !c.terminalEnabled {
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(rawID),
+				"error": map[string]any{
+					"code":    -32601,
+					"message": "terminal capability is not enabled",
+				},
+			}
+			break
+		}
+		result, err := c.acpTerminalCreate(raw["params"])
+		if err != nil {
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(rawID),
+				"error": map[string]any{
+					"code":    -32602,
+					"message": err.Error(),
+				},
+			}
+			break
+		}
+		resp = map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(rawID), "result": result}
+	case "terminal/output", "terminal/wait_for_exit", "terminal/kill", "terminal/release":
+		if !c.terminalEnabled {
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(rawID),
+				"error": map[string]any{
+					"code":    -32601,
+					"message": "terminal capability is not enabled",
+				},
+			}
+			break
+		}
+		result, err := c.acpTerminalResponse(method, raw["params"])
+		if err != nil {
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(rawID),
+				"error": map[string]any{
+					"code":    -32602,
+					"message": err.Error(),
+				},
+			}
+			break
+		}
+		resp = map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(rawID), "result": result}
 	case "session/request_permission":
 		selector := c.selectPermission
 		if selector == nil {
@@ -1118,14 +1507,26 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 		c.cfg.Logger.Debug("unhandled agent→client request", "method", method)
 	}
 
+	c.writeAgentRequestResponse(method, resp)
+}
+
+func (c *hermesClient) writeAgentRequestResponse(method string, resp map[string]any) {
 	data, err := json.Marshal(resp)
 	if err != nil {
-		c.cfg.Logger.Warn("marshal agent-request response", "method", method, "error", err)
+		logger := c.cfg.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("marshal agent-request response", "method", method, "error", err)
 		return
 	}
 	data = append(data, '\n')
 	if err := c.writeLine(data); err != nil {
-		c.cfg.Logger.Warn("write agent-request response", "method", method, "error", err)
+		logger := c.cfg.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("write agent-request response", "method", method, "error", err)
 	}
 }
 
@@ -1244,24 +1645,42 @@ func (e *acpRPCError) Error() string {
 	return fmt.Sprintf("%s: %s (code=%d)", e.Method, e.Message, e.Code)
 }
 
+// isACPSessionErrorCode reports whether a JSON-RPC error code is one the ACP
+// runtimes have been observed to report a lost session under. It is a guard,
+// not the decision: -32000 and -32603 are generic, so the wording checks in
+// isACPSessionNotFound / isACPResumeRejected are what actually discriminate.
+func isACPSessionErrorCode(code int) bool {
+	return code == -32603 || code == -32602 || code == -32002 || code == -32000
+}
+
 // isACPSessionNotFound reports whether err is the agent rejecting a
 // session id it no longer knows. Runtimes signal this with codes and
 // wording that vary — Hermes says "Session not found" under -32603
 // (Internal error), Kiro puts "No session found with id ..." in
 // `data` under -32603, and kimi-cli raises invalid_params (-32602)
 // with {"session_id": "Session not found"} in `data` for every
-// unknown-session path (src/kimi_cli/acp/server.py), while Reasonix says
-// "session/resume: unknown session <id>" under -32602 — so neither the
-// code nor one runtime's exact wording is discriminating and both are matched.
+// unknown-session path (src/kimi_cli/acp/server.py), Reasonix says
+// "session/resume: unknown session <id>" under -32602, and ZeroClaw defines
+// its own SESSION_NOT_FOUND = -32000 in the implementation-defined range
+// (zeroclaw-api/src/jsonrpc.rs) — so neither the code nor one runtime's exact
+// wording is discriminating and all of them are matched. The wording check
+// still carries the decision: -32000 is a generic server-error code, and a
+// transient failure reported under it must not read as a lost session.
 func isACPSessionNotFound(err error) bool {
 	var rpcErr *acpRPCError
 	if !errors.As(err, &rpcErr) {
 		return false
 	}
-	if rpcErr.Code != -32603 && rpcErr.Code != -32602 && rpcErr.Code != -32002 {
+	if !isACPSessionErrorCode(rpcErr.Code) {
 		return false
 	}
-	text := strings.ToLower(rpcErr.Message + " " + rpcErr.Data)
+	return acpSessionNotFoundWording(strings.ToLower(rpcErr.Message + " " + rpcErr.Data))
+}
+
+// acpSessionNotFoundWording is the wording half of isACPSessionNotFound, split
+// out so isACPResumeRejected can run it over text it has already scrubbed of
+// request-shaped complaints. Callers pass lower-cased Message+Data.
+func acpSessionNotFoundWording(text string) bool {
 	return strings.Contains(text, "session not found") ||
 		strings.Contains(text, "no session found") ||
 		strings.Contains(text, "unknown session")
@@ -1869,11 +2288,9 @@ func acpRawText(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// Terminal blocks ({type:"terminal", terminalId}) reference a remote
-// terminal the client would normally subscribe to via terminal/output;
-// we don't advertise terminal capability so we never receive those in
-// practice, but if one slips through we skip it (nothing useful to
-// surface from a bare ID).
+// Terminal blocks ({type:"terminal", terminalId}) reference a terminal whose
+// output is served through terminal/output. The textual extractor has no
+// payload to duplicate here; the ACP transport retains the terminal output.
 func extractACPToolCallText(blocks []json.RawMessage) string {
 	var b strings.Builder
 	appendPiece := func(piece string) {
@@ -2009,6 +2426,73 @@ func extractACPAuthMethods(result json.RawMessage) []string {
 		}
 	}
 	return ids
+}
+
+// splitACPModelID splits an ACP model id into its optional `provider:` prefix
+// and the bare model name. Ids without a colon (or with a leading colon) carry
+// no provider and return ("", id). Mirrors the prefix convention acpModelEntry
+// derives dropdown grouping from.
+//
+// Bare model names can themselves contain colons in theory, so only the FIRST
+// colon is treated as the provider separator — the remainder is the model.
+func splitACPModelID(modelID string) (provider, model string) {
+	id := strings.TrimSpace(modelID)
+	if idx := strings.Index(id, ":"); idx > 0 {
+		return id[:idx], id[idx+1:]
+	}
+	return "", id
+}
+
+// acpModelIDsEquivalent reports whether a configured model id and the id the
+// runtime reports as current denote the same selection.
+//
+// Normalisation is needed because two id namespaces meet here: agent.model is
+// persisted verbatim (handler/agent.go CreateAgent/UpdateAgent) and the CLI
+// documents the bare spelling as valid, while an ACP runtime commonly answers
+// session/new with a provider-encoded `provider:model` id. A raw == across
+// those two spellings misses, which is why the MUL-5029 skip-gate added in
+// #5690 never fired for bare-configured agents and set_model was replayed
+// every turn.
+//
+// The rules are deliberately asymmetric, because the risk is:
+//   - Either side empty → not equivalent (caller handles the empty-model case).
+//   - Bare configured id → equivalent on the model name alone. It expresses no
+//     provider preference, so the session's own provider is authoritative.
+//     This is the case the gate exists for.
+//   - Explicit configured provider → equivalent only when the session reports
+//     that same provider. A session reporting a bare id cannot confirm the
+//     match, so fall through and send set_model rather than silently swallow a
+//     provider switch the caller explicitly asked for. Bare current ids are
+//     not hypothetical: acp_effort_test.go captures an unprefixed
+//     `gpt-5.6-sol` from jcode, which routes through this same backend.
+//     Hermes Agent's encoder has a bare branch too — acp_adapter
+//     `_encode_model_choice` returns the model alone when the provider is
+//     empty — but a normally-configured install always resolves one, and a
+//     live `hermes acp` v0.20.0 session reports the prefixed form.
+//
+// Provider and model are compared case-insensitively: Hermes lowercases the
+// provider when encoding the id, so a config written as `Custom:...` would
+// otherwise miss.
+//
+// splitACPModelID cannot distinguish a provider prefix from a colon inside a
+// bare model name (Ollama-style `llama3:8b`). That degradation is safe in the
+// only direction that matters: `llama3:8b` vs `custom:llama3:8b` compares
+// unequal and falls back to sending set_model, never to a false skip.
+func acpModelIDsEquivalent(configured, current string) bool {
+	configured = strings.TrimSpace(configured)
+	current = strings.TrimSpace(current)
+	if configured == "" || current == "" {
+		return false
+	}
+	cfgProvider, cfgModel := splitACPModelID(configured)
+	curProvider, curModel := splitACPModelID(current)
+	if !strings.EqualFold(cfgModel, curModel) {
+		return false
+	}
+	if cfgProvider == "" {
+		return true
+	}
+	return strings.EqualFold(cfgProvider, curProvider)
 }
 
 // extractACPCurrentModelID pulls the model selected by the ACP runtime out of
@@ -2629,12 +3113,13 @@ func hermesToolNameFromTitle(title string, kind string) string {
 // a successful retry following an early per-attempt warning would be
 // wrongly marked as failed.
 type acpProviderErrorSniffer struct {
-	provider string
-	mu       sync.Mutex
-	remains  []byte   // buffer for a partial trailing line across writes
-	lines    []string // captured error lines, bounded
-	seen     map[string]bool
-	terminal bool // sticky: at least one line matched acpTerminalErrorRe
+	provider  string
+	kimiStyle bool // true for kimi: enables provider.api_error line detection
+	mu        sync.Mutex
+	remains   []byte   // buffer for a partial trailing line across writes
+	lines     []string // captured error lines, bounded
+	seen      map[string]bool
+	terminal  bool // sticky: at least one line matched acpTerminalErrorRe
 	// echoJSON tracks an incomplete structured payload from a Python
 	// INFO/DEBUG root-logger record. The JSON scanner state is persisted
 	// across Write calls so only actual payload continuations are skipped.
@@ -2652,6 +3137,8 @@ var acpErrorHeaderRe = regexp.MustCompile(`(?:⚠️|❌|\[ERROR\]).*(?:BadReque
 // acpErrorDetailRe pulls the most useful single-line messages out of
 // the subsequent lines of the error block (the one whose "Error:" or
 // "Details:" tag actually spells out what happened).
+// Branches keep \s* so "detail:value" (no space) and "Error: message"
+// (with space) are both matched.
 var acpErrorDetailRe = regexp.MustCompile(`(?:Error:|detail:|Details:)\s*(.+)`)
 
 // acpTerminalErrorRe matches markers that only appear when the
@@ -2661,6 +3148,25 @@ var acpErrorDetailRe = regexp.MustCompile(`(?:Error:|detail:|Details:)\s*(.+)`)
 // Authentication errors, ❌ / [ERROR] log levels). Per-attempt
 // warnings ("(attempt 1/3)") deliberately do NOT match this pattern.
 var acpTerminalErrorRe = regexp.MustCompile(`(?:❌|\[ERROR\]|after \d+ retr|Non-retryable|BadRequestError|AuthenticationError)`)
+
+// kimiProviderApiErrorRe matches kimi-specific "provider.api_error:" lines
+// that do not use the emoji-prefixed format of the shared ACP backends.
+// Scoped to kimiStyle sniffers to avoid false-positive captures when
+// other backends echo provider.api_error text in tool output.
+var kimiProviderApiErrorRe = regexp.MustCompile(`provider\.api_error`)
+
+// kimiTerminalErrorRe classifies kimi client errors (400/401/403) as
+// terminal. 429 (rate-limit) and 408 (timeout) are intentionally excluded:
+// the kimi adapter retries those internally, and a run that ultimately
+// succeeds after retries must stay status=completed.
+var kimiTerminalErrorRe = regexp.MustCompile(`provider\.api_error: (?:400|401|403)`)
+
+// providerApiErrorStatusRe extracts the numeric status code from a kimi
+// "provider.api_error: NNN" line so messageLocked can forward it into the
+// formatted detail string, letting taskfailure.UnresumableHistory detect the
+// 400 fingerprint even when the human-readable detail text is on a separate
+// stderr line (Kimi's two-line format).
+var providerApiErrorStatusRe = regexp.MustCompile(`provider\.api_error: (\d+)`)
 
 // acpAgentOutputTerminalRe matches the synthetic agent-text turn that
 // hermes-style ACP adapters inject when they exhaust retries against
@@ -2703,7 +3209,11 @@ const acpMaxErrorLineLen = 4096
 // with the given provider name (e.g. "hermes", "kimi") so failure
 // strings make it obvious which runtime produced the error.
 func newACPProviderErrorSniffer(provider string) *acpProviderErrorSniffer {
-	return &acpProviderErrorSniffer{provider: provider, seen: map[string]bool{}}
+	return &acpProviderErrorSniffer{
+		provider:  provider,
+		kimiStyle: provider == "kimi",
+		seen:      map[string]bool{},
+	}
 }
 
 // Write implements io.Writer so the sniffer can sit behind an
@@ -2760,10 +3270,11 @@ func (s *acpProviderErrorSniffer) Write(p []byte) (int, error) {
 				continue
 			}
 		}
-		if !(acpErrorHeaderRe.MatchString(line) || acpErrorDetailRe.MatchString(line)) {
+		isKimiErr := s.kimiStyle && kimiProviderApiErrorRe.MatchString(line)
+		if !(acpErrorHeaderRe.MatchString(line) || acpErrorDetailRe.MatchString(line) || isKimiErr) {
 			continue
 		}
-		if acpTerminalErrorRe.MatchString(line) {
+		if acpTerminalErrorRe.MatchString(line) || (s.kimiStyle && kimiTerminalErrorRe.MatchString(line)) {
 			s.terminal = true
 		}
 		if s.seen[line] {
@@ -2776,6 +3287,23 @@ func (s *acpProviderErrorSniffer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// Finalize must be called once after the process stderr pipe has been fully
+// drained (io.Copy returned). It flushes any partial last line that arrived
+// without a trailing newline so it is included in the terminal-error and
+// poisoned-history decisions. Without this, a process that exits after writing
+// "provider.api_error: 400 ..." without a trailing '\n' leaves the sniffer
+// with no captured error, causing the task to land as completed/empty.
+func (s *acpProviderErrorSniffer) Finalize() {
+	s.mu.Lock()
+	remaining := strings.TrimRight(string(s.remains), "\r")
+	s.remains = s.remains[:0]
+	s.mu.Unlock()
+	if remaining == "" {
+		return
+	}
+	_, _ = s.Write([]byte(remaining + "\n"))
 }
 
 func (s *acpProviderErrorSniffer) startEchoJSON(payload string) {
@@ -2859,10 +3387,89 @@ func (s *acpProviderErrorSniffer) terminalMessage() string {
 	return s.messageLocked()
 }
 
+// isPoisonedHistory reports whether the terminal error indicates a
+// permanently poisoned session history — the provider refused to replay the
+// transcript because a message it already contains has empty content. Resuming
+// the same session replays the identical body and reproduces the same
+// rejection, so the daemon must drop the session pointer and start fresh.
+//
+// This is the positive backend signal that sets Result.ResumeRejected. It
+// delegates to the exact predicate the daemon uses to retire the session
+// (taskfailure.UnresumableHistory) evaluated against the same surfaced message
+// (messageLocked) the daemon will classify. Sharing one predicate is
+// deliberate: the two must never disagree, or the backend would flag a
+// rejection the daemon then declines to act on (or vice versa). It also gives
+// the precision the reviewer asked for — UnresumableHistory requires BOTH an
+// emptiness complaint AND a history-message locator (role 'assistant', "message
+// at position", "messages[N]"), so an unrelated 400 such as "commit message
+// must not be empty" no longer trips ResumeRejected. messageLocked already
+// stitches Kimi's two-line stderr (status header + detail line) into a single
+// string, so the locator and the emptiness token are both visible here.
+func (s *acpProviderErrorSniffer) isPoisonedHistory() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.terminal {
+		return false
+	}
+	return taskfailure.UnresumableHistory(s.messageLocked())
+}
+
 // messageLocked is the lock-held implementation shared by message()
 // and terminalMessage(). Caller must hold s.mu.
 func (s *acpProviderErrorSniffer) messageLocked() string {
 	prefix := s.provider + " provider error: "
+
+	if s.kimiStyle {
+		// Find the LAST terminal provider.api_error line. Using the last one
+		// ensures a 429 (transient, internally retried) followed by a 400
+		// (definitive failure) always yields the 400 status tag rather than the
+		// earlier 429 "rate limit" noise. The loop does not break on the first
+		// match so a later terminal line always wins.
+		var apiErrTag string
+		apiErrLineIdx := -1
+		for i, line := range s.lines {
+			if kimiTerminalErrorRe.MatchString(line) {
+				if m := providerApiErrorStatusRe.FindStringSubmatch(line); m != nil {
+					apiErrTag = "provider.api_error: " + m[1] + " "
+					apiErrLineIdx = i
+				}
+			}
+		}
+
+		if apiErrLineIdx >= 0 {
+			// Scan for the detail belonging to the terminal line: start at
+			// apiErrLineIdx, not at 0. Starting at 0 would pair a preceding
+			// 429 "rate limit exceeded" detail with the 400 status tag, hiding
+			// the history locator from taskfailure.UnresumableHistory.
+			for i := apiErrLineIdx; i < len(s.lines); i++ {
+				line := s.lines[i]
+				if m := acpErrorDetailRe.FindStringSubmatch(line); m != nil {
+					detail := strings.TrimSpace(m[1])
+					if detail == "" {
+						continue
+					}
+					return acpTruncateError(prefix + apiErrTag + detail)
+				}
+			}
+			// Single-line format: "provider.api_error: 400 <detail>" where the
+			// detail text follows the status code on the same line but is not
+			// captured by acpErrorDetailRe (which requires Error:/detail:/Details:
+			// prefixes). Extract it directly from the header line.
+			headerLine := s.lines[apiErrLineIdx]
+			if loc := providerApiErrorStatusRe.FindStringIndex(headerLine); loc != nil {
+				after := strings.TrimLeft(headerLine[loc[1]:], " ")
+				if after != "" {
+					return acpTruncateError(prefix + apiErrTag + after)
+				}
+			}
+			// Nothing extractable beyond the status; surface the raw header.
+			return acpTruncateError(prefix + headerLine)
+		}
+	}
+
+	// Common path: non-kimi or kimi without a terminal provider.api_error line.
+	// Return the first detail tag, then fall back to the first header line.
 	for _, line := range s.lines {
 		if m := acpErrorDetailRe.FindStringSubmatch(line); m != nil {
 			detail := strings.TrimSpace(m[1])
@@ -2872,7 +3479,7 @@ func (s *acpProviderErrorSniffer) messageLocked() string {
 		}
 	}
 	for _, line := range s.lines {
-		if acpErrorHeaderRe.MatchString(line) {
+		if acpErrorHeaderRe.MatchString(line) || (s.kimiStyle && kimiProviderApiErrorRe.MatchString(line)) {
 			return acpTruncateError(prefix + line)
 		}
 	}

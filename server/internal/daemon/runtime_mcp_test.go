@@ -10,7 +10,7 @@ import (
 
 func TestListRuntimeLocalMcpServersCodexRedactsDetails(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	configDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -44,7 +44,7 @@ enabled = false
 }
 
 func TestListRuntimeLocalMcpServersClaudeMissingConfig(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	servers, supported, err := listRuntimeLocalMcpServers("claude")
 	if err != nil {
 		t.Fatal(err)
@@ -54,9 +54,33 @@ func TestListRuntimeLocalMcpServersClaudeMissingConfig(t *testing.T) {
 	}
 }
 
+func TestListRuntimeLocalMcpServersOmpReadsNativeConfig(t *testing.T) {
+	home := t.TempDir()
+	redirectTestHome(t, home)
+	configDir := filepath.Join(home, ".omp", "agent")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"mcpServers":{"native":{"command":"native-server","enabled":false}}}`
+	if err := os.WriteFile(filepath.Join(configDir, "mcp.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	servers, supported, err := listRuntimeLocalMcpServers("omp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported || len(servers) != 1 {
+		t.Fatalf("supported=%v servers=%#v", supported, servers)
+	}
+	if servers[0].Name != "native" || servers[0].Transport != "stdio" || servers[0].Enabled {
+		t.Fatalf("native summary = %#v", servers[0])
+	}
+}
+
 func TestListRuntimeLocalMcpServersClaudeEnabledPlugin(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	installPath := writeTestClaudePlugin(t, home, "paper-desktop@paper", "paper-desktop", true)
 	config := `{"mcpServers":{"paper":{"type":"http","url":"http://127.0.0.1:29979/mcp"}}}`
 	if err := os.WriteFile(filepath.Join(installPath, "mcp.json"), []byte(config), 0o600); err != nil {
@@ -79,7 +103,7 @@ func TestListRuntimeLocalMcpServersClaudeEnabledPlugin(t *testing.T) {
 }
 
 func TestListRuntimeLocalMcpServersUnknownProvider(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	servers, supported, err := listRuntimeLocalMcpServers("future-runtime")
 	if err != nil {
 		t.Fatal(err)
@@ -89,9 +113,79 @@ func TestListRuntimeLocalMcpServersUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestMergeRuntimeAndAgentMcpConfigClaudeCombinesAndAgentWins(t *testing.T) {
+func TestListRuntimeLocalMcpServersPi(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".pi", "agent")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"mcpServers":{"native":{"command":"native-server","enabled":false}}}`
+	if err := os.WriteFile(filepath.Join(configDir, "mcp.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	servers, supported, err := listRuntimeLocalMcpServers("pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported || len(servers) != 1 {
+		t.Fatalf("supported=%v servers=%#v", supported, servers)
+	}
+	if servers[0].Name != "native" || servers[0].Transport != "stdio" || servers[0].Enabled {
+		t.Fatalf("native summary = %#v", servers[0])
+	}
+}
+
+func TestMergeRuntimeAndAgentMcpConfigPiLeavesUserFileAlone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".pi", "agent")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "mcp.json"), []byte(`{"mcpServers":{"runtime-only":{"command":"runtime-server"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := mergeRuntimeAndAgentMcpConfig("pi", json.RawMessage(`{"mcpServers":{"agent":{"command":"agent-server"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		McpServers map[string]map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(merged, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document.McpServers["runtime-only"]; ok {
+		t.Fatalf("user server was copied into the task config: %#v", document.McpServers)
+	}
+	if document.McpServers["agent"]["command"] != "agent-server" {
+		t.Fatalf("merged servers = %#v", document.McpServers)
+	}
+}
+
+func TestMergeRuntimeAndAgentMcpConfigOmpUsesAgentConfig(t *testing.T) {
+	redirectTestHome(t, t.TempDir())
+	merged, err := mergeRuntimeAndAgentMcpConfig("omp", json.RawMessage(`{"mcpServers":{"agent":{"command":"agent-server"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		McpServers map[string]map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(merged, &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.McpServers) != 1 || document.McpServers["agent"]["command"] != "agent-server" {
+		t.Fatalf("merged servers = %#v", document.McpServers)
+	}
+}
+
+func TestMergeRuntimeAndAgentMcpConfigClaudeCombinesAndAgentWins(t *testing.T) {
+	home := t.TempDir()
+	redirectTestHome(t, home)
 	runtimeConfig := `{"mcpServers":{"runtime-only":{"command":"runtime-cmd","env":{"TOKEN":"local-secret"}},"shared":{"command":"runtime-shared"}}}`
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(runtimeConfig), 0o600); err != nil {
 		t.Fatal(err)
@@ -130,7 +224,7 @@ func TestMergeRuntimeAndAgentMcpConfigClaudeCombinesAndAgentWins(t *testing.T) {
 
 func TestMergeRuntimeAndAgentMcpConfigCodexNormalizesHeaders(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	configDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -171,7 +265,7 @@ args = ["mcp-server-fetch"]
 }
 
 func TestMergeRuntimeAndAgentMcpConfigNullKeepsNativeInheritance(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	for _, raw := range []json.RawMessage{nil, json.RawMessage("null"), json.RawMessage(" null ")} {
 		merged, err := mergeRuntimeAndAgentMcpConfig("claude", raw)
 		if err != nil {
@@ -180,6 +274,73 @@ func TestMergeRuntimeAndAgentMcpConfigNullKeepsNativeInheritance(t *testing.T) {
 		if string(merged) != string(raw) {
 			t.Fatalf("merged %q = %q", string(raw), string(merged))
 		}
+	}
+}
+
+func TestCodeArtsMcpConfigLoadsJSONCAndAgentWins(t *testing.T) {
+	home := t.TempDir()
+	redirectTestHome(t, home)
+	t.Setenv("USERPROFILE", home)
+	configDir := filepath.Join(home, ".codeartsdoer")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{
+  // CodeArts uses the OpenCode-compatible top-level key.
+  "mcp": {
+    "runtime-only": {"command": "runtime-cmd"},
+    "shared": {"url": "https://runtime.example/mcp"},
+  },
+}`
+	if err := os.WriteFile(filepath.Join(configDir, "codearts_cli.jsonc"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := mergeRuntimeAndAgentMcpConfig("codearts", json.RawMessage(`{"mcp":{"shared":{"command":"agent-shared"},"agent-only":{"command":"agent-cmd"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		McpServers map[string]map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(merged, &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.McpServers) != 3 {
+		t.Fatalf("merged servers = %#v", document.McpServers)
+	}
+	if got := document.McpServers["shared"]["command"]; got != "agent-shared" {
+		t.Fatalf("shared command = %#v, want agent-shared", got)
+	}
+
+	servers, supported, err := listRuntimeLocalMcpServers("codearts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported || len(servers) != 2 {
+		t.Fatalf("supported=%v servers=%#v", supported, servers)
+	}
+}
+
+func TestCodeArtsMcpConfigPrefersJSONOverJSONC(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".codeartsdoer")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonPath := filepath.Join(configDir, "codearts_cli.json")
+	jsoncPath := filepath.Join(configDir, "codearts_cli.jsonc")
+	if err := os.WriteFile(jsoncPath, []byte(`{"mcp":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := codeArtsUserConfigPath(home); got != jsoncPath {
+		t.Fatalf("JSONC-only path = %q, want %q", got, jsoncPath)
+	}
+	if err := os.WriteFile(jsonPath, []byte(`{"mcp":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := codeArtsUserConfigPath(home); got != jsonPath {
+		t.Fatalf("JSON path = %q, want %q", got, jsonPath)
 	}
 }
 
@@ -240,7 +401,7 @@ func TestCodebuddyUserMcpConfigPathHonorsConfigDirEnv(t *testing.T) {
 
 func TestListRuntimeLocalMcpServersCodebuddyReadsItsOwnConfig(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
 	configDir := filepath.Join(home, ".codebuddy")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -275,7 +436,7 @@ func TestListRuntimeLocalMcpServersCodebuddyReadsItsOwnConfig(t *testing.T) {
 // while losing scope precedence and the project-scope approval gate.
 func TestMergeRuntimeAndAgentMcpConfigCodebuddyIsPassthrough(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
 	configDir := filepath.Join(home, ".codebuddy")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -404,7 +565,7 @@ func TestStripJSONCRejectsUnterminatedBlockComment(t *testing.T) {
 // surfaces the problem rather than silently reporting zero servers.
 func TestListRuntimeLocalMcpServersCodebuddyRejectsUnterminatedComment(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
 	configDir := filepath.Join(home, ".codebuddy")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -422,7 +583,7 @@ func TestListRuntimeLocalMcpServersCodebuddyRejectsUnterminatedComment(t *testin
 
 func TestListRuntimeLocalMcpServersKimi(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("KIMI_CODE_HOME", "")
 	kimiHome := filepath.Join(home, ".kimi-code")
 	if err := os.MkdirAll(kimiHome, 0o755); err != nil {
@@ -447,7 +608,7 @@ func TestListRuntimeLocalMcpServersKimi(t *testing.T) {
 // config untouched.
 func TestMergeRuntimeAndAgentMcpConfigKimiIsPassthrough(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	t.Setenv("KIMI_CODE_HOME", "")
 	kimiHome := filepath.Join(home, ".kimi-code")
 	if err := os.MkdirAll(kimiHome, 0o755); err != nil {

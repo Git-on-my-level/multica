@@ -3,6 +3,20 @@ SELECT * FROM agent_runtime
 WHERE workspace_id = $1
 ORDER BY created_at ASC;
 
+-- name: ListAgentRuntimeIDsByWorkspace :many
+SELECT id FROM agent_runtime
+WHERE workspace_id = $1
+ORDER BY id ASC;
+
+-- name: ListVisibleAgentRuntimes :many
+-- A private runtime is another member's machine and must not leak into their
+-- runtime list. The owner can always see their own runtime; everyone else
+-- sees only runtimes shared with them or with the entire workspace.
+SELECT * FROM agent_runtime
+WHERE workspace_id = $1
+  AND (owner_id = $2 OR visibility = 'public' OR (visibility = 'private' AND $2 = ANY(shared_with)))
+ORDER BY created_at ASC;
+
 -- name: GetAgentRuntime :one
 SELECT * FROM agent_runtime
 WHERE id = $1;
@@ -14,6 +28,18 @@ WHERE id = $1;
 -- runtime. Rows are returned only for ids that exist; the caller matches them
 -- back by id and skips any that are missing.
 SELECT * FROM agent_runtime
+WHERE id = ANY(@ids::uuid[]);
+
+-- name: GetAgentRuntimeHeartbeatLeases :many
+-- Narrow connection-time and heartbeat-reconciliation projection. The daemon
+-- WebSocket authenticates its whole runtime set in one round trip and then
+-- keeps these immutable ownership fields plus liveness state in its connection
+-- lease, avoiding a GetAgentRuntime call on every heartbeat.
+--
+-- owner_id is carried so the WS handshake can enforce runtime ownership for
+-- user-credential connections (MUL-8154) with the same single round trip.
+SELECT id, workspace_id, daemon_id, owner_id, status, last_seen_at
+FROM agent_runtime
 WHERE id = ANY(@ids::uuid[]);
 
 -- name: LockAgentRuntime :one
@@ -41,6 +67,14 @@ WHERE id = $1 AND workspace_id = $2;
 -- (xmax = 0) AS inserted distinguishes a fresh insert (true) from an upsert
 -- that updated an existing row (false). Analytics reads this to fire
 -- runtime_registered/runtime_ready only on first-time registration.
+--
+-- Ownership fence (MUL-8154): when required_owner_id is set (user-credential
+-- registration), the conflict branch only updates a row already owned by that
+-- user. A row owned by someone else - or by nobody - is left untouched and the
+-- statement returns no row, so a workspace member cannot take over another
+-- member's runtime by re-registering its (daemon_id, provider). Daemon-token
+-- registration passes NULL here and NULL owner_id, which keeps the existing
+-- owner via the COALESCE below.
 INSERT INTO agent_runtime (
     workspace_id,
     daemon_id,
@@ -52,7 +86,10 @@ INSERT INTO agent_runtime (
     metadata,
     owner_id,
     last_seen_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+) VALUES (
+    @workspace_id, @daemon_id, @name, @runtime_mode, @provider, @status,
+    @device_info, @metadata, @owner_id, now()
+)
 -- Built-in runtimes carry no profile_id. The arbiter is the partial unique
 -- index from migration 121 (WHERE profile_id IS NULL); the predicate must be
 -- spelled out so Postgres selects that partial index, not the custom-runtime
@@ -67,6 +104,8 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE sqlc.narg('required_owner_id')::uuid IS NULL
+   OR agent_runtime.owner_id = sqlc.narg('required_owner_id')::uuid
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpsertAgentRuntimeWithProfile :one
@@ -74,9 +113,10 @@ RETURNING *, (xmax = 0) AS inserted;
 -- command_name on PATH and is registering an instance of it. The arbiter is the
 -- partial unique index from migration 120 (WHERE profile_id IS NOT NULL), so a
 -- single daemon can host the built-in provider AND any number of custom
--- profiles of the same protocol family. provider stays the protocol family so
--- task routing (agent.New(provider)) is unchanged; profile_id is the stable
--- identity. (xmax = 0) AS inserted mirrors UpsertAgentRuntime.
+-- profiles of the same protocol family. provider carries the base runtime
+-- identity so ResolveBackend applies its descriptor; profile_id preserves
+-- custom-profile provenance. (xmax = 0) AS inserted mirrors UpsertAgentRuntime,
+-- and the required_owner_id fence matches it too.
 INSERT INTO agent_runtime (
     workspace_id,
     daemon_id,
@@ -89,7 +129,10 @@ INSERT INTO agent_runtime (
     owner_id,
     profile_id,
     last_seen_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+) VALUES (
+    @workspace_id, @daemon_id, @name, @runtime_mode, @provider, @status,
+    @device_info, @metadata, @owner_id, @profile_id, now()
+)
 ON CONFLICT (workspace_id, daemon_id, profile_id) WHERE profile_id IS NOT NULL
 DO UPDATE SET
     name = EXCLUDED.name,
@@ -101,15 +144,18 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE sqlc.narg('required_owner_id')::uuid IS NULL
+   OR agent_runtime.owner_id = sqlc.narg('required_owner_id')::uuid
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpdateAgentRuntimeVisibility :one
--- Toggles a runtime between 'private' (only owner can bind agents) and
--- 'public' (any workspace member can). Default for new rows is 'private'
--- (see migration 083). Gated at the handler layer to owner / workspace
--- admin only.
+-- Replaces the runtime's access policy: private admits owner plus shared_with;
+-- public admits any workspace member. Default for new rows is private
+-- (see migration 083). Gated at the handler layer to the runtime owner only:
+-- visibility is consent to use that person's machine, not a workspace-governance
+-- setting.
 UPDATE agent_runtime
-SET visibility = @visibility, updated_at = now()
+SET visibility = @visibility, shared_with = @shared_with::uuid[], updated_at = now()
 WHERE id = @id
 RETURNING *;
 
@@ -169,19 +215,20 @@ UPDATE agent_runtime
 SET last_seen_at = now()
 WHERE id = $1 AND status = 'online';
 
--- name: TouchAgentRuntimesLastSeenBatch :execrows
+-- name: TouchAgentRuntimesLastSeenBatch :many
 -- Bulk variant of TouchAgentRuntimeLastSeen used by the BatchedHeartbeatScheduler:
 -- coalesces N per-runtime "bump last_seen_at" requests into a single UPDATE so a
 -- fleet beating every 15s costs ~1 DB transaction per batch tick instead of N.
 --
 -- Same load-bearing predicate as the single-id form: status='online' avoids
 -- silently un-deleting a sweeper-flipped offline row, and we deliberately do
--- NOT touch updated_at so the rows stay HOT-eligible. Affected-rows < len(ids)
--- means some IDs raced to offline between Schedule and flush; their next beat
--- will fall through the recordHeartbeat sync path and call MarkAgentRuntimeOnline.
+-- NOT touch updated_at so the rows stay HOT-eligible. RETURNING is load-bearing:
+-- the scheduler reconciles omitted IDs in one narrow batch query, restoring
+-- sweeper-raced offline rows and invalidating connections for deleted rows.
 UPDATE agent_runtime
 SET last_seen_at = now()
-WHERE id = ANY(@ids::uuid[]) AND status = 'online';
+WHERE id = ANY(@ids::uuid[]) AND status = 'online'
+RETURNING id;
 
 -- name: MarkAgentRuntimeOnline :one
 -- Used on the offline→online transition (and on first heartbeat after
@@ -191,6 +238,15 @@ UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1
 RETURNING *;
+
+-- name: MarkAgentRuntimeOnlineIfOffline :execrows
+-- Reports whether this heartbeat performed an offline -> online transition.
+-- The conditional update prevents concurrent stale heartbeat snapshots from
+-- publishing duplicate lifecycle refresh events after another beat already
+-- recovered the runtime.
+UPDATE agent_runtime
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1 AND status <> 'online';
 
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
@@ -312,10 +368,79 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- rejects an active row without a runtime — so a missed status now surfaces as
 -- a failed delete (runtime_delete_not_drained) instead of silent data loss.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled', completed_at = now(),
+    cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL
 WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
   AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
+
+-- name: ListNonOwnerActiveTasksByRuntime :many
+-- Lists live tasks whose agent owner will lose runtime access, including
+-- hidden Builder execution carriers. shared_with is the desired recipient list.
+SELECT task.*
+FROM agent_task_queue AS task
+JOIN agent ON agent.id = task.agent_id
+WHERE task.runtime_id = @runtime_id
+  AND agent.owner_id IS DISTINCT FROM @runtime_owner_id
+  AND NOT COALESCE(agent.owner_id = ANY(@shared_with::uuid[]), false)
+  AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+ORDER BY task.id;
+
+-- name: ListNonOwnerActiveTasksByRuntimeForUpdate :many
+-- Acquired after the affected agent and chat-session locks. Bindings serialize
+-- on LockAgentRuntimeForAccessChange; claim/delivery rechecks authorization.
+SELECT task.*
+FROM agent_task_queue AS task
+JOIN agent ON agent.id = task.agent_id
+WHERE task.runtime_id = @runtime_id
+  AND agent.owner_id IS DISTINCT FROM @runtime_owner_id
+  AND NOT COALESCE(agent.owner_id = ANY(@shared_with::uuid[]), false)
+  AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+ORDER BY task.id
+FOR UPDATE OF task;
+
+-- name: LockAgentRuntimeForAccessChange :one
+-- Binding and visibility writers share this lock and recheck access under it.
+-- NO KEY UPDATE deliberately permits legacy FK KEY SHARE locks: a chat enqueue
+-- holding session/agent locks must not wait here while revocation locks them.
+SELECT * FROM agent_runtime WHERE id = $1 FOR NO KEY UPDATE;
+
+-- name: LockRuntimeRevocationChatSessions :many
+-- Revocation already holds affected agents. Never wait in the reverse of the
+-- normal session -> agent/task order: a concurrent chat writer yields a 409
+-- and the entire revocation rolls back before changing anything.
+SELECT cs.id FROM chat_session cs
+WHERE EXISTS (
+    SELECT 1 FROM agent_task_queue task JOIN agent ON agent.id = task.agent_id
+    WHERE task.chat_session_id = cs.id
+      AND task.runtime_id = @runtime_id
+      AND agent.owner_id IS DISTINCT FROM @runtime_owner_id
+      AND NOT COALESCE(agent.owner_id = ANY(@shared_with::uuid[]), false)
+      AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+)
+ORDER BY cs.id
+FOR UPDATE OF cs NOWAIT;
+
+-- name: CancelNonOwnerTasksByRuntime :many
+-- Server-side execution revocation for a public runtime made private. The
+-- join deliberately classifies work by its agent owner rather than cancelling
+-- every task on the runtime, so the runtime owner's own tasks keep running.
+-- cancellation polling on an online daemon observes the state change; an
+-- offline daemon cannot run new work and will observe it after reconnecting.
+UPDATE agent_task_queue AS task
+SET status = 'cancelled',
+    completed_at = now(), prepare_lease_expires_at = NULL,
+    error = 'runtime access was revoked',
+    failure_reason = @failure_reason::text,
+    cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL,
+    wait_reason = NULL
+FROM agent
+WHERE task.agent_id = agent.id
+  AND task.runtime_id = @runtime_id
+  AND agent.owner_id IS DISTINCT FROM @runtime_owner_id
+  AND NOT COALESCE(agent.owner_id = ANY(@shared_with::uuid[]), false)
+  AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING task.*;
 
 -- name: CountUndrainedTasksByRuntimeOrAgent :one
 -- Belt-and-braces gate for the runtime-delete transaction: after cancelling,
@@ -357,6 +482,16 @@ WHERE runtime_id = $1 AND completed_at IS NOT NULL;
 UPDATE agent
 SET runtime_id = NULL, updated_at = now()
 WHERE runtime_id = $1 AND kind = 'user'
+RETURNING *;
+
+-- name: UnbindNonOwnerAgentsFromRuntime :many
+-- Companion to CancelNonOwnerTasksByRuntime: preserve agents belonging to
+-- the runtime owner or to recipients who retain access.
+UPDATE agent
+SET runtime_id = NULL, updated_at = now()
+WHERE runtime_id = @runtime_id
+  AND owner_id IS DISTINCT FROM @runtime_owner_id
+  AND NOT COALESCE(owner_id = ANY(@shared_with::uuid[]), false)
 RETURNING *;
 
 -- name: DeleteAgentRuntime :exec
@@ -428,7 +563,9 @@ FOR KEY SHARE;
 --
 -- Returns the ids it actually locked: a caller that asked for two and got fewer
 -- knows a runtime disappeared before it got there and must abandon the merge.
-SELECT id FROM agent_runtime
+-- workspace_id and owner_id come back with the lock so the merge can verify,
+-- against the locked rows, that the caller owns both sides (MUL-8154).
+SELECT id, workspace_id, owner_id FROM agent_runtime
 WHERE id = ANY(@runtime_ids::uuid[])
 ORDER BY id
 FOR UPDATE;
@@ -486,6 +623,8 @@ WHERE status = 'offline'
     SELECT 1
     FROM agent
     WHERE agent.runtime_id = agent_runtime.id
+      AND agent.kind = 'user'
+      AND agent.archived_at IS NULL
   )
   AND NOT EXISTS (
     SELECT 1
@@ -510,6 +649,8 @@ SELECT EXISTS (
       SELECT 1
       FROM agent
       WHERE agent.runtime_id = agent_runtime.id
+        AND agent.kind = 'user'
+        AND agent.archived_at IS NULL
     )
 ) AS eligible;
 
@@ -518,26 +659,30 @@ SELECT EXISTS (
 -- aborts the transaction instead of relying on the legacy ON DELETE CASCADE.
 SELECT count(*) FROM agent_task_queue WHERE runtime_id = $1;
 
--- name: CountStaleOfflineRuntimesBlockedByTasks :one
--- Bounded observability sample of runtimes that are otherwise GC-eligible but
--- retain a non-terminal task. In particular, deferred tasks have no generic
--- TTL, so silently filtering them from the candidate batch would hide a
--- permanently-starved runtime. The count saturates at max_rows so this
--- recurring safety signal cannot become an unbounded backlog scan.
-SELECT count(*) FROM (
-  SELECT 1 FROM agent_runtime
-  WHERE status = 'offline'
-    AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision)
-    AND NOT EXISTS (
-      SELECT 1
-      FROM agent
-      WHERE agent.runtime_id = agent_runtime.id
-    )
-    AND EXISTS (
-      SELECT 1
-      FROM agent_task_queue
-      WHERE agent_task_queue.runtime_id = agent_runtime.id
-        AND agent_task_queue.completed_at IS NULL
-    )
-  LIMIT @max_rows::int
-) AS blocked_runtimes;
+-- name: ListRuntimeOwnersByDaemon :many
+-- Registration pre-check (MUL-8154): every runtime row a daemon_id already
+-- holds in a workspace, with its owner. A user-credential registration is
+-- refused before any write when any of them belongs to someone else.
+SELECT id, owner_id FROM agent_runtime
+WHERE workspace_id = @workspace_id AND daemon_id = @daemon_id;
+
+-- name: LockRuntimeShareMembers :many
+-- Keep grant validation and member removal serialized until commit. NOWAIT
+-- avoids the member-removal path's reverse member/runtime lock order.
+SELECT user_id FROM member
+WHERE workspace_id = @workspace_id AND user_id = ANY(@user_ids::uuid[])
+ORDER BY user_id
+FOR KEY SHARE NOWAIT;
+
+-- name: LockRuntimeShareMemberRemoval :one
+-- Prevent new grants until membership deletion commits. Grant writers use
+-- NOWAIT on this row, so they never wait while holding a runtime we need.
+SELECT id FROM member
+WHERE workspace_id = @workspace_id AND user_id = @user_id
+FOR UPDATE;
+
+-- name: ListSharedAgentRuntimesForUpdate :many
+SELECT * FROM agent_runtime
+WHERE workspace_id = @workspace_id AND @user_id::uuid = ANY(shared_with)
+ORDER BY id
+FOR NO KEY UPDATE;

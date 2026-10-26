@@ -9,36 +9,16 @@ import {
   workspaceKeys,
 } from "@multica/core/workspace/queries";
 import { AgentNameField } from "./agent-configuration-panel";
-import { CreateMethodChooser } from "./choose-create-method-page";
 import { CreateAgentFooter } from "./create-agent-footer";
 import { draftPreview } from "./unfinished-drafts";
 import { classifyAgentCreateError } from "./use-create-agent-submit";
-import { NavigationProvider, type NavigationAdapter } from "../../navigation";
-
-const TEST_NAVIGATION: NavigationAdapter = {
-  push: vi.fn(),
-  replace: vi.fn(),
-  back: vi.fn(),
-  pathname: "/acme/agents/new",
-  searchParams: new URLSearchParams(),
-  getShareableUrl: (path: string) => path,
-};
 
 vi.mock("../../i18n", () => ({
   useT: () => ({
     t: (
       selector: (translations: {
         creation_studio: {
-          eyebrow: string;
-          choose_title: string;
-          choose_description: string;
-          recommended: string;
-          continue: string;
-          modes: {
-            blank: { title: string; description: string };
-            ai: { title: string; description: string };
-          };
-          create_and_open: string;
+          create_agent: string;
           create_and_add: string;
           creating: string;
           name_conflict: string;
@@ -51,22 +31,7 @@ vi.mock("../../i18n", () => ({
     ) =>
       selector({
         creation_studio: {
-          eyebrow: "Agent creation",
-          choose_title: "How would you like to start?",
-          choose_description: "Choose a creation mode.",
-          recommended: "Recommended",
-          continue: "Continue",
-          modes: {
-            blank: {
-              title: "Start blank",
-              description: "Configure every field yourself.",
-            },
-            ai: {
-              title: "Build with AI",
-              description: "Describe the outcome you want.",
-            },
-          },
-          create_and_open: "Create and open",
+          create_agent: "Create agent",
           create_and_add: "Create and add",
           creating: "Creating…",
           name_conflict: "An agent with this name already exists.",
@@ -168,7 +133,7 @@ describe("Agent creation errors", () => {
     );
 
     const error = screen.getByRole("alert");
-    const button = screen.getByRole("button", { name: "Create and open" });
+    const button = screen.getByRole("button", { name: "Create agent" });
     expect(error.parentElement).toBe(button.parentElement);
     expect(
       error.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -274,29 +239,5 @@ describe("Unfinished draft preview", () => {
     expect(
       draftPreview({ last_message_role: "", last_message_content: "" }),
     ).toBe("");
-  });
-});
-
-describe("Agent creation method chooser", () => {
-  it("always offers AI-assisted creation", () => {
-    render(
-      createElement(NavigationProvider, {
-        value: TEST_NAVIGATION,
-        children: createElement(CreateMethodChooser, {
-          blankHref: "/acme/agents/new/manual",
-          aiHref: "/acme/agents/new/ai",
-        }),
-      }),
-    );
-
-    expect(screen.getByText("Start blank")).toBeInTheDocument();
-    expect(screen.getByText("Build with AI")).toBeInTheDocument();
-    expect(
-      screen.getByText("Start blank").closest("a"),
-    ).toHaveAttribute("href", "/acme/agents/new/manual");
-    expect(screen.getByText("Build with AI").closest("a")).toHaveAttribute(
-      "href",
-      "/acme/agents/new/ai",
-    );
   });
 });

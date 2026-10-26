@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -281,6 +285,30 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	linkPreview, err := h.Queries.GetActiveShareLinkByCode(r.Context(), code)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "share link not found or expired")
+		return
+	}
+	if _, memberErr := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+		UserID: user.ID, WorkspaceID: linkPreview.WorkspaceID,
+	}); memberErr == nil {
+		writeError(w, http.StatusConflict, "you are already a member of this workspace")
+		return
+	} else if !errors.Is(memberErr, pgx.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "failed to join workspace")
+		return
+	}
+
+	var capacityToken uuid.UUID
+	if h.seatCapacityEnabled() {
+		capacityToken, err = h.beginShareJoinCapacity(r.Context(), uuid.UUID(linkPreview.WorkspaceID.Bytes), uuid.UUID(linkPreview.ID.Bytes), uuid.UUID(user.ID.Bytes))
+		if err != nil {
+			writeSeatCapacityError(w, err)
+			return
+		}
+	}
+
 	// Open the transaction first, then atomically claim the link. The claim is
 	// a conditional UPDATE that revalidates active/not-expired/below-max_uses
 	// and increments use_count in one statement, so concurrent joins cannot
@@ -294,7 +322,7 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 
 	qtx := h.Queries.WithTx(tx)
 
-	link, err := qtx.ClaimShareLinkByCode(r.Context(), code)
+	link, err := qtx.ClaimShareLinkByID(r.Context(), linkPreview.ID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "share link not found or expired")
 		return
@@ -310,6 +338,42 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Settle a matching pending email invitation in the same transaction
+	// (#8432). A user invited by email who joins through the share link
+	// instead would leave that row pending forever: it keeps its seat
+	// reservation, keeps showing in their pending list, and a later Accept
+	// on it dies on the CreateMember 409. The link's role wins — the user
+	// chose this entry point, so the member is created with link.Role below
+	// and the invitation row is only settled, its role left untouched.
+	// idx_invitation_unique_pending guarantees at most one pending row per
+	// (workspace, email).
+	var settledInvitationID pgtype.UUID
+	pendingInv, pendingErr := qtx.GetPendingInvitationByEmail(r.Context(), db.GetPendingInvitationByEmailParams{
+		WorkspaceID:  link.WorkspaceID,
+		InviteeEmail: strings.ToLower(user.Email),
+	})
+	switch {
+	case pendingErr == nil:
+		// AcceptInvitation re-checks status='pending' under the row lock, so
+		// a decline concluded concurrently leaves nothing to settle and the
+		// join still proceeds.
+		settled, settleErr := qtx.AcceptInvitation(r.Context(), pendingInv.ID)
+		switch {
+		case settleErr == nil:
+			settledInvitationID = settled.ID
+		case errors.Is(settleErr, pgx.ErrNoRows):
+			// Concluded elsewhere in between; its own path released the seat.
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to join workspace")
+			return
+		}
+	case errors.Is(pendingErr, pgx.ErrNoRows):
+		// No pending invitation for this email — the common case.
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to join workspace")
+		return
+	}
+
 	member, err := qtx.CreateMember(r.Context(), db.CreateMemberParams{
 		WorkspaceID: link.WorkspaceID,
 		UserID:      user.ID,
@@ -317,6 +381,7 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
+			h.compensateCapacityIntent(r.Context(), capacityToken)
 			writeError(w, http.StatusConflict, "you are already a member of this workspace")
 			return
 		}
@@ -330,10 +395,35 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to finalize onboarding")
 		return
 	}
+	if capacityToken != uuid.Nil {
+		if err := transitionCapacityIntentToConfirm(r.Context(), qtx, capacityToken, uuid.UUID(member.ID.Bytes), seatcapacity.ActionClaimShareJoin); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to join workspace")
+			return
+		}
+	}
+	if settledInvitationID.Valid && h.seatCapacityEnabled() {
+		// The settled invitation was holding a seat reservation (managed
+		// mode); the share join's own confirmed claim now covers the seat,
+		// so release the invitation's reservation instead of double-charging
+		// the workspace for one joining user.
+		if err := enqueueCapacityRelease(r.Context(), qtx, uuid.UUID(link.WorkspaceID.Bytes), uuid.UUID(settledInvitationID.Bytes)); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to join workspace")
+			return
+		}
+	}
 
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to join workspace")
 		return
+	}
+	if capacityToken != uuid.Nil {
+		h.confirmCapacityIntent(r.Context(), uuid.UUID(link.WorkspaceID.Bytes), capacityToken, uuid.UUID(member.ID.Bytes))
+	}
+	if settledInvitationID.Valid && h.seatCapacityEnabled() {
+		// Best-effort immediate release of the settled invitation's
+		// reservation; if the capacity service is unavailable the enqueued
+		// release above is retried by the outbox worker.
+		h.compensateCapacityIntent(r.Context(), uuid.UUID(settledInvitationID.Bytes))
 	}
 
 	wsID := uuidToString(link.WorkspaceID)
@@ -349,6 +439,14 @@ func (h *Handler) JoinByShareLink(w http.ResponseWriter, r *http.Request) {
 	h.publish(protocol.EventMemberAdded, wsID, "member", userID, map[string]any{
 		"member": memberResp,
 	})
+	if settledInvitationID.Valid {
+		// Same signal the accept path sends: workspace admins refresh their
+		// pending-invitation list, and the joiner's own clients converge.
+		h.publish(protocol.EventInvitationAccepted, wsID, "member", userID, map[string]any{
+			"invitation_id": uuidToString(settledInvitationID),
+			"member":        memberResp,
+		})
+	}
 	h.notifyDaemonWorkspacesChanged(userID)
 
 	writeJSON(w, http.StatusOK, map[string]any{

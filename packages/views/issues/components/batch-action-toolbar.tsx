@@ -15,9 +15,12 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
+import { useQuery } from "@tanstack/react-query";
 import type { Issue, UpdateIssueRequest } from "@multica/core/types";
+import { useWorkspaceId } from "@multica/core/hooks";
 import { commonIssueFields } from "@multica/core/issues/batch";
-import { issueBehavesAs } from "@multica/core/issues";
+import { sharedWorkflowStatusKeys, useIssueWorkflows } from "@multica/core/issue-workflows";
+import { projectListOptions } from "@multica/core/projects/queries";
 import { useBatchUpdateIssues, useBatchDeleteIssues } from "@multica/core/issues/mutations";
 import { useModalStore } from "@multica/core/modals";
 import { StatusPicker, PriorityPicker, AssigneePicker } from "./pickers";
@@ -33,6 +36,7 @@ import { useIssueSurfaceSelection } from "../surface/selection-context";
 export function BatchActionToolbar({
   issues,
   placement = "fixed-bottom",
+  clearSelectionOnApply = false,
 }: {
   /**
    * The universe of selectable issues at this call site (the same list the
@@ -48,6 +52,14 @@ export function BatchActionToolbar({
    * the selected rows (used inside scrollable sections like sub-issues).
    */
   placement?: "fixed-bottom" | "inline";
+  /**
+   * Drop the selection once a status / priority / assignee change fully
+   * applies. Off for full-screen lists, where the selection stays so several
+   * edits can be chained; on for sub-issues, where a batch edit is a one-shot
+   * dispatch and a lingering inline toolbar reads as unfinished. A partial or
+   * failed write keeps the selection so the user can retry.
+   */
+  clearSelectionOnApply?: boolean;
 }) {
   const { t } = useT("issues");
   const selection = useIssueSurfaceSelection();
@@ -74,6 +86,21 @@ export function BatchActionToolbar({
     [selectedIssues],
   );
 
+  // A selection inside one project offers that project's workflow statuses;
+  // one spanning projects offers the statuses every selected issue's
+  // workflow allows. (MUL-7420)
+  const sharedProjectId = useMemo(() => {
+    const first = selectedIssues[0]?.project_id ?? null;
+    return first && selectedIssues.every((i) => i.project_id === first) ? first : null;
+  }, [selectedIssues]);
+  const wsId = useWorkspaceId();
+  const { workflows } = useIssueWorkflows(wsId);
+  const { data: projects } = useQuery({ ...projectListOptions(wsId), enabled: count > 0 && !sharedProjectId });
+  const allowedStatuses = useMemo(
+    () => (sharedProjectId ? null : sharedWorkflowStatusKeys(workflows, projects, selectedIssues)),
+    [sharedProjectId, workflows, projects, selectedIssues],
+  );
+
   const [statusOpen, setStatusOpen] = useState(false);
   const [priorityOpen, setPriorityOpen] = useState(false);
   const [assigneeOpen, setAssigneeOpen] = useState(false);
@@ -96,12 +123,15 @@ export function BatchActionToolbar({
 
   const handleBatchUpdate = async (updates: Partial<UpdateIssueRequest>) => {
     try {
-      if (surfaceActions) {
-        await surfaceActions.batchUpdate(ids, updates);
+      const { updated } = surfaceActions
+        ? await surfaceActions.batchUpdate(ids, updates)
+        : await batchUpdate.mutateAsync({ ids, updates });
+      if (updated < count) {
+        toast.warning(t(($) => $.batch.update_partial, { updated, count }));
       } else {
-        await batchUpdate.mutateAsync({ ids, updates });
+        if (clearSelectionOnApply) clear();
+        toast.success(t(($) => $.batch.update_success, { count }));
       }
-      toast.success(t(($) => $.batch.update_success, { count }));
     } catch (err) {
       toast.error(
         err instanceof Error && err.message
@@ -132,15 +162,15 @@ export function BatchActionToolbar({
       // start" box — apply directly, matching handleBatchStatus's backlog short-
       // circuit. A mixed selection still routes through the modal: the non-backlog
       // issues will trigger and need confirmation.
-      // Category, not key: a custom status in the backlog category is a parking
-      // lot too, and assigning into it never starts a run. (MUL-6243)
-      const allBacklog = selectedIssues.every((i) => issueBehavesAs(i, "backlog"));
+      // Only the fixed Backlog key parks work; custom Unstarted does not.
+      const allBacklog = selectedIssues.every((i) => i.status === "backlog");
       if (!allBacklog) {
         openModal("issue-run-confirm", {
           issueIds: ids,
           mode: "assign",
           assigneeType: updates.assignee_type,
           assigneeId: updates.assignee_id,
+          onApplied: clearSelectionOnApply ? clear : undefined,
         });
         return;
       }
@@ -215,7 +245,7 @@ export function BatchActionToolbar({
           <button
             type="button"
             onClick={clear}
-            className="rounded p-0.5 hover:bg-accent transition-colors"
+            className="rounded-xs p-0.5 hover:bg-accent transition-colors"
           >
             <X className="size-3.5 text-muted-foreground" />
           </button>
@@ -224,6 +254,10 @@ export function BatchActionToolbar({
         {/* Status */}
         <StatusPicker
           status={common.status}
+          // No shared project spans projects (or none): not the Default-only
+          // list of a single issue outside a project. (MUL-8121)
+          projectId={sharedProjectId ?? undefined}
+          allowedStatuses={allowedStatuses}
           onUpdate={handleBatchStatus}
           open={statusOpen}
           onOpenChange={setStatusOpen}

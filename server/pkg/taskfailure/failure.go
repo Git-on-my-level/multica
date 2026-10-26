@@ -26,7 +26,8 @@
 //     queued_expired, runtime_offline, runtime_reconnect_timeout,
 //     runtime_recovery, timeout, iteration_limit, agent_blocked,
 //     api_invalid_request, skill_bundle_unavailable,
-//     runtime_cli_timeout, invalid_task_identity, issue_window_restricted
+//     runtime_cli_timeout, environment_prepare_failed,
+//     invalid_task_identity, runtime_access_denied
 //
 //   - 14 agent-side values (with `agent_error.` prefix) produced by
 //     Classify(rawError) when the agent process surfaced an error string.
@@ -71,6 +72,10 @@ const (
 	// ReasonRuntimeOffline: the runtime owning a dispatched/running
 	// task went offline. Written by FailTasksForOfflineRuntimes.
 	ReasonRuntimeOffline Reason = "runtime_offline"
+
+	// ReasonRuntimeAccessRevoked: the runtime owner withdrew workspace access.
+	// This is a cancellation, not a runner failure or a retryable outage.
+	ReasonRuntimeAccessRevoked Reason = "runtime_access_revoked"
 
 	// ReasonRuntimeReconnectTimeout: a retry waiting for an offline runtime
 	// remained deferred for the full reconnect grace. Non-retryable: the
@@ -131,6 +136,43 @@ const (
 	// taskRunFailureReason in daemon/daemon.go.
 	ReasonRuntimeCLITimeout Reason = "runtime_cli_timeout"
 
+	// ReasonEnvironmentPrepareFailed: the daemon could not build or re-open
+	// the task's execution environment on this host, so the agent process was
+	// never launched.
+	//
+	// That phase is everything execenv.Prepare / Reuse does before launch —
+	// the workspace directory and its overlay homes, AND the per-provider
+	// local config written or validated inside it (Codex home, Hermes
+	// overlay, Cursor MCP, OpenClaw config, which fails closed on a config
+	// the CLI cannot read). So the causes are wider than a disk fault: a full
+	// volume, a read-only or permission-denied workspaces root, a directory
+	// another process still holds open (Windows) and an I/O error all land
+	// here, and so does a malformed local runtime config. What they share is
+	// the machine — every one is fixed on the host running the daemon, and
+	// the raw error is what names which step failed.
+	//
+	// Copy that narrows this to "check your disk" therefore sends the user
+	// past half the real causes, which is the same defect in miniature that
+	// this reason exists to fix. Read the wording in the chat bundles and the
+	// docs failure-reason table as part of the contract.
+	//
+	// Platform-side, and that is the point (#7913). Before this reason
+	// existed the wrapped OS error went through Classify — a classifier
+	// written to read agent and provider output — and landed somewhere in
+	// agent_error.*: today the catchall, historically provider_server_error,
+	// which sent one report's diagnosis at an LLM vendor for hours. The task
+	// never reached an agent, so no value in that namespace can be correct,
+	// and any fleet health read grouping by the agent_error.* prefix
+	// over-reports agent problems by exactly these rows.
+	//
+	// Deliberately NOT retryable: a full disk or a denied permission
+	// reproduces identically on the next attempt, and preparation already
+	// waits out the one transient case it knows about (a prior run still
+	// holding the directory) before it fails. Written by
+	// taskRunFailureReason in daemon/daemon.go; resume-safe, because no
+	// session was touched.
+	ReasonEnvironmentPrepareFailed Reason = "environment_prepare_failed"
+
 	// ReasonInvalidTaskIdentity: the daemon refused a claimed task because
 	// the task row's authoritative agent_id was absent or disagreed with the
 	// nested agent payload. The agent process is never launched. This is
@@ -138,11 +180,21 @@ const (
 	// only repeat an isolation failure.
 	ReasonInvalidTaskIdentity Reason = "invalid_task_identity"
 
-	// ReasonIssueWindowRestricted: an entitlement change made the task's issue
-	// unavailable before a daemon claimed it. The agent process is never
-	// launched and retrying the same issue remains non-actionable until the
-	// workspace policy changes.
-	ReasonIssueWindowRestricted Reason = "issue_window_restricted"
+	// ReasonRuntimeAccessDenied: the daemon refused a claimed task because
+	// a private runtime does not authorize the task's agent — the runtime
+	// owner and the agent owner differ, a private owned runtime was paired
+	// with an ownerless agent, or the runtime owner needed for
+	// authorization was missing at the delivery gate. The agent process is
+	// never launched. Unlike ReasonInvalidTaskIdentity the task's persisted
+	// identity is intact; what fails is ownership authorization. Permanent
+	// and non-retryable: retrying the same runtime/agent pair reproduces
+	// the denial, so recovery is user configuration (make the runtime
+	// public, or rebind the agent to a runtime its owner may use), not
+	// another attempt. Written by the daemon claim settlement paths in
+	// handler/daemon.go. Shares the runtime_access_denied wire value with
+	// dispatch.ReasonRuntimeAccessDenied so admission blocks and persisted
+	// settlement failures surface the same recovery guidance.
+	ReasonRuntimeAccessDenied Reason = "runtime_access_denied"
 
 	// Agent process side: failure surfaced by the agent CLI / SDK as
 	// an error string. Classify(rawError) is responsible for picking
@@ -219,7 +271,7 @@ const (
 	ReasonAgentUnknown Reason = "agent_error.unknown"
 )
 
-// allReasons is the canonical ordered list of the 26 reasons. Order is
+// allReasons is the canonical ordered list of the 27 reasons. Order is
 // stable so callers (e.g. Prometheus collectors that pre-warm series via
 // AllReasons) can build deterministic label sets across restarts.
 //
@@ -232,6 +284,7 @@ var allReasons = []Reason{
 	// Platform / scheduler side.
 	ReasonQueuedExpired,
 	ReasonRuntimeOffline,
+	ReasonRuntimeAccessRevoked,
 	ReasonRuntimeReconnectTimeout,
 	ReasonRuntimeRecovery,
 	ReasonTimeout,
@@ -240,8 +293,9 @@ var allReasons = []Reason{
 	ReasonAPIInvalidRequest,
 	ReasonSkillBundleUnavailable,
 	ReasonRuntimeCLITimeout,
+	ReasonEnvironmentPrepareFailed,
 	ReasonInvalidTaskIdentity,
-	ReasonIssueWindowRestricted,
+	ReasonRuntimeAccessDenied,
 
 	// Agent process side: provider errors.
 	ReasonAgentProviderAuthOrAccess,

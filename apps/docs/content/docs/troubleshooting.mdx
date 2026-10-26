@@ -56,18 +56,18 @@ multica config show
 
 ## Issue does not start executing
 
-Open the issue's **execution log** and check the task's current status and what it is waiting for.
+Open the issue's **execution log** and check the run's current status and what it is waiting for.
 
 ### `queued` status
 
-`queued` means the task is still waiting for a runtime to claim it. Check in order:
+`queued` means the run is still waiting for a runtime to claim it. Check in order:
 
 1. Is the runtime the agent is bound to online?
 2. Did the runtime detect the AI coding tool the agent is configured with?
 3. Does the agent still have concurrency headroom?
 4. Does the daemon still have global execution capacity?
 
-An agent runs at most 6 tasks concurrently by default; a single daemon runs at most 20. At the limit, new tasks stay in the queue until a running one finishes. Tasks also keep queueing while the runtime is offline; they only fail after going unclaimed for more than 2 hours by default (raise the limit with `MULTICA_TASK_QUEUED_TTL`, see [Environment variables](/environment-variables)).
+An agent executes at most 6 runs concurrently by default; a single daemon executes at most 20. At the limit, new runs stay in the queue until an active one finishes. Runs also keep queueing while the runtime is offline; they only fail once that runtime has stopped heartbeating for longer than the reconnect grace and the run has itself waited that long, so a long queue behind a busy runtime is never expired for waiting, and assigning work to a machine that is already offline still leaves a full grace to bring it back.
 
 ```bash
 multica daemon status --output json
@@ -79,11 +79,11 @@ If the runtime list is missing an expected tool, first confirm the tool runs and
 
 ### `waiting_local_directory` status
 
-This means another in-flight task is using the same local directory. Multica waits for the directory lock to be released so two agents never modify the same files at once.
+This means another in-flight run is using the same local directory. Multica waits for the directory lock to be released so two agents never modify the same files at once.
 
-This wait only exists in the directory's `in_place` ("Direct") mode. If the directory is a git repository, switching the resource to `worktree` ("Parallel") removes the queue altogether: each task gets its own worktree and hands its work back as a branch, so nothing waits on anything. See [Project resources](/project-resources#how-tasks-share-the-directory).
+This wait only exists in the directory's `in_place` ("Direct") mode. If the directory is a git repository, switching the resource to `worktree` ("Parallel") removes the queue altogether: each run gets its own worktree and hands its work back as a branch, so nothing waits on anything. See [Project resources](/project-resources#how-runs-share-the-directory).
 
-Otherwise you just wait for the earlier task to finish. If it is stuck, stop it from its execution log, or pick a different local directory for the current agent. This directory mutex lives in the daemon's memory — no lock file is written to disk. If you suspect stale lock state, `multica daemon restart` releases it; there is nothing to delete manually.
+Otherwise you just wait for the earlier run to finish. If it is stuck, stop it from its execution log, or pick a different local directory for the current agent. This directory mutex lives in the daemon's memory — no lock file is written to disk. If you suspect stale lock state, `multica daemon restart` releases it; there is nothing to delete manually.
 
 ## AI coding tool fails to start
 
@@ -95,11 +95,35 @@ An online daemon does not mean the tool itself works. Open the run's detailed re
 - Whether the local working directory exists and is writable.
 - Whether the agent's custom arguments or environment variables are valid.
 
-Run the same tool directly in a terminal on the executing computer first. If the tool cannot start on its own, fix its sign-in or configuration, then retry the task from the execution log.
+Run the same tool directly in a terminal on the executing computer first. If the tool cannot start on its own, fix its sign-in or configuration, then retry the run from the execution log.
+
+## Runs hang on macOS after a CLI upgrade
+
+After the Homebrew `multica` CLI is upgraded, by `brew upgrade`, `multica update`, **Update** on the Runtimes page, or the daemon's auto-update, a run that reads `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive, or another protected folder can stop making progress: the agent's process uses no CPU, and the run neither finishes nor fails.
+
+This happens when macOS attributes privacy permissions (TCC) to the daemon itself, as it does for a daemon started by launchd (for example a LaunchAgent): the pending dialog names `multica`, and every tool an agent starts uses the daemon's grants. The Homebrew CLI binary is not signed with a stable identity, so macOS ties those grants to that exact build at its resolved path, such as `/opt/homebrew/Cellar/multica/<version>/bin/multica`. After an upgrade, macOS treats the new binary as a different app and asks again. The file access blocks until someone answers the prompt, and the daemon cannot tell that a prompt is pending.
+
+To restore access:
+
+1. On that Mac, answer the pending "would like to access" dialog with **Allow**. The stuck run continues.
+2. For a Mac that runs unattended, grant Full Disk Access to the new binary. Print its path with `realpath "$(command -v multica)"`, then under **System Settings → Privacy & Security → Full Disk Access** remove the stale `multica` entry and add that path (press ⌘⇧G in the file picker to paste it).
+3. Restart the daemon the same way you started it: `multica daemon restart`, or `launchctl kickstart -k gui/$(id -u)/<label>` for a LaunchAgent.
+
+Repeat this after every CLI upgrade. Auto-update is on by default only for daemons connected to Multica Cloud; start the daemon with `--no-auto-update` so upgrades happen only when you run them. The CLI bundled with [Multica Desktop](/desktop-app) is signed with a Developer ID, so its grants survive upgrades.
+
+## Hermes runs reinstall dependencies after you use the Hermes CLI
+
+If you alternate between the Hermes CLI (or the Hermes desktop app) and Multica Hermes runs, each switch can add 30–60 seconds to startup while Hermes rebuilds its shared Python dependency environment. Each rebuild also leaves a new environment generation on disk until Hermes cleans it up.
+
+This happens when your own Hermes home sets `memory.provider` to a plugin that has Python dependencies. Each Multica run uses its own Hermes home, shares your installed dependencies, and turns the external memory provider off so memory is not shared across runs. Hermes works out which dependencies it needs from the active home's plugins, so your home and the run's home disagree, and each one treats the other's install as out of date. The underlying behavior is tracked upstream in [NousResearch/hermes-agent#137726](https://github.com/NousResearch/hermes-agent/issues/137726).
+
+To confirm, look in the [daemon log](#log-locations) for `hermes is reinstalling its dependency environment before this task starts`. A follow-up `hermes dependency reinstall finished` entry reports, in `startup_delay_ms`, how long Hermes took from launch until it was ready, including the reinstall.
+
+Until Hermes fixes this upstream, you can avoid the rebuilds by setting `memory.provider: ""` in your own Hermes `config.yaml`, which turns that memory plugin off for the CLI as well. Otherwise, expect the one-time delay after each switch.
 
 ## Realtime updates stop working
 
-If tasks still execute but comments and status changes no longer appear live, the WebSocket is usually not connected.
+If runs still execute but comments and status changes no longer appear live, the WebSocket is usually not connected.
 
 Check the `/ws` connection under **Network → WS** in the browser's developer tools. For self-hosted deployments, focus on:
 
@@ -108,6 +132,10 @@ Check the `/ws` connection under **Network → WS** in the browser's developer t
 - Whether the reverse proxy forwards the WebSocket Upgrade request.
 - Whether the browser sign-in has expired.
 
+A plain `curl` against `/ws` returning HTTP 400 is expected: the endpoint requires workspace-scoped query parameters and rejects a bare handshake before any WebSocket upgrade happens. A 400/401 recorded in the backend logs therefore proves only that ordinary HTTP routing reaches the backend — it does not prove the proxy preserves the WebSocket `Upgrade` headers. To verify the actual connection, open the browser DevTools → Network → WS tab (or use a WebSocket-aware client) and look for a `101` handshake.
+
+Self-host note: daemons dial `/api/daemon/ws` for their long connection (not `/ws`) — route it to the backend the same way. If the WebSocket handshake fails there, the daemon silently falls back to polling; repeated `status=400` lines on that path in the backend log are the symptom.
+
 Containers read `.env` only at creation time; recreate them after changes:
 
 ```bash
@@ -115,6 +143,35 @@ docker compose -f docker-compose.selfhost.yml up -d
 ```
 
 For a complete reverse-proxy example, see the [self-host quickstart](/self-host-quickstart#3-choose-how-to-access).
+
+## `multica setup` reports the server is not reachable
+
+The CLI reachability probe GETs `<server-url>/health` and needs a 200. The backend serves this path. Current web releases forward `/health` to the backend, but older ones do not — a reverse proxy that forwards everything to such an older frontend returns 404, and the CLI concludes the server is down while the stack is healthy.
+
+Routing `/health` to the backend (port 8080) explicitly in your proxy works across all releases — both Caddy examples in the [self-host quickstart](/self-host-quickstart#3-choose-how-to-access) do this. Confirm with:
+
+```bash
+curl -fsS <server-url>/health
+```
+
+## `multica login` fails with a TLS handshake timeout
+
+`multica login` opens the browser and the web sign-in completes, but the CLI still fails with "Sign-in did not complete" or "TLS handshake timed out". `multica --debug login` shows `net/http: TLS handshake timeout` on `POST /api/tokens`, while `curl.exe -I https://api.multica.ai` or a browser on the same machine connects fine.
+
+The TCP connection opens, but the TLS handshake never completes. Go clients, including the Multica CLI and daemon, send a post-quantum key share in the TLS ClientHello by default, which makes it about 1.5 KB and splits it across two packets. Some security software, VPNs, routers, and firewalls drop such handshakes; curl sends a much smaller ClientHello and gets through.
+
+Confirm the cause by retrying with the post-quantum key share disabled:
+
+```powershell
+$env:GODEBUG = 'tlsmlkem=0'
+multica --debug login
+```
+
+```bash
+GODEBUG=tlsmlkem=0 multica --debug login
+```
+
+If that succeeds, set `GODEBUG=tlsmlkem=0` permanently for the user that runs the CLI and the daemon — on Windows, run `[Environment]::SetEnvironmentVariable('GODEBUG', 'tlsmlkem=0', 'User')` and open a new terminal — then restart the daemon or the desktop app. Raising `MULTICA_HTTP_TIMEOUT` does not help: it does not govern the handshake. The permanent fix is on the network side: update or reconfigure the device or software that drops split TLS handshakes.
 
 ## Verification code and invitation emails not delivered
 
@@ -148,7 +205,7 @@ With Docker Compose, the default `backend_uploads` volume stores local attachmen
 
 ## Usage shows zero
 
-The Usage page reads hourly rollups, not each task's raw usage. Check the raw data and the rollup table first:
+The Usage page reads hourly rollups, not each run's raw usage. Check the raw data and the rollup table first:
 
 ```sql
 SELECT count(*) FROM task_usage;
@@ -219,5 +276,5 @@ If you still cannot pin it down, search existing issues or file a new one on [Gi
 ## Next steps
 
 - [Daemon and runtimes](/daemon-runtimes) — how runtimes register and report online status.
-- [Tasks](/tasks) — status, timeout, and failure reference.
+- [Runs](/tasks) — status, timeout, and failure reference.
 - [Environment variables](/environment-variables) — the full self-hosting configuration reference.

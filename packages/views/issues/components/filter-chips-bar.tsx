@@ -6,6 +6,7 @@ import { NO_PROPERTY_VALUE } from "../utils/filter";
 import { useMemo, type ReactNode } from "react";
 import {
   CalendarDays,
+  CircleDashed,
   CircleDot,
   FolderKanban,
   SignalHigh,
@@ -16,12 +17,14 @@ import {
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@multica/ui/components/ui/button";
+import { TooltipHint } from "@multica/ui/components/common/tooltip-hint";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions, agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
+import { PROJECT_STATUS_CONFIG } from "@multica/core/projects/config";
 import { labelListOptions } from "@multica/core/labels/queries";
 import { propertyListOptions } from "@multica/core/properties";
-import { isActorPropertyType, parseActorRef } from "@multica/core/types";
+import { isActorPropertyType, isListPropertyType, isScalarPropertyType, parseActorRef, propertyFilterValueKey, PROPERTY_FILTER_OP_SYMBOLS, type PropertyFilterValue } from "@multica/core/types";
 import {
   type ActorFilterValue,
   type FilterDimension,
@@ -36,6 +39,7 @@ import { useViewStore, useViewStoreApi } from "@multica/core/issues/stores/view-
 import { StatusIcon } from "./status-icon";
 import { PriorityIcon } from "./priority-icon";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { useProjectStatusLabels } from "../../projects/components/labels";
 import { useT } from "../../i18n";
 
 /** One rendered chip: a dimension with its selected values summarised. */
@@ -104,7 +108,7 @@ export function buildChipActorNames(
  * stack. Unparseable entries drop out — the chip degrades to fewer avatars
  * rather than rendering a broken one.
  */
-export function actorFilterValues(selected: string[]): ActorFilterValue[] {
+export function actorFilterValues(selected: PropertyFilterValue[]): ActorFilterValue[] {
   return selected
     .map((value) => parseActorRef(value))
     .filter((ref): ref is NonNullable<ReturnType<typeof parseActorRef>> => ref !== null)
@@ -120,7 +124,7 @@ export function actorFilterValues(selected: string[]): ActorFilterValue[] {
  * can only render a bare count (MUL-6286 review).
  */
 export function hasActorPropertyFilterSelection(
-  propertyFilters: Record<string, string[]>,
+  propertyFilters: Record<string, PropertyFilterValue[]>,
   properties: { id: string; type: string }[],
 ): boolean {
   return Object.entries(propertyFilters).some(
@@ -180,9 +184,10 @@ function useFilterChips(
   baseline?: IssueViewBaseline,
 ) {
   const { t } = useT("issues");
+  const projectStatusLabels = useProjectStatusLabels();
   const wsId = useWorkspaceId();
   const resolveStatusLabel = useStatusLabel(wsId);
-  const { categoryOf, colorOf } = useIssueStatuses(wsId);
+  const { categoryOf, colorOf, iconOf } = useIssueStatuses(wsId);
 
   const statusFilters = useViewStore((s) => s.statusFilters);
   const priorityFilters = useViewStore((s) => s.priorityFilters);
@@ -191,6 +196,7 @@ function useFilterChips(
   const creatorFilters = useViewStore((s) => s.creatorFilters);
   const projectFilters = useViewStore((s) => s.projectFilters);
   const includeNoProject = useViewStore((s) => s.includeNoProject);
+  const projectStatusFilters = useViewStore((s) => s.projectStatusFilters);
   const labelFilters = useViewStore((s) => s.labelFilters);
   const propertyFilters = useViewStore((s) => s.propertyFilters);
   const store = useViewStoreApi();
@@ -203,6 +209,7 @@ function useFilterChips(
     creatorFilters.length > 0 ||
     projectFilters.length > 0 ||
     includeNoProject ||
+    projectStatusFilters.length > 0 ||
     labelFilters.length > 0 ||
     Object.values(propertyFilters).some((selected) => selected.length > 0);
   const showDateChip = !!onDateFilterChange && !!dateFilter;
@@ -264,6 +271,7 @@ function useFilterChips(
       creatorFilters: s.creatorFilters,
       projectFilters: s.projectFilters,
       includeNoProject: s.includeNoProject,
+      projectStatusFilters: s.projectStatusFilters,
       labelFilters: s.labelFilters,
       propertyFilters: s.propertyFilters,
     };
@@ -289,6 +297,12 @@ function useFilterChips(
           ...current,
           projectFilters: raw.projectFilters,
           includeNoProject: raw.includeNoProject,
+        });
+        break;
+      case "projectStatus":
+        s.resetFiltersTo({
+          ...current,
+          projectStatusFilters: raw.projectStatusFilters,
         });
         break;
       case "label":
@@ -327,13 +341,22 @@ function useFilterChips(
   const deltaNoProject = baseline
     ? includeNoProject && !baseline.includeNoProject
     : includeNoProject;
+  const deltaProjectStatuses = (
+    baseline
+      ? projectStatusFilters.filter((s) => !baseline.projectStatus.has(s))
+      : projectStatusFilters
+    // The store sanitizes on rehydrate; this keeps a member the config does
+    // not know from throwing on `.dotColor` if one ever gets past that.
+  ).filter((status) => PROJECT_STATUS_CONFIG[status] !== undefined);
   const deltaLabels = baseline
     ? labelFilters.filter((id) => !baseline.label.has(id))
     : labelFilters;
-  const deltaProperties: Record<string, string[]> = {};
+  const deltaProperties: Record<string, PropertyFilterValue[]> = {};
   for (const [id, selected] of Object.entries(propertyFilters)) {
     const fixed = baseline?.property.get(id);
-    const delta = fixed ? selected.filter((v) => !fixed.has(v)) : selected;
+    const delta = fixed
+      ? selected.filter((v) => !fixed.has(propertyFilterValueKey(v)))
+      : selected;
     if (delta.length > 0) deltaProperties[id] = delta;
   }
 
@@ -353,6 +376,7 @@ function useFilterChips(
               status={s}
               category={categoryOf(s)}
               color={colorOf(s)}
+              icon={iconOf(s)}
               className="size-3"
             />
           ))}
@@ -430,6 +454,29 @@ function useFilterChips(
       onRemove: () => clearDimension("project"),
     });
   }
+  if (deltaProjectStatuses.length > 0) {
+    chips.push({
+      key: "projectStatus",
+      icon: <CircleDashed className={CHIP_ICON_CLASS} />,
+      label: t(($) => $.filters.section_project_status),
+      valueIcons: (
+        // PROJECT_STATUS_CONFIG carries Tailwind classes, not CSS colors, so
+        // DotStack (inline styles) does not apply here.
+        <IconStack>
+          {deltaProjectStatuses.slice(0, 3).map((status) => (
+            <span
+              key={status}
+              className={`size-2.5 rounded-full ${PROJECT_STATUS_CONFIG[status].dotColor}`}
+            />
+          ))}
+        </IconStack>
+      ),
+      value: summarize(
+        deltaProjectStatuses.map((status) => projectStatusLabels[status]),
+      ),
+      onRemove: () => clearDimension("projectStatus"),
+    });
+  }
   if (deltaLabels.length > 0) {
     const labelById = new Map(labels.map((l) => [l.id, l]));
     chips.push({
@@ -457,20 +504,40 @@ function useFilterChips(
     // references, so names come from the directory and the icons are avatars.
     const actorProperty = isActorPropertyType(definition.type);
     const actorValues = actorProperty ? actorFilterValues(selected) : [];
-    const optionName = (optionId: string): string | undefined => {
-      if (optionId === NO_PROPERTY_VALUE) {
+    const optionName = (member: PropertyFilterValue): string | undefined => {
+      if (member === NO_PROPERTY_VALUE) {
         return t(($) => $.pickers.custom_property.none);
       }
+      // Scalar operator members summarize with their operator; the comparison
+      // symbols are locale-independent, the word ops get chip phrases.
+      if (typeof member === "object") {
+        if (member.op === "contains") {
+          return t(($) => $.filters.chip_op_contains, { value: member.value });
+        }
+        if (member.op === "before") {
+          return t(($) => $.filters.chip_op_before, { value: member.value });
+        }
+        if (member.op === "after") {
+          return t(($) => $.filters.chip_op_after, { value: member.value });
+        }
+        const symbol = PROPERTY_FILTER_OP_SYMBOLS[member.op] ?? member.op;
+        return `${symbol} ${member.value}`;
+      }
       if (actorProperty) {
-        const ref = parseActorRef(optionId);
+        const ref = parseActorRef(member);
         return ref ? actorName({ type: ref.kind, id: ref.id }) : undefined;
       }
       if (definition.type === "checkbox") {
-        return optionId === "true"
+        return member === "true"
           ? t(($) => $.pickers.custom_property.true_label)
           : t(($) => $.pickers.custom_property.false_label);
       }
-      return definition.config.options?.find((o) => o.id === optionId)?.name;
+      // Scalar and list properties have no option list — the filter value IS
+      // the label (for lists it is one matched element).
+      if (isScalarPropertyType(definition.type) || isListPropertyType(definition.type)) {
+        return member;
+      }
+      return definition.config.options?.find((o) => o.id === member)?.name;
     };
     const optionColors =
       definition.type === "checkbox" || actorProperty
@@ -528,6 +595,7 @@ function useFilterChips(
 
 function ChipSpan({ chip }: { chip: FilterChip }) {
   const { t } = useT("issues");
+  const removeLabel = t(($) => $.filters.chip_remove, { name: chip.label });
   return (
     // Keyed per dimension: the chip animates in once when its dimension
     // first gains a value; value changes inside it re-render without
@@ -542,14 +610,16 @@ function ChipSpan({ chip }: { chip: FilterChip }) {
         {chip.valueIcons}
         <span className="truncate font-medium">{chip.value}</span>
       </span>
-      <button
-        type="button"
-        aria-label={t(($) => $.filters.chip_remove, { name: chip.label })}
-        onClick={chip.onRemove}
-        className="flex size-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
-      >
-        <X className="size-3" />
-      </button>
+      <TooltipHint label={removeLabel}>
+        <button
+          type="button"
+          aria-label={removeLabel}
+          onClick={chip.onRemove}
+          className="flex size-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+        >
+          <X className="size-3" />
+        </button>
+      </TooltipHint>
     </span>
   );
 }

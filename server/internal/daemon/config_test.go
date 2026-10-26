@@ -106,18 +106,12 @@ func TestPatternsFromEnv_DefaultsWhenUnset(t *testing.T) {
 	}
 }
 
-func TestDefaultGCIntervalIsTwoHours(t *testing.T) {
-	if DefaultGCInterval != 2*time.Hour {
-		t.Fatalf("DefaultGCInterval = %s, want 2h", DefaultGCInterval)
-	}
-}
-
 // A localhost server URL is not the official cloud host, so this exercises the
 // self-host branch of defaultGCCompletedTaskTTL: retention stays unbounded until
 // an operator opts in, and a daemon upgrade never starts deleting on its own.
 func TestLoadConfig_CompletedTaskTTLDefaultsDisabledOnSelfHostAndReadsEnv(t *testing.T) {
 	stageFakeAgent(t)
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
 	t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "")
 
@@ -148,9 +142,49 @@ func TestLoadConfig_CompletedTaskTTLDefaultsDisabledOnSelfHostAndReadsEnv(t *tes
 	}
 }
 
+func TestLoadConfig_WSClaimPollIntervalPrecedence(t *testing.T) {
+	stageFakeAgent(t)
+	redirectTestHome(t, t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
+	t.Setenv("MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL", "")
+	base := Overrides{ServerURL: "http://localhost:0", WorkspacesRoot: t.TempDir()}
+
+	cfg, err := LoadConfig(base)
+	if err != nil {
+		t.Fatalf("LoadConfig default: %v", err)
+	}
+	if cfg.WSClaimPollInterval != DefaultWSClaimPollInterval {
+		t.Fatalf("default WSClaimPollInterval = %s, want %s", cfg.WSClaimPollInterval, DefaultWSClaimPollInterval)
+	}
+
+	t.Setenv("MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL", "75s")
+	cfg, err = LoadConfig(base)
+	if err != nil {
+		t.Fatalf("LoadConfig env: %v", err)
+	}
+	if cfg.WSClaimPollInterval != 75*time.Second {
+		t.Fatalf("env WSClaimPollInterval = %s, want 75s", cfg.WSClaimPollInterval)
+	}
+
+	base.WSClaimPollInterval = 2 * time.Minute
+	cfg, err = LoadConfig(base)
+	if err != nil {
+		t.Fatalf("LoadConfig override: %v", err)
+	}
+	if cfg.WSClaimPollInterval != 2*time.Minute {
+		t.Fatalf("override WSClaimPollInterval = %s, want 2m", cfg.WSClaimPollInterval)
+	}
+
+	base.WSClaimPollInterval = 0
+	t.Setenv("MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL", "0s")
+	if _, err := LoadConfig(base); err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Fatalf("LoadConfig zero WS claim poll error = %v, want positive-duration validation", err)
+	}
+}
+
 func TestLoadConfig_CompletedTaskTTLDefaultsBoundedOnOfficialCloud(t *testing.T) {
 	stageFakeAgent(t)
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
 	t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "")
 
@@ -484,7 +518,7 @@ func TestLoadConfig_SkipsMulticaHooksShadowingAgentBinaries(t *testing.T) {
 	}
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	hooksDir := filepath.Join(home, ".multica", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatalf("create hooks dir: %v", err)
@@ -544,7 +578,7 @@ func TestLoadConfig_SkipsMulticaHooksFromLoginShellFallback(t *testing.T) {
 	}
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	redirectTestHome(t, home)
 	hooksDir := filepath.Join(home, ".multica", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatalf("create hooks dir: %v", err)
@@ -628,6 +662,9 @@ func TestLoadConfig_CodexHandshakeTimeout(t *testing.T) {
 	if cfg.CodexHandshakeTimeout != DefaultCodexHandshakeTimeout {
 		t.Fatalf("CodexHandshakeTimeout = %s, want default %s", cfg.CodexHandshakeTimeout, DefaultCodexHandshakeTimeout)
 	}
+	if cfg.CodexThreadHandshakeTimeout != DefaultCodexThreadHandshakeTimeout {
+		t.Fatalf("CodexThreadHandshakeTimeout = %s, want default %s", cfg.CodexThreadHandshakeTimeout, DefaultCodexThreadHandshakeTimeout)
+	}
 
 	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "47s")
 
@@ -641,6 +678,24 @@ func TestLoadConfig_CodexHandshakeTimeout(t *testing.T) {
 	if cfg.CodexHandshakeTimeout != 47*time.Second {
 		t.Fatalf("CodexHandshakeTimeout = %s, want 47s from env", cfg.CodexHandshakeTimeout)
 	}
+	if cfg.CodexThreadHandshakeTimeout != 47*time.Second {
+		t.Fatalf("CodexThreadHandshakeTimeout = %s, want legacy 47s env override", cfg.CodexThreadHandshakeTimeout)
+	}
+
+	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "1d")
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with day-unit env: %v", err)
+	}
+	if cfg.CodexHandshakeTimeout != 24*time.Hour {
+		t.Fatalf("CodexHandshakeTimeout = %s, want 24h from 1d env", cfg.CodexHandshakeTimeout)
+	}
+	if cfg.CodexThreadHandshakeTimeout != 24*time.Hour {
+		t.Fatalf("CodexThreadHandshakeTimeout = %s, want legacy 24h env override", cfg.CodexThreadHandshakeTimeout)
+	}
 
 	t.Setenv("MULTICA_CODEX_HANDSHAKE_TIMEOUT", "0")
 	cfg, err = LoadConfig(Overrides{
@@ -653,6 +708,9 @@ func TestLoadConfig_CodexHandshakeTimeout(t *testing.T) {
 	if cfg.CodexHandshakeTimeout != DefaultCodexHandshakeTimeout {
 		t.Fatalf("CodexHandshakeTimeout = %s, want default %s for zero env", cfg.CodexHandshakeTimeout, DefaultCodexHandshakeTimeout)
 	}
+	if cfg.CodexThreadHandshakeTimeout != DefaultCodexThreadHandshakeTimeout {
+		t.Fatalf("CodexThreadHandshakeTimeout = %s, want default %s for zero env", cfg.CodexThreadHandshakeTimeout, DefaultCodexThreadHandshakeTimeout)
+	}
 
 	cfg, err = LoadConfig(Overrides{
 		ServerURL:             "http://localhost:8080",
@@ -664,6 +722,37 @@ func TestLoadConfig_CodexHandshakeTimeout(t *testing.T) {
 	}
 	if cfg.CodexHandshakeTimeout != 12*time.Second {
 		t.Fatalf("CodexHandshakeTimeout = %s, want 12s from override", cfg.CodexHandshakeTimeout)
+	}
+	if cfg.CodexThreadHandshakeTimeout != 12*time.Second {
+		t.Fatalf("CodexThreadHandshakeTimeout = %s, want legacy 12s override", cfg.CodexThreadHandshakeTimeout)
+	}
+}
+
+func TestLoadConfig_CodexTurnInterruptTimeout(t *testing.T) {
+	stageFakeAgent(t)
+	t.Setenv("MULTICA_CODEX_TURN_INTERRUPT_TIMEOUT", "750ms")
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with interrupt timeout: %v", err)
+	}
+	if cfg.CodexTurnInterruptTimeout != 750*time.Millisecond {
+		t.Fatalf("CodexTurnInterruptTimeout = %s, want 750ms", cfg.CodexTurnInterruptTimeout)
+	}
+
+	t.Setenv("MULTICA_CODEX_TURN_INTERRUPT_TIMEOUT", "0")
+	cfg, err = LoadConfig(Overrides{
+		ServerURL:      "http://localhost:8080",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with zero interrupt timeout: %v", err)
+	}
+	if cfg.CodexTurnInterruptTimeout != DefaultCodexTurnInterruptTimeout {
+		t.Fatalf("CodexTurnInterruptTimeout = %s, want default %s", cfg.CodexTurnInterruptTimeout, DefaultCodexTurnInterruptTimeout)
 	}
 }
 
@@ -757,6 +846,140 @@ func TestLoadConfig_CodexFirstTurnTimeoutEqualToSemanticWarns(t *testing.T) {
 	// no warning.
 	if logs := loadWithLoggedWarnings(t, "30m", "10m"); strings.Contains(logs, warnNeedle) {
 		t.Fatalf("semantic strictly above first-turn must not warn; logs = %q", logs)
+	}
+}
+
+// TestLoadConfig_ToolWatchdogDefaultsToIdleWatchdog pins the merge: the
+// in-flight-tool budget is no longer an independent constant, so an operator
+// who raises the idle budget cannot accidentally leave tool calls capped at a
+// lower, invisible ceiling.
+func TestLoadConfig_ToolWatchdogDefaultsToIdleWatchdog(t *testing.T) {
+	stageFakeAgent(t)
+	t.Setenv("MULTICA_AGENT_IDLE_WATCHDOG", "")
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "")
+
+	load := func(t *testing.T) Config {
+		t.Helper()
+		cfg, err := LoadConfig(Overrides{
+			ServerURL:      "http://localhost:8080",
+			WorkspacesRoot: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		return cfg
+	}
+
+	cfg := load(t)
+	if cfg.AgentIdleWatchdog != DefaultAgentIdleWatchdog {
+		t.Fatalf("AgentIdleWatchdog = %s, want default %s", cfg.AgentIdleWatchdog, DefaultAgentIdleWatchdog)
+	}
+	if cfg.AgentToolWatchdog != cfg.AgentIdleWatchdog {
+		t.Fatalf("AgentToolWatchdog = %s, want it to track AgentIdleWatchdog %s", cfg.AgentToolWatchdog, cfg.AgentIdleWatchdog)
+	}
+
+	// Raising only the idle budget must carry the tool budget with it.
+	t.Setenv("MULTICA_AGENT_IDLE_WATCHDOG", "6h")
+	cfg = load(t)
+	if cfg.AgentIdleWatchdog != 6*time.Hour || cfg.AgentToolWatchdog != 6*time.Hour {
+		t.Fatalf("idle=%s tool=%s, want both 6h", cfg.AgentIdleWatchdog, cfg.AgentToolWatchdog)
+	}
+
+	// An explicit tool override still wins, so "tools may run longer than the
+	// model may think" stays expressible.
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "12h")
+	cfg = load(t)
+	if cfg.AgentIdleWatchdog != 6*time.Hour {
+		t.Fatalf("AgentIdleWatchdog = %s, want 6h", cfg.AgentIdleWatchdog)
+	}
+	if cfg.AgentToolWatchdog != 12*time.Hour {
+		t.Fatalf("AgentToolWatchdog = %s, want 12h from env", cfg.AgentToolWatchdog)
+	}
+
+	// Zero keeps its distinct meaning: never force-stop while a tool is in
+	// flight. It must NOT be re-derived from the idle budget.
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "0")
+	cfg = load(t)
+	if cfg.AgentToolWatchdog != 0 {
+		t.Fatalf("AgentToolWatchdog = %s, want 0 from env", cfg.AgentToolWatchdog)
+	}
+
+	// Disabling the suite disables both.
+	t.Setenv("MULTICA_AGENT_IDLE_WATCHDOG", "0")
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "")
+	cfg = load(t)
+	if cfg.AgentIdleWatchdog != 0 || cfg.AgentToolWatchdog != 0 {
+		t.Fatalf("idle=%s tool=%s, want both 0", cfg.AgentIdleWatchdog, cfg.AgentToolWatchdog)
+	}
+}
+
+// TestLoadConfig_CodexSemanticInactivityDerivesFromWatchdog pins the fix for
+// the gap the 2h change left behind: Codex's own semantic-inactivity timer is
+// not tool-aware, so if it keeps a 10m ceiling it kills a quiet build long
+// before the daemon budget that was supposed to protect it, and the raised
+// budget is a lie for Codex users.
+func TestLoadConfig_CodexSemanticInactivityDerivesFromWatchdog(t *testing.T) {
+	stageFakeAgent(t)
+	for _, key := range []string{
+		"MULTICA_AGENT_IDLE_WATCHDOG",
+		"MULTICA_AGENT_TOOL_WATCHDOG",
+		"MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT",
+	} {
+		t.Setenv(key, "")
+	}
+
+	load := func(t *testing.T) Config {
+		t.Helper()
+		cfg, err := LoadConfig(Overrides{
+			ServerURL:      "http://localhost:8080",
+			WorkspacesRoot: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		return cfg
+	}
+
+	cfg := load(t)
+	if cfg.CodexSemanticInactivityTimeout != DefaultAgentIdleWatchdog {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want the idle budget %s", cfg.CodexSemanticInactivityTimeout, DefaultAgentIdleWatchdog)
+	}
+
+	// Raising the idle budget carries Codex with it.
+	t.Setenv("MULTICA_AGENT_IDLE_WATCHDOG", "6h")
+	if got := load(t).CodexSemanticInactivityTimeout; got != 6*time.Hour {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want 6h", got)
+	}
+
+	// A wider tool budget wins: this timer cannot see that a tool is in flight,
+	// so it has to be sized like the larger of the two or it re-creates the very
+	// bug being fixed, one tier up.
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "9h")
+	if got := load(t).CodexSemanticInactivityTimeout; got != 9*time.Hour {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want the wider tool budget 9h", got)
+	}
+
+	// A tool budget of 0 means "never force-stop during a tool", which this
+	// timer cannot express; it falls back to the idle budget rather than
+	// silently running unbounded.
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "0")
+	if got := load(t).CodexSemanticInactivityTimeout; got != 6*time.Hour {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want the idle budget 6h when the tool budget is unbounded", got)
+	}
+
+	// The explicit env still wins over the derivation.
+	t.Setenv("MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT", "20m")
+	if got := load(t).CodexSemanticInactivityTimeout; got != 20*time.Minute {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want 20m from env", got)
+	}
+
+	// Disabling the watchdog suite has never disabled this timer; Codex keeps
+	// its own built-in default rather than becoming unbounded.
+	t.Setenv("MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT", "")
+	t.Setenv("MULTICA_AGENT_IDLE_WATCHDOG", "0")
+	t.Setenv("MULTICA_AGENT_TOOL_WATCHDOG", "")
+	if got := load(t).CodexSemanticInactivityTimeout; got != DefaultCodexSemanticInactivityTimeout {
+		t.Fatalf("CodexSemanticInactivityTimeout = %s, want the codex built-in %s when watchdogs are off", got, DefaultCodexSemanticInactivityTimeout)
 	}
 }
 
@@ -1048,6 +1271,11 @@ func TestResolveAgentsViaLoginShell_HardTimeoutOnBackgroundedStdout(t *testing.T
 	}
 	t.Setenv("SHELL", sh)
 	t.Setenv("ENV", rc)
+	// The shell itself exits at once, so the whole run is the wait delay; a
+	// short one proves the same ceiling without the test paying the real 2s.
+	origWaitDelay := loginShellResolveWaitDelay
+	loginShellResolveWaitDelay = 100 * time.Millisecond
+	t.Cleanup(func() { loginShellResolveWaitDelay = origWaitDelay })
 
 	// Cap = context timeout + wait delay + generous slack for goroutine
 	// scheduling. A bug that disables WaitDelay would blow past 60s here.
@@ -1207,35 +1435,137 @@ func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
 	}
 }
 
+// Regression for #8941: ChatGPT.app 26.924+ ships the CLI at
+// Resources/codex-cli/bin/codex. Discovery must use that path when the older
+// flat Resources/codex file is absent.
+func TestLoadConfig_UsesNestedChatGPTCodexCLIPath(t *testing.T) {
+	pathDir := t.TempDir()
+	nested := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(nested, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake CLI: %v", err)
+	}
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return []string{nested} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	pinNonCodexAgentsToMissingPaths(t)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex agent from nested ChatGPT.app path, got %#v", cfg.Agents)
+	}
+	if got.Path != nested {
+		t.Fatalf("codex path = %q, want nested path %q", got.Path, nested)
+	}
+}
+
+// A bundled CLI that exists but cannot be spawned must stay unregistered:
+// registering it would advertise a healthy runtime whose every task fails.
+func TestProbeAgentCLIsIgnoresNonExecutableCodexBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Codex Desktop app bundle fallback is macOS-only")
+	}
+
+	pathDir := t.TempDir()
+	nested := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(nested, []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
+		t.Fatalf("write non-executable fake CLI: %v", err)
+	}
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return []string{nested} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	pinNonCodexAgentsToMissingPaths(t)
+
+	if _, found := probeAgentCLIs()["codex"]; found {
+		t.Fatal("codex was registered from a non-executable app bundle path")
+	}
+}
+
+// When both the nested CLI and the older flat binary exist, the nested path
+// is the current ChatGPT.app layout and must win.
+func TestLoadConfig_PrefersNestedChatGPTCodexCLIPath(t *testing.T) {
+	pathDir := t.TempDir()
+	nested := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex")
+	flat := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex")
+	for _, p := range []string{nested, flat} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake CLI: %v", err)
+		}
+	}
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return []string{nested, flat} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	pinNonCodexAgentsToMissingPaths(t)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex agent, got %#v", cfg.Agents)
+	}
+	if got.Path != nested {
+		t.Fatalf("codex path = %q, want nested path %q", got.Path, nested)
+	}
+}
+
 func TestCodexDesktopAppBundlePaths_IncludesChatGPTAndLegacy(t *testing.T) {
 	paths := codexDesktopAppBundlePaths()
-	var hasChatGPT, hasLegacy bool
-	for _, p := range paths {
-		if strings.Contains(p, "ChatGPT.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
-			hasChatGPT = true
-		}
-		if strings.Contains(p, "Codex.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
-			hasLegacy = true
-		}
-	}
-	if !hasChatGPT {
-		t.Fatalf("codexDesktopAppBundlePaths missing ChatGPT.app entry: %#v", paths)
-	}
-	if !hasLegacy {
-		t.Fatalf("codexDesktopAppBundlePaths missing legacy Codex.app entry: %#v", paths)
-	}
-	// New path must be preferred (listed before legacy).
-	chatgptIdx, legacyIdx := -1, -1
+	const (
+		nestedSuffix = "ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+		flatSuffix   = "ChatGPT.app/Contents/Resources/codex"
+		legacySuffix = "Codex.app/Contents/Resources/codex"
+	)
+	nestedIdx, flatIdx, legacyIdx := -1, -1, -1
 	for i, p := range paths {
-		if chatgptIdx < 0 && strings.Contains(p, "ChatGPT.app") {
-			chatgptIdx = i
-		}
-		if legacyIdx < 0 && strings.Contains(p, "Codex.app") {
+		slash := filepath.ToSlash(p)
+		switch {
+		case nestedIdx < 0 && strings.HasSuffix(slash, nestedSuffix):
+			nestedIdx = i
+		case flatIdx < 0 && strings.HasSuffix(slash, flatSuffix):
+			flatIdx = i
+		case legacyIdx < 0 && strings.HasSuffix(slash, legacySuffix):
 			legacyIdx = i
 		}
 	}
-	if chatgptIdx < 0 || legacyIdx < 0 || chatgptIdx > legacyIdx {
-		t.Fatalf("expected ChatGPT.app before Codex.app, got indices chat=%d legacy=%d paths=%#v", chatgptIdx, legacyIdx, paths)
+	if nestedIdx < 0 || flatIdx < 0 || legacyIdx < 0 {
+		t.Fatalf("codexDesktopAppBundlePaths missing nested, flat, or legacy entry: %#v", paths)
+	}
+	if nestedIdx > flatIdx || flatIdx > legacyIdx {
+		t.Fatalf("expected nested ChatGPT path before flat ChatGPT path before Codex.app, got nested=%d flat=%d legacy=%d paths=%#v", nestedIdx, flatIdx, legacyIdx, paths)
 	}
 }
 
@@ -1307,7 +1637,7 @@ func pinNonCodexAgentsToMissingPaths(t *testing.T) {
 func writeCLIConfigForProfile(t *testing.T, profile string, cfg cli.CLIConfig) {
 	t.Helper()
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	redirectTestHome(t, tmp)
 	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
 		t.Fatalf("write cli config: %v", err)
 	}
@@ -1452,7 +1782,7 @@ func TestLoadConfig_AppliesBackendOverridesFromConfigFile(t *testing.T) {
 	// Drop a CLI config under the user's HOME (already pointed at TempDir
 	// by stageFakeAgent's t.Setenv chain — but reassert here for clarity).
 	homeForCLIConfig := t.TempDir()
-	t.Setenv("HOME", homeForCLIConfig)
+	redirectTestHome(t, homeForCLIConfig)
 	cfg := cli.CLIConfig{
 		ServerURL: "http://localhost:8080",
 		Backends: &cli.BackendOverrides{
@@ -1494,7 +1824,7 @@ func TestLoadConfig_BackendOverrides_BackwardCompat_NoConfigFile(t *testing.T) {
 	stageFakeAgent(t)
 
 	// Point HOME at an empty dir — no config.json present.
-	t.Setenv("HOME", t.TempDir())
+	redirectTestHome(t, t.TempDir())
 	os.Unsetenv("MULTICA_OPENCLAW_PATH")
 	os.Unsetenv("OPENCLAW_STATE_DIR")
 	t.Cleanup(func() {
@@ -1523,7 +1853,7 @@ func TestLoadConfig_BackendOverrides_BackwardCompat_NoConfigFile(t *testing.T) {
 func TestLoadConfig_BackendOverrides_MalformedConfigFileNonFatal(t *testing.T) {
 	stageFakeAgent(t)
 	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
+	redirectTestHome(t, homeDir)
 
 	// Write malformed JSON.
 	cfgDir := filepath.Join(homeDir, ".multica")

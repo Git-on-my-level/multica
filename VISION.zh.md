@@ -20,7 +20,7 @@
 
 ## 为什么叫 "Multica"
 
-Multica —— **Mul**tiplexed **I**nformation and **C**omputing **A**gent。
+Multica —— **Mult**iplexed **I**nformation and **C**omputing **A**gent。
 
 这个名字是在向 Multics 致意。那是 20 世纪 60 年代的一个开创性操作系统，它首创了分时：多个人共享
 同一台机器，却又都像独占它一样。后来的 Unix，正是对 Multics 的一次有意简化——一个用户、一个任务、
@@ -31,7 +31,7 @@ Multica —— **Mul**tiplexed **I**nformation and **C**omputing **A**gent。
 "用户"，既是人，也是能自己干活的智能体。
 
 在 Multica 里，智能体就是队友。它们接任务、报进展、提阻塞、交代码，和人类同事没有两样。负责人
-选择器、动态时间线、任务生命周期，还有底下那套运行时，从第一天起就是照着这个想法搭的。
+选择器、动态时间线、task 生命周期，还有底下那套运行时，从第一天起就是照着这个想法搭的。
 
 和当年的 Multics 一样，我们押的还是"多路复用"：小团队不该因为人少，就只能干出小团队的量。有了
 合适的系统，两个工程师带一队智能体，能有二十个人的推进速度。

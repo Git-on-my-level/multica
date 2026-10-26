@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { Archive, ChevronRight, Inbox } from "lucide-react";
 import { isEditableShortcutTarget } from "@multica/core/shortcuts";
@@ -43,20 +51,26 @@ export function InboxList({
   items,
   view,
   selectedKey,
-  archivedCount,
+  onLoadMore,
+  loadingMore = false,
+  loadMoreError = false,
   onSelect,
   onAction,
   onOpenArchived,
+  emptyLabel,
+  emptyAction,
 }: {
   items: InboxItem[];
   view: InboxView;
   selectedKey: string;
-  // Deduplicated archived-issue count. Only read in the main view, to label the
-  // entry into the archive; the entry hides at zero.
-  archivedCount: number;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
+  loadMoreError?: boolean;
   onSelect: (item: InboxItem) => void;
   onAction: (id: string) => void;
   onOpenArchived: () => void;
+  emptyLabel?: string;
+  emptyAction?: ReactNode;
 }) {
   const { t } = useT("inbox");
   // Virtuoso's `customScrollParent` wants the actual HTMLElement, not a ref.
@@ -147,7 +161,7 @@ export function InboxList({
   // remounts on every parent render and drops hover/focus mid-click.
   const archivedEntry = useMemo(
     () =>
-      !isArchivedView && archivedCount > 0 ? (
+      !isArchivedView ? (
         <button
           type="button"
           onClick={onOpenArchived}
@@ -159,31 +173,47 @@ export function InboxList({
           <span className="min-w-0 flex-1 truncate font-medium">
             {t(($) => $.list.archived_title)}
           </span>
-          <span className="shrink-0 tabular-nums text-muted-foreground">
-            {archivedCount}
-          </span>
           <ChevronRight className="size-4 shrink-0 text-faint-foreground" />
         </button>
       ) : null,
-    [isArchivedView, archivedCount, onOpenArchived, t],
+    [isArchivedView, onOpenArchived, t],
   );
 
-  const Footer = useCallback(() => archivedEntry, [archivedEntry]);
+  const loadMore = useCallback(() => {
+    if (!loadingMore && !loadMoreError) onLoadMore?.();
+  }, [loadingMore, loadMoreError, onLoadMore]);
+  useEffect(() => {
+    if (items.length === 0) loadMore();
+  }, [items.length, loadMore]);
+  const Footer = useCallback(() => <>
+    {archivedEntry}
+    {isArchivedView && onLoadMore && (
+      <div className="flex flex-col items-center gap-2 py-3">
+        {loadMoreError && <p role="alert" className="text-caption text-destructive">{t(($) => $.errors.archived_load_failed)}</p>}
+        <button type="button" disabled={loadingMore} onClick={onLoadMore}
+          className="rounded-md px-3 py-2 text-caption text-muted-foreground hover:bg-accent/50 focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50">
+          {loadingMore ? t(($) => $.list.loading_more) : loadMoreError ? t(($) => $.list.retry) : t(($) => $.list.load_more)}
+        </button>
+      </div>
+    )}
+  </>, [archivedEntry, isArchivedView, onLoadMore, loadingMore, loadMoreError, t]);
 
   if (items.length === 0) {
     return (
       <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+        {!onLoadMore && <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
           <Inbox className="mb-3 h-8 w-8 text-faint-foreground" />
           <p className="text-body">
-            {isArchivedView
-              ? t(($) => $.list.archived_empty)
-              : t(($) => $.list.empty)}
+            {emptyLabel ??
+              (isArchivedView
+                ? t(($) => $.list.archived_empty)
+                : t(($) => $.list.empty))}
           </p>
-        </div>
+          {emptyAction && <div className="mt-3">{emptyAction}</div>}
+        </div>}
         {/* Still offer the archive when the main list is empty — that is
             exactly when a user goes looking for what they filed away. */}
-        {archivedEntry && <div className="px-2">{archivedEntry}</div>}
+        <div className="px-2"><Footer /></div>
       </div>
     );
   }
@@ -219,6 +249,7 @@ export function InboxList({
             ref={virtuosoRef}
             customScrollParent={scrollEl}
             data={items}
+            endReached={loadMore}
             computeItemKey={computeItemKey}
             initialScrollTop={restoredScrollTop}
             initialItemCount={Math.min(items.length, VIRTUOSO_SEED_COUNT)}

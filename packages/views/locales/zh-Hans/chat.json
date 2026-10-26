@@ -23,6 +23,7 @@
     "send_failed_toast": "发送消息失败",
     "send_blocked_toast": "消息未发送——你已没有该智能体的使用权限",
     "runtime_required_toast": "消息未发送——请先为该智能体绑定运行时",
+    "runtime_access_denied_toast": "消息未发送——该智能体无法在其私有运行时上运行。请将该运行时设为公开，或将智能体重新绑定/复制到其所有者可用的运行时",
     "attachment_bind_failed_toast": "消息已发送，但文件未能附加。请稍后重试。",
     "add_tooltip": "添加",
     "upload_file": "图片或文件",
@@ -50,16 +51,19 @@
     "replied_in": "{{elapsed}} 内回复",
     "failed_after": "{{elapsed}} 后失败",
     "finished_in": "{{elapsed}} 内结束",
-    "no_response": "本轮已结束，Agent 没有返回文字回复。",
+    "no_response": "本轮已结束，智能体没有返回文字回复。",
     "failure": {
       "agent_error": "智能体运行时出错，没能完成回复。请重试。",
       "timeout": "智能体处理超时，未能完成。可以重试，或把需求拆得更小一些。",
       "codex_semantic_inactivity": "智能体长时间无响应，已停止。请重试。",
       "runtime_offline": "智能体当前离线，暂时无法回复。等它恢复在线后再试。",
+      "runtime_access_denied": "该智能体无法在其私有运行时上运行，暂时无法回复。请将该运行时设为公开，或将智能体重新绑定/复制到其所有者可用的运行时。",
       "runtime_recovery": "智能体在完成前重启了。请重试。",
+      "runtime_access_revoked": "运行时访问已撤销。请先将智能体绑定到可用的运行时，再开始新的运行。",
       "manual": "这次回复已取消。",
       "skill_bundle_unavailable": "没能下载到智能体的 skill，这次回复没有启动。通常是网络连接问题，请重试。",
       "runtime_cli_timeout": "本机 OpenClaw CLI 没能在超时时间内响应，这次运行没有启动。这是本地启动超时，不是网络问题——除非 CLI 变快或调大超时（MULTICA_OPENCLAW_CLI_TIMEOUT），否则重试也不会成功。",
+      "environment_prepare_failed": "运行智能体的那台机器没能把这次运行准备好，任务没有启动。下方的原始错误会说明是哪一步失败——常见的是磁盘空间、权限、目录仍被占用，或本地配置读不出来。与智能体和模型厂商无关。",
       "provider_network": "与模型服务的连接中断，回复没能完成。检查网络后重试。",
       "provider_auth_or_access": "智能体的模型账号登录已失效。重新登录后再试。",
       "provider_quota_limit": "智能体的模型账号额度已用尽。充值或更换账号后再试。",
@@ -78,6 +82,7 @@
     "copy_failed_toast": "复制失败",
     "loading_older": "正在加载更早的消息…",
     "quick_actions_heading": "后续提问",
+    "quick_actions_aria": "后续提问建议",
     "quick_actions_regenerate": "重新生成建议",
     "quick_actions_regenerate_failed": "无法重新生成建议，请重试。"
   },
@@ -100,8 +105,8 @@
     },
     "stop_dialog": {
       "title": "停止这次运行？",
-      "description_with_title": "这会取消 \"{{title}}\" 里的当前智能体 task。已产生的内容会保留在对话里。",
-      "description_default": "这会取消当前智能体 task。已产生的内容会保留在对话里。",
+      "description_with_title": "这会取消 \"{{title}}\" 里的当前智能体运行。已产生的内容会保留在对话里。",
+      "description_default": "这会取消当前智能体运行。已产生的内容会保留在对话里。",
       "cancel": "继续运行",
       "confirm": "停止运行",
       "confirming": "停止中..."
@@ -146,10 +151,23 @@
     "returning_subtitle": "试试问",
     "chat_with_named": "与 {{name}} 对话"
   },
-  "starter_prompts": {
-    "list_open": "按优先级列出我未完成的任务",
-    "summarize_today": "总结一下我今天做了什么",
-    "plan_next": "规划接下来该做什么"
+  "conversation_starters": {
+    "aria_label": "对话开场建议",
+    "capabilities": {
+      "label": "你能帮我做什么？",
+      "prompt": "你最擅长帮我做什么？请简要介绍。"
+    },
+    "first_task": {
+      "label": "建议第一个任务",
+      "prompt": "建议三个适合分配给你的实用任务。"
+    },
+    "recommend": {
+      "label": "推荐一个操作",
+      "prompt": "根据你对我的工作区的了解，推荐一个有用的初始操作。"
+    },
+    "customize": "自定义开场建议",
+    "uploading": "请等待附件上传完成后再使用开场建议。",
+    "draft_in_progress": "请先发送或清空草稿，再使用开场建议。"
   },
   "onboarding_cards": {
     "aria_label": "开始方式",
@@ -211,9 +229,9 @@
     "you_prefix": "你：",
     "no_messages": "还没有消息",
     "no_response_preview": "无文字回复",
-    "quick_agents": "常用 Agent",
+    "quick_agents": "常用智能体",
     "add": "添加",
-    "add_agent": "添加常用 Agent",
+    "add_agent": "添加常用智能体",
     "unpin_agent": "移出常用",
     "waiting": "等待回复",
     "pin": "置顶",
@@ -225,7 +243,7 @@
     "row_actions_aria": "聊天操作"
   },
   "header": {
-    "view_profile": "查看 Agent 资料",
+    "view_profile": "查看智能体资料",
     "rename": "重命名会话",
     "delete": "删除会话",
     "archive": "归档会话",

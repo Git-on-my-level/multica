@@ -2,6 +2,7 @@
 
 import { cn } from "@multica/ui/lib/utils";
 import { SidebarTrigger, useSidebarSafe } from "@multica/ui/components/ui/sidebar";
+import { ActionShortcutKeycaps } from "../common/shortcut-keycaps";
 
 /**
  * The left edge every page shares: the header, the toolbar under it, and any
@@ -14,6 +15,27 @@ import { SidebarTrigger, useSidebarSafe } from "@multica/ui/components/ui/sideba
  * spells its own gutter is the bug coming back.
  */
 export const PAGE_GUTTER = "px-4";
+
+/**
+ * The centred column a detail page reads inside: `runtimes`, and the agent and
+ * skill detail pages. A detail page is a document about one entity, not a
+ * table, so past a point more width stops helping and starts stretching a
+ * two-column layout apart.
+ *
+ * Pair it with `PAGE_GUTTER` on the same element, or on a child that already
+ * carries the gutter itself (a toolbar, a secondary nav rail). Every band on
+ * the page — header, tab bar, banners, each panel — has to read this same
+ * constant, because the bug it fixes is chrome sitting on the rail while the
+ * content under it does not: below ~1730px they agree, and above it the tabs
+ * walk away from what they label (MUL-7107).
+ *
+ * Full-width borders and backgrounds stay on the outer element; the rail goes
+ * on the child that holds the content.
+ *
+ * Not for list surfaces that are genuinely tables — Issues, My Issues, member
+ * detail — which stay full-bleed on `PAGE_GUTTER` alone.
+ */
+export const PAGE_RAIL = "mx-auto w-full max-w-[1440px]";
 
 /**
  * The filter/actions row directly under a `PageHeader`: same height and
@@ -44,7 +66,12 @@ export const PAGE_TOOLBAR = cn(
 export function CollapsedNavTrigger() {
   const sidebar = useSidebarSafe();
   if (!sidebar || sidebar.hasExternalTrigger) return null;
-  return <SidebarTrigger className="xl:hidden" />;
+  return (
+    <SidebarTrigger
+      className="xl:hidden"
+      shortcut={<ActionShortcutKeycaps action="toggleSidebar" />}
+    />
+  );
 }
 
 interface PageHeaderProps {

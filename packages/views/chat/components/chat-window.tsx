@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { motion } from "motion/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { AnimatePresence, motion } from "motion/react";
 import { Minus, Maximize2, Minimize2, ChevronDown, Plus, Check, Archive, Pencil, Loader2, Square } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
 import { cn } from "@multica/ui/lib/utils";
@@ -17,14 +17,17 @@ import { useWorkspaceId } from "@multica/core/hooks";
 import { useAuthStore } from "@multica/core/auth";
 import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
-import { canAssignAgent } from "@multica/views/issues/components";
+import { canAssignAgent } from "../../issues/components/pickers/assignee-picker";
 import { api, dispatchReasonCode } from "@multica/core/api";
 import {
   isAgentRuntimeBound,
   useAgentPresenceDetail,
+  useCustomizeConversationStartersHref,
   useWorkspaceAgentAvailability,
 } from "@multica/core/agents";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { DeferredTooltip } from "../../common/deferred-tooltip";
+import { ActionShortcutKeycaps } from "../../common/shortcut-keycaps";
 import { useAppForeground } from "../../common/use-app-foreground";
 import {
   RowActionsMenu,
@@ -45,7 +48,6 @@ import { AgentAccessRevokedBanner } from "./agent-access-revoked-banner";
 import { RuntimeRequiredBanner } from "./runtime-required-banner";
 import {
   chatSessionsOptions,
-  chatMessagesPageOptions,
   pendingChatTaskOptions,
   pendingChatTasksOptions,
   chatKeys,
@@ -54,7 +56,6 @@ import {
 import {
   useCreateChatSession,
   useMarkChatSessionRead,
-  useRegenerateChatQuickActions,
   useSetChatSessionArchived,
   useSetChatSessionProject,
   useUpdateChatSession,
@@ -64,14 +65,14 @@ import { upsertChatMessageToCaches } from "@multica/core/chat/message-cache";
 import { chatQuickActionsPendingOptions } from "@multica/core/chat/queries";
 import { useQuickActionsPendingTimeout } from "@multica/core/chat/use-quick-actions-pending-timeout";
 import { useQuickActionsFailureToast } from "./use-quick-actions-failure-toast";
-import { hideQueuedChatMessages } from "@multica/core/chat/pending";
 import { removeChatMessageFromCaches } from "@multica/core/realtime";
 import { useChatDraftRestore } from "./use-chat-draft-restore";
 import { useChatTaskActions } from "./use-chat-task-actions";
 import { useChatInputFocus } from "./use-chat-input-focus";
-import { ChatMessageList, ChatMessageSkeleton } from "./chat-message-list";
+import { ChatWindowMessages } from "./chat-window-messages";
 import { ChatInput } from "./chat-input";
 import { ChatQueue } from "./chat-queue";
+import { EmptyState } from "./chat-empty-state";
 import { SessionRenameInput } from "./session-rename-input";
 import { ChatResizeHandles } from "./chat-resize-handles";
 import { useChatContextItems } from "./use-chat-context-items";
@@ -87,11 +88,10 @@ import {
 import { useChatProjectContextSupport } from "./use-chat-project-context-support";
 import { createLogger } from "@multica/core/logger";
 import type { Agent, Attachment, ChatMessage, ChatSession, PendingChatTasksResponse } from "@multica/core/types";
-import { useT } from "../../i18n";
+import { useLocale, useT } from "../../i18n";
 
 const uiLogger = createLogger("chat.ui");
 const apiLogger = createLogger("chat.api");
-const CHAT_VIRTUOSO_INITIAL_FIRST_ITEM_INDEX = 1_000_000;
 
 
 export function ChatWindow() {
@@ -107,7 +107,6 @@ export function ChatWindow() {
   useQuickActionsPendingTimeout(activeSessionId ?? null, quickActionsPending);
   // Toast when an accepted refresh later fails in the daemon (async half).
   useQuickActionsFailureToast(activeSessionId ?? null);
-  const regenerateQuickActions = useRegenerateChatQuickActions();
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const selectedProjectId = useChatStore((s) => s.selectedProjectId);
   const setOpen = useChatStore((s) => s.setOpen);
@@ -125,24 +124,6 @@ export function ChatWindow() {
   const { data: projects = [], isSuccess: projectsLoaded } = useQuery(
     projectListOptions(wsId),
   );
-  const {
-    data: rawMessagePages,
-    isLoading: messagesLoading,
-    fetchNextPage: fetchOlderMessages,
-    hasNextPage: hasOlderMessages,
-    isFetchingNextPage: isFetchingOlderMessages,
-  } = useInfiniteQuery(chatMessagesPageOptions(activeSessionId ?? ""));
-  // When no active session, always show empty — don't use stale cache.
-  // Page 0 contains the latest chronological window; later cursor pages are
-  // older chronological windows. Reverse pages so older fetched pages render
-  // above the initial latest page. The Virtuoso firstItemIndex is client-owned:
-  // it starts from a large stable base and only subtracts the count of loaded
-  // prepended rows, so concurrent server inserts cannot drift the scroll anchor.
-  const messagePages = activeSessionId ? rawMessagePages?.pages ?? [] : [];
-  const allMessages = [...messagePages].reverse().flatMap((page) => page.messages);
-  // Skeleton only shows for an un-cached session fetch. Cached switches
-  // return data synchronously — no flash. `enabled: false` (new chat)
-  // keeps isLoading false so the starter prompts aren't hidden.
   // Server-authoritative pending task. Survives refresh / reopen / session
   // switch because it's keyed on sessionId in the Query cache; WS events
   // (chat:message / chat:done / task:*) keep it invalidated in real time.
@@ -151,16 +132,6 @@ export function ChatWindow() {
   const { data: pendingTask, isLoading: pendingTaskLoading } = useQuery(
     pendingChatTaskOptions(activeSessionId ?? ""),
   );
-  const showSkeleton =
-    !!activeSessionId && (messagesLoading || pendingTaskLoading);
-  const messages = hideQueuedChatMessages(allMessages, pendingTask);
-  const olderMessageCount = messagePages.slice(1).reduce(
-    (sum, page) => sum + page.messages.length,
-    0,
-  );
-  const firstItemIndex = messages.length > 0
-    ? CHAT_VIRTUOSO_INITIAL_FIRST_ITEM_INDEX - olderMessageCount
-    : 0;
   const pendingTaskId = pendingTask?.task_id ?? null;
   const stopRequestedBeforeTaskRef = useRef(false);
   // Durable deferred-cancellation draft restores (#5219). Same hook as the chat
@@ -186,7 +157,27 @@ export function ChatWindow() {
   } = useChatTaskActions(activeSessionId, enqueueLocalRestore);
   // Nonce handed to ChatInput to pull focus into the compose box: when a new
   // chat starts (⊕ or switching agent), and whenever the window itself opens.
-  const { focusRequest, requestInputFocus } = useChatInputFocus(isOpen);
+  const windowRef = useRef<HTMLDivElement>(null);
+  const { focusRequest, requestInputFocus } = useChatInputFocus(isOpen, windowRef);
+  const [conversationStarterRequest, setConversationStarterRequest] = useState<{
+    id: number;
+    content: string;
+  } | null>(null);
+  const nextConversationStarterRequestIdRef = useRef(0);
+  const sendConversationStarter = useCallback(
+    (prompt: string) => {
+      setConversationStarterRequest({
+        id: ++nextConversationStarterRequestIdRef.current,
+        content: prompt,
+      });
+      requestInputFocus();
+    },
+    [requestInputFocus],
+  );
+  const handleConversationStarterApplied = useCallback(
+    () => setConversationStarterRequest(null),
+    [],
+  );
 
   // Legacy archived sessions (the old soft-archive feature was removed but
   // pre-existing rows with status='archived' may still exist) are excluded
@@ -250,6 +241,13 @@ export function ChatWindow() {
   // user types (MUL-6380). Mirrors use-chat-controller.ts.
   const isAgentAccessRevoked =
     !!activeAgent && !canAssignAgent(activeAgent, user?.id, memberRole);
+
+  // "Customize" under the starter buttons — the only place the empty state
+  // admits that those buttons are configuration at all.
+  const customizeConversationStartersHref = useCustomizeConversationStartersHref(
+    activeAgent,
+    wsId,
+  );
 
   const projectContextSupport = useChatProjectContextSupport(wsId, activeAgent);
 
@@ -466,7 +464,9 @@ export function ChatWindow() {
             ? t(($) => $.input.send_blocked_toast)
             : reason === "agent_runtime_required"
               ? t(($) => $.input.runtime_required_toast)
-              : t(($) => $.input.send_failed_toast),
+              : reason === "runtime_access_denied"
+                ? t(($) => $.input.runtime_access_denied_toast)
+                : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -492,7 +492,9 @@ export function ChatWindow() {
             ? t(($) => $.input.send_blocked_toast)
             : reason === "agent_runtime_required"
               ? t(($) => $.input.runtime_required_toast)
-              : t(($) => $.input.send_failed_toast),
+              : reason === "runtime_access_denied"
+                ? t(($) => $.input.runtime_access_denied_toast)
+                : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -728,12 +730,7 @@ export function ChatWindow() {
 
   const isExpanded = useChatStore((s) => s.isExpanded);
 
-  const windowRef = useRef<HTMLDivElement>(null);
   const { renderWidth, renderHeight, isAtMax, boundsReady, isDragging, toggleExpand, startDrag } = useChatResize(windowRef);
-
-  // Show the list (vs empty state) as soon as there's anything to display —
-  // a real message, or a pending task whose timeline will stream in.
-  const hasMessages = messages.length > 0 || !!pendingTaskId;
 
   const isVisible = isOpen && (isExpanded || boundsReady);
 
@@ -803,19 +800,19 @@ export function ChatWindow() {
   return (
     <motion.div
       ref={windowRef}
+      inert={!isOpen}
+      aria-hidden={!isOpen}
       className={containerClass}
       style={containerStyle}
-      initial={{ opacity: 0, scale: 0.95, ...motionSize }}
+      initial={{ opacity: 0, ...motionSize }}
       animate={{
         opacity: isVisible ? 1 : 0,
-        scale: isVisible ? 1 : 0.95,
         ...motionSize,
       }}
       transition={{
         width: isDragging ? { duration: 0 } : { type: "spring", duration: 0.3, bounce: 0 },
         height: isDragging ? { duration: 0 } : { type: "spring", duration: 0.3, bounce: 0 },
         opacity: { duration: 0.15 },
-        scale: { type: "spring", duration: 0.2, bounce: 0 },
       }}
     >
       {!isMobile && <ChatResizeHandles onDragStart={startDrag} />}
@@ -879,50 +876,42 @@ export function ChatWindow() {
             >
               <Minus />
             </TooltipTrigger>
-            <TooltipContent side="top">{t(($) => $.window.minimize_tooltip)}</TooltipContent>
+            <TooltipContent side="top">
+              {t(($) => $.window.minimize_tooltip)}
+              <ActionShortcutKeycaps action="toggleChat" />
+            </TooltipContent>
           </Tooltip>
         </div>
       </div>
 
       {/* Messages / skeleton / empty state */}
-      {showSkeleton ? (
-        <ChatMessageSkeleton />
-      ) : hasMessages ? (
-        <ChatMessageList
-          key={activeSessionId}
-          messages={messages}
-          pendingTask={pendingTask}
-          availability={availability}
-          firstItemIndex={firstItemIndex}
-          hasOlderMessages={!!hasOlderMessages}
-          isFetchingOlderMessages={isFetchingOlderMessages}
-          onLoadOlderMessages={() => void fetchOlderMessages()}
-          onQuickAction={(action) => handleSend(action.prompt)}
-          quickActionsDisabled={
-            !!pendingTaskId ||
-            isSessionArchived ||
-            isAgentArchived ||
-            isAgentAccessRevoked ||
-            !activeAgentRuntimeBound ||
-            noAgent
-          }
-          onRegenerateQuickActions={(message) =>
-            activeSessionId
-              ? regenerateQuickActions.mutateAsync({
-                  sessionId: activeSessionId,
-                  messageId: message.id,
-                })
-              : undefined
-          }
-          quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
-        />
-      ) : (
-        <EmptyState
-          hasSessions={sessions.length > 0}
-          agentName={activeAgent?.name}
-          onPickPrompt={(text) => handleSend(text)}
-        />
-      )}
+      <AnimatePresence initial={false}>
+        {isOpen && (
+          <ChatWindowMessages
+            sessionId={activeSessionId}
+            pendingTask={pendingTask}
+            pendingTaskLoading={pendingTaskLoading}
+            availability={availability}
+            onQuickAction={(action) => handleSend(action.prompt)}
+            quickActionsDisabled={
+              !!pendingTaskId ||
+              isSessionArchived ||
+              isAgentArchived ||
+              isAgentAccessRevoked ||
+              !activeAgentRuntimeBound ||
+              noAgent
+            }
+            quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
+          >
+            <EmptyState
+              agent={activeAgent}
+              hasSessions={sessions.length > 0}
+              onPickPrompt={sendConversationStarter}
+              customizeHref={customizeConversationStartersHref}
+            />
+          </ChatWindowMessages>
+        )}
+      </AnimatePresence>
 
       {/* Status banner above the input — single mutually-exclusive slot.
        *  Priority: no-agent > offline / unstable. Agent presence is the
@@ -964,6 +953,8 @@ export function ChatWindow() {
       <ChatInput
         onSend={handleSend}
         restoreDraftRequest={restoreDraftRequest}
+        conversationStarterRequest={conversationStarterRequest}
+        onConversationStarterApplied={handleConversationStarterApplied}
         onRestoreDraftApplied={handleRestoreDraftApplied}
         uploadEnabled={!!activeAgent && !isAgentAccessRevoked}
         onStop={handleStop}
@@ -1463,7 +1454,7 @@ function SessionDropdown({
                   setConfirmingStopId(null);
                 }}
                 disabled={stoppingTaskId === pendingTask.task_id}
-                className="inline-flex h-7 items-center rounded px-2 text-micro font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+                className="inline-flex h-7 items-center rounded-xs px-2 text-micro font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
               >
                 {t(($) => $.session_history.stop_dialog.cancel)}
               </button>
@@ -1479,7 +1470,7 @@ function SessionDropdown({
                   handleConfirmStop(session, pendingTask);
                 }}
                 disabled={stoppingTaskId === pendingTask.task_id}
-                className="inline-flex h-7 items-center rounded px-2 text-micro font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                className="inline-flex h-7 items-center rounded-xs px-2 text-micro font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
               >
                 {stoppingTaskId === pendingTask.task_id
                   ? t(($) => $.session_history.stop_dialog.confirming)
@@ -1507,31 +1498,33 @@ function SessionDropdown({
                 groups={[rowActions]}
               />
               <div className="hidden h-7 items-center gap-0.5 [@media(hover:hover)]:group-hover/history-row:flex [@media(hover:hover)]:group-focus-within/history-row:flex">
-                {rowActions.map((action) => (
-                  <button
-                    key={action.key}
-                    type="button"
-                    onPointerDown={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      action.onSelect();
-                    }}
-                    className={
-                      action.danger
-                        ? "inline-flex h-7 items-center gap-1 rounded px-1.5 text-micro font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive focus-visible:outline-none"
-                        : "inline-flex size-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground focus-visible:outline-none"
-                    }
-                    aria-label={action.label}
-                    title={action.label}
-                  >
-                    {action.icon}
-                    {action.stripText}
-                  </button>
-                ))}
+                {rowActions.map((action) => {
+                  const button = (
+                    <button
+                      key={action.key}
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        action.onSelect();
+                      }}
+                      className={
+                        action.danger
+                          ? "inline-flex h-7 items-center gap-1 rounded-xs px-1.5 text-micro font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive focus-visible:outline-none"
+                          : "inline-flex size-7 items-center justify-center rounded-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground focus-visible:outline-none"
+                      }
+                      aria-label={action.label}
+                    >
+                      {action.icon}
+                      {action.stripText}
+                    </button>
+                  );
+                  return <DeferredTooltip key={action.key} content={action.label} trigger={button} />;
+                })}
               </div>
             </div>
           )
@@ -1608,6 +1601,7 @@ function SessionDropdown({
 
 function useFormatTimeAgo(): (dateStr: string) => string {
   const { t } = useT("chat");
+  const locale = useLocale();
   return (dateStr: string) => {
     const date = new Date(dateStr);
     const now = new Date();
@@ -1620,88 +1614,6 @@ function useFormatTimeAgo(): (dateStr: string) => string {
     if (diffMins < 60) return t(($) => $.session_history.time.minutes, { count: diffMins });
     if (diffHours < 24) return t(($) => $.session_history.time.hours, { count: diffHours });
     if (diffDays < 7) return t(($) => $.session_history.time.days, { count: diffDays });
-    return date.toLocaleDateString();
+    return date.toLocaleDateString(locale);
   };
-}
-
-// Three starter prompts shown on the empty state. Each is keyed into the
-// chat namespace so labels translate per locale; the icon stays raw since
-// emojis are locale-neutral.
-const STARTER_KEYS: ("list_open" | "summarize_today" | "plan_next")[] = [
-  "list_open",
-  "summarize_today",
-  "plan_next",
-];
-const STARTER_ICONS: Record<(typeof STARTER_KEYS)[number], string> = {
-  list_open: "📋",
-  summarize_today: "📝",
-  plan_next: "💡",
-};
-
-function EmptyState({
-  hasSessions,
-  agentName,
-  onPickPrompt,
-}: {
-  hasSessions: boolean;
-  agentName?: string;
-  onPickPrompt: (text: string) => void;
-}) {
-  const { t } = useT("chat");
-  // First-time experience: the user has never started a chat in this
-  // workspace. Educate before suggesting actions — starter prompts
-  // presume the user already knows what chat is for.
-  if (!hasSessions) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center-safe gap-3 overflow-y-auto px-6 py-8">
-        <div className="text-center space-y-3">
-          <h3 className="text-title-sm font-semibold">
-            {t(($) => $.empty_state.first_time_title)}
-          </h3>
-          <p className="text-body text-muted-foreground">
-            {t(($) => $.empty_state.first_time_intro)}{" "}
-            <span className="font-medium text-foreground">
-              {t(($) => $.empty_state.first_time_pillars)}
-            </span>
-            {t(($) => $.empty_state.first_time_pillars_suffix)}
-          </p>
-          <p className="text-body text-muted-foreground">
-            {t(($) => $.empty_state.first_time_actions)}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // Returning user: starter prompts are the fastest path back to action.
-  return (
-    <div className="flex min-h-0 flex-1 flex-col items-center justify-center-safe gap-5 overflow-y-auto px-6 py-8">
-      <div className="text-center space-y-1">
-        <h3 className="text-title-sm font-semibold">
-          {agentName
-            ? t(($) => $.empty_state.returning_title_named, { name: agentName })
-            : t(($) => $.empty_state.returning_title_default)}
-        </h3>
-        <p className="text-body text-muted-foreground">
-          {t(($) => $.empty_state.returning_subtitle)}
-        </p>
-      </div>
-      <div className="w-full max-w-xs space-y-2">
-        {STARTER_KEYS.map((key) => {
-          const text = t(($) => $.starter_prompts[key]);
-          return (
-            <button
-              key={key}
-              type="button"
-              onClick={() => onPickPrompt(text)}
-              className="w-full rounded-lg border border-border bg-card px-3 py-2 text-left text-body text-foreground transition-colors hover:bg-accent hover:border-brand/40"
-            >
-              <span className="mr-2">{STARTER_ICONS[key]}</span>
-              {text}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/internal/util"
 )
 
 // HealthResponse is returned by the daemon's local health endpoint.
@@ -44,6 +45,9 @@ type HealthResponse struct {
 	DeviceName string `json:"device_name"`
 	ServerURL  string `json:"server_url"`
 	CLIVersion string `json:"cli_version"`
+	// CLICommit belongs to this running process, not an installed replacement.
+	// Empty or unknown values do not attest a revision; never fall back to version.
+	CLICommit string `json:"cli_commit"`
 	// LaunchedBy is "desktop" when the Electron app spawned this daemon, empty
 	// for a standalone one. Already reported to the server on registration;
 	// surfaced here so `daemon status` can say who manages the daemon instead
@@ -58,9 +62,16 @@ type HealthResponse struct {
 	// Repo maintenance stays a liveness-safe background activity, so health
 	// remains HTTP 200/running. These additive counters explain degraded repo
 	// checkout capacity to operators without exposing local cache paths.
-	RepoMaintenanceActive int      `json:"repo_maintenance_active,omitempty"`
-	RepoCheckoutWaiters   int      `json:"repo_checkout_waiters,omitempty"`
-	Agents                []string `json:"agents"`
+	RepoMaintenanceActive int `json:"repo_maintenance_active,omitempty"`
+	RepoCheckoutWaiters   int `json:"repo_checkout_waiters,omitempty"`
+	// Terminal report queue diagnostics are additive and expose only counts and
+	// bytes, never payloads or local paths. Failed records require operator
+	// attention; pending records are still being replayed automatically.
+	PendingTerminalReportCount int      `json:"pending_terminal_report_count"`
+	PendingTerminalReportBytes int64    `json:"pending_terminal_report_bytes"`
+	FailedTerminalReportCount  int      `json:"failed_terminal_report_count"`
+	FailedTerminalReportBytes  int64    `json:"failed_terminal_report_bytes"`
+	Agents                     []string `json:"agents"`
 	// SkippedAgents maps a provider that WAS discovered on this machine to the
 	// reason the last registration round dropped it (version undetectable,
 	// below the minimum supported version). Purely diagnostic, and omitted when
@@ -83,13 +94,12 @@ type healthWorkspace struct {
 	Runtimes []string `json:"runtimes"`
 }
 
-// listenHealth binds the health port. Returns the listener or an error if
-// another daemon is already running (port taken).
+// listenHealth binds the health port for callers without a prebound listener.
 func (d *Daemon) listenHealth() (net.Listener, error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", d.cfg.HealthPort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("another daemon is already running on %s: %w", addr, err)
+		return nil, fmt.Errorf("bind health port %s: %w", addr, err)
 	}
 	return ln, nil
 }
@@ -106,6 +116,11 @@ type repoCheckoutRequest struct {
 	// RetryBusy is sent by clients that understand 503 + Retry-After. Older
 	// clients omit it and retain their historical unbounded lock-wait behavior.
 	RetryBusy bool `json:"retry_busy,omitempty"`
+	// Fresh asks to discard an existing checkout's uncommitted changes and
+	// untracked files and start over on a new branch (`multica repo checkout
+	// --fresh`). Without it an existing checkout that holds work is kept; older
+	// daemons ignore the field and always start over.
+	Fresh bool `json:"fresh,omitempty"`
 }
 
 type activeRepoCheckoutTask struct {
@@ -136,42 +151,158 @@ func (d *Daemon) clearActiveRepoCheckoutTask(token string) {
 	d.repoCheckoutTasksMu.Unlock()
 }
 
-func (d *Daemon) activeRepoCheckoutTask(r *http.Request) (activeRepoCheckoutTask, bool) {
+// repoCheckoutAuthResult distinguishes the two ways /repo/checkout auth fails.
+// They look identical to a caller but have completely different fixes, and
+// collapsing them into one 401 is what made #7520 take 13 hours to diagnose.
+type repoCheckoutAuthResult int
+
+const (
+	repoCheckoutAuthOK repoCheckoutAuthResult = iota
+	// repoCheckoutAuthNoCredential: the request carried no usable Authorization
+	// header. The current CLI always sends one, so in practice this is a
+	// `multica` binary older than repoCheckoutMinCLIVersion — a permanent
+	// failure that no retry fixes.
+	repoCheckoutAuthNoCredential
+	// repoCheckoutAuthUnknownCredential: a token was presented but is not bound
+	// to a task running in THIS daemon — the task already finished, or the
+	// daemon restarted while the agent process kept running.
+	repoCheckoutAuthUnknownCredential
+)
+
+// repoCheckoutMinCLIVersion is the first release whose `multica repo checkout`
+// sends the Authorization header this endpoint requires. The header and the
+// check landed in the same commit (#7205), so every older CLI is rejected here
+// no matter how healthy the task is.
+const repoCheckoutMinCLIVersion = "v0.4.30"
+
+func (d *Daemon) activeRepoCheckoutTask(r *http.Request) (activeRepoCheckoutTask, repoCheckoutAuthResult) {
 	const bearer = "Bearer "
 	header := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !strings.HasPrefix(header, bearer) {
-		return activeRepoCheckoutTask{}, false
+		return activeRepoCheckoutTask{}, repoCheckoutAuthNoCredential
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(header, bearer))
 	if token == "" {
-		return activeRepoCheckoutTask{}, false
+		return activeRepoCheckoutTask{}, repoCheckoutAuthNoCredential
 	}
 	d.repoCheckoutTasksMu.RLock()
 	task, ok := d.repoCheckoutTasks[token]
 	d.repoCheckoutTasksMu.RUnlock()
-	return task, ok
+	if !ok {
+		return activeRepoCheckoutTask{}, repoCheckoutAuthUnknownCredential
+	}
+	return task, repoCheckoutAuthOK
 }
 
+// repoCheckoutListBinariesCommand names the platform's "show every copy on
+// PATH" command. The whole point of the rejection is that the caller ran the
+// wrong binary, so handing them a command their shell does not have just moves
+// the dead end.
+func repoCheckoutListBinariesCommand() string {
+	if runtime.GOOS == "windows" {
+		return "where.exe multica"
+	}
+	return "which -a multica"
+}
+
+// repoCheckoutAuthErrorMessage builds the rejection body. It has to be
+// self-explanatory: the caller is an agent inside a task, and the CLI prints
+// this string as the whole failure. Anything it does not say has to be
+// reconstructed from daemon logs the agent cannot read.
+//
+// Compatibility advice deliberately lives HERE rather than in the CLI. The
+// population that hits repoCheckoutAuthNoCredential is, by definition, running
+// a CLI too old to have received any client-side fix; the daemon is the only
+// component on this path guaranteed to be current.
+//
+// Every claim here has to survive Windows and Linux as well as macOS, and has
+// to be true rather than merely likely — advice that is wrong on the reader's
+// platform, or that asserts a version match nobody verified, recreates exactly
+// the misdirection this message exists to end.
+func (d *Daemon) repoCheckoutAuthErrorMessage(result repoCheckoutAuthResult) string {
+	if result == repoCheckoutAuthUnknownCredential {
+		return "repo checkout credential is not bound to a task running in this daemon: " +
+			"the task it belongs to has already finished, or the daemon restarted after this agent started. " +
+			"Repo checkout is only available while the task that owns this workdir is still running."
+	}
+
+	var b strings.Builder
+	b.WriteString("repo checkout requires an active task credential, and this request carried none. ")
+	b.WriteString("The multica CLI has sent that credential since ")
+	b.WriteString(repoCheckoutMinCLIVersion)
+	b.WriteString(", so this request came from an older `multica` binary")
+	if daemonVersion := strings.TrimSpace(d.cfg.CLIVersion); daemonVersion != "" {
+		b.WriteString(" (this daemon runs ")
+		b.WriteString(daemonVersion)
+		b.WriteString(")")
+	}
+	b.WriteString(" and will fail every time, not intermittently. List every copy on PATH with `")
+	b.WriteString(repoCheckoutListBinariesCommand())
+	b.WriteString("`, check each one's version, then upgrade the stale one with `multica update`")
+	b.WriteString(" — it handles Homebrew and direct installs on every platform.")
+	// os.Executable() reports where this process was STARTED from, which is not
+	// a promise about the bytes on disk now: the daemon deliberately supports a
+	// binary being replaced out of band while a restart is deferred (see
+	// trySelfReload). Claiming a version match here could hand a version-skew
+	// victim a second stale binary, so state the provenance and let the reader
+	// verify the version.
+	if selfBin, err := resolveSelfExecutable(); err == nil {
+		b.WriteString(" This daemon started from ")
+		b.WriteString(selfBin)
+		if pending := d.reloadPending(); pending != "" {
+			b.WriteString(", whose on-disk copy has since changed (")
+			b.WriteString(pending)
+			b.WriteString(")")
+		}
+		b.WriteString("; check that copy's version before running it directly.")
+	}
+	return b.String()
+}
+
+// writeRepoCheckoutAuthError rejects the request and leaves a trace in
+// daemon.log. Before this, the 401 branch logged nothing at all, so a failure
+// the agent saw on stderr was invisible to whoever went looking for it (#7520).
+// The token is never logged: it is a live task credential.
+func (d *Daemon) writeRepoCheckoutAuthError(w http.ResponseWriter, result repoCheckoutAuthResult) {
+	message := d.repoCheckoutAuthErrorMessage(result)
+	reason := "no_credential"
+	if result == repoCheckoutAuthUnknownCredential {
+		reason = "unknown_credential"
+	}
+	d.logger.Warn("repo checkout rejected",
+		"reason", reason,
+		"min_cli_version", repoCheckoutMinCLIVersion,
+		"daemon_version", d.cfg.CLIVersion,
+	)
+	http.Error(w, message, http.StatusUnauthorized)
+}
+
+// authorizeRepoCheckoutWorkDir proves the requested checkout directory lies
+// inside the active task's workdir and returns its resolved form. Both sides
+// are resolved the way the kernel opens them — util.ResolveSymlinks, not
+// filepath.EvalSymlinks, which on Windows cannot pass through a directory
+// junction: a workspaces root moved to another drive and left behind as a
+// junction made every checkout fail here (#8946). Any path that cannot be
+// resolved is refused; the error says which side and why, because the caller
+// surfaces it instead of a bare "not owned".
 func authorizeRepoCheckoutWorkDir(activeRoot, requested string) (string, error) {
 	root, err := filepath.Abs(activeRoot)
-	if err != nil {
-		return "", err
+	if err == nil {
+		root, err = util.ResolveSymlinks(root)
 	}
-	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve active task workdir: %w", err)
 	}
 	workdir, err := filepath.Abs(requested)
-	if err != nil {
-		return "", err
+	if err == nil {
+		workdir, err = util.ResolveSymlinks(workdir)
 	}
-	workdir, err = filepath.EvalSymlinks(workdir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve requested workdir: %w", err)
 	}
 	rel, err := filepath.Rel(root, workdir)
 	if err != nil || !filepath.IsLocal(rel) {
-		return "", errors.New("workdir is outside the active task workdir")
+		return "", fmt.Errorf("%s is outside the active task workdir %s", workdir, root)
 	}
 	return workdir, nil
 }
@@ -224,6 +355,7 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			DeviceName:            d.cfg.DeviceName,
 			ServerURL:             d.cfg.ServerBaseURL,
 			CLIVersion:            d.cfg.CLIVersion,
+			CLICommit:             d.cfg.CLICommit,
 			ActiveTaskCount:       d.activeTasks.Load(),
 			RunningTaskCount:      d.runningTasks.Load(),
 			ResourceWaitTaskCount: d.resourceWaitTasks.Load(),
@@ -237,6 +369,14 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			activity := reporter.Activity()
 			resp.RepoMaintenanceActive = activity.MaintenanceActive
 			resp.RepoCheckoutWaiters = activity.ForegroundWaiters
+		}
+		if stats, err := d.terminalReports.stats(); err != nil {
+			d.logger.Warn("health: scan terminal report queue", "error", err)
+		} else {
+			resp.PendingTerminalReportCount = stats.PendingCount
+			resp.PendingTerminalReportBytes = stats.PendingBytes
+			resp.FailedTerminalReportCount = stats.FailedCount
+			resp.FailedTerminalReportBytes = stats.FailedBytes
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -293,9 +433,9 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		activeTask, ok := d.activeRepoCheckoutTask(r)
-		if !ok {
-			http.Error(w, "repo checkout requires an active task credential", http.StatusUnauthorized)
+		activeTask, authResult := d.activeRepoCheckoutTask(r)
+		if authResult != repoCheckoutAuthOK {
+			d.writeRepoCheckoutAuthError(w, authResult)
 			return
 		}
 
@@ -327,7 +467,17 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 		}
 		authorizedWorkDir, authErr := authorizeRepoCheckoutWorkDir(activeTask.WorkDir, req.WorkDir)
 		if authErr != nil {
-			http.Error(w, "repo checkout workdir is not owned by the active task", http.StatusForbidden)
+			// The reason goes to both the agent and daemon.log: a refusal that
+			// says only "not owned" sent #8946 looking at ownership when the
+			// real failure was resolving a junctioned path. Both paths come from
+			// the requesting task — its own workdir and the path it sent — so
+			// the message tells it nothing it could not read for itself.
+			d.logger.Warn("repo checkout rejected",
+				"reason", "workdir_not_owned",
+				"task_id", activeTask.TaskID,
+				"error", authErr,
+			)
+			http.Error(w, "repo checkout workdir is not owned by the active task: "+authErr.Error(), http.StatusForbidden)
 			return
 		}
 		// Identity is derived from the token-bound active task. AgentName and the
@@ -371,6 +521,7 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 			TaskID:              req.TaskID,
 			CoAuthoredByEnabled: d.workspaceCoAuthoredByEnabled(req.WorkspaceID),
 			IsolatedGitMetadata: req.CheckoutMode == repoCheckoutModeIsolated,
+			Fresh:               req.Fresh,
 		}
 		if req.RetryBusy {
 			params.LockWaitTimeout = repoCheckoutLockWaitTimeout

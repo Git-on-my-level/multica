@@ -12,10 +12,37 @@ import (
 // (the Chocolatey shim in #6538 is a real PE binary, not a .cmd wrapper), so
 // the backend's argv reaches CreateProcess unmediated.
 const (
-	opencodeStdinHelperEnv      = "MULTICA_OPENCODE_STDIN_HELPER"
-	opencodeStdinHelperArgvFile = "MULTICA_OPENCODE_STDIN_HELPER_ARGV_FILE"
-	opencodeStdinHelperInFile   = "MULTICA_OPENCODE_STDIN_HELPER_STDIN_FILE"
+	opencodeStdinHelperEnv       = "MULTICA_OPENCODE_STDIN_HELPER"
+	opencodeStdinHelperArgvFile  = "MULTICA_OPENCODE_STDIN_HELPER_ARGV_FILE"
+	opencodeStdinHelperInFile    = "MULTICA_OPENCODE_STDIN_HELPER_STDIN_FILE"
+	opencodeStdinHelperUsageOnly = "MULTICA_OPENCODE_STDIN_HELPER_USAGE_ONLY"
 )
+
+const (
+	codeartsModelHelperEnv      = "CODEARTS_MODEL_TEST_HELPER"
+	codeartsModelHelperArgvFile = "CODEARTS_MODEL_TEST_HELPER_ARGV_FILE"
+)
+
+func runFakeCodeArtsModelHelper() {
+	args := os.Args[1:]
+	if path := os.Getenv(codeartsModelHelperArgvFile); path != "" {
+		if err := os.WriteFile(path, []byte(strings.Join(args, "\n")), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "helper: write CodeArts model argv: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	for _, arg := range args {
+		if arg == "--version" {
+			fmt.Println("CodeArts Agent 1.2.3")
+			return
+		}
+	}
+	if len(args) > 0 && strings.HasPrefix(args[0], "profile-") {
+		fmt.Println("test/" + args[0])
+		return
+	}
+	fmt.Println("huaweicloud-maas/deepseek-v3.2")
+}
 
 // runFakeOpencodeStdinHelper records the argv and stdin the backend handed this
 // process, then emits a successful OpenCode event stream. It is dispatched from
@@ -37,8 +64,16 @@ func runFakeOpencodeStdinHelper() {
 		fmt.Fprintf(os.Stderr, "helper: write stdin: %v\n", err)
 		os.Exit(1)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "models" {
+		fmt.Println("huaweicloud-maas/deepseek-v3.2")
+		return
+	}
 
 	fmt.Println(`{"type":"step_start","timestamp":1,"sessionID":"ses_fake","part":{"type":"step-start"}}`)
+	if os.Getenv(opencodeStdinHelperUsageOnly) == "1" {
+		fmt.Println(`{"type":"step_finish","timestamp":2,"sessionID":"ses_fake","part":{"type":"step-finish","reason":"stop","tokens":{"input":0,"output":0,"reasoning":20}}}`)
+		return
+	}
 	fmt.Println(`{"type":"text","timestamp":2,"sessionID":"ses_fake","part":{"type":"text","text":"ok"}}`)
 	fmt.Println(`{"type":"step_finish","timestamp":3,"sessionID":"ses_fake","part":{"type":"step-finish"}}`)
 }

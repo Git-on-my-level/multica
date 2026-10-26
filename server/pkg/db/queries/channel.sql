@@ -213,6 +213,15 @@ cleared_dingtalk_bot_identity AS (
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM dead)
 ),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message WHERE installation_id IN (SELECT id FROM dead)
+),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM dead)
+),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding
     WHERE installation_id IN (SELECT id FROM dead)
@@ -258,6 +267,82 @@ detached_audit AS (
 )
 SELECT id FROM dead;
 
+-- name: ClearChannelInstallationBotScopedRows :one
+-- Bot-swap cleanup. Pointing an existing installation at a DIFFERENT bot keeps
+-- the installation row and its id — UpsertChannelInstallation conflicts on
+-- (workspace_id, agent_id, channel_type) and only rewrites config — so every
+-- dependent row keyed on installation_id survives into a bot it does not belong
+-- to. This clears the ones that are scoped to the OLD bot (#6547).
+--
+-- Why they are invalid rather than merely stale: a WeCom aibot userid is
+-- anonymized per (bot, user), so a carried-over channel_user_binding addresses
+-- the new bot with an id from a namespace it does not share — Outbound's inbox
+-- push resolves the sender by installation_id (reused, hence the LIVE new bot)
+-- and then sends to the OLD bot's userid. The same reasoning covers a p2p chat
+-- binding, whose channel_chat_id IS that userid, and every queued outbound row
+-- carrying one.
+--
+-- The installation itself, and the audit trail beneath it, deliberately stay:
+-- the row is the same connection under new credentials, and a channel_inbound_
+-- audit row still records something an operator can act on. Reclaim DETACHes
+-- audit only because the installation is going away, which here it is not.
+--
+-- chat_session is likewise NOT touched. Deleting the binding detaches the WeCom
+-- route from the Chat, the same shape a disconnect leaves behind; the Chat and
+-- its history are the user's work product and outlive whichever bot carried
+-- them. channel_outbound_card_message has no installation_id and no FK, so it
+-- is reached through the just-removed bindings — the only link back — and goes
+-- because the platform message ids on it belong to the old bot.
+--
+-- Returns what it removed. A queued channel_task_delivery is a RUNNING task's
+-- answer: processEvent finds no row and returns nil, so the answer is dropped
+-- with no counter and no log line of its own. Deleting it is still right — the
+-- address on it is the old bot's userid and unreachable either way — but
+-- whoever is waiting for that answer deserves one line saying where it went.
+-- channel_outbound_message is counted for the same reason and not because it is
+-- expected to be non-zero: a dropped queued send is a reply that never arrives,
+-- and a count nobody has to read costs nothing next to guessing later.
+WITH cleared_chat_sessions AS (
+    DELETE FROM channel_chat_session_binding AS binding
+    WHERE binding.installation_id = @installation_id
+    RETURNING binding.chat_session_id
+),
+cleared_outbound_cards AS (
+    DELETE FROM channel_outbound_card_message AS card
+    WHERE card.chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+    RETURNING card.id
+),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery
+    WHERE delivery.installation_id = @installation_id
+    RETURNING delivery.task_id
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message AS outbound
+    WHERE outbound.installation_id = @installation_id
+    RETURNING outbound.channel_message_id
+),
+cleared_binding_tokens AS (
+    DELETE FROM channel_binding_token AS token
+    WHERE token.installation_id = @installation_id
+    RETURNING token.token_hash
+),
+cleared_inbound_dedup AS (
+    DELETE FROM channel_inbound_message_dedup AS dedup
+    WHERE dedup.installation_id = @installation_id
+    RETURNING dedup.message_id
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding AS user_binding
+    WHERE user_binding.installation_id = @installation_id
+    RETURNING user_binding.id
+)
+SELECT
+    (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
+    (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries,
+    (SELECT count(*) FROM cleared_outbound_messages)::bigint AS outbound_messages;
+
 -- name: DeleteChannelInstallationsBySystemRuntimeAgents :exec
 -- Application-layer replacement for the (deliberately absent, MUL-3515 §4)
 -- workspace/agent ON DELETE CASCADE: on runtime teardown, before the system
@@ -290,6 +375,15 @@ cleared_dingtalk_bot_identity AS (
 ),
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_task_deliveries AS (
+    DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_outbound_messages AS (
+    DELETE FROM channel_outbound_message WHERE installation_id IN (SELECT id FROM doomed)
 ),
 cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding WHERE installation_id IN (SELECT id FROM doomed)
@@ -470,6 +564,39 @@ WHERE b.workspace_id = sqlc.arg('workspace_id')
 ORDER BY b.bound_at DESC
 LIMIT 1;
 
+-- name: FindChannelBindingForMemberOnAgentInstallation :one
+-- Agent-attributed notification lookup: the same member lookup as
+-- FindChannelBindingForMember, pinned to the ONE installation the agent whose
+-- activity raised the notification owns.
+--
+-- Why this exists. FindChannelBindingForMember answers by the
+-- RECIPIENT alone, so in a multi-bot org — one bot per agent, several of them
+-- bound by the same person — every notification a member receives is pushed
+-- through whichever bot they bound most recently, no matter which agent the
+-- notification is about. The recipient reads three agents' activity as if it
+-- all came from one of them. Pinning the lookup to the acting agent's bot is
+-- what makes the notification follow the bot↔agent mapping the sender is
+-- reading.
+--
+-- The tiebreak stays for the case where one member holds two channel users on
+-- the same bot (two WeCom accounts, one Multica account): both rows answer,
+-- and `:one` cannot take more than one, so the newest binding wins here
+-- exactly as it does in the recipient-wide lookup.
+--
+-- channel_type is named once and used for both columns: the installation's
+-- own discriminator and the binding's must agree, or installs of two
+-- platforms could cross-answer here.
+SELECT b.* FROM channel_user_binding b
+JOIN channel_installation ci ON ci.id = b.installation_id
+WHERE b.workspace_id = sqlc.arg('workspace_id')
+  AND b.multica_user_id = sqlc.arg('multica_user_id')
+  AND b.channel_type = sqlc.arg('channel_type')
+  AND ci.channel_type = sqlc.arg('channel_type')
+  AND ci.agent_id = sqlc.arg('agent_id')
+  AND ci.status = 'active'
+ORDER BY b.bound_at DESC
+LIMIT 1;
+
 -- name: FindReusableChannelUserBinding :one
 -- Cross-installation account-link reuse (MUL-3911). When a platform user
 -- messages an installation they have NOT linked, but the SAME user id is already
@@ -524,12 +651,17 @@ WHERE installation_id = $1;
 -- is its own session. config carries any platform-specific outbound routing the
 -- key alone does not (e.g. Slack's real channel_id when the key is composite);
 -- it is opaque to the shared session service.
-WITH binding AS (
+WITH next_route AS (
+    SELECT COALESCE(MAX(route_revision) + 1, 1)::bigint AS route_revision
+    FROM channel_chat_session_binding AS existing
+    WHERE existing.installation_id = $2 AND existing.channel_chat_id = $4
+), binding AS (
 INSERT INTO channel_chat_session_binding (
-    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config
-) VALUES (
-    $1, $2, $3, $4, $5, $6
+    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type,
+    config, route_revision
 )
+SELECT $1, $2, $3, $4, $5, $6, next_route.route_revision
+FROM next_route
 RETURNING *
 ), generation AS (
     INSERT INTO channel_chat_context_generation (chat_session_id, revision)
@@ -537,11 +669,59 @@ RETURNING *
 )
 SELECT * FROM binding;
 
+-- name: CreateChannelChatSessionBindingGeneration :one
+WITH next_route AS (
+    SELECT GREATEST(
+        @route_revision::bigint,
+        COALESCE(MAX(route_revision) + 1, 1)::bigint
+    ) AS route_revision
+    FROM channel_chat_session_binding AS existing
+    WHERE existing.installation_id = @installation_id
+      AND existing.channel_chat_id = @channel_chat_id
+), binding AS (
+INSERT INTO channel_chat_session_binding (
+    chat_session_id, installation_id, channel_type, channel_chat_id, chat_type,
+    config, route_revision, history_start_message_id, history_boundary_pending
+) SELECT
+    @chat_session_id, @installation_id, @channel_type, @channel_chat_id, @chat_type,
+    @config, next_route.route_revision, sqlc.narg('history_start_message_id'), @history_boundary_pending
+FROM next_route
+RETURNING *
+), generation AS (
+    INSERT INTO channel_chat_context_generation (
+        chat_session_id, revision, history_start_message_id, history_boundary_pending
+    )
+    SELECT chat_session_id, context_revision, history_start_message_id, history_boundary_pending
+    FROM binding
+)
+SELECT * FROM binding;
+
 -- name: GetChannelChatSessionBinding :one
 -- Lookup-by-channel-chat: the inbound dispatcher finds the existing
 -- chat_session before deciding whether to create one.
 SELECT * FROM channel_chat_session_binding
-WHERE installation_id = $1 AND channel_chat_id = $2;
+WHERE installation_id = $1 AND channel_chat_id = $2 AND retired_at IS NULL;
+
+-- name: LockCurrentChannelChatSessionBinding :one
+SELECT * FROM channel_chat_session_binding
+WHERE installation_id = $1 AND channel_chat_id = $2 AND retired_at IS NULL
+FOR UPDATE;
+
+-- name: LockCurrentChannelChatSessionBindingBySession :one
+-- Shared append fence. A message may have resolved a Chat immediately before
+-- /new retired it; locking only chat_session would then let the stale append
+-- land after the route switch. Requiring the binding to remain current makes
+-- every adapter retry against the winning generation.
+SELECT * FROM channel_chat_session_binding
+WHERE chat_session_id = $1 AND retired_at IS NULL
+FOR UPDATE;
+
+-- name: RetireChannelChatSessionBinding :one
+UPDATE channel_chat_session_binding
+SET retired_at = now(),
+    history_end_message_id = sqlc.narg('history_end_message_id')
+WHERE id = @id AND retired_at IS NULL
+RETURNING *;
 
 -- name: GetChannelChatSessionBindingBySession :one
 -- Reverse lookup for the outbound patcher: given a chat_session_id, find
@@ -562,26 +742,67 @@ WHERE chat_session_id = sqlc.arg('chat_session_id')
 SELECT * FROM channel_chat_session_binding
 WHERE chat_session_id = $1;
 
+-- name: ListChannelChatSessionBindingsBySessions :many
+-- Batch projection for Chat list responses. Historical bindings are retained,
+-- so retired Chats keep their channel source while only the active generation
+-- reports itself as the current route.
+SELECT * FROM channel_chat_session_binding
+WHERE chat_session_id = ANY(@chat_session_ids::uuid[]);
+
 -- name: UpdateChannelChatSessionBindingReplyTarget :exec
--- Records the most recent inbound trigger message + thread so the decoupled
--- outbound patcher can thread its reply back into the originating topic.
-UPDATE channel_chat_session_binding
+-- Advances the session's latest-trigger cursor, which drives the history
+-- boundary bookkeeping below. NOT the outbound reply target: that is frozen
+-- per context generation (SetChannelChatContextReplyTarget), because this row
+-- only ever remembers the newest trigger and a debounced run can be enqueued
+-- after a later generation has already moved it.
+WITH current_route AS (
+    SELECT current_binding.*
+    FROM channel_chat_session_binding AS current_binding
+    WHERE current_binding.chat_session_id = sqlc.arg('reply_chat_session_id')
+    FOR UPDATE OF current_binding
+), closed_previous AS (
+    UPDATE channel_chat_session_binding AS previous
+    SET history_end_message_id = sqlc.narg('last_message_id')
+    FROM current_route AS current
+    WHERE current.history_boundary_pending
+      AND sqlc.narg('last_message_id')::text IS NOT NULL
+      AND previous.installation_id = current.installation_id
+      AND previous.channel_chat_id = current.channel_chat_id
+      -- Multiple native Slack /new commands can rotate through empty
+      -- generations before another public message supplies a platform cursor.
+      -- That cursor closes every still-open retired generation.
+      AND previous.route_revision < current.route_revision
+      AND previous.retired_at IS NOT NULL
+      AND previous.history_end_message_id IS NULL
+)
+UPDATE channel_chat_session_binding AS binding
 SET last_message_id = sqlc.narg('last_message_id'),
-    last_thread_id  = sqlc.narg('last_thread_id')
-WHERE chat_session_id = $1;
+    last_thread_id  = sqlc.narg('last_thread_id'),
+    history_start_message_id = CASE
+        WHEN binding.history_boundary_pending
+          AND sqlc.narg('last_message_id')::text IS NOT NULL
+        THEN sqlc.narg('last_message_id')
+        ELSE binding.history_start_message_id
+    END,
+    history_boundary_pending = CASE
+        WHEN sqlc.narg('last_message_id')::text IS NOT NULL THEN FALSE
+        ELSE binding.history_boundary_pending
+    END
+FROM current_route
+WHERE binding.id = current_route.id;
 
 -- name: MarkChannelChatSessionPendingFresh :one
--- Persists a channel `/new` intent until the next chat task is successfully
+-- Persists a channel `/clear` intent until the next chat task is successfully
 -- created. RETURNING makes a missing binding an error instead of silently
 -- acknowledging a fresh start that was never stored.
 UPDATE channel_chat_session_binding
 SET pending_fresh = TRUE
-WHERE chat_session_id = $1
+WHERE chat_session_id = $1 AND retired_at IS NULL
 RETURNING pending_fresh;
 
 -- name: LockChannelChatSessionPendingFresh :one
 -- EnqueueChatTask reads this under the same row lock and transaction that
--- creates the task. A concurrent `/new` therefore lands either before this
+-- creates the task. A concurrent `/clear` therefore lands either before this
 -- task and is consumed by it, or after this task and remains for the next one.
 SELECT pending_fresh FROM channel_chat_session_binding
 WHERE chat_session_id = $1
@@ -590,7 +811,7 @@ FOR UPDATE;
 -- name: LockChannelChatSessionBindingForContext :one
 -- Context mutations acquire this row after chat_session and before any
 -- channel_chat_context_generation row. Keeping the statements separate makes
--- the lock order explicit and identical for append, /new, and task enqueue.
+-- the lock order explicit and identical for append, /clear, and task enqueue.
 SELECT * FROM channel_chat_session_binding
 WHERE chat_session_id = $1
 FOR UPDATE;
@@ -605,18 +826,6 @@ UPDATE channel_chat_session_binding
 SET pending_fresh = FALSE
 WHERE chat_session_id = @chat_session_id
   AND context_revision = @revision;
-
--- name: EnsureChannelChatContextGeneration :exec
--- Rolling-deploy repair: an older server can create a binding after the schema
--- migration but before every process is upgraded. Materialize its generation
--- lazily before a new server attempts to lock it.
-INSERT INTO channel_chat_context_generation (
-    chat_session_id, revision
-)
-SELECT binding.chat_session_id, binding.context_revision
-FROM channel_chat_session_binding AS binding
-WHERE binding.chat_session_id = $1
-ON CONFLICT (chat_session_id, revision) DO NOTHING;
 
 -- name: AdvanceChannelChatContextGeneration :one
 -- Opens a new agent-visible context while retaining the same Multica Chat.
@@ -672,6 +881,24 @@ WHERE chat_session_id = @chat_session_id
   AND revision = @revision
 RETURNING initiator_user_id;
 
+-- name: SetChannelChatContextReplyTarget :exec
+-- Snapshots the trigger this generation will be answered on: the message an
+-- outbound reply targets, its thread, and the channel-native id of whoever
+-- sent it. The sibling of SetChannelChatContextInitiator, and load-bearing for
+-- the same reason — a debounced run flushes against ITS generation, which may
+-- no longer be the session's newest, so reading the trigger from the session
+-- would answer one member's question quoting and @-mentioning another's.
+--
+-- All three move together in one statement: a sender or thread that described
+-- a different message than the reply targets is precisely the cross-attribution
+-- this exists to prevent.
+UPDATE channel_chat_context_generation
+SET last_message_id = sqlc.narg('last_message_id'),
+    last_thread_id  = sqlc.narg('last_thread_id'),
+    last_sender_id  = sqlc.narg('last_sender_id')
+WHERE chat_session_id = @chat_session_id
+  AND revision = @revision;
+
 -- name: ClearChannelChatContextPendingFresh :exec
 UPDATE channel_chat_context_generation
 SET pending_fresh = FALSE
@@ -685,10 +912,19 @@ WHERE chat_session_id = @chat_session_id
 
 -- name: DeleteChannelChatSessionBindingBySession :exec
 -- Application-layer integrity (replaces the old chat_session-FK ON DELETE
--- CASCADE): drop the binding when its chat_session is deleted.
-WITH deleted_binding AS (
-    DELETE FROM channel_chat_session_binding AS binding
+-- CASCADE): drop the binding, its immutable delivery/history dependents,
+-- and the Chat's context generations.
+WITH target AS (
+    SELECT binding.id FROM channel_chat_session_binding AS binding
     WHERE binding.chat_session_id = sqlc.arg('chat_session_id')
+), cleared_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery WHERE delivery.binding_id IN (SELECT id FROM target)
+), cleared_outbound AS (
+    DELETE FROM channel_outbound_message AS outbound WHERE outbound.binding_id IN (SELECT id FROM target)
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply WHERE reply.binding_id IN (SELECT id FROM target)
+), deleted_binding AS (
+    DELETE FROM channel_chat_session_binding AS binding WHERE binding.id IN (SELECT id FROM target)
 )
 DELETE FROM channel_chat_context_generation AS generation
 WHERE generation.chat_session_id = sqlc.arg('chat_session_id');
@@ -703,9 +939,130 @@ WHERE generation.chat_session_id = sqlc.arg('chat_session_id');
 -- channel binding is removed. Context generations belong to the preserved Chat,
 -- not to the retired binding: in-flight task history snapshots may still read
 -- them after this statement commits.
+WITH cleared_deliveries AS (
+    DELETE FROM channel_task_delivery AS delivery
+    WHERE delivery.installation_id = sqlc.arg('installation_id')
+      AND delivery.channel_type = sqlc.arg('channel_type')
+), cleared_outbound AS (
+    DELETE FROM channel_outbound_message AS outbound
+    WHERE outbound.installation_id = sqlc.arg('installation_id')
+      AND outbound.channel_type = sqlc.arg('channel_type')
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply
+    WHERE reply.installation_id = sqlc.arg('installation_id')
+      AND reply.channel_type = sqlc.arg('channel_type')
+)
 DELETE FROM channel_chat_session_binding AS binding
 WHERE binding.installation_id = sqlc.arg('installation_id')
   AND binding.channel_type = sqlc.arg('channel_type');
+
+-- =====================
+-- channel_task_delivery
+-- =====================
+
+-- name: CreateChannelTaskDeliveryFromSession :one
+-- Freezes one task's outbound delivery, from two different sources on purpose.
+--
+-- ROUTE — chat, type, config, revision — comes from the session binding. It is
+-- a property of the session and does not vary by generation.
+--
+-- TRIGGER — the message an answer quotes, the thread it replies into, and the
+-- account it @-mentions — comes from the generation this task answers, NOT
+-- from the binding's latest-trigger cursor, which a newer generation may
+-- already have advanced past.
+--
+-- The thread sits with the trigger rather than the route deliberately. For a
+-- thread-isolated session (Lark topic, Slack channel thread) the two coincide,
+-- so it is easy to mistake the thread for route data — but Slack DMs keep ONE
+-- binding per channel while replying into whichever thread the member used
+-- (slackSessionRouting), so the binding cursor there names the latest thread,
+-- not this run's. Taking it from the generation is correct for both shapes.
+--
+-- The one exception is the CASE below: when a generation recorded no trigger
+-- at all, a thread-isolated binding can still say which thread the session
+-- lives in, and must, or the answer surfaces in the parent channel.
+--
+-- A NULL trigger means "we cannot attribute this run": callers reply without a
+-- quote or mention rather than inventing one. INNER JOIN on the generation: a
+-- task whose generation row is missing entirely has no context to deliver
+-- against at all.
+INSERT INTO channel_task_delivery (
+    task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type,
+    channel_message_id, channel_thread_id, channel_sender_id, route_revision, config
+)
+SELECT
+    @task_id, binding.id, binding.installation_id, binding.channel_type,
+    binding.channel_chat_id, binding.chat_type,
+    generation.last_message_id,
+    CASE
+        -- This generation recorded a trigger, so its thread is authoritative —
+        -- including when it is legitimately empty, which is how a Slack DM
+        -- answered at top level is distinguished from one answered inside a
+        -- thread.
+        WHEN generation.last_message_id IS NOT NULL THEN generation.last_thread_id
+        -- No trigger: pre-migration, or a generation whose only messages were
+        -- channel commands. Recover the thread ONLY for a thread-isolated
+        -- binding, where it is a stable property of the session rather than a
+        -- moving cursor. Such a binding is exactly the one whose key is the
+        -- composite "chat:thread", which is why it carries the real chat id in
+        -- its config — the marker every adapter writes (larkSessionRouting,
+        -- slackSessionRouting, telegramSessionRouting). Without this, a
+        -- recovered pre-migration run in a Slack channel thread or a Telegram
+        -- forum topic would answer in the parent conversation.
+        WHEN COALESCE(binding.config ->> 'chat_id', binding.config ->> 'channel_id', '')
+             NOT IN ('', binding.channel_chat_id) THEN binding.last_thread_id
+        -- A non-isolated binding's cursor names whichever thread spoke last,
+        -- which is not this run's. Nothing we can justify.
+        ELSE NULL
+    END,
+    generation.last_sender_id,
+    binding.route_revision, binding.config
+FROM channel_chat_session_binding AS binding
+JOIN channel_chat_context_generation AS generation
+  ON generation.chat_session_id = binding.chat_session_id
+ AND generation.revision = @context_revision
+WHERE binding.chat_session_id = @chat_session_id
+RETURNING *;
+
+-- name: GetChannelTaskDelivery :one
+SELECT * FROM channel_task_delivery WHERE task_id = $1;
+
+-- name: CopyChannelTaskDelivery :exec
+INSERT INTO channel_task_delivery (
+    task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type,
+    channel_message_id, channel_thread_id, channel_sender_id, route_revision, config
+)
+SELECT
+    @child_task_id, delivery.binding_id, delivery.installation_id, delivery.channel_type, delivery.channel_chat_id, delivery.chat_type,
+    delivery.channel_message_id, delivery.channel_thread_id, delivery.channel_sender_id, delivery.route_revision, delivery.config
+FROM channel_task_delivery AS delivery
+WHERE delivery.task_id = @parent_task_id;
+
+-- =====================
+-- channel_outbound_message
+-- =====================
+
+-- name: RecordChannelOutboundMessage :exec
+INSERT INTO channel_outbound_message (
+    installation_id, channel_type, channel_message_id, binding_id,
+    route_revision, task_id, outbound_kind
+) VALUES (
+    sqlc.arg('outbound_installation_id'), sqlc.arg('outbound_channel_type'),
+    sqlc.arg('outbound_message_id'), sqlc.arg('outbound_binding_id'),
+    sqlc.arg('outbound_route_revision'), sqlc.narg('outbound_task_id'),
+    sqlc.arg('outbound_kind')
+)
+ON CONFLICT (installation_id, channel_message_id) DO NOTHING;
+
+-- name: ListChannelOutboundMessageIDsForBinding :many
+SELECT outbound.channel_message_id FROM channel_outbound_message AS outbound
+WHERE outbound.binding_id = $1
+ORDER BY outbound.created_at ASC;
+
+-- name: ListChannelOutboundMessagesByIDs :many
+SELECT outbound.* FROM channel_outbound_message AS outbound
+WHERE outbound.installation_id = @installation_id
+  AND outbound.channel_message_id = ANY(@channel_message_ids::text[]);
 
 -- =====================
 -- channel_inbound_message_dedup
@@ -1041,11 +1398,187 @@ SELECT EXISTS (
       AND url = @storage_url
 ) AS referenced;
 
--- name: CountChannelMediaPendingObjects :one
--- Ledger backlog gauge for the reconciler's observability. Tombstones are
--- reported separately: they are bounded bookkeeping for already-deleted
--- objects, not a backlog of objects awaiting reclaim.
+-- ---------------------------------------------------------------------------
+-- Reply delivery ownership (channel_reply_delivery).
+--
+-- One user turn, one owner, one reply. Every path that can put a message in a
+-- chat proves it holds the turn's lease before it calls the provider, and
+-- proves it still holds the lease when it records what happened.
+-- ---------------------------------------------------------------------------
+
+-- name: GetChannelReplyTurn :one
+-- The root of a task's automatic-retry chain — the user turn all its attempts
+-- belong to — and how far down the chain this attempt sits. A retry runs under
+-- a new task id and must finish the reply its previous attempt started, so
+-- ownership is keyed by the root; depth is what stops an earlier attempt's late
+-- frame from taking the turn back off the retry that superseded it.
+WITH RECURSIVE chain(task_id, parent_task_id, depth) AS (
+    SELECT attempt.id, attempt.retry_of_task_id, 0
+    FROM agent_task_queue attempt
+    WHERE attempt.id = $1
+    UNION ALL
+    SELECT parent.id, parent.retry_of_task_id, chain.depth + 1
+    FROM agent_task_queue parent
+    JOIN chain ON parent.id = chain.parent_task_id
+)
 SELECT
-    count(*) FILTER (WHERE state <> 'tombstoned') AS pending_objects,
-    count(*) FILTER (WHERE state = 'tombstoned') AS tombstoned_objects
-FROM channel_media_pending_object;
+    (SELECT root.task_id FROM chain root WHERE root.parent_task_id IS NULL LIMIT 1) AS turn_id,
+    (SELECT COALESCE(MAX(step.depth), 0) FROM chain step)::int AS attempt_depth;
+
+-- name: AcquireChannelReplyDelivery :one
+-- Take the turn's delivery lease, creating the row on first use. Returns no
+-- row when the turn is settled, when a live owner holds it, or when a
+-- streaming path asks for a reply the final answer has taken over — the three
+-- cases where this caller must not touch the provider.
+--
+-- An expired lease is a process that died mid-delivery. Its successor gets the
+-- turn, but never a clean slate: send_state survives, so an outstanding send
+-- stays outstanding rather than being silently retried.
+INSERT INTO channel_reply_delivery (
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, owner_token, owner_expires_at
+) VALUES (
+    @turn_id, @task_id, @attempt_depth, @binding_id, @installation_id, @channel_type, @chat_id,
+    @phase, 'none', @owner_token, now() + make_interval(secs => @lease_seconds::double precision)
+)
+ON CONFLICT (turn_id) DO UPDATE
+SET task_id = EXCLUDED.task_id,
+    attempt_depth = EXCLUDED.attempt_depth,
+    phase = CASE WHEN EXCLUDED.phase = 'terminal' THEN 'terminal' ELSE channel_reply_delivery.phase END,
+    owner_token = EXCLUDED.owner_token,
+    owner_expires_at = EXCLUDED.owner_expires_at,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  AND NOT (EXCLUDED.phase = 'streaming' AND channel_reply_delivery.phase = 'terminal')
+  -- An attempt the retry chain has already moved past may not take the turn
+  -- back: its late frames would rewrite what the user is reading with content
+  -- from a run that was superseded.
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING *;
+
+-- name: GetChannelReplyDelivery :one
+-- Read without taking the lease, so a caller that lost the race can tell
+-- "someone else is working on it" from "this turn is finished".
+SELECT * FROM channel_reply_delivery WHERE turn_id = $1;
+
+-- name: ReleaseChannelReplyDelivery :execrows
+-- Hand the turn back so the next path does not wait out the lease.
+UPDATE channel_reply_delivery
+SET owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2;
+
+-- name: RenewChannelReplyDelivery :execrows
+-- Prove the turn is still ours and push the lease out. Terminal delivery holds
+-- a turn across several scheduler rounds — edit pacing, a 429 backoff — so it
+-- re-proves ownership before each Telegram call rather than trusting a lease
+-- taken minutes earlier. No rows means another process took the turn over, and
+-- this one must stop.
+UPDATE channel_reply_delivery
+SET owner_expires_at = now() + make_interval(secs => sqlc.arg(lease_seconds)::double precision), updated_at = now()
+WHERE turn_id = sqlc.arg(turn_id) AND owner_token = sqlc.arg(owner_token) AND phase <> 'settled';
+
+-- name: MarkChannelReplyDeliverySending :execrows
+-- Publish a send before making it, so any other process reads "a send is
+-- outstanding" rather than "nothing has been sent". A resolved earlier send
+-- does not block the next part of a multi-part answer; an unresolved one does,
+-- because that is the case where nobody knows what is already in the chat.
+UPDATE channel_reply_delivery
+SET send_state = 'in_flight', updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state NOT IN ('in_flight', 'unknown');
+
+-- name: RecordChannelReplyDeliveryPlaceholder :execrows
+-- The placeholder landed. It gives the turn an editable message; it delivers
+-- no part of the final answer, so chunks_sent stays where it is.
+UPDATE channel_reply_delivery
+SET send_state = 'known', message_id = $3, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight';
+
+-- name: RecordChannelReplyDeliveryChunk :execrows
+-- A part of the final answer landed. message_id is only adopted when the turn
+-- has no editable message yet, so later parts never retarget the first one.
+UPDATE channel_reply_delivery
+SET send_state = 'known',
+    message_id = CASE WHEN message_id = '' THEN sqlc.arg(message_id)::text ELSE message_id END,
+    chunks_sent = GREATEST(chunks_sent, sqlc.arg(chunks_sent)::int),
+    updated_at = now()
+WHERE turn_id = sqlc.arg(turn_id) AND owner_token = sqlc.arg(owner_token);
+
+-- name: ResetChannelReplyDeliverySend :execrows
+-- The provider answered and refused: nothing is in the chat, so the turn may
+-- be attempted again.
+UPDATE channel_reply_delivery
+SET send_state = CASE WHEN message_id = '' THEN 'none' ELSE 'known' END, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight';
+
+-- name: MarkChannelReplyDeliverySendUnknown :execrows
+-- The response was lost. Recorded without the owner check: this is the write
+-- that must survive a caller whose lease expired while its own request hung,
+-- because the alternative is a successor assuming nothing was ever sent.
+UPDATE channel_reply_delivery
+SET send_state = 'unknown', updated_at = now()
+WHERE turn_id = $1 AND send_state = 'in_flight';
+
+-- name: SettleChannelReplyDelivery :execrows
+-- Delivery is over. Nothing sends or edits for this turn afterwards.
+UPDATE channel_reply_delivery
+SET phase = 'settled', settled_reason = $3, owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND phase <> 'settled';
+
+-- name: CloseChannelReplyDeliveryTurn :one
+-- End a turn that has no answer to deliver — cancelled, or completed empty —
+-- creating the row when the turn never reached the provider at all. Without
+-- the insert, a first text frame arriving after the cancellation would find
+-- nothing, open a placeholder, and leave it there forever.
+INSERT INTO channel_reply_delivery (
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, settled_reason
+) VALUES (
+    @turn_id, @task_id, @attempt_depth, @binding_id, @installation_id, @channel_type, @chat_id,
+    'settled', 'none', @settled_reason
+)
+ON CONFLICT (turn_id) DO UPDATE
+SET phase = 'settled',
+    settled_reason = @settled_reason,
+    owner_token = NULL,
+    owner_expires_at = NULL,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  -- Same one-way rule the claim follows. A cancellation or empty completion
+  -- belonging to an attempt the retry chain has moved past must not end the
+  -- turn: the attempt that superseded it is still delivering, and its answer
+  -- would be dropped as "already settled".
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING *;
+
+-- name: IsChannelMessageTypingActive :one
+-- Revalidate the exact input after a remote reaction Add. A pending debounce
+-- input has no task yet; a sealed input follows its immutable owning task.
+-- Do not use the binding's latest message or another turn's active task.
+SELECT EXISTS (
+    SELECT 1 FROM chat_message AS message
+    JOIN chat_session AS session ON session.id = message.chat_session_id
+    JOIN channel_chat_session_binding AS binding ON binding.chat_session_id = session.id
+    JOIN channel_installation AS installation ON installation.id = binding.installation_id
+    LEFT JOIN agent_task_queue AS task ON task.id = message.task_id
+    LEFT JOIN agent AS task_agent ON task_agent.id = task.agent_id
+    WHERE message.id = @message_id
+      AND session.id = @chat_session_id
+      AND session.workspace_id = @workspace_id
+      AND installation.workspace_id = @workspace_id
+      AND installation.id = @installation_id
+      AND installation.channel_type = @channel_type
+      AND binding.channel_type = @channel_type
+      AND installation.status = 'active'
+      AND session.status = 'active'
+      AND binding.retired_at IS NULL
+      AND message.role = 'user'
+      AND message.channel_ingested
+      AND NOT message.channel_typing_settled
+      AND (message.task_id IS NULL OR (
+          task_agent.workspace_id = @workspace_id
+          AND task.chat_session_id = session.id
+          AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+      ))
+);

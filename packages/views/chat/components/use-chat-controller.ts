@@ -9,13 +9,15 @@ import {
 import { toast } from "sonner";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useAuthStore } from "@multica/core/auth";
+import { getCurrentWsId } from "@multica/core/platform";
 import { agentListOptions, memberListOptions } from "@multica/core/workspace/queries";
 import { projectListOptions } from "@multica/core/projects/queries";
-import { canAssignAgent } from "@multica/views/issues/components";
+import { canAssignAgent } from "../../issues/components/pickers/assignee-picker";
 import { api, dispatchReasonCode } from "@multica/core/api";
 import {
   isAgentRuntimeBound as hasAgentRuntime,
   useAgentPresenceDetail,
+  useCustomizeConversationStartersHref,
   useWorkspaceAgentAvailability,
 } from "@multica/core/agents";
 import {
@@ -277,6 +279,25 @@ export function useChatController(opts?: { isActive?: boolean }) {
     () => setFocusInputRequest((n) => n + 1),
     [],
   );
+  const [conversationStarterRequest, setConversationStarterRequest] = useState<{
+    id: number;
+    content: string;
+  } | null>(null);
+  const nextConversationStarterRequestIdRef = useRef(0);
+  const sendConversationStarter = useCallback(
+    (prompt: string) => {
+      setConversationStarterRequest({
+        id: ++nextConversationStarterRequestIdRef.current,
+        content: prompt,
+      });
+      requestInputFocus();
+    },
+    [requestInputFocus],
+  );
+  const handleConversationStarterApplied = useCallback(
+    () => setConversationStarterRequest(null),
+    [],
+  );
 
   const currentSession = activeSessionId
     ? sessions.find((s) => s.id === activeSessionId)
@@ -293,12 +314,14 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // A project may be deleted on another client while this workspace's next
   // chat preference is still persisted locally. Normalize it as soon as the
   // authoritative project list settles so a future send cannot carry a stale
-  // selection.
+  // selection. An outgoing route can retain its queries after the shared
+  // store has rehydrated another workspace; only clean up our own namespace.
   useEffect(() => {
+    if (getCurrentWsId() !== wsId) return;
     if (!projectsLoaded || !selectedProjectId) return;
     if (projects.some((project) => project.id === selectedProjectId)) return;
     setSelectedProjectId(null);
-  }, [projectsLoaded, projects, selectedProjectId, setSelectedProjectId]);
+  }, [wsId, projectsLoaded, projects, selectedProjectId, setSelectedProjectId]);
 
   const qc = useQueryClient();
   const createSession = useCreateChatSession();
@@ -350,6 +373,14 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // (MUL-6380). Same rule the server enforces, via the shared predicate.
   const isAgentAccessRevoked =
     !!activeAgent && !canAssignAgent(activeAgent, user?.id, memberRole);
+
+  // "Customize" under the starter buttons in the empty state — the only place
+  // that admits those buttons are configuration. Resolved here so the full
+  // page and the floating window cannot disagree about who sees it.
+  const customizeConversationStartersHref = useCustomizeConversationStartersHref(
+    activeAgent,
+    wsId,
+  );
 
   const agentAvailability = useWorkspaceAgentAvailability();
   const noAgent = agentAvailability === "none";
@@ -447,12 +478,13 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // rendering an editable empty chat whose send would POST into a nonexistent
   // session. Lives in the shared controller so every surface self-heals.
   useEffect(() => {
+    if (getCurrentWsId() !== wsId) return;
     if (!activeSessionId || !sessionsLoaded) return;
     if (sessions.some((s) => s.id === activeSessionId)) return;
     if (hasInFlightPendingTask(qc, activeSessionId)) return;
     uiLogger.info("clearing dangling activeSessionId", { sessionId: activeSessionId });
     setActiveSession(null);
-  }, [activeSessionId, sessionsLoaded, sessions, qc, setActiveSession]);
+  }, [wsId, activeSessionId, sessionsLoaded, sessions, qc, setActiveSession]);
 
   // Upload transport moved into the coordinated-upload engine inside ChatInput
   // (MUL-5181 L2); surfaces only forward whether the affordance exists.
@@ -525,7 +557,9 @@ export function useChatController(opts?: { isActive?: boolean }) {
             ? t(($) => $.input.send_blocked_toast)
             : reason === "agent_runtime_required"
               ? t(($) => $.input.runtime_required_toast)
-              : t(($) => $.input.send_failed_toast),
+              : reason === "runtime_access_denied"
+                ? t(($) => $.input.runtime_access_denied_toast)
+                : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -555,7 +589,9 @@ export function useChatController(opts?: { isActive?: boolean }) {
             ? t(($) => $.input.send_blocked_toast)
             : reason === "agent_runtime_required"
               ? t(($) => $.input.runtime_required_toast)
-              : t(($) => $.input.send_failed_toast),
+              : reason === "runtime_access_denied"
+                ? t(($) => $.input.runtime_access_denied_toast)
+                : t(($) => $.input.send_failed_toast),
         );
         return false;
       }
@@ -815,6 +851,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
     isAgentAccessRevoked,
     isAgentRuntimeBound,
     activeAgent,
+    customizeConversationStartersHref,
     noAgent,
     availability,
     // messages
@@ -832,6 +869,9 @@ export function useChatController(opts?: { isActive?: boolean }) {
     handleRestoreDraftApplied,
     // compose-box focus nonce (bumped on new chat)
     focusInputRequest,
+    conversationStarterRequest,
+    handleConversationStarterApplied,
+    sendConversationStarter,
     // actions
     handleSend,
     handleStop,

@@ -25,7 +25,22 @@ const RESIGN_STALE_MS = 20 * 60 * 1000;
 // `staleTime: Infinity`; this bound exists purely to keep a long scroll
 // through an image-heavy thread from pinning every decoded screenshot in
 // renderer memory forever.
-const INLINE_BLOB_GC_MS = 5 * 60 * 1000;
+export const INLINE_BLOB_GC_MS = 5 * 60 * 1000;
+
+// Module-level cache for blob: URLs keyed by attachment id. Without this,
+// useObjectURL creates a new object URL on every mount (state "" -> effect
+// creates URL), so a cached blob still flashes the fallback pickedUrl for one
+// frame on re-entry — the flicker reported in #7741 for image-heavy issues.
+const blobUrlCache = new Map<string, string>();
+const blobUrlRefCount = new Map<string, number>();
+const blobUrlGCTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export function __resetInlineMediaBlobCacheForTests(): void {
+  for (const t of blobUrlGCTimers.values()) clearTimeout(t);
+  blobUrlGCTimers.clear();
+  blobUrlRefCount.clear();
+  blobUrlCache.clear();
+}
 
 // useResignedInlineMediaURL upgrades an auth-gated media URL to a freshly
 // signed one for clients that cannot load `/api/attachments/<id>/download`
@@ -58,11 +73,16 @@ const INLINE_BLOB_GC_MS = 5 * 60 * 1000;
 // URL. `blobFallback` gates that on the caller actually rendering a native
 // `<img>`: a file card only needs a link, and downloading a 100 MB archive
 // into renderer memory to draw a chip would be a bad trade.
-export function useResignedInlineMediaURL(
+//
+// `pending` is true while that upgrade is still in flight — `url` is then the
+// picked URL, which this client may be unable to load. A caller that treats a
+// load failure as meaningful (the viewer skips broken images) waits it out
+// instead of rendering it.
+export function useResignedInlineMedia(
   attachmentId: string | undefined,
   pickedUrl: string,
   blobFallback: boolean,
-): string {
+): { url: string; pending: boolean } {
   const idFromPickedUrl = attachmentIdFromDownloadURL(pickedUrl);
   const resignAttachmentId = attachmentId ?? idFromPickedUrl;
   const isCrossOriginWebURL = (() => {
@@ -71,7 +91,8 @@ export function useResignedInlineMediaURL(
     }
     try {
       return new URL(pickedUrl).origin !== window.location.origin;
-    } catch {
+    } catch (_err) {
+      void _err;
       return false;
     }
   })();
@@ -81,7 +102,7 @@ export function useResignedInlineMediaURL(
     idFromPickedUrl !== undefined &&
     ((api.getBaseUrl?.() ?? "") !== "" || isCrossOriginWebURL);
 
-  const { data: fresh } = useQuery({
+  const { data: fresh, isError: freshFailed } = useQuery({
     queryKey: ["attachment-inline-resign", resignAttachmentId],
     queryFn: () => api.getAttachment(resignAttachmentId as string),
     enabled: needsResign,
@@ -101,38 +122,106 @@ export function useResignedInlineMediaURL(
   // Only after `fresh` has landed do we know this deployment has nothing
   // signed to give — firing the byte fetch earlier would double-download on
   // every CloudFront / presign client.
-  const { data: blob } = useQuery({
+  const { data: blob, isError: blobFailed } = useQuery({
     queryKey: ["attachment-inline-blob", resignAttachmentId],
     queryFn: () => api.getAttachmentBlob(resignAttachmentId as string),
     enabled: needsResign && blobFallback && !!fresh && signedUrl === "",
     staleTime: Infinity,
     gcTime: INLINE_BLOB_GC_MS,
   });
-  const blobUrl = useObjectURL(blob);
+  const isAuthenticated = !!fresh;
+  const blobUrl = useObjectURL(resignAttachmentId, blob, isAuthenticated);
 
-  if (!needsResign) return pickedUrl;
-  if (signedUrl) return signedUrl;
-  return blobUrl || pickedUrl;
+  if (!needsResign) return { url: pickedUrl, pending: false };
+  if (signedUrl) return { url: signedUrl, pending: false };
+  // Only return the cached blob URL when it belongs to the current id and
+  // the current QueryClient has authenticated metadata for it. This keeps
+  // the 5-min re-entry cache for the same session but prevents a logged-out
+  // or account-switched QueryClient (fresh pending/rejected) from reusing a
+  // previous account's private blob: URL without coupling to logout code.
+  if (
+    blobUrl &&
+    resignAttachmentId &&
+    isAuthenticated &&
+    blobUrlCache.get(resignAttachmentId) === blobUrl
+  ) {
+    return { url: blobUrl, pending: false };
+  }
+  if (blobUrl && !resignAttachmentId && isAuthenticated) {
+    return { url: blobUrl, pending: false };
+  }
+  // Still upgrading while the metadata is in flight, and — for a caller that
+  // renders the bytes — while they are. A failure at either step ends the
+  // wait on the picked URL.
+  const pending = !freshFailed && (!fresh || (blobFallback && !blobFailed));
+  return { url: pickedUrl, pending };
 }
 
-// useObjectURL turns a Blob into a `blob:` URL for the lifetime of the calling
-// component, revoking it on unmount / replacement so the bytes are released
-// once nothing renders them. Returns "" while there is no blob (and during
-// SSR, where createObjectURL does not exist).
-function useObjectURL(blob: Blob | undefined): string {
-  const [url, setUrl] = useState("");
+// useObjectURL turns a Blob into a `blob:` URL. The module cache keeps the
+// URL stable across remounts so a re-entry with a cached blob does not flash
+// the fallback pickedUrl for one frame (see #7741). Refcount + delayed GC
+// ensures bytes are released 5 min after last unmount (matching
+// INLINE_BLOB_GC_MS) without leaking until renderer exit.
+function useObjectURL(
+  id: string | undefined,
+  blob: Blob | undefined,
+  isAuthenticated: boolean,
+): string {
+  const [, bump] = useState(0);
+
+  // Refcount: cancel pending GC on re-enter, schedule revoke+delete after
+  // INLINE_BLOB_GC_MS when last consumer unmounts. Only participate when the
+  // current QueryClient has authenticated metadata — otherwise a logged-out
+  // client would cancel the previous account's GC and extend the lifetime of
+  // private bytes.
   useEffect(() => {
-    if (!blob || typeof URL.createObjectURL !== "function") {
-      setUrl("");
+    if (!id || !isAuthenticated) return;
+    const pending = blobUrlGCTimers.get(id);
+    if (pending) {
+      clearTimeout(pending);
+      blobUrlGCTimers.delete(id);
+    }
+    blobUrlRefCount.set(id, (blobUrlRefCount.get(id) ?? 0) + 1);
+    return () => {
+      const cur = blobUrlRefCount.get(id) ?? 1;
+      const next = cur - 1;
+      if (next <= 0) {
+        blobUrlRefCount.delete(id);
+        const t = setTimeout(() => {
+          const cached = blobUrlCache.get(id);
+          if (cached) {
+            try {
+              URL.revokeObjectURL(cached);
+            } catch (_err) {
+              void _err;
+            }
+            blobUrlCache.delete(id);
+          }
+          blobUrlGCTimers.delete(id);
+        }, INLINE_BLOB_GC_MS);
+        if (typeof (t as unknown as { unref?: () => void }).unref === "function") {
+          (t as unknown as { unref: () => void }).unref();
+        }
+        blobUrlGCTimers.set(id, t);
+      } else {
+        blobUrlRefCount.set(id, next);
+      }
+    };
+  }, [id, isAuthenticated]);
+
+  useEffect(() => {
+    if (!blob || !id || !isAuthenticated || typeof URL.createObjectURL !== "function") return;
+    if (blobUrlCache.has(id)) {
+      bump((v) => v + 1);
       return;
     }
     const next = URL.createObjectURL(blob);
-    setUrl(next);
-    return () => {
-      URL.revokeObjectURL(next);
-    };
-  }, [blob]);
-  return url;
+    blobUrlCache.set(id, next);
+    bump((v) => v + 1);
+  }, [blob, id, isAuthenticated]);
+
+  if (isAuthenticated && id && blobUrlCache.has(id)) return blobUrlCache.get(id)!;
+  return "";
 }
 
 // isObjectURL flags a src that only resolves inside this renderer session —

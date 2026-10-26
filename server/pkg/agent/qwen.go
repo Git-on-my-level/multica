@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
 // qwenBackend drives Qwen Code's native non-interactive JSONL protocol:
-// qwen -p <prompt> --output-format stream-json. The event schema is based on
-// Qwen Code 0.20.0 captures in testdata/qwen-code-0.20.0-stream-json.jsonl.
+// qwen --output-format stream-json, prompt on stdin. The event schema is based
+// on Qwen Code 0.20.0 captures in testdata/qwen-code-0.20.0-stream-json.jsonl.
 type qwenBackend struct {
 	cfg Config
 }
@@ -45,8 +47,20 @@ var qwenBlockedArgs = map[string]blockedArgMode{
 	"--core-tools":         blockedWithValue,
 }
 
-func buildQwenArgs(prompt string, opts ExecOptions, logger *slog.Logger) []string {
-	args := []string{"-p", prompt, "--output-format", "stream-json"}
+// buildQwenArgs assembles the argv for a one-shot qwen invocation.
+//
+// The prompt is deliberately NOT part of argv. Qwen Code's headless mode
+// reads a non-interactive prompt from stdin when none is given via -p, and
+// putting the (arbitrarily large, user-influenced) prompt text on the command
+// line is not safe on Windows: even after routing qwen.cmd through
+// qwen.ps1 directly (qwen_invocation_windows.go), PowerShell's own argument
+// re-serialisation does not survive a value containing embedded double quotes
+// — the same class of failure cursor-agent hit before it moved its prompt to
+// stdin (#5649). This is that fix's qwen equivalent (#6082). Only fixed,
+// content-free flags remain in argv; --mcp-config's payload also goes through
+// a temp file for the same reason, not inline JSON.
+func buildQwenArgs(opts ExecOptions, logger *slog.Logger) []string {
+	args := []string{"--output-format", "stream-json"}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
 	}
@@ -64,16 +78,17 @@ func buildQwenArgs(prompt string, opts ExecOptions, logger *slog.Logger) []strin
 }
 
 func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
-	execPath := b.cfg.ExecutablePath
-	if execPath == "" {
-		execPath = "qwen"
+	execName := b.cfg.ExecutablePath
+	if execName == "" {
+		execName = "qwen"
 	}
-	if _, err := exec.LookPath(execPath); err != nil {
-		return nil, fmt.Errorf("qwen executable not found at %q: %w", execPath, err)
+	lookedUp, err := exec.LookPath(execName)
+	if err != nil {
+		return nil, fmt.Errorf("qwen executable not found at %q: %w", execName, err)
 	}
 	timeout := opts.Timeout
 	runCtx, cancel := runContext(ctx, timeout)
-	args := buildQwenArgs(prompt, opts, b.cfg.Logger)
+	args := buildQwenArgs(opts, b.cfg.Logger)
 
 	// Qwen Code 0.20.0 accepts a JSON string or a file path through
 	// --mcp-config. Materialise a managed config into a 0600 temp file so it
@@ -96,9 +111,8 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			mcpFileCleanup()
 		}
 	}()
-	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
+	cmd, _, _ := b.cfg.commandAt(execName).execVia(runCtx, chooseQwenInvocation, lookedUp, args, b.cfg.Logger)
 	hideAgentWindow(cmd)
-	// args contain the task prompt; the shared logger preserves only flag names.
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
@@ -111,15 +125,36 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		cancel()
 		return nil, fmt.Errorf("qwen stdout pipe: %w", err)
 	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("qwen stdin pipe: %w", err)
+	}
+	var closeStdinOnce sync.Once
+	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
 	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[qwen:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
+		closeStdin()
 		cancel()
 		return nil, fmt.Errorf("start qwen: %w", err)
 	}
 	// cmd.Start succeeded; result goroutine now owns cleanup.
 	mcpFileCleanup = nil
 	b.cfg.Logger.Info("qwen started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+
+	// The prompt is delivered on stdin (see buildQwenArgs). Write it from its
+	// own goroutine so it cannot deadlock against the stdout reader below: a
+	// prompt larger than the OS pipe buffer blocks mid-write until the child
+	// drains it, and the child cannot drain while we are not yet reading its
+	// stdout. Closing stdin is what signals end-of-prompt — qwen reads to
+	// EOF — so we always close, on both the success and error paths.
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(stdin, prompt)
+		closeStdin()
+		writeErrCh <- err
+	}()
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -132,9 +167,13 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		started := time.Now()
-		state := qwenStreamState{model: opts.Model, usage: make(map[string]TokenUsage)}
+		state := qwenStreamState{model: opts.Model, usage: make(map[string]TokenUsage), resumed: opts.ResumeSessionID != ""}
 		go func() {
 			<-runCtx.Done()
+			// Closing stdin releases a prompt write still blocked on a full pipe
+			// (e.g. the child died before draining it), so that goroutine cannot
+			// leak.
+			closeStdin()
 			_ = stdout.Close()
 		}()
 
@@ -158,9 +197,15 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			_ = stdout.Close()
 		}
 		exitErr := cmd.Wait()
+		releaseProcessGroup(cmd)
 		duration := time.Since(started)
 
-		status, output, errMsg := finalizeStreamResult("qwen", timeout, runCtx.Err(), nil, exitErr, state.sessionID, streamTerminalState{
+		// Wait has already closed the stdin pipe, so a prompt write still
+		// blocked on a full pipe has returned by now; the writer sends exactly
+		// once.
+		writeErr := <-writeErrCh
+
+		status, output, errMsg := finalizeStreamResult("qwen", timeout, runCtx.Err(), writeErr, exitErr, state.sessionID, streamTerminalState{
 			lastAssistantText: state.lastAssistantText,
 			finalResultText:   state.finalResultText,
 			sawResult:         state.sawResult,
@@ -202,6 +247,7 @@ type qwenStreamEvent struct {
 }
 
 type qwenMessage struct {
+	ID      string             `json:"id,omitempty"`
 	Model   string             `json:"model,omitempty"`
 	Content []qwenContentBlock `json:"content"`
 	Usage   *qwenUsage         `json:"usage,omitempty"`
@@ -228,6 +274,11 @@ type qwenStreamState struct {
 	sessionID, model, lastAssistantText, finalResultText, lastEventType string
 	sawResult, resultIsError                                            bool
 	usage                                                               map[string]TokenUsage
+	fallbackUsage                                                       map[string]TokenUsage
+	seenUsageMessageIDs                                                 map[string]struct{}
+	anonymousUsage                                                      map[string]TokenUsage
+	hasResultUsage                                                      bool
+	resumed                                                             bool
 	eventCount, invalidEventCount, assistantEventCount, toolUseCount    int
 	unreadableAssistantCount                                            int
 }
@@ -244,7 +295,7 @@ func handleQwenEvent(event qwenStreamEvent, ch chan<- Message, state *qwenStream
 		trySend(ch, Message{Type: MessageStatus, Status: "running", SessionID: state.sessionID})
 	case "assistant":
 		state.assistantEventCount++
-		turn, model := handleQwenAssistant(event.Message, ch, state.usage)
+		turn, model := handleQwenAssistant(event.Message, ch, state)
 		if model != "" {
 			state.model = model
 		}
@@ -265,8 +316,15 @@ func handleQwenEvent(event qwenStreamEvent, ch chan<- Message, state *qwenStream
 		} else {
 			state.finalResultText = event.Result
 		}
-		if usage := qwenResultUsage(event.Usage, state.model); len(usage) > 0 {
+		// Qwen restores historical telemetry on resume, so result.usage is a
+		// session total, not this invocation's usage. Only fresh runs can use
+		// it. Resumed runs retain the deduplicated assistant-message totals;
+		// these are best effort and may omit internal calls absent from the
+		// stream. Without a run-scoped total or a baseline, the cumulative
+		// result cannot safely fill those gaps (including a result-only run).
+		if usage := qwenResultUsage(event.Usage, state.model); !state.resumed && len(usage) > 0 {
 			state.usage = usage
+			state.hasResultUsage = true
 		}
 	case "error":
 		// Be fail-closed if a later Qwen release emits a terminal error event.
@@ -276,7 +334,7 @@ func handleQwenEvent(event qwenStreamEvent, ch chan<- Message, state *qwenStream
 	}
 }
 
-func handleQwenAssistant(raw json.RawMessage, ch chan<- Message, usage map[string]TokenUsage) (assistantTurn, string) {
+func handleQwenAssistant(raw json.RawMessage, ch chan<- Message, state *qwenStreamState) (assistantTurn, string) {
 	var message qwenMessage
 	if json.Unmarshal(raw, &message) != nil {
 		// Unreadable body: understood stays false so the caller drops any
@@ -285,7 +343,7 @@ func handleQwenAssistant(raw json.RawMessage, ch chan<- Message, usage map[strin
 	}
 	turn := assistantTurn{understood: true}
 	if message.Usage != nil && message.Model != "" {
-		usage[message.Model] = qwenTokenUsage(message.Usage)
+		state.accumulateAssistantUsage(message)
 	}
 	var text strings.Builder
 	tools := 0
@@ -320,6 +378,39 @@ func handleQwenAssistant(raw json.RawMessage, ch chan<- Message, usage map[strin
 	return turn, message.Model
 }
 
+func (s *qwenStreamState) accumulateAssistantUsage(message qwenMessage) {
+	if s.fallbackUsage == nil {
+		s.fallbackUsage = make(map[string]TokenUsage)
+		s.seenUsageMessageIDs = make(map[string]struct{})
+		s.anonymousUsage = make(map[string]TokenUsage)
+	}
+	current := qwenTokenUsage(message.Usage)
+	var previous TokenUsage
+	if message.ID != "" {
+		// Qwen emits full assistant messages at finalization. Count the first
+		// non-empty snapshot once by ID, keeping its counters and model together.
+		if current.InputTokens == 0 && current.OutputTokens == 0 && current.CacheReadTokens == 0 {
+			return
+		}
+		if _, seen := s.seenUsageMessageIDs[message.ID]; seen {
+			return
+		}
+		s.seenUsageMessageIDs[message.ID] = struct{}{}
+	} else {
+		// Without an ID, preserve the existing latest-per-model best effort.
+		previous = s.anonymousUsage[message.Model]
+		s.anonymousUsage[message.Model] = current
+	}
+	total := s.fallbackUsage[message.Model]
+	total.InputTokens += current.InputTokens - previous.InputTokens
+	total.OutputTokens += current.OutputTokens - previous.OutputTokens
+	total.CacheReadTokens += current.CacheReadTokens - previous.CacheReadTokens
+	s.fallbackUsage[message.Model] = total
+	if !s.hasResultUsage {
+		s.usage = s.fallbackUsage
+	}
+}
+
 func handleQwenUser(raw json.RawMessage, ch chan<- Message) {
 	var message qwenMessage
 	if json.Unmarshal(raw, &message) != nil {
@@ -333,7 +424,13 @@ func handleQwenUser(raw json.RawMessage, ch chan<- Message) {
 }
 
 func qwenTokenUsage(usage *qwenUsage) TokenUsage {
-	return TokenUsage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CacheReadTokens: usage.CacheReadInputTokens}
+	// Qwen includes cache reads in input_tokens on both assistant and result
+	// messages. Keep the shared input and cache buckets mutually exclusive.
+	return TokenUsage{
+		InputTokens:     max(0, usage.InputTokens-usage.CacheReadInputTokens),
+		OutputTokens:    usage.OutputTokens,
+		CacheReadTokens: usage.CacheReadInputTokens,
+	}
 }
 
 func qwenResultUsage(usage *qwenUsage, model string) map[string]TokenUsage {

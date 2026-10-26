@@ -1,7 +1,7 @@
 // Package agent provides a unified interface for executing prompts via
 // coding agents (Claude Code, CodeBuddy, Codex, Copilot, OpenCode, DevEco Code,
 // OpenClaw, Hermes, Pi, Oh-My-Pi, Cursor, Kimi, Reasonix, Kiro, Antigravity, Qoder,
-// Trae, Grok, Qwen Code, QwenPaw, MiniMax Code). It
+// Trae, Grok, Qwen Code, QwenPaw, MiniMax Code, Meta Muse Code). It
 // mirrors the happy-cli AgentBackend pattern, translated to idiomatic Go.
 package agent
 
@@ -24,8 +24,11 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
-	Cwd   string
-	Model string
+	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server
+	// capability handshake enabled additional messages.
+	EnableTaskSupplement bool
+	Cwd                  string
+	Model                string
 	// SystemPrompt carries the Multica runtime brief for the few providers
 	// that cannot pick it up from disk. The daemon leaves it empty for every
 	// other provider (see daemon.providerNeedsInlineSystemPrompt), because the
@@ -56,10 +59,21 @@ type ExecOptions struct {
 	// tool continues to use the separate tool watchdog budget.
 	IdleWatchdogTimeout time.Duration
 	// HandshakeTimeout bounds startup RPCs for providers with a long-lived
-	// protocol transport. It is currently consumed by Codex app-server;
+	// protocol transport, including Codex app-server and Claude SDK hooks;
 	// zero uses the provider default rather than disabling the bound.
 	HandshakeTimeout time.Duration
-	ResumeSessionID  string // if non-empty, resume a previous agent session
+	// TurnInterruptTimeout bounds how long the Codex backend waits for the
+	// app-server to acknowledge turn/interrupt and emit turn/completed after a
+	// task is cancelled. Zero uses the provider default. A positive override is
+	// useful on slower hosts without coupling cancellation cleanup to the much
+	// longer execution or handshake budgets.
+	TurnInterruptTimeout time.Duration
+	// ThreadHandshakeTimeout optionally gives Codex's heavier thread/start and
+	// thread/resume RPCs a wider budget than initialize and turn/start. Zero
+	// preserves the legacy behavior for callers that explicitly set
+	// HandshakeTimeout; when both are zero Codex uses separate built-in defaults.
+	ThreadHandshakeTimeout time.Duration
+	ResumeSessionID        string // if non-empty, resume a previous agent session
 	// ResumeExpected records that this task intended to continue a prior
 	// conversation, independent of ResumeSessionID (which a fallback retry may
 	// clear). When it is true but the backend ends up on a fresh thread — the
@@ -100,7 +114,8 @@ type ExecOptions struct {
 	// incrementally without breaking unrelated agents).
 	ThinkingLevel string
 	// ServiceTier is a runtime-native Codex execution tier (for example
-	// "priority", displayed as Fast). Empty means inherit local Codex config.
+	// "priority", displayed as Fast). "default" explicitly selects standard
+	// routing; empty means inherit local Codex config.
 	// Other providers ignore this field.
 	ServiceTier string
 	// OpenclawMode chooses between local (embedded) and gateway routing for
@@ -118,6 +133,14 @@ type ExecOptions struct {
 	// through Claude Code's --settings flag. It currently carries restrictive
 	// runtime-skill overrides only; other providers ignore it.
 	ClaudeSettingsPath string
+	// CursorHookCommand is the argv of the multica hook relay (the daemon's own
+	// binary followed by CursorHookHelperArg). The cursor backend needs it, with
+	// EnableTaskSupplement, to accept additional messages; other providers
+	// ignore it.
+	CursorHookCommand []string
+	// piMcpExtensionPath is set by piBackend.Execute after it writes the
+	// temporary MCP extension. The daemon does not fill it.
+	piMcpExtensionPath string
 }
 
 // runContext derives the execution context for an agent subprocess from the
@@ -135,6 +158,47 @@ func runContext(ctx context.Context, timeout time.Duration) (context.Context, co
 
 // Session represents a running agent execution.
 type Session struct {
+	// Supplement delivers an additional human instruction to the currently
+	// active provider turn. Nil means the backend cannot safely do so.
+	// Adapters bound their own transport calls; a hook-based adapter may wait
+	// for the next provider boundary until ctx or the execution is cancelled.
+	Supplement func(context.Context, string) error
+	// SupplementReady reports whether Supplement currently targets a live,
+	// provider-confirmed turn. The daemon must not claim durable input before
+	// this becomes true: claiming during provider initialization would convert
+	// a transient startup window into a user-visible delivery failure. Nil is
+	// fail-closed and means no run-scoped input may be claimed.
+	SupplementReady func() bool
+	// ToolActivity optionally reports backend-owned tool accounting and its last
+	// transition time, independent of the best-effort transcript. Nil uses the
+	// daemon's message-based accounting. The timestamp gives completed tools a
+	// fresh idle budget even when their transcript message has not drained yet.
+	// The timestamp is an awakeclock reading (see package awakeclock), the same
+	// clock the idle watchdog measures, so host sleep never counts as silence.
+	ToolActivity func() (int32, time.Duration)
+	// InterruptBackgroundTools stops owned background tools at the daemon's
+	// tool watchdog boundary without cancelling the agent. True means at least
+	// one tool completed/was stopped and released from accounting; the watchdog
+	// gives the agent a fresh budget to report its authoritative result.
+	// Implementations must be concurrency-safe and return false after cleanup.
+	//
+	// This is reached only at the tool budget, so a zero tool budget never calls
+	// it: work that is genuinely in flight is what that setting declines to
+	// force-stop. The daemon's AgentToolWatchdog documentation states the
+	// operator-facing consequence.
+	InterruptBackgroundTools func() bool
+	// TerminalObserved reports whether the backend has already read its
+	// authoritative terminal result. Once true the run's outcome is decided and
+	// no liveness policy may reclassify it, however long the backend then takes
+	// to finish cleaning up. Backends must publish this before any cleanup that
+	// can block or fail, otherwise a completed run can still be re-tagged as a
+	// hang. Nil means the backend offers no such boundary.
+	//
+	// It must also be published before the backend sends on Result. The daemon
+	// reads it only after a result is in hand, so that ordering is what makes
+	// the read reliable instead of a race: delivering the result establishes
+	// the happens-before, and no flag read has to win a timing window.
+	TerminalObserved func() bool
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).
 	Messages <-chan Message
@@ -169,6 +233,10 @@ type Message struct {
 }
 
 // TokenUsage tracks token consumption for a single model.
+// Its four token counts are mutually exclusive: InputTokens excludes cache
+// reads and writes, and OutputTokens includes reasoning/thinking.
+// Breakdowns already included in a total must not be added to that total again.
+// Zero counters alone do not establish that the provider reported complete usage.
 type TokenUsage struct {
 	InputTokens      int64
 	OutputTokens     int64
@@ -200,7 +268,7 @@ type Result struct {
 	SessionID  string
 	Usage      map[string]TokenUsage // keyed by model name
 	// ResumeRejected is positive evidence that this run's requested resume
-	// was itself refused — the transcript is gone, the session belongs to
+	// was permanently refused — the transcript is gone, the session belongs to
 	// another provider account, OR the session still exists but its history
 	// can no longer be replayed to the provider (e.g. GH #5975: a stored
 	// image now exceeds the provider's max dimensions, so every resumed
@@ -229,6 +297,12 @@ type Result struct {
 	// shouldRetryWithFreshSession, where "was this run a resume?" is already
 	// known. Do not encode it here.
 	ResumeRejected bool
+	// ResumeRejectedTransient is positive evidence that this run's requested
+	// resume cannot proceed right now, but the session itself remains healthy.
+	// The daemon may use a fresh session for this turn, but must not retire the
+	// requested session from future lookups. Backends must not set this together
+	// with ResumeRejected; the latter means the session is permanently unusable.
+	ResumeRejectedTransient bool
 	// codexInitializeRetrySafe is provider-internal evidence that an
 	// initialize timeout happened before semantic activity and after the
 	// process tree was reaped. It is intentionally not part of the public
@@ -243,8 +317,8 @@ type Result struct {
 
 // Config configures a Backend instance.
 type Config struct {
-	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim)
-	CLIVersion     string            // detected version paired with ExecutablePath; observation only, never used to choose behavior
+	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, codearts, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, muse, dim, zeroclaw)
+	CLIVersion     string            // detected version paired with ExecutablePath; vendor-specific usage semantics also require BuiltinRuntime
 	Env            map[string]string // extra environment variables
 	Logger         *slog.Logger
 	TaskID         string
@@ -278,7 +352,7 @@ type Config struct {
 }
 
 // New creates a Backend for the given agent type.
-// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode".
+// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "codearts", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode", "muse".
 //
 // SupportedTypes is the canonical whitelist of agent types eligible to back a
 // custom runtime profile. It MUST stay in lockstep with the
@@ -286,10 +360,10 @@ type Config struct {
 // migration 134 to add qoder, migration 136 to add traecli, migration 175 to
 // add deveco, migration 179 to add grok, migration 202 to add qwen,
 // migration 242 to add qoderclicn, migration 253 to add qwenpaw,
-// migration 254 to add reasonix, migration 313 to add dsh, migration 327 to
-// add mcode): a
-// custom runtime profile may only
-// be based on a backend Multica officially supports.
+// migration 254 to add reasonix, migration 313 to add dsh, migration 342 to
+// add mcode, migration 370 to add dim, migration 403 to add zeroclaw, and
+// migration 441 to add codearts): a custom runtime profile may
+// only be based on a backend Multica officially supports.
 // qoder and qoderclicn share the same ACP backend; keeping both provider keys
 // lets the daemon auto-detect and register the international and China-region
 // binaries independently. traecli (Trae) has a New backend, launch
@@ -303,6 +377,7 @@ var SupportedTypes = []string{
 	"codex",
 	"copilot",
 	"opencode",
+	"codearts",
 	"deveco",
 	"openclaw",
 	"hermes",
@@ -320,8 +395,10 @@ var SupportedTypes = []string{
 	"qwen",
 	"qwenpaw",
 	"mcode",
+	"muse",
 	"dim",
 	"devin",
+	"zeroclaw",
 }
 
 // IsSupportedType reports whether agentType is in the SupportedTypes whitelist.
@@ -353,6 +430,7 @@ var resumeRejectionUndetectable = map[string]bool{
 	"cursor":      true,
 	"deveco":      true,
 	"opencode":    true,
+	"codearts":    true,
 }
 
 // ResumeRejectionUndetectable reports whether agentType is a backend that
@@ -388,6 +466,8 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &copilotBackend{cfg: cfg}, nil
 	case "opencode":
 		return &opencodeBackend{cfg: cfg}, nil
+	case "codearts":
+		return newCodeArtsBackend(cfg)
 	case "deveco":
 		return &devecoBackend{cfg: cfg}, nil
 	case "openclaw":
@@ -424,6 +504,10 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &mcodeBackend{cfg: cfg}, nil
 	case "devin":
 		return &devinBackend{cfg: cfg}, nil
+	case "muse":
+		return &museBackend{cfg: cfg}, nil
+	case "zeroclaw":
+		return &zeroclawBackend{cfg: cfg}, nil
 	default:
 		return nil, fmt.Errorf("unknown agent type: %q (supported: %s)", agentType, strings.Join(SupportedTypes, ", "))
 	}
@@ -452,6 +536,7 @@ var launchHeaders = map[string]string{
 	"codex":       "codex app-server",
 	"copilot":     "copilot (json)",
 	"cursor":      "cursor-agent (stream-json)",
+	"codearts":    "codearts run (json)",
 	"deveco":      "deveco run (json)",
 	"hermes":      "hermes acp",
 	"kimi":        "kimi acp",
@@ -470,6 +555,8 @@ var launchHeaders = map[string]string{
 	"dim":         "dim acp",
 	"devin":       "devin acp",
 	"mcode":       "mcode acp",
+	"muse":        "muse serve (msp)",
+	"zeroclaw":    "zeroclaw acp",
 }
 
 // LaunchHeader returns the user-visible launch skeleton for agentType, or an
