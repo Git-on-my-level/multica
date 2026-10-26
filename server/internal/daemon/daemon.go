@@ -7831,6 +7831,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		WorkspaceContext:                 task.WorkspaceContext,
 		IssueStatuses:                    convertIssueStatusesForEnv(task.IssueStatuses),
 		IssueStatusesOmitted:             task.IssueStatusesOmitted,
+		HasProjectWorkflow:               taskHasProjectWorkflow(task),
 		ConnectedApps:                    task.ConnectedApps,
 	}
 
@@ -8008,8 +8009,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// task dispatch.
 	var openclawMode string
 	var openclawGateway execenv.OpenclawGatewayPin
+	var openclawModelOverride string
 	if task.Agent != nil && provider == "openclaw" {
 		openclawMode, openclawGateway = decodeOpenclawRuntimeConfig(task.Agent.RuntimeConfig, d.logger)
+		// Use the server's claim-time snapshot of the agent's persistent model
+		// override throughout preparation and execution.
+		openclawModelOverride = strings.TrimSpace(task.ModelOverride)
 	}
 	var agentEnvOverrides map[string]string
 	var agentCustomArgs []string
@@ -8780,6 +8785,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		ThinkingLevel:          thinkingLevel,
 		ServiceTier:            serviceTier,
 		OpenclawMode:           openclawMode,
+		OpenclawModelOverride:  openclawModelOverride,
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
 	}

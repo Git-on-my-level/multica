@@ -300,6 +300,23 @@ func preserveMaskedGatewayToken(incoming any, persistedRuntimeConfig []byte) {
 	gw["token"] = prev.Gateway.Token
 }
 
+// openclawModelOverride reads the agent's persistent underlying-model override
+// from runtime_config. Every claim snapshots the current setting until it is
+// changed or cleared. Absent, malformed, or whitespace-only values return "".
+func openclawModelOverride(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var rc struct {
+		ModelOverride string `json:"model_override"`
+	}
+	if err := json.Unmarshal(trimmed, &rc); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(rc.ModelOverride)
+}
+
 // RepoData holds repository information included in claim responses so the
 // daemon can set up worktrees for each workspace repo.
 type RepoData struct {
@@ -435,6 +452,11 @@ type AgentTaskResponse struct {
 	CreatedAt          string                   `json:"created_at"`
 	PriorSessionID     string                   `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
 	PriorWorkDir       string                   `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+	// ModelOverride snapshots the agent's persistent OpenClaw model override at
+	// claim time. Later config edits affect subsequent claims, not this payload.
+	// Mirrors internal/daemon/types.go with the same JSON name; empty for other
+	// providers.
+	ModelOverride string `json:"model_override,omitempty"`
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if
 	// any) is then an older fallback, and the daemon surfaces the continuity gap

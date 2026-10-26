@@ -129,6 +129,12 @@ type ExecOptions struct {
 	// ignore this field, mirroring ThinkingLevel's renderer-side fall-through
 	// pattern. See issue #3260.
 	OpenclawMode string
+	// OpenclawModelOverride is the claim-time snapshot of the agent's persistent
+	// underlying-model override. The setting applies to all newly claimed runs
+	// until changed or cleared. OpenClaw receives it as `--model <id>` alongside
+	// `--agent <id>`, preserving the identity, workspace, sessions, and memory
+	// selected by Model. Other backends ignore this field.
+	OpenclawModelOverride string
 	// ClaudeSettingsPath is a daemon-owned, task-local settings file passed
 	// through Claude Code's --settings flag. It currently carries restrictive
 	// runtime-skill overrides only; other providers ignore it.
