@@ -16,6 +16,10 @@ import (
 
 // Replays the reported Devin CLI v3000.10.21 wire contract without account access.
 const fakeDevinContractScript = `#!/bin/sh
+if [ "$1" = models ]; then
+  printf '%s\n' "${DEVIN_TEST_CATALOG:-null}"
+  exit 0
+fi
 while IFS= read -r line; do
   if [ -n "$DEVIN_REQUESTS_FILE" ]; then printf '%s\n' "$line" >> "$DEVIN_REQUESTS_FILE"; fi
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -27,10 +31,13 @@ while IFS= read -r line; do
   fi
   case "$method" in
     initialize)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"affogato","version":"0.0.0-dev"},"agentCapabilities":{"loadSession":%s,"mcpCapabilities":{"http":false,"sse":false}}}}\n' "$id" "${DEVIN_TEST_LOAD_SUPPORTED:-true}"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"affogato","version":"0.0.0-dev"},"agentCapabilities":{"loadSession":%s,"mcpCapabilities":{"http":false,"sse":false}},"authMethods":%s}}\n' "$id" "${DEVIN_TEST_LOAD_SUPPORTED:-true}" "${DEVIN_TEST_AUTH_METHODS:-[]}"
+      ;;
+    authenticate)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     session/new|session/load|session/set_config_option)
-      model=default-model
+      model=${DEVIN_TEST_INITIAL_MODEL:-default-model}
       if [ "$method" = session/set_config_option ] && [ "$DEVIN_TEST_APPLY_MODEL" = 1 ]; then model=selected-model; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"devin-session","configOptions":[{"id":"model","category":"model","name":"Model","type":"select","currentValue":"%s","options":[{"value":"default-model","name":"Default"},{"value":"selected-model","name":"Selected"}]}]}}\n' "$id" "$model"
       ;;
@@ -43,6 +50,83 @@ while IFS= read -r line; do
 done
 if [ "$DEVIN_TEST_IGNORE_EOF" = 1 ]; then while true; do sleep 1; done; fi
 `
+
+func TestDevinStoredCredentialsDoNotRequireAuthenticate(t *testing.T) {
+	for _, method := range []string{"windsurf-api-key", "future-auth", "cached-login", "devin-browser"} {
+		t.Run(method, func(t *testing.T) {
+			result, _, requests := runDevinContract(t, ExecOptions{}, map[string]string{
+				"WINDSURF_API_KEY": "", "DEVIN_TEST_AUTH_METHODS": fmt.Sprintf(`[{"id":%q}]`, method),
+			})
+			if result.Status != "completed" || strings.Contains(requests, `"method":"authenticate"`) {
+				t.Fatalf("stored credential path was intercepted: result=%+v requests=%s", result, requests)
+			}
+		})
+	}
+}
+
+func TestDevinExplicitKeyAuthenticatesOnlyWhenAdvertised(t *testing.T) {
+	for _, method := range []string{"windsurf-api-key", "future-auth"} {
+		t.Run(method, func(t *testing.T) {
+			result, _, requests := runDevinContract(t, ExecOptions{}, map[string]string{
+				"WINDSURF_API_KEY": "fixture-key", "DEVIN_TEST_AUTH_METHODS": fmt.Sprintf(`[{"id":%q}]`, method),
+			})
+			if result.Status != "completed" || strings.Contains(requests, `"method":"authenticate"`) != (method == "windsurf-api-key") {
+				t.Fatalf("unexpected auth selection: result=%+v requests=%s", result, requests)
+			}
+			if strings.Contains(requests, "fixture-key") {
+				t.Fatal("API key was copied into the RPC transcript")
+			}
+		})
+	}
+}
+
+func TestDevinMissingCredentialsSurfaceSessionError(t *testing.T) {
+	result, _, requests := runDevinContract(t, ExecOptions{}, map[string]string{
+		"WINDSURF_API_KEY": "", "DEVIN_TEST_AUTH_METHODS": `[{"id":"windsurf-api-key"}]`,
+		"DEVIN_TEST_FAIL_RPC": "session/new", "DEVIN_TEST_ERROR_MESSAGE": "Authentication required: run devin auth login",
+	})
+	if result.Status != "failed" || result.ResumeRejected || result.SessionID != "" ||
+		!strings.Contains(result.Error, "run devin auth login") || strings.Contains(requests, `"method":"session/prompt"`) {
+		t.Fatalf("real session auth error was lost: result=%+v requests=%s", result, requests)
+	}
+}
+
+func TestDevinAliasResolvedByCLIUsesCanonicalUsage(t *testing.T) {
+	// The launch flag is `opus`, but ACP returns a canonical value, not the flag.
+	result, _, requests := runDevinContract(t, ExecOptions{Model: "opus"}, map[string]string{
+		"DEVIN_TEST_INITIAL_MODEL": "selected-model",
+		"DEVIN_TEST_CATALOG":       `{"families":[{"slug":"claude-opus-5","aliases":["opus"],"variants":[{"model_uid":"selected-model"}]}]}`,
+	})
+	if result.Status != "completed" || result.Usage["selected-model"].InputTokens != 7 ||
+		strings.Contains(requests, `"method":"session/set_config_option"`) {
+		t.Fatalf("resolved alias was rejected or misattributed: result=%+v requests=%s", result, requests)
+	}
+}
+
+func TestDevinResumedAliasMustBeAppliedBeforePrompt(t *testing.T) {
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("applied=%v", applied), func(t *testing.T) {
+			env := map[string]string{
+				"DEVIN_TEST_CATALOG": `{"families":[{"slug":"claude-opus-5","aliases":["opus"],"variants":[{"model_uid":"selected-model"}]}]}`,
+			}
+			if applied {
+				env["DEVIN_TEST_APPLY_MODEL"] = "1"
+			}
+			result, _, requests := runDevinContract(t, ExecOptions{Model: "opus", ResumeSessionID: "old-session"}, env)
+			if strings.Contains(requests, `"method":"session/prompt"`) != applied ||
+				!strings.Contains(requests, `"value":"selected-model"`) {
+				t.Fatalf("alias was not applied canonically: result=%+v requests=%s", result, requests)
+			}
+			if applied {
+				if result.Status != "completed" || result.Usage["selected-model"].InputTokens != 7 {
+					t.Fatalf("alias usage was not canonical: %+v", result)
+				}
+			} else if result.Status != "failed" || result.ResumeRejected || len(result.Usage) != 0 {
+				t.Fatalf("silent model fallback was accepted: %+v", result)
+			}
+		})
+	}
+}
 
 func runDevinContract(t *testing.T, opts ExecOptions, env map[string]string) (Result, []Message, string) {
 	t.Helper()
@@ -209,7 +293,7 @@ func TestDevinGroupedModelOptions(t *testing.T) {
 	actual, err := confirmDevinModel(context.Background(), func(_ context.Context, method string, params any) (json.RawMessage, error) {
 		requested = method == "session/set_config_option" && params.(map[string]any)["value"] == "b"
 		return json.RawMessage(`{"configOptions":[{"id":"model","category":"model","currentValue":"b"}]}`), nil
-	}, "session", "b", raw)
+	}, "session", "b", raw, nil)
 	if err != nil || actual != "b" || !requested {
 		t.Fatalf("grouped choice was not applied: model=%q err=%v", actual, err)
 	}

@@ -19,7 +19,12 @@ func TestDevinLocalSkillRoots(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			primary, legacy := devinLocalSkillRoots(home, tc.goos, tc.xdg, tc.appData)
-			if primary != filepath.Join(tc.want, "devin", "skills") || !reflect.DeepEqual(legacy, []string{filepath.Join(tc.want, "cognition", "skills")}) {
+			if primary != filepath.Join(tc.want, "devin", "skills") || !reflect.DeepEqual(legacy, []string{
+				filepath.Join(tc.want, "cognition", "skills"),
+				filepath.Join(home, ".codeium", "windsurf", "skills"),
+				filepath.Join(home, ".codeium", "windsurf-next", "skills"),
+				filepath.Join(home, ".codeium", "windsurf-insiders", "skills"),
+			}) {
 				t.Fatalf("roots = %q %q", primary, legacy)
 			}
 		})
@@ -32,17 +37,22 @@ func TestDevinLocalSkillsMergeAndImportPrecedence(t *testing.T) {
 	configDir := filepath.Join(home, "config")
 	t.Setenv("XDG_CONFIG_HOME", configDir)
 	t.Setenv("APPDATA", configDir)
-	roots := []string{filepath.Join(configDir, "devin", "skills"), filepath.Join(configDir, "cognition", "skills"), filepath.Join(home, ".agents", "skills")}
-	names := []string{"Devin Copy", "Cognition Copy", "Universal Copy"}
+	roots := []string{
+		filepath.Join(configDir, "devin", "skills"), filepath.Join(configDir, "cognition", "skills"),
+		filepath.Join(home, ".codeium", "windsurf", "skills"), filepath.Join(home, ".codeium", "windsurf-next", "skills"),
+		filepath.Join(home, ".codeium", "windsurf-insiders", "skills"), filepath.Join(home, ".agents", "skills"),
+	}
+	names := []string{"Devin Copy", "Cognition Copy", "Windsurf Copy", "Next Copy", "Insiders Copy", "Universal Copy"}
+	keys := []string{"devin-only", "legacy-only", "windsurf-only", "next-only", "insiders-only", "universal-only"}
 	for i, root := range roots {
 		writeTestLocalSkill(t, root, "duplicate", map[string]string{"SKILL.md": "---\nname: " + names[i] + "\n---\n"})
-		writeTestLocalSkill(t, root, []string{"devin-only", "legacy-only", "universal-only"}[i], map[string]string{"SKILL.md": "---\nname: Unique\n---\n"})
+		writeTestLocalSkill(t, root, keys[i], map[string]string{"SKILL.md": "---\nname: Unique\n---\n"})
 	}
 	skills, supported, err := listRuntimeLocalSkills("devin")
-	if err != nil || !supported || len(skills) != 4 {
+	if err != nil || !supported || len(skills) != len(roots)+1 {
 		t.Fatalf("list = %+v supported=%v err=%v", skills, supported, err)
 	}
-	for _, key := range []string{"duplicate", "legacy-only", "universal-only"} {
+	for _, key := range append([]string{"duplicate"}, keys...) {
 		bundle, supported, err := loadRuntimeLocalSkillBundle("devin", key)
 		if err != nil || !supported {
 			t.Fatalf("import %s: supported=%v err=%v", key, supported, err)

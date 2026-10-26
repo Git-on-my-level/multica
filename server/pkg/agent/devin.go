@@ -8,7 +8,6 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,14 +228,9 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		// unsupported transport tanks the whole session/new.
 		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "devin", b.cfg)
 
-		// Browser authentication cannot run headlessly; standalone Devin uses
-		// stored CLI credentials unless a supported noninteractive method is offered.
-		if methodID, authErr := selectDevinAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(cmd.Env, "WINDSURF_API_KEY")); authErr != nil {
-			finalStatus = "failed"
-			finalError = fmt.Sprintf("devin authentication setup failed: %v", authErr)
-			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
-			return
-		} else if methodID != "" {
+		// ACP authentication is optional: the CLI reads the environment or its
+		// stored login. Never guess a method or preempt session/new's auth error.
+		if methodID := selectDevinAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(cmd.Env, "WINDSURF_API_KEY")); methodID != "" {
 			authParams := map[string]any{"methodId": methodID}
 			if methodID == devinAuthMethodWindsurfAPIKey {
 				authParams["_meta"] = map[string]any{"headless": true}
@@ -297,7 +291,9 @@ func (b *devinBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 
 		c.sessionID = sessionID
-		effectiveModel, err := confirmDevinModel(runCtx, c.request, sessionID, opts.Model, sessionResult)
+		effectiveModel, err := confirmDevinModel(runCtx, c.request, sessionID, opts.Model, sessionResult, func(ctx context.Context) ([]byte, error) {
+			return devinModelsOutput(ctx, b.cfg.commandAt(execPath), cmd.Env, cwd)
+		})
 		if err != nil {
 			finalStatus, finalError, _ = classifyACPResumeFailure(runCtx, "devin", "model selection", err, timeout, b.cfg.Logger)
 			resumeRejected = runCtx.Err() == nil && opts.ResumeSessionID != "" && devinSessionNotFound(err)
@@ -422,44 +418,17 @@ const (
 	devinAuthMethodWindsurfAPIKey = "windsurf-api-key"
 )
 
-// selectDevinAuthMethod picks an ACP authenticate method advertised by
-// initialize. Empty methods means skip (standalone `devin acp` often uses
-// local `devin auth` without an explicit handshake).
-func selectDevinAuthMethod(methods []string, haveWindsurfKey bool) (string, error) {
-	if len(methods) == 0 {
-		return "", nil
-	}
-	offered := make(map[string]bool, len(methods))
-	for _, m := range methods {
-		if m = strings.TrimSpace(m); m != "" {
-			offered[m] = true
+// Only opt into the advertised API-key handshake when its credential exists.
+// Unknown or interactive methods do not disable the CLI's stored credentials.
+func selectDevinAuthMethod(methods []string, haveWindsurfKey bool) string {
+	if haveWindsurfKey {
+		for _, method := range methods {
+			if strings.TrimSpace(method) == devinAuthMethodWindsurfAPIKey {
+				return devinAuthMethodWindsurfAPIKey
+			}
 		}
 	}
-	if haveWindsurfKey && offered[devinAuthMethodWindsurfAPIKey] {
-		return devinAuthMethodWindsurfAPIKey, nil
-	}
-	for _, candidate := range []string{"devin-cli", "cached-login", "local", "login"} {
-		if offered[candidate] {
-			return candidate, nil
-		}
-	}
-	// Standalone `devin acp` advertises interactive browser login. Multica
-	// cannot complete that from a daemon; skip the handshake and rely on
-	// stored `devin auth` / WINDSURF_API_KEY. If both browser and
-	// windsurf-api-key are advertised and no key is set, still skip — do
-	// not treat it as "windsurf-only".
-	if offered["devin-browser"] {
-		return "", nil
-	}
-	if offered[devinAuthMethodWindsurfAPIKey] {
-		return "", fmt.Errorf("devin acp advertised only windsurf-api-key; set WINDSURF_API_KEY or run `devin auth login`")
-	}
-	advertised := make([]string, 0, len(offered))
-	for method := range offered {
-		advertised = append(advertised, method)
-	}
-	sort.Strings(advertised)
-	return "", fmt.Errorf("devin acp advertised unsupported auth methods %q", advertised)
+	return ""
 }
 
 // discoverDevinModels runs `devin models list --format json`.
@@ -471,15 +440,24 @@ func discoverDevinModels(ctx context.Context, runtimeCmd Command) ([]Model, erro
 	if _, err := exec.LookPath(runtimeCmd.Path); err != nil {
 		return []Model{}, nil
 	}
+	stdout, err := devinModelsOutput(ctx, runtimeCmd, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	return parseDevinModels(stdout)
+}
+
+func devinModelsOutput(ctx context.Context, runtimeCmd Command, env []string, cwd string) ([]byte, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := runtimeCmd.exec(runCtx, "models", "list", "--format", "json")
+	cmd.Env, cmd.Dir = env, cwd
 	hideAgentWindow(cmd)
 	stdout, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil {
 		return nil, fmt.Errorf("devin model discovery: %w", err)
 	}
-	return parseDevinModels(stdout)
+	return stdout, nil
 }
 
 func parseDevinModels(data []byte) ([]Model, error) {

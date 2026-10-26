@@ -52,7 +52,11 @@ Les étapes d'installation se trouvent dans [Installer les outils de codage IA](
 
 ## Sources des modèles
 
-Devin utilise ACP en local et prend en charge les serveurs MCP stdio. HTTP/SSE ne sont transmis que si le CLI annonce leur prise en charge. Le catalogue peut inclure des modèles indisponibles pour votre compte : sélectionnez l'identifiant complet ou laissez le champ vide pour utiliser le modèle par défaut du CLI. Multica confirme le modèle avant d'envoyer le prompt et échoue si ce choix ne peut pas être confirmé.
+Devin utilise ACP en local et prend en charge les serveurs MCP stdio. HTTP/SSE ne sont transmis que si le CLI annonce leur prise en charge. L'import des skills inclut aussi `~/.codeium/<channel>/skills` (`windsurf`, `windsurf-next`, `windsurf-insiders`), après les répertoires Devin/Cognition et avant `~/.agents/skills`.
+
+Le catalogue Devin peut inclure des modèles indisponibles pour votre compte. Choisissez un identifiant complet, un nom de modèle de session ou un slug/alias de famille non ambigu (par exemple `opus`), ou laissez le champ vide pour le modèle par défaut. Multica confirme le modèle de session avant d'envoyer le prompt et refuse un repli vers une autre famille. Pour les noms ambigus, les noms partiels ou les variantes indisponibles, utilisez un identifiant complet. L'usage est attribué au modèle retourné ; Adaptive reste associé à son identifiant de routage, sans déduire le modèle sous-jacent.
+
+Devin utilise `WINDSURF_API_KEY` s'il est défini, sinon les identifiants enregistrés par `devin auth login`. Une méthode d'authentification ACP inconnue ne bloque pas cette connexion. Multica conserve le mode de session configuré sans augmenter les permissions : si le mode par défaut est `plan`, passez à un mode d'édition dans Devin avant d'envoyer une tâche qui modifie des fichiers.
 
 Lorsque vous créez un agent, la liste des modèles provient du runtime correspondant. Certains outils exposent un ensemble fixe de noms de modèles ; d'autres renvoient les modèles disponibles selon la configuration locale, le compte connecté et les droits de l'abonnement.
 

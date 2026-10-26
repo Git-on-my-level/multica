@@ -52,9 +52,11 @@ Multica 不会替代你使用的 AI 编程工具。运行时会调用电脑上�
 
 ## 模型来源
 
-Devin 通过本机 ACP 运行，支持 stdio MCP；只有 CLI 声明支持时才会传入 HTTP/SSE 配置。全局 skill 依次从 `$XDG_CONFIG_HOME/devin/skills`（默认 `~/.config/devin/skills`，Windows 为 `%APPDATA%\devin\skills`）、旧版 `cognition/skills` 和 `~/.agents/skills` 导入。
+Devin 通过本机 ACP 运行，支持 stdio MCP；只有 CLI 声明支持时才会传入 HTTP/SSE 配置。全局 skill 依次从 `$XDG_CONFIG_HOME/devin/skills`（默认 `~/.config/devin/skills`，Windows 为 `%APPDATA%\devin\skills`）、旧版 `cognition/skills`、`~/.codeium/<channel>/skills`（依次为 `windsurf`、`windsurf-next`、`windsurf-insiders`）和 `~/.agents/skills` 导入。同名 skill 在列表和导入时都以前面的目录为准。
 
-Devin 模型列表可能包含当前账号无权使用的模型。请选择完整模型 ID，或留空使用 CLI 默认模型；Multica 会在发送任务前确认实际模型，无法确认时直接报错，不会静默使用其他模型。
+Devin 模型列表可能包含当前账号无权使用的模型。可以选择完整模型 ID、无歧义的会话模型名称或目录中的系列 slug/别名（如 `opus`），也可以留空使用 CLI 默认模型。Multica 会在发送任务前确认实际模型，拒绝回退到其他系列；有歧义的名称、任意截断名称或不可用的变体需要改选完整 ID，不会猜测匹配。用量按实际返回的模型归属；Adaptive 按返回的 Adaptive 路由 ID 记录，不推测底层模型。
+
+Devin 优先读取 `WINDSURF_API_KEY`，否则使用 `devin auth login` 保存的凭据；未知的 ACP 认证方式不会阻断已保存的登录。Multica 保留 Devin 配置的会话模式，不自动提升权限。如果默认为 `plan`，请先在 Devin 中切换到可编辑模式，再派发需要修改文件的任务。
 
 创建智能体时，模型列表来自对应的运行时。有些工具提供固定的模型名称，有些会根据本机配置、登录账号和订阅权益返回可用模型。
 

@@ -50,7 +50,7 @@ Install steps are in [Install AI coding tools](/install-agent-runtime).
 
 "Multica-managed MCP" means you can define MCP servers in the agent configuration and Multica passes them to the tool before a run. It does not mean the tool has no other way to configure MCP.
 
-Devin supports stdio MCP servers; HTTP/SSE entries are passed only if the CLI advertises support. Devin skills are imported from `$XDG_CONFIG_HOME/devin/skills` (default `~/.config/devin/skills`) or `%APPDATA%\devin\skills` on Windows, then the legacy `cognition/skills` root, then `~/.agents/skills`.
+Devin supports stdio MCP servers; HTTP/SSE entries are passed only if the CLI advertises support. Devin skills are imported from `$XDG_CONFIG_HOME/devin/skills` (default `~/.config/devin/skills`) or `%APPDATA%\devin\skills` on Windows, then the legacy `cognition/skills` root, then `~/.codeium/<channel>/skills` (`windsurf`, `windsurf-next`, `windsurf-insiders`, in that order), and finally `~/.agents/skills`. On duplicate skill keys, the first root wins for both listing and import.
 
 ## Model sources
 
@@ -58,7 +58,9 @@ When you create an agent, the model list comes from the corresponding runtime. S
 
 If you do not pick a model, Multica uses the tool's own default. If the list is empty, confirm the runtime is online and the tool is signed in, then refresh the model list.
 
-Devin's catalog can include models unavailable to your account. Choose a canonical model ID, or leave the model empty to use the CLI default. Multica confirms an explicit choice against the session before sending the prompt and fails if the CLI falls back; usage is attributed to the reported session model, not the launch flag.
+Devin's catalog can include models unavailable to your account. Choose a canonical model ID, an unambiguous session model name or catalog family slug/alias (such as `opus`), or leave the model empty for the CLI default. Multica confirms the actual session model before sending the prompt; a fallback to another family is rejected. Ambiguous names, arbitrary partial names, or unavailable variants require a canonical ID rather than a guessed match. Usage is attributed to the reported model, not the launch flag. Adaptive usage stays under the reported Adaptive routing ID, not an inferred underlying model.
+
+Devin reads `WINDSURF_API_KEY` when set, otherwise the login saved by `devin auth login`; unknown ACP auth methods do not block that stored login. Multica preserves Devin's configured session mode rather than raising permissions. If it defaults to `plan`, switch to an editing mode in Devin before dispatching work that must change files.
 
 QwenPaw and MiniMax Code are exceptions: they do not accept a model chosen from Multica, so the picker is inert and shows "Managed by runtime". Choose the model in the tool's own configuration instead. An empty model list is expected there and is not a sign that the runtime is offline.
 

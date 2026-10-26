@@ -203,26 +203,18 @@ func TestDevinPassesModelFlag(t *testing.T) {
 
 func TestSelectDevinAuthMethod(t *testing.T) {
 	t.Parallel()
-	if got, err := selectDevinAuthMethod(nil, false); err != nil || got != "" {
-		t.Fatalf("empty methods: got %q err %v", got, err)
-	}
-	if got, err := selectDevinAuthMethod([]string{"windsurf-api-key"}, true); err != nil || got != "windsurf-api-key" {
-		t.Fatalf("windsurf with key: got %q err %v", got, err)
-	}
-	if _, err := selectDevinAuthMethod([]string{"windsurf-api-key"}, false); err == nil {
-		t.Fatal("windsurf without key should fail")
-	}
-	if got, err := selectDevinAuthMethod([]string{"cached-login"}, false); err != nil || got != "cached-login" {
-		t.Fatalf("cached-login: got %q err %v", got, err)
-	}
-	if got, err := selectDevinAuthMethod([]string{"devin-browser"}, false); err != nil || got != "" {
-		t.Fatalf("devin-browser should skip handshake: got %q err %v", got, err)
-	}
-	if got, err := selectDevinAuthMethod([]string{"devin-browser", "windsurf-api-key"}, false); err != nil || got != "" {
-		t.Fatalf("browser+windsurf without key should skip handshake: got %q err %v", got, err)
-	}
-	if got, err := selectDevinAuthMethod([]string{"devin-browser", "windsurf-api-key"}, true); err != nil || got != "windsurf-api-key" {
-		t.Fatalf("browser+windsurf with key: got %q err %v", got, err)
+	for _, methods := range [][]string{nil, {"windsurf-api-key"}, {"cached-login"}, {"devin-cli"}, {"local"}, {"login"}, {"devin-browser"}, {"future-auth"}, {"devin-browser", "windsurf-api-key"}} {
+		for _, haveKey := range []bool{false, true} {
+			want := ""
+			for _, method := range methods {
+				if method == "windsurf-api-key" && haveKey {
+					want = method
+				}
+			}
+			if got := selectDevinAuthMethod(methods, haveKey); got != want {
+				t.Errorf("methods=%v haveKey=%v: got %q want %q", methods, haveKey, got, want)
+			}
+		}
 	}
 }
 

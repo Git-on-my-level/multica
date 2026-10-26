@@ -12,8 +12,9 @@ import (
 )
 
 func TestDevinTerminatesOwnedProcessTree(t *testing.T) {
-	for _, failEarly := range []bool{false, true} {
-		t.Run(map[bool]string{false: "cancel-prompt", true: "unsupported-resume"}[failEarly], func(t *testing.T) {
+	for _, stage := range []string{"cancel-prompt", "unsupported-resume", "cancel-model-discovery"} {
+		t.Run(stage, func(t *testing.T) {
+			failEarly := stage == "unsupported-resume"
 			dir := t.TempDir()
 			pidFile := filepath.Join(dir, "pids")
 			fakePath := filepath.Join(dir, "devin")
@@ -22,6 +23,10 @@ spawn_child() {
   ( sleep 300 ) >/dev/null 2>&1 &
   printf '%s %s\n' "$$" "$!" > "$DEVIN_PID_FILE"
 }
+if [ "$1" = models ]; then
+  spawn_child
+  while true; do sleep 1; done
+fi
 
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -53,6 +58,9 @@ while true; do sleep 1; done
 			opts := ExecOptions{Cwd: dir}
 			if failEarly {
 				opts.ResumeSessionID = "old-session"
+			}
+			if stage == "cancel-model-discovery" {
+				opts.Model = "opus"
 			}
 			session, err := backend.Execute(ctx, "keep working", opts)
 			if err != nil {

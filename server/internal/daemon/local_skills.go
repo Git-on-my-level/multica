@@ -289,9 +289,9 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 	return roots, true, nil
 }
 
-// Devin's legacy Cognition root precedes the universal .agents fallback, just
-// as devin skills paths reports. The explicit inputs keep OS resolution testable
-// without reading or changing a real user's configuration.
+// Include the documented Windsurf channels after Devin/Cognition roots and
+// before the universal fallback. The order is deterministic for import/listing
+// collisions; the explicit inputs keep OS resolution testable.
 func devinLocalSkillRoots(home, goos, configHome, appData string) (string, []string) {
 	if goos == "windows" {
 		configHome = appData
@@ -301,7 +301,11 @@ func devinLocalSkillRoots(home, goos, configHome, appData string) (string, []str
 	} else if configHome == "" {
 		configHome = filepath.Join(home, ".config")
 	}
-	return filepath.Join(configHome, "devin", "skills"), []string{filepath.Join(configHome, "cognition", "skills")}
+	additional := []string{filepath.Join(configHome, "cognition", "skills")}
+	for _, channel := range []string{"windsurf", "windsurf-next", "windsurf-insiders"} {
+		additional = append(additional, filepath.Join(home, ".codeium", channel, "skills"))
+	}
+	return filepath.Join(configHome, "devin", "skills"), additional
 }
 
 // hermesLocalSkillsRoot returns the skills dir of the Hermes home a task runs
