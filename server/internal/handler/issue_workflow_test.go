@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/issueworkflow"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -48,7 +47,6 @@ func createTestWorkflow(t *testing.T, name string, middle ...string) IssueWorkfl
 
 func createTestWorkflowSteps(t *testing.T, name string, steps []map[string]any) IssueWorkflowResponse {
 	t.Helper()
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	var created IssueWorkflowResponse
 	testutil.Call(t, testHandler.CreateIssueWorkflow, workflowRequest("POST", "/api/issue-workflows", map[string]any{
 		"name":  name,
@@ -101,7 +99,6 @@ func projectWorkflowID(t *testing.T, projectID string) string {
 		return *id
 	}
 	resetDefaultWorkflow(t)
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	var list struct {
 		Workflows []IssueWorkflowResponse `json:"workflows"`
 	}
@@ -111,7 +108,6 @@ func projectWorkflowID(t *testing.T, projectID string) string {
 
 func setWorkflowHandoff(t *testing.T, workflowID, statusKey string, body map[string]any) *testutil.Response {
 	t.Helper()
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	req := withURLParams(workflowRequest("PUT", "/api/issue-workflows/"+workflowID+"/handoffs/"+statusKey, body),
 		"id", workflowID, "status", statusKey)
 	return testutil.Call(t, testHandler.SetIssueWorkflowHandoff, req)
@@ -157,12 +153,69 @@ func deliveryProject(t *testing.T, title, agentID string) string {
 	return projectID
 }
 
-func TestCreateIssueWorkflowRequiresFlag(t *testing.T) {
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, false)
-	testutil.Call(t, testHandler.CreateIssueWorkflow, workflowRequest("POST", "/api/issue-workflows", map[string]any{
-		"name":  "Flag off " + workflowTestSuffix(),
-		"steps": statusSteps(),
-	})).Want(http.StatusForbidden)
+func TestProjectWorkflowsAvailableWithoutFlag(t *testing.T) {
+	seedTestCatalog(t)
+	resetDefaultWorkflow(t)
+	withFeatureFlag(t, testHandler, "project_workflows_v1", false)
+
+	var list struct {
+		Workflows []IssueWorkflowResponse `json:"workflows"`
+	}
+	testutil.Call(t, testHandler.ListIssueWorkflows, workflowRequest("GET", "/api/issue-workflows", nil)).Want(http.StatusOK).JSON(&list)
+	if len(list.Workflows) == 0 || !list.Workflows[0].IsDefault {
+		t.Fatalf("list = %+v, want Default without feature flag configuration", list.Workflows)
+	}
+
+	wf := createTestWorkflow(t, "Available "+workflowTestSuffix(), "in_progress")
+	projectID := createWorkflowTestProject(t, "Workflow available project")
+	setProjectWorkflow(t, projectID, map[string]any{"workflow_id": wf.ID}).Want(http.StatusOK)
+	agentID := seededReadyAgentID(t)
+	setWorkflowHandoff(t, wf.ID, "in_progress", handToAgent(agentID, "")).Want(http.StatusOK)
+
+	var project ProjectResponse
+	testutil.Call(t, testHandler.CreateProject, workflowRequest("POST", "/api/projects", map[string]any{
+		"title": "Created with workflow", "workflow_id": wf.ID,
+	})).Want(http.StatusCreated).JSON(&project)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, project.ID)
+	})
+	if project.WorkflowID == nil || *project.WorkflowID != wf.ID {
+		t.Fatalf("workflow_id = %v, want %s", project.WorkflowID, wf.ID)
+	}
+}
+
+func TestProjectWorkflowsKeepWorkspaceIsolation(t *testing.T) {
+	seedTestCatalog(t)
+	resetDefaultWorkflow(t)
+	wf := createTestWorkflow(t, "Isolated "+workflowTestSuffix(), "in_progress")
+	projectID := createWorkflowTestProject(t, "Isolated workflow project")
+	outsiderID := dbfx.User(t, "Workflow outsider", "workflow-outsider-"+workflowTestSuffix()+"@example.com")
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		req := workflowRequest(method, "/api/issue-workflows", map[string]any{"name": "Unauthorized", "steps": statusSteps()})
+		req.Header.Set("X-User-ID", outsiderID)
+		if method == http.MethodGet {
+			testutil.Call(t, testHandler.ListIssueWorkflows, req).Want(http.StatusNotFound)
+		} else {
+			testutil.Call(t, testHandler.CreateIssueWorkflow, req).Want(http.StatusNotFound)
+		}
+	}
+
+	otherWorkspaceID := dbfx.Workspace(t, "Other workflow workspace", "wf-isolated-"+workflowTestSuffix())
+	dbfx.Member(t, otherWorkspaceID, testUserID, "owner")
+	otherRequest := func(method, path string, body any) *http.Request {
+		req := newRequest(method, path, body)
+		req.Header.Set("X-Workspace-ID", otherWorkspaceID)
+		return req
+	}
+	get := withURLParam(otherRequest("GET", "/api/issue-workflows/"+wf.ID, nil), "id", wf.ID)
+	testutil.Call(t, testHandler.GetIssueWorkflow, get).Want(http.StatusNotFound)
+	switchReq := withURLParam(otherRequest("POST", "/api/projects/"+projectID+"/workflow", map[string]any{"workflow_id": wf.ID}), "id", projectID)
+	testutil.Call(t, testHandler.SetProjectWorkflow, switchReq).Want(http.StatusNotFound)
+	handoff := withURLParams(otherRequest("PUT", "/api/issue-workflows/"+wf.ID+"/handoffs/in_progress", map[string]any{"handler": map[string]any{"type": "none"}}), "id", wf.ID, "status", "in_progress")
+	testutil.Call(t, testHandler.SetIssueWorkflowHandoff, handoff).Want(http.StatusNotFound)
+	testutil.Call(t, testHandler.CreateProject, otherRequest("POST", "/api/projects", map[string]any{
+		"title": "Cross-workspace workflow", "workflow_id": wf.ID,
+	})).Want(http.StatusBadRequest)
 }
 
 func TestCreateIssueWorkflowPlacesFixedStatusesAndValidates(t *testing.T) {
@@ -197,7 +250,6 @@ func TestCreateIssueWorkflowCreatesNewStatusesOutsideDefault(t *testing.T) {
 	seedTestCatalog(t)
 	resetDefaultWorkflow(t)
 	statusName := "Spec " + workflowTestSuffix()[10:]
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	var created IssueWorkflowResponse
 	testutil.Call(t, testHandler.CreateIssueWorkflow, workflowRequest("POST", "/api/issue-workflows", map[string]any{
 		"name":  "Template " + workflowTestSuffix(),
@@ -236,7 +288,6 @@ func lookupStatusName(t *testing.T, key string) string {
 func TestDefaultWorkflowIsEditableButNotDeletable(t *testing.T) {
 	seedTestCatalog(t)
 	resetDefaultWorkflow(t)
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	var list struct {
 		Workflows []IssueWorkflowResponse `json:"workflows"`
 	}
@@ -314,8 +365,7 @@ func TestSetProjectWorkflowMapsOnlyUnlistedStatuses(t *testing.T) {
 		t.Fatalf("a workflow switch handed the issue off (assignee type %q)", assigneeType)
 	}
 
-	// Switching back to Default needs no mapping and works with the flag off.
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, false)
+	// Switching back to Default needs no mapping.
 	setProjectWorkflow(t, projectID, map[string]any{"workflow_id": nil}).Want(http.StatusOK)
 }
 
@@ -445,7 +495,6 @@ func addWorkflowTestMember(t *testing.T, label string) (string, func(*http.Reque
 func TestWorkflowOwnerPermissions(t *testing.T) {
 	seedTestCatalog(t)
 	agentID := seededReadyAgentID(t)
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	ownerID, asOwner := addWorkflowTestMember(t, "owner")
 	_, asOther := addWorkflowTestMember(t, "other")
 
@@ -674,7 +723,6 @@ func TestMoveIntoWorkflowProjectKeepsEquivalentStatusWithoutHandoff(t *testing.T
 func TestWorkflowHandoffCopyForProject(t *testing.T) {
 	seedTestCatalog(t)
 	agentID := seededReadyAgentID(t)
-	withFeatureFlag(t, testHandler, featureflags.ProjectWorkflowsV1, true)
 	wf := createTestWorkflow(t, "Shared "+workflowTestSuffix(), "in_progress")
 	mine := createWorkflowTestProject(t, "Workflow copy mine")
 	theirs := createWorkflowTestProject(t, "Workflow copy theirs")
