@@ -93,14 +93,18 @@ func runDevinContract(t *testing.T, opts ExecOptions, env map[string]string) (Re
 }
 
 func TestDevinSessionRejection(t *testing.T) {
-	for _, rpc := range []string{"session/load", "session/prompt"} {
+	for _, rpc := range []string{"session/load", "session/set_config_option", "session/prompt"} {
 		for _, rejected := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/rejected=%v", rpc, rejected), func(t *testing.T) {
 				env := map[string]string{"DEVIN_TEST_FAIL_RPC": rpc}
 				if !rejected {
 					env["DEVIN_TEST_ERROR_MESSAGE"] = "Authentication required"
 				}
-				result, _, _ := runDevinContract(t, ExecOptions{ResumeSessionID: "old-session"}, env)
+				opts := ExecOptions{ResumeSessionID: "old-session"}
+				if rpc == "session/set_config_option" {
+					opts.Model = "selected-model"
+				}
+				result, _, _ := runDevinContract(t, opts, env)
 				if result.Status != "failed" || result.ResumeRejected != rejected {
 					t.Fatalf("result=%+v, want rejected=%v", result, rejected)
 				}
@@ -170,6 +174,13 @@ func TestDevinDefaultModelAndAbsoluteCwd(t *testing.T) {
 		if request.Method == "session/new" && !filepath.IsAbs(request.Params.Cwd) {
 			t.Fatalf("relative cwd sent to Devin: %q", request.Params.Cwd)
 		}
+	}
+}
+
+func TestDevinUnadvertisedModelFailsBeforePrompt(t *testing.T) {
+	result, _, requests := runDevinContract(t, ExecOptions{Model: "unavailable-model"}, nil)
+	if result.Status != "failed" || result.SessionID != "" || result.ResumeRejected || len(result.Usage) != 0 || strings.Contains(requests, `"method":"session/prompt"`) {
+		t.Fatalf("unavailable model was not rejected before prompt: %+v requests=%s", result, requests)
 	}
 }
 

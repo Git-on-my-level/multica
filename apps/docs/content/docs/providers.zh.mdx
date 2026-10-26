@@ -52,6 +52,10 @@ Multica 不会替代你使用的 AI 编程工具。运行时会调用电脑上�
 
 ## 模型来源
 
+Devin 通过本机 ACP 运行，支持 stdio MCP；只有 CLI 声明支持时才会传入 HTTP/SSE 配置。全局 skill 依次从 `$XDG_CONFIG_HOME/devin/skills`（默认 `~/.config/devin/skills`，Windows 为 `%APPDATA%\devin\skills`）、旧版 `cognition/skills` 和 `~/.agents/skills` 导入。
+
+Devin 模型列表可能包含当前账号无权使用的模型。请选择完整模型 ID，或留空使用 CLI 默认模型；Multica 会在发送任务前确认实际模型，无法确认时直接报错，不会静默使用其他模型。
+
 创建智能体时，模型列表来自对应的运行时。有些工具提供固定的模型名称，有些会根据本机配置、登录账号和订阅权益返回可用模型。
 
 不选择模型时，Multica 使用该工具的默认设置。列表为空时，先确认运行时在线并且工具已经登录，再刷新模型列表。

@@ -52,6 +52,8 @@ Les étapes d'installation se trouvent dans [Installer les outils de codage IA](
 
 ## Sources des modèles
 
+Devin utilise ACP en local et prend en charge les serveurs MCP stdio. HTTP/SSE ne sont transmis que si le CLI annonce leur prise en charge. Le catalogue peut inclure des modèles indisponibles pour votre compte : sélectionnez l'identifiant complet ou laissez le champ vide pour utiliser le modèle par défaut du CLI. Multica confirme le modèle avant d'envoyer le prompt et échoue si ce choix ne peut pas être confirmé.
+
 Lorsque vous créez un agent, la liste des modèles provient du runtime correspondant. Certains outils exposent un ensemble fixe de noms de modèles ; d'autres renvoient les modèles disponibles selon la configuration locale, le compte connecté et les droits de l'abonnement.
 
 Si vous ne choisissez pas de modèle, Multica utilise le modèle par défaut de l'outil. Si la liste est vide, vérifiez que le runtime est en ligne et que l'outil est connecté, puis actualisez la liste des modèles.
