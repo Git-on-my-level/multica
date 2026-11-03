@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -270,6 +271,59 @@ func TestValidateTaskRootRecordErrorsNameTheRecordDir(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), recordDir) {
 				t.Fatalf("error %q does not name the record dir %q", err, recordDir)
+			}
+		})
+	}
+}
+
+func TestIndexedEnvRootOwnerRequiresPublishedMatchingRecord(t *testing.T) {
+	for _, state := range []string{"valid", "unrelated incomplete", "pending", "wrong key", "wrong path", "empty identity"} {
+		t.Run(state, func(t *testing.T) {
+			root := t.TempDir()
+			params := pruneParams(root, "00000000-0000-0000-0000-000000000001")
+			envRoot, err := ResolveRootDir(params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recordDir := taskRootRecordDir(params)
+			switch state {
+			case "unrelated incomplete":
+				if err := os.Mkdir(filepath.Join(root, taskRootIndexDir, "unrelated"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			case "pending", "wrong key":
+				name := "wrong-key"
+				if state == "pending" {
+					name = taskRootPendingPrefix + "interrupted"
+				}
+				if err := os.Rename(recordDir, filepath.Join(root, taskRootIndexDir, name)); err != nil {
+					t.Fatal(err)
+				}
+			case "wrong path", "empty identity":
+				record, err := readTaskRootRecord(recordDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state == "wrong path" {
+					record.RelativePath = "../../source"
+				} else {
+					record.WorkspaceID = ""
+				}
+				data, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(recordDir, taskRootRecordFile), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			owner, err := IndexedEnvRootOwner(root, envRoot)
+			if state == "valid" || state == "unrelated incomplete" {
+				if err != nil || owner.WorkspaceID != params.WorkspaceID || owner.TaskID != params.TaskID {
+					t.Fatalf("owner=%+v err=%v", owner, err)
+				}
+			} else if err == nil || owner != nil {
+				t.Fatalf("invalid record established ownership: %+v", owner)
 			}
 		})
 	}

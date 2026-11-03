@@ -557,11 +557,9 @@ func TestRunGC_SharedRootPreservesForeignDirectories(t *testing.T) {
 	}
 }
 
-// The incident regression above only proves the no-meta orphan path returns
-// early. applyGCAction is the single gate every mutating action passes
-// through, so pin all four: an unowned directory must survive full cleanup,
-// orphan removal, pattern artifact cleanup and managed artifact cleanup alike.
-func TestApplyGCAction_RefusesEveryMutationWithoutOwner(t *testing.T) {
+// Fresh unowned directories must survive every mutation request until the
+// artifact grace period expires. Full-root removal always requires ownership.
+func TestApplyGCAction_RefusesEveryMutationOnFreshUnownedRoot(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -2592,5 +2590,256 @@ func TestShouldCleanTaskDir_LocalDirectoryFalsePreservesNormalClean(t *testing.T
 
 	if got := d.shouldCleanTaskDir(context.Background(), taskDir); got != gcActionClean {
 		t.Fatalf("expected gcActionClean for normal task, got %d", got)
+	}
+}
+
+func TestRunGC_UnownedRootStripsOnlyApprovedArtifacts(t *testing.T) {
+	d := newGCTestDaemon(t, http.NewServeMux())
+	// A configured extra pattern must not broaden the unowned-root allowlist.
+	d.cfg.GCArtifactPatterns = append(d.cfg.GCArtifactPatterns, "source")
+	root := filepath.Join(d.cfg.WorkspacesRoot, "unknown-workspace", "unknown-task")
+	survivors := []string{"source/main.go", ".git/target/history", ".task_owner", ".gc_meta.json", execenv.ManagedReclaimableArtifactSubpaths()[0] + "/payload"}
+	for _, path := range survivors {
+		path = filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pattern := range unownedArtifactPatterns {
+		path := filepath.Join(root, "checkout", pattern)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "payload"), []byte("remove"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	external := t.TempDir()
+	if err := os.Mkdir(filepath.Join(external, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	old := time.Now().Add(-2 * d.cfg.GCOrphanTTL)
+	if err := os.Chtimes(root, old, old); err != nil {
+		t.Fatal(err)
+	}
+	d.runGC(context.Background())
+	for _, path := range survivors {
+		if _, err := os.Stat(filepath.Join(root, path)); err != nil {
+			t.Fatalf("survivor %s: %v", path, err)
+		}
+	}
+	for _, pattern := range unownedArtifactPatterns {
+		if _, err := os.Stat(filepath.Join(root, "checkout", pattern)); !os.IsNotExist(err) {
+			t.Fatalf("artifact %s remains: %v", pattern, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(external, "node_modules")); err != nil {
+		t.Fatalf("linked target changed: %v", err)
+	}
+	if _, removed := d.cleanTaskDir(root); removed {
+		t.Fatal("unattributable root removed")
+	}
+	meta, err := json.Marshal(execenv.GCMeta{Kind: execenv.GCKindIssue, WorkspaceID: "workspace", IssueID: "issue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gc_meta.json"), meta, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(root, "node_modules")
+	if err := os.Mkdir(artifact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(root, old, old); err != nil {
+		t.Fatal(err)
+	}
+	d.runGC(context.Background())
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("issue metadata bypassed unowned stripping: %v", err)
+	}
+}
+
+func TestUnownedArtifactsRespectTTLAndActivity(t *testing.T) {
+	for _, state := range []string{"recent", "disabled", "active", "reserved", "linked root", "linked workspace"} {
+		t.Run(state, func(t *testing.T) {
+			d := newGCTestDaemon(t, http.NewServeMux())
+			root := filepath.Join(d.cfg.WorkspacesRoot, "unknown", "task")
+			artifact := filepath.Join(root, "node_modules", "payload")
+			if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(artifact, []byte("keep"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if state != "recent" {
+				old := time.Now().Add(-2 * d.cfg.GCArtifactTTL)
+				if err := os.Chtimes(root, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch state {
+			case "disabled":
+				d.cfg.GCArtifactTTL = 0
+			case "active":
+				d.markActiveEnvRoot(root)
+				defer d.unmarkActiveEnvRoot(root)
+			case "reserved":
+				release, ok := d.reserveEnvRootForGC(root)
+				if !ok {
+					t.Fatal("reserve failed")
+				}
+				defer release()
+			case "linked root", "linked workspace":
+				original := root
+				if state == "linked workspace" {
+					original = filepath.Dir(root)
+				}
+				moved := filepath.Join(t.TempDir(), "moved")
+				if err := os.Rename(original, moved); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(moved, original); err != nil {
+					t.Skipf("symlink not supported: %v", err)
+				}
+			}
+			stats := &gcStats{}
+			d.applyGCAction(root, gcActionOrphan, stats)
+			if _, err := os.Stat(artifact); err != nil {
+				t.Fatalf("protected artifact removed: %v", err)
+			}
+			if stats.bytesReclaimed != 0 {
+				t.Fatalf("counted protected bytes: %d", stats.bytesReclaimed)
+			}
+		})
+	}
+}
+
+func TestGCRecoversTaskIndexOwnership(t *testing.T) {
+	for _, marker := range []string{"missing", "legacy", "conflict"} {
+		t.Run(marker, func(t *testing.T) {
+			d := newGCTestDaemon(t, http.NewServeMux())
+			params := execenv.RootDirParams{WorkspacesRoot: d.cfg.WorkspacesRoot, WorkspaceID: "workspace", TaskID: "task"}
+			root, err := execenv.ResolveRootDir(params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if marker != "missing" {
+				value := "task"
+				if marker == "conflict" {
+					value = "other-task"
+				}
+				if err := os.WriteFile(filepath.Join(root, ".task_owner"), []byte(value), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			old := time.Now().Add(-2 * d.cfg.GCOrphanTTL)
+			if err := os.Chtimes(root, old, old); err != nil {
+				t.Fatal(err)
+			}
+			action := d.shouldCleanTaskDir(context.Background(), root)
+			if marker == "conflict" {
+				if action != gcActionCleanUnownedArtifacts {
+					t.Fatalf("conflicting marker action: %v", action)
+				}
+				return
+			}
+			if action != gcActionOrphan {
+				t.Fatalf("index did not recover normal orphan policy: %v", action)
+			}
+			stats := &gcStats{}
+			if removed := d.applyGCAction(root, action, stats); removed != 1 {
+				t.Fatal("indexed root not removed")
+			}
+			if _, err := os.Stat(root); !os.IsNotExist(err) {
+				t.Fatalf("indexed root remains: %v", err)
+			}
+		})
+	}
+}
+
+func TestGCReceiptReportsFilesystemFreeBytes(t *testing.T) {
+	d := newGCTestDaemon(t, http.NewServeMux())
+	root := createTaskDir(t, d.cfg.WorkspacesRoot, "workspace", "task", nil)
+	if err := os.WriteFile(filepath.Join(root, "payload"), []byte("removed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * d.cfg.GCOrphanTTL)
+	if err := os.Chtimes(root, old, old); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	d.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	d.runGC(context.Background())
+	for _, line := range strings.Split(logs.String(), "\n") {
+		var receipt map[string]any
+		if json.Unmarshal([]byte(line), &receipt) != nil || receipt["msg"] != "gc: cycle complete" {
+			continue
+		}
+		for _, key := range []string{"filesystem_free_bytes_before", "filesystem_free_bytes_after"} {
+			if value, ok := receipt[key].(float64); !ok || value <= 0 {
+				t.Fatalf("invalid %s: %v", key, receipt[key])
+			}
+			if receipt[key+"_error"] != nil {
+				t.Fatalf("unexpected measurement error: %v", receipt[key+"_error"])
+			}
+		}
+		if receipt["bytes_reclaimed"].(float64) < 7 {
+			t.Fatalf("missing logical bytes: %v", receipt)
+		}
+		_, err := gcFilesystemFreeBytes(filepath.Join(t.TempDir(), "missing"))
+		if err == nil || gcFreeBytesValue(0, err) != nil {
+			t.Fatal("failed measurement represented as zero")
+		}
+		return
+	}
+	t.Fatalf("missing GC receipt: %s", logs.String())
+}
+
+func TestGCIndexedOwnershipPreservesNormalRetention(t *testing.T) {
+	checked := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/tasks/task/gc-check", func(w http.ResponseWriter, r *http.Request) {
+		checked <- struct{}{}
+		_ = json.NewEncoder(w).Encode(TaskGCStatus{Status: "running"})
+	})
+	d := newGCTestDaemon(t, mux)
+	params := execenv.RootDirParams{WorkspacesRoot: d.cfg.WorkspacesRoot, WorkspaceID: "workspace", TaskID: "task"}
+	root, err := execenv.ResolveRootDir(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if action := d.shouldCleanTaskDir(context.Background(), root); action != gcActionSkip {
+		t.Fatalf("recent indexed root action=%v", action)
+	}
+	meta, err := json.Marshal(execenv.GCMeta{Kind: execenv.GCKindQuickCreate, WorkspaceID: "workspace", TaskID: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gc_meta.json"), meta, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * d.cfg.GCOrphanTTL)
+	if err := os.Chtimes(root, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if action := d.shouldCleanTaskDir(context.Background(), root); action != gcActionSkip {
+		t.Fatalf("running indexed root action=%v", action)
+	}
+	select {
+	case <-checked:
+	default:
+		t.Fatal("indexed root did not follow normal task-status reconciliation")
 	}
 }
