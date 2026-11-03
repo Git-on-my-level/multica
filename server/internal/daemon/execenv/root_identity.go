@@ -201,6 +201,56 @@ func ValidateEnvRootOwnerPath(workspacesRoot, envRoot string, owner EnvRootOwner
 	return nil
 }
 
+// IndexedEnvRootOwner recovers provenance from a published stable-root record.
+// Readable suffixes alone are never ownership proof. This lookup creates nothing.
+func IndexedEnvRootOwner(workspacesRoot, envRoot string) (*EnvRootOwner, error) {
+	indexDir := filepath.Join(workspacesRoot, taskRootIndexDir)
+	info, err := os.Lstat(indexDir)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return nil, fmt.Errorf("execenv: task root index is not a physical directory")
+	}
+	entries, err := os.ReadDir(indexDir)
+	if err != nil {
+		return nil, err
+	}
+	var found *EnvRootOwner
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Type()&(os.ModeSymlink|os.ModeIrregular) != 0 || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		recordDir := filepath.Join(indexDir, entry.Name())
+		record, err := readTaskRootRecord(recordDir)
+		// An unrelated incomplete record must not prevent recovery. Only a
+		// published, validated record pointing at this exact root is proof.
+		if err != nil || filepath.Clean(filepath.Join(workspacesRoot, record.RelativePath)) != filepath.Clean(envRoot) {
+			continue
+		}
+		owner := EnvRootOwner{WorkspaceID: record.WorkspaceID, TaskID: record.TaskID}
+		params := RootDirParams{WorkspacesRoot: workspacesRoot, WorkspaceID: owner.WorkspaceID, TaskID: owner.TaskID}
+		if owner.WorkspaceID == "" || owner.TaskID == "" || filepath.Clean(recordDir) != filepath.Clean(taskRootRecordDir(params)) {
+			return nil, fmt.Errorf("execenv: invalid task root index identity at %s", recordDir)
+		}
+		resolved, err := validateTaskRootRecord(params, recordDir, record)
+		if err != nil {
+			return nil, err
+		}
+		if filepath.Clean(resolved) != filepath.Clean(envRoot) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("execenv: multiple task root records for %s", envRoot)
+		}
+		found = &owner
+	}
+	if found == nil {
+		return nil, fmt.Errorf("execenv: no task root record for %s", envRoot)
+	}
+	return found, nil
+}
+
 // RemoveRootDirRecord removes the stable index after GC has reclaimed a
 // terminal task root. It verifies that the record still points at envRoot so a
 // stale cleanup can never remove another task's identity.

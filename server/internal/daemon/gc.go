@@ -76,7 +76,7 @@ type gcStats struct {
 	repoCachesReclaimed           int            // bare repo caches under .repos evicted past their TTL
 	taskTempDirsReclaimed         int            // per-task temp dirs under the temp base reclaimed after their owning execution ended
 	taskRootIndexEntriesReclaimed int            // abandoned stable-root records and unpublished entries reclaimed past the orphan TTL
-	bytesReclaimed                int64          // total bytes freed in this cycle
+	bytesReclaimed                int64          // logical bytes removed in this cycle
 	byPattern                     map[string]int // configured basename or managed path label -> reclaim count
 }
 
@@ -92,6 +92,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 		return
 	}
 
+	freeBefore, freeBeforeErr := gcFilesystemFreeBytes(root)
 	stats := &gcStats{byPattern: map[string]int{}}
 	for _, wsEntry := range entries {
 		// Skip every daemon-internal dot directory, not just .repos. A
@@ -174,6 +175,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 	}
 
 	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
+		freeAfter, freeAfterErr := gcFilesystemFreeBytes(root)
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
@@ -187,6 +189,10 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"task_temp_dirs_reclaimed", stats.taskTempDirsReclaimed,
 			"task_root_index_entries_reclaimed", stats.taskRootIndexEntriesReclaimed,
 			"bytes_reclaimed", stats.bytesReclaimed,
+			"filesystem_free_bytes_before", gcFreeBytesValue(freeBefore, freeBeforeErr),
+			"filesystem_free_bytes_after", gcFreeBytesValue(freeAfter, freeAfterErr),
+			"filesystem_free_bytes_before_error", freeBeforeErr,
+			"filesystem_free_bytes_after_error", freeAfterErr,
 			"by_pattern", stats.byPattern,
 		)
 	}
@@ -212,6 +218,12 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 		taskDir := filepath.Join(wsDir, entry.Name())
 		if d.isActiveEnvRoot(taskDir) {
 			stats.skipped++
+			continue
+		}
+		// Unattributable roots always take the bounded artifact path, even
+		// when stale metadata would otherwise enter the issue batch fast path.
+		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
+			cleanedHere += d.applyGCAction(taskDir, d.unownedArtifactAction(taskDir), stats)
 			continue
 		}
 		meta, metaErr := execenv.ReadGCMeta(taskDir)
@@ -322,9 +334,11 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) int {
 	if action != gcActionSkip {
 		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
-			d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)
-			stats.skipped++
-			return 0
+			action = d.unownedArtifactAction(taskDir)
+			if action == gcActionSkip {
+				stats.skipped++
+				return 0
+			}
 		}
 		release, ok := d.reserveEnvRootForGC(taskDir)
 		if !ok {
@@ -335,9 +349,11 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		// Re-read provenance after taking the exclusion lock so a concurrent
 		// reset cannot change ownership between validation and mutation.
 		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
-			d.logger.Warn("gc: refusing to mutate task directory after ownership changed", "dir", taskDir, "error", err)
-			stats.skipped++
-			return 0
+			action = d.unownedArtifactAction(taskDir)
+			if action == gcActionSkip {
+				stats.skipped++
+				return 0
+			}
 		}
 	}
 	switch action {
@@ -359,6 +375,10 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		stats.orphaned++
 		stats.bytesReclaimed += bytes
 		return 1
+	case gcActionCleanUnownedArtifacts:
+		removed, bytes, perPattern := d.cleanTaskArtifactsMatching(taskDir, newArtifactMatcher(unownedArtifactPatterns, nil))
+		recordArtifactCleanup(stats, removed, bytes, perPattern)
+		stats.skipped++
 	case gcActionCleanArtifacts:
 		removed, bytes, perPattern := d.cleanTaskArtifacts(taskDir, d.cfg.GCArtifactPatterns)
 		recordArtifactCleanup(stats, removed, bytes, perPattern)
@@ -395,6 +415,7 @@ const (
 	gcActionClean                          // a parent-lifecycle or completed-task policy selected full cleanup
 	gcActionOrphan                         // no meta or unknown issue and dir is old
 	gcActionCleanArtifacts                 // task completed long enough ago; drop regenerable artifacts only
+	gcActionCleanUnownedArtifacts          // only approved basename artifacts; never remove the root
 	gcActionCleanManagedArtifacts          // preserve the task and drop exact daemon-managed artifacts only
 )
 
@@ -415,8 +436,7 @@ func (d *Daemon) shouldCleanTaskDir(ctx context.Context, taskDir string) gcActio
 	meta, err := execenv.ReadGCMeta(taskDir)
 	if err != nil {
 		if _, ownerErr := d.gcTaskDirOwner(taskDir); ownerErr != nil {
-			d.logger.Warn("gc: skipping directory without valid task ownership", "dir", taskDir, "error", ownerErr)
-			return gcActionSkip
+			return d.unownedArtifactAction(taskDir)
 		}
 		return d.orphanByMTime(taskDir, "no meta")
 	}
@@ -839,33 +859,78 @@ func isAgentTaskTerminal(status string) bool {
 	}
 }
 
-// gcTaskDirOwner returns authoritative provenance only when both the marker
-// and its position under WorkspacesRoot agree. Missing GC metadata is not
-// ownership proof: partially prepared roots have .task_owner, while arbitrary
-// user directories do not.
-func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
-	owner, err := execenv.ReadEnvRootOwner(taskDir)
-	if err != nil {
-		return nil, fmt.Errorf("read task owner: %w", err)
+// These are the only regenerable basename patterns allowed without provenance.
+var unownedArtifactPatterns = []string{"node_modules", ".next", ".turbo", ".build", ".venv", "venv", ".openapi-venv", "target"}
+
+// gcTaskRootIsPhysical refuses linked workspace/root components before any walk.
+func (d *Daemon) gcTaskRootIsPhysical(taskDir string) bool {
+	rel, err := filepath.Rel(d.cfg.WorkspacesRoot, taskDir)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
 	}
-	if owner == nil {
-		return nil, errors.New("task owner is missing")
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] == ".." || strings.HasPrefix(parts[0], ".") || parts[1] == ".." || parts[1] == "." {
+		return false
 	}
-	validated := *owner
-	if validated.WorkspaceID == "" && validated.TaskID != "" {
-		// Legacy owner markers contain only the task ID. Completion metadata can
-		// supply the missing workspace identity without weakening the hard
-		// requirement that a Prepare-time owner marker exists.
-		meta, metaErr := execenv.ReadGCMeta(taskDir)
-		if metaErr != nil || strings.TrimSpace(meta.WorkspaceID) == "" {
-			return nil, errors.New("legacy task owner has no workspace identity or valid GC metadata")
+	current := d.cfg.WorkspacesRoot
+	for _, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() || info.Mode()&linkedDirModes != 0 {
+			return false
 		}
-		validated.WorkspaceID = strings.TrimSpace(meta.WorkspaceID)
 	}
-	if err := execenv.ValidateEnvRootOwnerPath(d.cfg.WorkspacesRoot, taskDir, validated); err != nil {
+	return true
+}
+
+func (d *Daemon) unownedArtifactAction(taskDir string) gcAction {
+	if d.cfg.GCArtifactTTL <= 0 || !d.gcTaskRootIsPhysical(taskDir) {
+		return gcActionSkip
+	}
+	info, err := os.Lstat(taskDir)
+	if err != nil || time.Since(info.ModTime()) <= d.cfg.GCArtifactTTL {
+		return gcActionSkip
+	}
+	return gcActionCleanUnownedArtifacts
+}
+
+// gcTaskDirOwner accepts a valid marker or reattaches provenance from the
+// authoritative task-root index. Recovery is read-only and never claims a root.
+func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
+	if !d.gcTaskRootIsPhysical(taskDir) {
+		return nil, errors.New("task root is not a physical two-level directory")
+	}
+	owner, err := execenv.ReadEnvRootOwner(taskDir)
+	if err == nil && owner != nil && owner.TaskID != "" && owner.WorkspaceID == "" {
+		if meta, metaErr := execenv.ReadGCMeta(taskDir); metaErr == nil {
+			owner.WorkspaceID = strings.TrimSpace(meta.WorkspaceID)
+		}
+	}
+	if err == nil && owner != nil && owner.WorkspaceID != "" && owner.TaskID != "" {
+		if err := execenv.ValidateEnvRootOwnerPath(d.cfg.WorkspacesRoot, taskDir, *owner); err != nil {
+			return nil, err
+		}
+		return owner, nil
+	}
+	indexed, indexErr := execenv.IndexedEnvRootOwner(d.cfg.WorkspacesRoot, taskDir)
+	if indexErr != nil {
+		return nil, fmt.Errorf("task owner unavailable: %w", indexErr)
+	}
+	if owner != nil && ((owner.TaskID != "" && owner.TaskID != indexed.TaskID) || (owner.WorkspaceID != "" && owner.WorkspaceID != indexed.WorkspaceID)) {
+		return nil, errors.New("task owner conflicts with task root index")
+	}
+	if err := execenv.ValidateEnvRootOwnerPath(d.cfg.WorkspacesRoot, taskDir, *indexed); err != nil {
 		return nil, err
 	}
-	return &validated, nil
+	return indexed, nil
+}
+
+// A failed measurement is unknown, never a misleading zero-byte reading.
+func gcFreeBytesValue(bytes uint64, err error) any {
+	if err != nil {
+		return nil
+	}
+	return bytes
 }
 
 // cleanTaskDir removes a proven daemon-owned task directory, logs the
