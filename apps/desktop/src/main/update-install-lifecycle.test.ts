@@ -47,6 +47,7 @@ vi.mock("electron", () => ({
 
 vi.mock("electron-updater", () => ({
   autoUpdater: {
+    setFeedURL: vi.fn(),
     autoInstallOnAppQuit: true,
     quitAndInstall: ctx.install,
     checkForUpdates: vi.fn(async () => null),
