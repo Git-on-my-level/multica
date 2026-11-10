@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-// routerSourceFile is parsed by TestWecomMediaAllowListIsWiredAtBoot. Kept as
+// wecomMediaRouterSourceFile is parsed by TestWecomMediaAllowListIsWiredAtBoot. Kept as
 // a constant so a rename shows up as one failing test rather than a silently
 // skipped guard.
-const routerSourceFile = "router.go"
+const wecomMediaRouterSourceFile = "router.go"
 
 const wecomMediaAllowEnv = "MULTICA_WECOM_MEDIA_ALLOW_CIDRS"
 
@@ -32,9 +32,9 @@ const wecomMediaAllowEnv = "MULTICA_WECOM_MEDIA_ALLOW_CIDRS"
 // state, so the only thing reachable from here is the wiring.
 func TestWecomMediaAllowListIsWiredAtBoot(t *testing.T) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, routerSourceFile, nil, 0)
+	file, err := parser.ParseFile(fset, wecomMediaRouterSourceFile, nil, 0)
 	if err != nil {
-		t.Fatalf("parse %s: %v", routerSourceFile, err)
+		t.Fatalf("parse %s: %v", wecomMediaRouterSourceFile, err)
 	}
 
 	var (
@@ -57,7 +57,7 @@ func TestWecomMediaAllowListIsWiredAtBoot(t *testing.T) {
 			}
 			switch calleeName(call) {
 			case "os.Getenv":
-				if len(call.Args) == 1 && stringLit(call.Args[0]) == wecomMediaAllowEnv {
+				if len(call.Args) == 1 && wecomMediaStringLit(call.Args[0]) == wecomMediaAllowEnv {
 					envHere = fset.Position(call.Pos()).String()
 				}
 			case "wecom.SetMediaAllowedPrefixes":
@@ -79,11 +79,11 @@ func TestWecomMediaAllowListIsWiredAtBoot(t *testing.T) {
 
 	if readsEnv == "" {
 		t.Errorf("no os.Getenv(%q) in %s — the media guard's allow-list has no operator switch again",
-			wecomMediaAllowEnv, routerSourceFile)
+			wecomMediaAllowEnv, wecomMediaRouterSourceFile)
 	}
 	if appliesIt == "" {
 		t.Errorf("no call to wecom.SetMediaAllowedPrefixes in %s — %s is read but never reaches the guard",
-			routerSourceFile, wecomMediaAllowEnv)
+			wecomMediaRouterSourceFile, wecomMediaAllowEnv)
 	}
 	if t.Failed() {
 		t.FailNow()
@@ -132,8 +132,8 @@ func reportsMalformedCIDRs(fset *token.FileSet, file *ast.File) bool {
 	return consumed
 }
 
-// stringLit returns the value of a plain string literal, or "".
-func stringLit(e ast.Expr) string {
+// wecomMediaStringLit returns the value of a plain string literal, or "".
+func wecomMediaStringLit(e ast.Expr) string {
 	lit, ok := e.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
 		return ""

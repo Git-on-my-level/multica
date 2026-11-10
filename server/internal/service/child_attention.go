@@ -182,9 +182,9 @@ func (s *TaskService) recoverChildAttentionParent(ctx context.Context, parentID 
 	writer.FeatureFlags, writer.Composio, writer.Entitlements = s.FeatureFlags, s.Composio, s.Entitlements
 	var task db.AgentTaskQueue
 	if squadID.Valid {
-		task, err = writer.EnqueueTaskForSquadLeader(ctx, parent, agentID, squadID, comment.ID)
+		task, err = writer.EnqueueTaskForSquadLeader(ctx, parent, agentID, squadID, comment.ID, OriginDerived)
 	} else {
-		task, err = writer.EnqueueTaskForMention(ctx, parent, agentID, comment.ID)
+		task, err = writer.EnqueueTaskForMention(ctx, parent, agentID, comment.ID, OriginDerived)
 	}
 	if err != nil {
 		return false, err

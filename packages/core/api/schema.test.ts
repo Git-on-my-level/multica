@@ -1,7 +1,9 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ApiClient, ApiError } from "./client";
 import { parseWithFallback } from "./schema";
+import { CreateIssueResponseSchema } from "./schemas";
 
 // Helper: stub fetch with a single JSON response. Status defaults to 200.
 function stubFetchJson(body: unknown, status = 200) {
@@ -24,6 +26,20 @@ afterEach(() => {
 // app in past incidents. The contract is: a malformed response degrades to
 // an empty/safe shape, never throws into React.
 describe("ApiClient schema fallback", () => {
+  describe("workspace pin responses", () => {
+    it("defaults missing or malformed pinned_at to null and falls back on malformed lists", async () => {
+      const ws = { id: "ws-1", name: "One", slug: "one", description: null, context: null, settings: {}, repos: [], issue_prefix: "ONE", avatar_url: null, created_at: "2026-01-01", updated_at: "2026-01-01" };
+      const client = new ApiClient("https://api.example.test");
+      stubFetchJson([ws, { ...ws, id: "ws-2", pinned_at: 123 }]);
+      expect((await client.listWorkspaces()).map((item) => item.pinned_at)).toEqual([null, null]);
+      stubFetchJson({ invalid: true });
+      await expect(client.listWorkspaces()).resolves.toEqual([]);
+      stubFetchJson({ pinned_at: 123 });
+      await expect(client.setWorkspacePinned("ws-1", true)).resolves.toEqual({ pinned_at: null });
+      expect(vi.mocked(fetch).mock.calls[0]?.[1]).toMatchObject({ method: "PUT", body: JSON.stringify({ pinned: true }) });
+    });
+  });
+
   describe("GitHub repository import", () => {
     it("falls back safely when installation or repository responses are malformed", async () => {
       stubFetchJson({ installations: "not-an-array", configured: true });
@@ -126,6 +142,90 @@ describe("ApiClient schema fallback", () => {
       const client = new ApiClient("https://api.example.test");
       const res = await client.listIssues();
       expect(res).toEqual({ issues: [], total: 0 });
+    });
+  });
+
+  describe("listSkills", () => {
+    const baseSkill = {
+      id: "skill-1",
+      workspace_id: "ws-1",
+      name: "review-helper",
+      description: "",
+      config: {},
+      created_by: null,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    };
+    const skillLabel = {
+      id: "label-1",
+      workspace_id: "ws-1",
+      resource_type: "skill",
+      name: "mattpocock",
+      color: "#3b82f6",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    };
+
+    it("falls back to an empty list when the response is malformed", async () => {
+      stubFetchJson({ skills: "not-an-array" });
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listSkills();
+      expect(res).toEqual([]);
+    });
+
+    it.each([{ body: { skills: [] } }, { body: null }, { body: [{ id: "missing-identity" }] }])(
+      "rejects malformed skill lists for absence checks while preserving rendering fallback: %j",
+      async ({ body }) => {
+        stubFetchJson(body);
+        const client = new ApiClient("https://api.example.test");
+        await expect(client.listSkills()).resolves.toEqual([]);
+        stubFetchJson(body);
+        await expect(client.listSkills({ requireValidResponse: true })).rejects.toThrow("Invalid skill list response");
+      },
+    );
+
+    it("does not accept a defaulted 204 response as proof of absence", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(null, { status: 204 })));
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.listSkills()).resolves.toEqual([]);
+      await expect(client.listSkills({ requireValidResponse: true })).rejects.toThrow("Invalid skill list response");
+    });
+
+    it("accepts a verified empty list and older valid rows for absence checks", async () => {
+      const client = new ApiClient("https://api.example.test");
+      stubFetchJson([]);
+      await expect(client.listSkills({ requireValidResponse: true })).resolves.toEqual([]);
+      stubFetchJson([baseSkill]);
+      await expect(client.listSkills({ requireValidResponse: true })).resolves.toMatchObject([{ id: "skill-1", name: "review-helper" }]);
+    });
+
+    it("treats a missing labels field as an empty array (older backends)", async () => {
+      stubFetchJson([baseSkill]);
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listSkills();
+      expect(res).toHaveLength(1);
+      expect(res[0]?.id).toBe("skill-1");
+      expect(res[0]?.labels).toEqual([]);
+      // List parsing must not invent detail-only fields (GH #2174).
+      expect(res[0]).not.toHaveProperty("content");
+      expect(res[0]).not.toHaveProperty("files");
+    });
+
+    it("keeps a well-formed labels array", async () => {
+      stubFetchJson([{ ...baseSkill, labels: [skillLabel] }]);
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listSkills();
+      expect(res[0]?.labels?.map((l) => l.id)).toEqual(["label-1"]);
+      expect(res[0]?.labels?.[0]?.resource_type).toBe("skill");
+    });
+
+    it("catches malformed labels to [] without dropping the skill", async () => {
+      stubFetchJson([{ ...baseSkill, labels: [{ nope: true }] }]);
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listSkills();
+      expect(res).toHaveLength(1);
+      expect(res[0]?.id).toBe("skill-1");
+      expect(res[0]?.labels).toEqual([]);
     });
   });
 
@@ -244,6 +344,11 @@ describe("ApiClient schema fallback", () => {
       expect(issue.labels).toBeUndefined();
     });
 
+    it.each([true, false, undefined, null, "off"])("validates the create PR override %s without breaking older responses", (value) => {
+      const parsed = CreateIssueResponseSchema.parse({ ...validIssue, pr_auto_complete_disabled: value });
+      expect(parsed.pr_auto_complete_disabled).toBe(typeof value === "boolean" ? value : undefined);
+    });
+
     it("validates a well-formed labels array", async () => {
       stubFetchJson({ ...validIssue, labels: [label] }, 201);
       const client = new ApiClient("https://api.example.test");
@@ -279,9 +384,136 @@ describe("ApiClient schema fallback", () => {
       const client = new ApiClient("https://api.example.test");
       await expect(client.createIssue({ title: "Created" })).rejects.toThrow();
     });
+
+    it("fails closed before POST when create properties are unsupported", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createIssue({ title: "Created", properties: { "property-1": "value" } }),
+      ).rejects.toThrow("does not support atomic custom properties");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.example.test/api/config");
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+    });
+
+    it("preflights properties and requires the canonical response snapshot", async () => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ issue_create_properties_supported: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              ...validIssue,
+              properties: { "property-1": ["first", "second"] },
+            }),
+            { status: 201, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createIssue({
+          title: "Created",
+          properties: { "property-1": ["second", "first", "second"] },
+        }),
+      ).resolves.toMatchObject({ properties: { "property-1": ["first", "second"] } });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+    });
+
+    it("reports a created identifier when the response property snapshot mismatches", async () => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ issue_create_properties_supported: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(validIssue), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createIssue({ title: "Created", properties: { "property-1": "value" } }),
+      ).rejects.toThrow("Issue MUL-1 was created");
+    });
   });
 
   describe("comment source-context sub-issues", () => {
+    it("preflights manual sub-issue properties and validates their snapshot", async () => {
+      const issue = {
+        id: "issue-2",
+        workspace_id: "ws-1",
+        number: 2,
+        identifier: "MUL-2",
+        title: "Child",
+        description: null,
+        status: "todo",
+        priority: "none",
+        assignee_type: null,
+        assignee_id: null,
+        creator_type: "member",
+        creator_id: "user-1",
+        parent_issue_id: "issue-1",
+        project_id: null,
+        position: 0,
+        stage: null,
+        start_date: null,
+        due_date: null,
+        metadata: {},
+        properties: { "property-1": true },
+        created_at: "2025-01-01T00:00:00Z",
+        updated_at: "2025-01-01T00:00:00Z",
+      };
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ issue_create_properties_supported: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(issue), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      await expect(
+        client.createCommentSubIssue("comment-1", {
+          mode: "manual",
+          capture_token: "token",
+          issue: { title: "Child", properties: { "property-1": true } },
+        }),
+      ).resolves.toMatchObject({ id: "issue-2" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "https://api.example.test/api/comments/comment-1/sub-issues",
+      );
+    });
+
     it("uses the dedicated endpoint for agent creation", async () => {
       stubFetchJson({ task_id: "task-1" }, 202);
       const client = new ApiClient("https://api.example.test");
@@ -344,6 +576,60 @@ describe("ApiClient schema fallback", () => {
       const client = new ApiClient("https://api.example.test");
       const res = await client.searchProjects({ q: "roadmap" });
       expect(res).toEqual({ projects: [] });
+    });
+  });
+
+  // Local search index sync applies whatever these return to the local copy,
+  // so a malformed body rejects instead of degrading to an empty page.
+  describe("search index sync", () => {
+    it("sends the workspace slug and parses a snapshot page", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            issues: [],
+            comments: [{ id: "c1", issue_id: "i1", content: "hi", created_at: "2026-01-01T00:00:00.5Z" }],
+            projects: [],
+            next_after_number: 200,
+            done: false,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      const page = await client.getSearchIndexSnapshot({ workspaceSlug: "acme", afterNumber: 0, limit: 200 });
+
+      expect(page.comments).toHaveLength(1);
+      expect(page.done).toBe(false);
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(String(url)).toBe("https://api.example.test/api/search-index/snapshot?after_number=0&limit=200");
+      expect((init as RequestInit).headers).toMatchObject({ "X-Workspace-Slug": "acme" });
+    });
+
+    it("rejects malformed manifest, snapshot, and changes bodies", async () => {
+      const client = new ApiClient("https://api.example.test");
+
+      stubFetchJson({ cursor: "", issue_count: 0, comment_count: 0, project_count: 0, text_bytes: 0 });
+      await expect(client.getSearchIndexManifest({ workspaceSlug: "acme" })).rejects.toThrow(/Malformed response/);
+
+      stubFetchJson({ issues: "nope", comments: [], projects: [], next_after_number: 0, done: true });
+      await expect(client.getSearchIndexSnapshot({ workspaceSlug: "acme", afterNumber: 0 })).rejects.toThrow(
+        /Malformed response/,
+      );
+
+      stubFetchJson({ issues: [], comments: [], projects: [], cursor: "c2", has_more: false });
+      await expect(client.getSearchIndexChanges({ workspaceSlug: "acme", cursor: "c1" })).rejects.toThrow(
+        /Malformed response/,
+      );
+    });
+
+    it("surfaces an expired cursor as a 410 ApiError", async () => {
+      stubFetchJson({ error: "search index cursor expired; rebuild the local index" }, 410);
+      const client = new ApiClient("https://api.example.test");
+      const err = await client.getSearchIndexChanges({ workspaceSlug: "acme", cursor: "c1" }).catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).status).toBe(410);
     });
   });
 
@@ -661,7 +947,82 @@ describe("ApiClient schema fallback", () => {
     });
   });
 
+  describe("listWecomInstallations", () => {
+    it("falls back to a safe empty shape when the response is malformed", async () => {
+      stubFetchJson({ installations: "not-an-array", configured: true });
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listWecomInstallations("ws-1");
+      expect(res).toEqual({ installations: [], configured: false });
+    });
+
+    // The settings tab shows the QR install entry point only when this is
+    // exactly true, so the flag has to survive parsing.
+    it("keeps both install flags, and treats a missing one as off", async () => {
+      stubFetchJson({
+        installations: [{ id: "wc-1", status: "active" }],
+        configured: true,
+        install_supported: true,
+        scan_install_supported: true,
+        future_field: true,
+      });
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listWecomInstallations("ws-1");
+      expect(res.install_supported).toBe(true);
+      expect(res.scan_install_supported).toBe(true);
+
+      // A server that predates the scan flow sends neither, and must not be
+      // read as "scanning is available".
+      stubFetchJson({ installations: [], configured: true });
+      const older = await client.listWecomInstallations("ws-1");
+      expect(older.scan_install_supported).toBeUndefined();
+      expect(older.scan_install_supported === true).toBe(false);
+    });
+
+    // The flag has to be VALIDATED, not merely passed through: this object is
+    // loose, so an undeclared key would survive parsing untouched.
+    it("does not let a non-boolean scan flag through unvalidated", async () => {
+      stubFetchJson({
+        installations: [],
+        configured: true,
+        scan_install_supported: "yes",
+      });
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listWecomInstallations("ws-1");
+      expect(res.scan_install_supported).toBeUndefined();
+    });
+  });
+
   describe("getConfig", () => {
+    it("preserves an omitted daemon setup target for legacy self-host detection", async () => {
+      stubFetchJson({
+        daemon_server_url: "https://api.example.com",
+        daemon_app_url: "https://app.example.com",
+      });
+      const config = await new ApiClient("https://api.example.test").getConfig();
+      expect(config.daemon_setup_target).toBeUndefined();
+      expect(config.daemon_server_url).toBe("https://api.example.com");
+      expect(config.daemon_app_url).toBe("https://app.example.com");
+    });
+
+    it.each([null, 123, {}, "unexpected", "unknown"])(
+      "does not infer Cloud from an unrecognized daemon setup target: %j",
+      async (target) => {
+        stubFetchJson({
+          daemon_setup_target: target,
+          daemon_server_url: "https://api.example.com",
+          daemon_app_url: "https://app.example.com",
+        });
+        const config = await new ApiClient("https://api.example.test").getConfig();
+        expect(config.daemon_setup_target).toBe("unknown");
+      },
+    );
+
+    it.each(["cloud", "self_host"])("preserves the confirmed daemon setup target %s", async (target) => {
+      stubFetchJson({ cdn_domain: "", daemon_setup_target: target });
+      const config = await new ApiClient("https://api.example.test").getConfig();
+      expect(config.daemon_setup_target).toBe(target);
+    });
+
     it("drops malformed daemon setup URLs instead of throwing", async () => {
       stubFetchJson({
         cdn_domain: "cdn.example.com",
@@ -723,6 +1084,22 @@ describe("ApiClient schema fallback", () => {
       const client = new ApiClient("https://api.example.test");
       const res = await client.listChildIssues("issue-1");
       expect(res).toEqual({ issues: [] });
+    });
+  });
+
+  describe("listIssueDuplicates", () => {
+    it("falls back to an empty relation when the body is null", async () => {
+      stubFetchJson(null);
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listIssueDuplicates("issue-1");
+      expect(res).toEqual({ duplicate_of: null, duplicates: [] });
+    });
+
+    it("defaults missing fields instead of failing", async () => {
+      stubFetchJson({});
+      const client = new ApiClient("https://api.example.test");
+      const res = await client.listIssueDuplicates("issue-1");
+      expect(res).toEqual({ duplicate_of: null, duplicates: [] });
     });
   });
 
@@ -1076,7 +1453,7 @@ describe("parseWithFallback", () => {
 
 // Workspace subscription reads carry a specific hazard the wallet schemas do
 // not: the fallback for a paid workspace must never be a shape that reads as
-// Free. An older cloud, a 503, or a renamed field has to surface as "unknown"
+// Free. An older/disabled cloud, an upstream 503, or a renamed field has to surface as "unknown"
 // so the UI shows "unavailable" instead of quietly downgrading a paying team.
 describe("workspace subscription contract", () => {
   const entitlement = {
@@ -1231,7 +1608,7 @@ describe("workspace subscription contract", () => {
     // parsing: fetch rejects first and a React Query caller sees isError. What
     // matters for both paths is the same — no snapshot is produced, so nothing
     // can be mistaken for a Free workspace.
-    for (const status of [404, 503]) {
+    for (const status of [403, 404, 503]) {
       stubFetchJson({ error: "unavailable" }, status);
       const client = new ApiClient("https://api.example.test");
       await expect(client.getWorkspaceSubscriptionSummary()).rejects.toThrow();

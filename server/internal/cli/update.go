@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,7 +33,34 @@ const ChecksumManifestName = "checksums.txt"
 
 const DefaultGitHubRepo = "multica-ai/multica"
 
+const defaultReleaseAPIBaseURL = "https://api.github.com"
+
+// MULTICA_RELEASE_API_BASE_URL points at a GitHub Releases API-compatible
+// mirror. MULTICA_RELEASE_DOWNLOAD_BASE_URL points at an artifact mirror
+// serving /<tag>/<asset-name>; when unset, the release-provided URLs win.
+const releaseAPIBaseURLEnv = "MULTICA_RELEASE_API_BASE_URL"
+const releaseDownloadBaseURLEnv = "MULTICA_RELEASE_DOWNLOAD_BASE_URL"
+
 const DefaultUpdateDownloadTimeout = 120 * time.Second
+
+func releaseAPIBaseURL() string {
+	if value := strings.TrimRight(strings.TrimSpace(os.Getenv(releaseAPIBaseURLEnv)), "/"); value != "" {
+		return value
+	}
+	return defaultReleaseAPIBaseURL
+}
+
+func releaseDownloadBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv(releaseDownloadBaseURLEnv)), "/")
+}
+
+func releaseAssetDownloadURL(assetName, targetVersion, fallback string) string {
+	base := releaseDownloadBaseURL()
+	if base == "" {
+		return fallback
+	}
+	return fmt.Sprintf("%s/%s/%s", base, url.PathEscape(normalizeReleaseTag(targetVersion)), url.PathEscape(assetName))
+}
 
 // GitHubRelease is the subset of the GitHub releases API response we need.
 type GitHubRelease struct {
@@ -228,8 +256,7 @@ func verifyAssetSHA256(data []byte, expectedHex, assetName string) error {
 
 func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	repo := ResolveGitHubRepo()
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag), nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/"+ResolveGitHubRepo()+"/releases/tags/"+url.PathEscape(tag), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +269,7 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("release API returned %d", resp.StatusCode)
 	}
 
 	var release GitHubRelease
@@ -252,11 +279,10 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from the configured GitHub repo.
+// FetchLatestRelease fetches the latest release tag from the multica GitHub repo.
 func FetchLatestRelease() (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	repo := ResolveGitHubRepo()
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo), nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/"+ResolveGitHubRepo()+"/releases/latest", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +295,7 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("release API returned %d", resp.StatusCode)
 	}
 
 	var release GitHubRelease
@@ -277,53 +303,6 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 		return nil, err
 	}
 	return &release, nil
-}
-
-// ResolveGitHubRepo returns the owner/repo slug used for release lookups.
-// MULTICA_GITHUB_REPO overrides the upstream default when it is a valid slug.
-func ResolveGitHubRepo() string {
-	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
-	if repo != "" && validGithubRepoSlug(repo) {
-		return repo
-	}
-	cfg, err := LoadCLIConfig()
-	if err == nil {
-		repo = strings.TrimSpace(cfg.GitHubRepo)
-		if repo != "" && validGithubRepoSlug(repo) {
-			return repo
-		}
-	}
-	return DefaultGitHubRepo
-}
-
-// ShouldSkipBrewUpgrade reports whether brew-based self-update should be skipped.
-func ShouldSkipBrewUpgrade() bool {
-	if strings.TrimSpace(os.Getenv("MULTICA_SKIP_BREW")) == "1" {
-		return true
-	}
-	return ResolveGitHubRepo() != DefaultGitHubRepo
-}
-
-// GitHubReleasesLatestURL returns the web URL for the latest release page.
-func GitHubReleasesLatestURL() string {
-	return fmt.Sprintf("https://github.com/%s/releases/latest", ResolveGitHubRepo())
-}
-
-func validGithubRepoSlug(raw string) bool {
-	if strings.Contains(raw, "://") {
-		return false
-	}
-	parts := strings.Split(raw, "/")
-	if len(parts) != 2 {
-		return false
-	}
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" || strings.Contains(part, "/") {
-			return false
-		}
-	}
-	return true
 }
 
 // knownBrewPrefixes lists the install roots Homebrew uses on each platform.
@@ -344,22 +323,14 @@ func MatchKnownBrewPrefix(path string) string {
 }
 
 // IsBrewInstall checks whether the running multica binary was installed via Homebrew.
+// The check itself lives in brewInstallForPath (stable_exe.go) so it stays
+// one implementation with the stable-path resolver that depends on it.
 func IsBrewInstall() bool {
 	exePath, err := selfexec.Resolve()
 	if err != nil {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(exePath)
-	if err != nil {
-		resolved = exePath
-	}
-
-	brewPrefix := GetBrewPrefix()
-	if brewPrefix != "" && strings.HasPrefix(resolved, brewPrefix) {
-		return true
-	}
-
-	return MatchKnownBrewPrefix(resolved) != ""
+	return brewInstallForPath(exePath)
 }
 
 // GetBrewPrefix returns the Homebrew prefix by running `brew --prefix`, or empty string.
@@ -443,14 +414,15 @@ func UpdateViaDownloadWithTimeout(targetVersion string, downloadTimeout time.Dur
 	if err != nil {
 		return "", err
 	}
-	downloadURL := asset.BrowserDownloadURL
+	downloadURL := releaseAssetDownloadURL(asset.Name, tag, asset.BrowserDownloadURL)
 	assetName := asset.Name
 
 	// Pull the checksum manifest first so a release that is half-published
 	// (archives uploaded but checksums.txt not yet) fails before we eat the
 	// archive's bandwidth.
 	timeout := updateDownloadTimeoutOrDefault(downloadTimeout)
-	manifestData, err := fetchURLBytes(manifestAsset.BrowserDownloadURL, timeout)
+	manifestURL := releaseAssetDownloadURL(manifestAsset.Name, tag, manifestAsset.BrowserDownloadURL)
+	manifestData, err := fetchURLBytes(manifestURL, timeout)
 	if err != nil {
 		return "", fmt.Errorf("download checksum manifest: %w", err)
 	}
@@ -588,4 +560,44 @@ func extractBinaryFromZip(r io.Reader, name string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("binary %q not found in archive", name)
+}
+
+func ResolveGitHubRepo() string {
+	repo := strings.TrimSpace(os.Getenv("MULTICA_GITHUB_REPO"))
+	if repo != "" && validGithubRepoSlug(repo) {
+		return repo
+	}
+	cfg, err := LoadCLIConfig()
+	if err == nil {
+		repo = strings.TrimSpace(cfg.GitHubRepo)
+		if repo != "" && validGithubRepoSlug(repo) {
+			return repo
+		}
+	}
+	return DefaultGitHubRepo
+}
+
+// ShouldSkipBrewUpgrade reports whether brew-based self-update should be skipped.
+func ShouldSkipBrewUpgrade() bool {
+	if strings.TrimSpace(os.Getenv("MULTICA_SKIP_BREW")) == "1" {
+		return true
+	}
+	return ResolveGitHubRepo() != DefaultGitHubRepo
+}
+
+func validGithubRepoSlug(raw string) bool {
+	if strings.Contains(raw, "://") {
+		return false
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, "/") {
+			return false
+		}
+	}
+	return true
 }

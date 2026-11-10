@@ -4,12 +4,11 @@ import { use } from "react";
 import { useSearchParams } from "next/navigation";
 import { AttachmentPreviewPage } from "@multica/views/attachments";
 import { ErrorBoundary } from "@multica/ui/components/common/error-boundary";
-import { PageTitle } from "@/components/page-title";
 
 // Lives at /:slug/attachments/:id/preview — OUTSIDE the (dashboard) group on
 // purpose. The dashboard layout adds a left sidebar + top chrome; this page
-// wants the full viewport for the HTML iframe. Workspace resolution still
-// happens in the parent [workspaceSlug] layout so useWorkspaceId() works.
+// wants the full viewport for the file. Workspace resolution still happens in
+// the parent [workspaceSlug] layout so useWorkspaceId() works.
 export default function AttachmentPreviewWebPage({
   params,
 }: {
@@ -18,11 +17,16 @@ export default function AttachmentPreviewWebPage({
   const { id } = use(params);
   const search = useSearchParams();
   const filename = search.get("name") ?? undefined;
+  // Query and fragment the document opens at (the viewer's address bar).
+  const initialAddress = search.get("loc") ?? undefined;
 
   return (
     <ErrorBoundary resetKeys={[id]}>
-      <PageTitle title="Attachment" />
-      <AttachmentPreviewPage attachmentId={id} filename={filename} />
+      <AttachmentPreviewPage
+        attachmentId={id}
+        filename={filename}
+        initialAddress={initialAddress}
+      />
     </ErrorBoundary>
   );
 }

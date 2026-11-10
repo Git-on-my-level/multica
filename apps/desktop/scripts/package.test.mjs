@@ -529,7 +529,6 @@ describe("builderArgsForTarget", () => {
       "--config.publish.owner=Git-on-my-level",
       "--config.publish.repo=multica",
       "-c.directories.output=dist/mac-x64",
-      "-c.mac.minimumSystemVersion=12.0.0",
       "-c.publish.channel=latest-x64",
     ]);
   });

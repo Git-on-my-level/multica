@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/multica-ai/multica/server/internal/agentconfig"
 	"github.com/multica-ai/multica/server/internal/cli"
 )
 
@@ -57,6 +59,16 @@ var runtimeRenameCmd = &cobra.Command{
 	RunE: runRuntimeRename,
 }
 
+var runtimeConcurrencyCmd = &cobra.Command{
+	Use:   "concurrency <runtime-id> <limit|none>",
+	Short: "Set or clear a runtime-wide concurrency limit",
+	Long: "Limit how many runs may be in progress at once across every agent bound to this runtime.\n\n" +
+		"Each agent's own limit still applies; this caps their combined work, e.g. when several " +
+		"agents share one local GPU. Pass \"none\" to remove the limit.",
+	Args: exactArgs(2),
+	RunE: runRuntimeConcurrency,
+}
+
 var runtimeDeleteCmd = &cobra.Command{
 	Use:   "delete <runtime-id>",
 	Short: "Delete a runtime from the workspace",
@@ -74,6 +86,7 @@ func init() {
 	runtimeCmd.AddCommand(runtimeActivityCmd)
 	runtimeCmd.AddCommand(runtimeUpdateCmd)
 	runtimeCmd.AddCommand(runtimeRenameCmd)
+	runtimeCmd.AddCommand(runtimeConcurrencyCmd)
 	runtimeCmd.AddCommand(runtimeDeleteCmd)
 
 	// runtime list
@@ -95,14 +108,15 @@ func init() {
 	runtimeRenameCmd.Flags().Bool("machine", false, "Apply the name to every runtime on the same machine")
 	runtimeRenameCmd.Flags().String("output", "table", "Output format: table or json")
 
+	// runtime concurrency
+	runtimeConcurrencyCmd.Flags().String("output", "table", "Output format: table or json")
+
 	// runtime delete
 	runtimeDeleteCmd.Flags().Bool("cascade", false, "Unbind active agents from the runtime, cancel their runs, then delete the runtime")
 	runtimeDeleteCmd.Flags().String("output", "table", "Output format: table or json")
 }
 
-// ---------------------------------------------------------------------------
 // Runtime commands
-// ---------------------------------------------------------------------------
 
 func runRuntimeList(cmd *cobra.Command, _ []string) error {
 	client, err := newAPIClient(cmd)
@@ -232,6 +246,13 @@ func runRuntimeDelete(cmd *cobra.Command, args []string) error {
 
 	conflict, ok := runtimeDeleteConflict(err)
 	if !ok {
+		// Any other 409 is a deliberate, already-explained refusal — most often
+		// a profile-backed instance that cannot be deleted on its own. Show the
+		// server's guidance instead of a raw HTTP wrapper; --cascade cannot get
+		// past these, so there is nothing more for this command to try.
+		if _, msg, isConflict := serverConflictMessage(err); isConflict {
+			return errors.New(msg)
+		}
 		return fmt.Errorf("delete runtime: %w", err)
 	}
 
@@ -284,6 +305,51 @@ func runRuntimeRename(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Custom name cleared; runtime is now %q.\n", strVal(rt, "name"))
 	} else {
 		fmt.Fprintf(os.Stderr, "Runtime renamed to %q.\n", strVal(rt, "custom_name"))
+	}
+	return nil
+}
+
+// parseRuntimeConcurrencyArg maps the CLI argument onto the PATCH value:
+// "none" clears the limit (JSON null), otherwise an integer in the agent
+// limit range.
+func parseRuntimeConcurrencyArg(arg string) (any, error) {
+	if strings.EqualFold(strings.TrimSpace(arg), "none") {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(arg))
+	if err != nil || n < int(agentconfig.MinMaxConcurrentTasks) || n > int(agentconfig.MaxMaxConcurrentTasks) {
+		return nil, fmt.Errorf("limit must be \"none\" or an integer between %d and %d", agentconfig.MinMaxConcurrentTasks, agentconfig.MaxMaxConcurrentTasks)
+	}
+	return n, nil
+}
+
+func runRuntimeConcurrency(cmd *cobra.Command, args []string) error {
+	limit, err := parseRuntimeConcurrencyArg(args[1])
+	if err != nil {
+		return err
+	}
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	var rt map[string]any
+	body := map[string]any{"max_concurrent_tasks": limit}
+	if err := client.PatchJSON(ctx, "/api/runtimes/"+args[0], body, &rt); err != nil {
+		return fmt.Errorf("set runtime concurrency: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, rt)
+	}
+	if limit == nil {
+		fmt.Fprintln(os.Stderr, "Runtime concurrency limit removed.")
+	} else {
+		fmt.Fprintf(os.Stderr, "Runtime concurrency limit set to %d.\n", limit)
 	}
 	return nil
 }
@@ -348,6 +414,38 @@ func runRuntimeUpdate(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 	}
+}
+
+// serverConflictMessage pulls the server's own sentence out of a 409 body.
+//
+// The refusals behind runtime and profile deletion are written to be read by
+// the person who ran the command — they name the machine, the profile and what
+// to do instead. HTTPError.Error() would bury that sentence inside a raw JSON
+// dump of the whole response, which is what a blocked user used to see.
+func serverConflictMessage(err error) (code string, message string, ok bool) {
+	var httpErr *cli.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict {
+		return "", "", false
+	}
+	body := strings.TrimSpace(httpErr.Body)
+	if body == "" {
+		return "", "", false
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &payload) != nil {
+		// Not JSON. An older or proxied server can still put a readable
+		// sentence here, and swallowing it would be worse than passing it
+		// through — there is nothing to leak when the body was never
+		// structured in the first place.
+		return "", body, true
+	}
+	if strings.TrimSpace(payload.Error) == "" {
+		return payload.Code, "", false
+	}
+	return payload.Code, payload.Error, true
 }
 
 type runtimeDeleteConflictPayload struct {

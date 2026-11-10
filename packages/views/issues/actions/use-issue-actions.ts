@@ -1,5 +1,6 @@
 "use client";
 
+import { subIssueCreateDefaults } from "@multica/core/issues";
 import { useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -26,12 +27,16 @@ export interface UseIssueActionsResult {
     options?: IssueSurfaceMutationOptions,
   ) => void;
   openInNewTab: () => void;
+  openInDesktop?: () => void;
   togglePin: () => void;
   copyLink: () => Promise<void>;
+  copyCommentLink: (commentId: string) => Promise<void>;
   openCreateSubIssue: () => void;
+  openRename: () => void;
   openSetParent: () => void;
   removeParent: () => void;
   openAddChild: () => void;
+  openMarkDuplicate: () => void;
   openDeleteConfirm: (opts?: { onDeletedFallbackPath?: string }) => void;
 }
 
@@ -67,6 +72,7 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
 
   const issueId = issue?.id ?? null;
   const issueIdentifier = issue?.identifier ?? null;
+  const issueTitle = issue?.title ?? "";
   const issueProjectId = issue?.project_id ?? null;
   const issueAssigneeType = issue?.assignee_type ?? null;
   const issueAssigneeId = issue?.assignee_id ?? null;
@@ -146,6 +152,15 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
     );
   }, [issueId, issueIdentifier, navigation, paths]);
 
+  const openInDesktop = useCallback(() => {
+    if (!issueId) return;
+    const path = paths.issueDetail(issueIdentifier || issueId);
+    const isCurrentIssue =
+      navigation.pathname === path ||
+      navigation.pathname === paths.issueDetail(issueId);
+    navigation.openInDesktop?.(path + (isCurrentIssue ? navigation.hash : ""));
+  }, [issueId, issueIdentifier, navigation, paths]);
+
   const togglePin = useCallback(() => {
     if (!issueId) return;
     if (isPinned) {
@@ -168,23 +183,35 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
     }
   }, [paths, issueId, issueIdentifier, navigation, t]);
 
+  // Built during render so `copyCommentLink` depends on this string alone:
+  // `paths` is rebuilt on every render, and the handler is passed to every
+  // memoized comment card, so depending on it would re-render all of them on
+  // any unrelated page update. Identifier form for the same reason as `copyLink`.
+  const issueShareUrl = issueId
+    ? navigation.getShareableUrl(paths.issueDetail(issueIdentifier || issueId))
+    : null;
+  const copyCommentLink = useCallback(async (commentId: string) => {
+    if (!issueShareUrl) return;
+    // The `#comment-…` fragment is the deep-link anchor `IssueDetailRoute`
+    // resolves via `parseCommentHighlightHash`; dropping it would downgrade the
+    // link to the whole issue.
+    const url = `${issueShareUrl}#comment-${commentId}`;
+    if (await copyText(url)) {
+      toast.success(t(($) => $.comment.link_copied));
+    } else {
+      toast.error(t(($) => $.comment.link_copy_failed));
+    }
+  }, [issueShareUrl, t]);
+
   const openCreateSubIssue = useCallback(() => {
     if (!issueId) return;
-    openModal("create-issue", {
-      parent_issue_id: issueId,
-      parent_issue_identifier: issueIdentifier,
-      ...(issueProjectId ? { project_id: issueProjectId } : {}),
-      // Inherit the parent's assignee (member/agent/squad) so a sub-issue
-      // created from the "Add sub-issue" entry starts with the same owner
-      // (discussion #1728). The modal keys off whether these fields are
-      // present, not their value, so a seed overrides the sticky last-used
-      // assignee it would otherwise fall back to, while omitting both for
-      // an unassigned parent leaves that fallback intact. Seed the two
-      // together — assignee_type is meaningless without assignee_id.
-      ...(issueAssigneeType && issueAssigneeId
-        ? { assignee_type: issueAssigneeType, assignee_id: issueAssigneeId }
-        : {}),
-    });
+    openModal("create-issue", subIssueCreateDefaults({
+      id: issueId,
+      identifier: issueIdentifier,
+      project_id: issueProjectId,
+      assignee_type: issueAssigneeType,
+      assignee_id: issueAssigneeId,
+    }));
   }, [
     openModal,
     issueId,
@@ -197,6 +224,24 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
   const openSetParent = useCallback(() => {
     if (!issueId) return;
     openModal("issue-set-parent", { issueId });
+  }, [openModal, issueId]);
+
+  // Rename entry point for every surface that renders the actions menu. The
+  // issue detail page can also activate its inline title editor by clicking the
+  // title, but list, board, gantt and sub-issue rows have no such affordance —
+  // one shared modal keeps the write path identical everywhere.
+  const openRename = useCallback(() => {
+    if (!issueId) return;
+    openModal("issue-rename", {
+      issueId,
+      identifier: issueIdentifier,
+      title: issueTitle,
+    });
+  }, [openModal, issueId, issueIdentifier, issueTitle]);
+
+  const openMarkDuplicate = useCallback(() => {
+    if (!issueId) return;
+    openModal("issue-mark-duplicate", { issueId });
   }, [openModal, issueId]);
 
   // Detach from the parent and promote to a standalone issue. Reversible
@@ -264,12 +309,16 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
     isPinned,
     updateField,
     openInNewTab,
+    openInDesktop: navigation.openInDesktop ? openInDesktop : undefined,
     togglePin,
     copyLink,
+    copyCommentLink,
     openCreateSubIssue,
+    openRename,
     openSetParent,
     removeParent,
     openAddChild,
+    openMarkDuplicate,
     openDeleteConfirm,
   };
 }

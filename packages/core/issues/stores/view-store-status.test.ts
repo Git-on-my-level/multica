@@ -5,6 +5,7 @@ import {
   cardPropertyOptionsForView,
   sortOptionsForView,
   viewStoreSlice,
+  mergeViewStatePersisted,
   type IssueViewState,
 } from "./view-store";
 import { baselineFromQuery } from "../../issue-views/baseline";
@@ -22,11 +23,11 @@ describe("column visibility vs status filter", () => {
 
   // The regression: hiding one column wrote the OTHER six built-in keys into
   // statusFilters, so the query then excluded every custom status too — hiding
-  // Backlog silently dropped a QA card sitting in the In Review column.
+  // Backlog silently dropped a QA card too.
   it("hiding a column does not touch the status filter", () => {
     store.getState().hideStatus("backlog");
 
-    expect(store.getState().hiddenStatusCategories).toEqual([
+    expect(store.getState().hiddenStatuses).toEqual([
       "cancelled",
       "backlog",
     ]);
@@ -38,7 +39,7 @@ describe("column visibility vs status filter", () => {
     store.getState().hideStatus("done");
     store.getState().showStatus("backlog");
 
-    expect(store.getState().hiddenStatusCategories).toEqual([
+    expect(store.getState().hiddenStatuses).toEqual([
       "cancelled",
       "done",
     ]);
@@ -49,7 +50,7 @@ describe("column visibility vs status filter", () => {
     store.getState().hideStatus("backlog");
     store.getState().hideStatus("backlog");
 
-    expect(store.getState().hiddenStatusCategories).toEqual([
+    expect(store.getState().hiddenStatuses).toEqual([
       "cancelled",
       "backlog",
     ]);
@@ -68,7 +69,30 @@ describe("column visibility vs status filter", () => {
     store.getState().showStatus("cancelled");
     store.getState().clearFilters();
 
-    expect(store.getState().hiddenStatusCategories).toEqual(["backlog"]);
+    expect(store.getState().hiddenStatuses).toEqual(["backlog"]);
+  });
+});
+
+describe("persisted lifecycle category upgrade", () => {
+  const defaults = createStore<IssueViewState>()((set) => viewStoreSlice(set)).getState();
+  it("normalizes legacy hidden/collapsed categories without changing exact status filters", () => {
+    const state = mergeViewStatePersisted({
+      hiddenStatusCategories: ["backlog", "todo", "in_progress", "in_review", "blocked", "cancelled"],
+      listCollapsedStatuses: ["completed", "canceled"],
+      statusFilters: ["in_review", "awaiting_response"],
+    }, defaults);
+    expect(state.hiddenStatuses).toEqual(["backlog", "todo", "in_progress", "in_review", "blocked", "cancelled"]);
+    expect(state.listCollapsedStatuses).toEqual(["done", "cancelled"]);
+    expect(state.statusFilters).toEqual(["in_review", "awaiting_response"]);
+  });
+  it("keeps independent visibility for old concrete columns", () => {
+    const state = mergeViewStatePersisted({ hiddenStatuses: ["backlog", "in_review"] }, defaults);
+    expect(state.hiddenStatuses).toEqual(["backlog", "in_review"]);
+  });
+  it("preserves exact custom keys even if they resemble category names", () => {
+    const state = mergeViewStatePersisted({ hiddenStatuses: ["started"], listCollapsedStatuses: [] }, defaults);
+    expect(state.hiddenStatuses).toEqual(["started"]);
+    expect(state.listCollapsedStatuses).toEqual([]);
   });
 });
 
@@ -78,10 +102,10 @@ describe("issue view defaults", () => {
     store = createStore<IssueViewState>()((set) => viewStoreSlice(set));
   });
 
-  it("starts with newest-created issues first and a compact card", () => {
+  it("starts with recently updated issues first and a compact card", () => {
     const state = store.getState();
 
-    expect([state.sortBy, state.sortDirection]).toEqual(["created_at", "desc"]);
+    expect([state.sortBy, state.sortDirection]).toEqual(["updated_at", "desc"]);
     expect(state.cardProperties).toEqual({
       priority: true,
       description: false,
@@ -115,7 +139,7 @@ describe("issue view defaults", () => {
     store.getState().setSortBy("position");
     store.getState().setGrouping("assignee");
 
-    expect(store.getState().sortBy).toBe("created_at");
+    expect(store.getState().sortBy).toBe("updated_at");
     expect(store.getState().sortDirection).toBe("desc");
   });
 
@@ -126,7 +150,7 @@ describe("issue view defaults", () => {
     store.getState().setViewMode("board");
 
     expect(store.getState().grouping).toBe("assignee");
-    expect(store.getState().sortBy).toBe("created_at");
+    expect(store.getState().sortBy).toBe("updated_at");
     expect(store.getState().sortDirection).toBe("desc");
   });
 

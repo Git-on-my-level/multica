@@ -8,6 +8,8 @@ const (
 	EventIssueDeleted            = "issue:deleted"
 	EventIssueMetadataChanged    = "issue_metadata:changed"
 	EventIssueAttachmentsChanged = "issue_attachments:changed"
+	// Personal: one member's unread mark on an issue changed (MUL-8438).
+	EventIssueUnreadChanged = "issue_unread:changed"
 
 	// Comment events
 	EventCommentCreated       = "comment:created"
@@ -27,15 +29,17 @@ const (
 	EventAgentRestored = "agent:restored"
 
 	// Task events (server <-> daemon).
-	// Each event maps to a status transition on agent_task_queue. Front-end
+	// Events describe task lifecycle or recorded usage changes. Front-end
 	// subscribes by `task:` prefix and invalidates the workspace task
 	// snapshot, so the granularity here is "what does the user want to see
 	// change" — not "every internal status flip".
 	EventTaskQueued                = "task:queued"                  // ∅ → queued (enqueue / retry create)
+	EventTaskCoalesced             = "task:coalesced"               // status unchanged (a comment folded into a run not yet claimed, which now answers it)
 	EventTaskDispatch              = "task:dispatch"                // queued → dispatched (daemon claim)
 	EventTaskRunning               = "task:running"                 // dispatched → running (daemon started)
 	EventTaskWaitingLocalDirectory = "task:waiting_local_directory" // dispatched → waiting_local_directory (daemon parked on a busy local_directory path)
 	EventTaskProgress              = "task:progress"
+	EventTaskUsage                 = "task:usage"
 	EventTaskCompleted             = "task:completed" // running → completed
 	EventTaskFailed                = "task:failed"    // running → failed
 	EventTaskMessage               = "task:message"
@@ -98,6 +102,10 @@ const (
 	EventProjectResourceUpdated = "project_resource:updated"
 	EventProjectResourceDeleted = "project_resource:deleted"
 
+	// EventProjectMembersChanged carries {project_id}: a private project's
+	// member list changed (MUL-8472).
+	EventProjectMembersChanged = "project:members_changed"
+
 	// Label events
 	EventLabelCreated       = "label:created"
 	EventLabelUpdated       = "label:updated"
@@ -118,6 +126,21 @@ const (
 	// The `action` in the payload is advisory (it makes a frame in devtools
 	// self-describing); nothing routes on it.
 	EventIssueStatusChanged = "issue_status:changed"
+
+	// Project workflow events (MUL-7420). Same shape as the status catalog
+	// event: workflows are read as one list, so every write answers the same
+	// way — re-read it. A project switching workflows publishes
+	// project:updated instead.
+	EventIssueWorkflowChanged = "issue_workflow:changed"
+
+	// Saved issue views. One event for create, edit and delete: every client
+	// answers by re-reading the views it can see. A view that is private on
+	// both sides of the write reaches its owner only.
+	EventIssueViewChanged = "issue_view:changed"
+
+	// A member's own view and sidebar preferences. Always private to that
+	// member: it exists so their other devices follow along.
+	EventIssueViewPreferenceChanged = "issue_view_preference:changed"
 
 	// Pin events
 	EventPinCreated   = "pin:created"
@@ -143,12 +166,13 @@ const (
 	EventSquadDeleted = "squad:deleted"
 
 	// Daemon events
-	EventDaemonHeartbeat              = "daemon:heartbeat"
-	EventDaemonHeartbeatAck           = "daemon:heartbeat_ack"
-	EventDaemonRegister               = "daemon:register"
-	EventDaemonTaskAvailable          = "daemon:task_available"
-	EventDaemonRuntimeProfilesChanged = "daemon:runtime_profiles_changed"
-	EventDaemonWorkspacesChanged      = "daemon:workspaces_changed"
+	EventDaemonHeartbeat               = "daemon:heartbeat"
+	EventDaemonHeartbeatAck            = "daemon:heartbeat_ack"
+	EventDaemonRegister                = "daemon:register"
+	EventDaemonTaskAvailable           = "daemon:task_available"
+	EventDaemonTaskSupplementAvailable = "daemon:task_supplement_available"
+	EventDaemonRuntimeProfilesChanged  = "daemon:runtime_profiles_changed"
+	EventDaemonWorkspacesChanged       = "daemon:workspaces_changed"
 	// EventDaemonPendingWork is a runtime-scoped hint that a heartbeat-carried
 	// request (model discovery, capability discovery, or local-skill import) is
 	// queued for that runtime. Without it the daemon only learns about the
@@ -172,6 +196,10 @@ const (
 	EventPullRequestLinked         = "pull_request:linked"
 	EventPullRequestUpdated        = "pull_request:updated"
 	EventPullRequestUnlinked       = "pull_request:unlinked"
+
+	// An issue's local environments changed: one started, stopped, changed
+	// state, or its daemon stopped reporting it.
+	EventEnvironmentChanged = "environment:changed"
 
 	// VCS integration events (Forgejo / Gitea / GitLab)
 	EventVCSConnectionCreated = "vcs_connection:created"

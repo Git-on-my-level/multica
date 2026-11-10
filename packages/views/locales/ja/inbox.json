@@ -15,10 +15,24 @@
     "status": "ステータス",
     "priority": "優先度",
     "from": "送信者",
-    "unread_only": "未読のみ",
     "notification_count_other": "{{count}} 件の通知",
     "clear": "フィルターをクリア",
-    "empty": "フィルターに一致する通知はありません"
+    "empty": "フィルターに一致する通知はありません",
+    "section_notification": "通知",
+    "section_issue": "タスク",
+    "type": "通知の種類",
+    "received": "受信日時",
+    "type_mention": "メンション",
+    "type_comment": "コメントとリアクション",
+    "type_assign": "割り当てと購読",
+    "type_review": "レビュー依頼",
+    "type_change": "タスクの変更",
+    "type_run": "エージェントの実行",
+    "type_system": "システム",
+    "received_today": "今日",
+    "received_last_7_days": "過去 7 日間",
+    "received_last_30_days": "過去 30 日間",
+    "agent_idle": "待機中"
   },
   "context_menu": {
     "mark_read": "既読にする",
@@ -28,6 +42,7 @@
     "open_in_new_tab": "新しいタブで開く"
   },
   "list": {
+    "loading_selection": "通知を読み込み中…",
     "empty": "通知はありません",
     "mark_done_tooltip": "完了にする",
     "archive_tooltip": "アーカイブ",
@@ -40,7 +55,10 @@
     "archived_title": "アーカイブ済み",
     "archived_empty": "アーカイブされた通知はありません",
     "unarchive_tooltip": "アーカイブ解除",
-    "actions_aria": "通知の操作"
+    "actions_aria": "通知の操作",
+    "load_more": "さらに読み込む",
+    "loading_more": "読み込み中…",
+    "retry": "再試行"
   },
   "detail": {
     "select_prompt": "詳細を表示する通知を選択してください",
@@ -74,7 +92,12 @@
     "quick_create_failed": "エージェントでの作成に失敗",
     "quick_create_unconfirmed": "エージェントでの作成結果は未確認",
     "autopilot_paused": "自動化を一時停止しました",
-    "autopilot_quota_exceeded": "自動化の実行上限に達しました"
+    "children_done": "サブタスクがすべて終わりました",
+    "autopilot_quota_exceeded": "自動化の実行上限に達しました",
+    "app_action_requested": "確認が必要",
+    "app_action_reminder": "確認の期限が近い",
+    "app_connect_requested": "アプリの接続依頼",
+    "app_action_result": "アプリ操作の結果"
   },
   "labels": {
     "set_status_to": "ステータスを変更:",
@@ -88,7 +111,8 @@
     "reacted_to_comment": "あなたのコメントに {{emoji}} のリアクションをしました",
     "created_with_agent": "エージェントで作成: {{identifier}}",
     "failed_with_detail": "失敗: {{detail}}",
-    "autopilot_quota_blocked": "上限に達したため実行をブロックしました"
+    "autopilot_quota_blocked": "上限に達したため実行をブロックしました",
+    "children_done_stage": "ステージ {{stage}} のサブタスクがすべて終わりました"
   },
   "toasts": {
     "source_context_retry_started": "元のコンテキストで再試行を開始しました",
@@ -96,6 +120,7 @@
     "unarchived": "通知を元に戻しました"
   },
   "errors": {
+    "archived_lookup_failed": "リンク先の通知を読み込めませんでした",
     "source_context_retry_failed": "元のコンテキストで再試行できませんでした",
     "source_context_retry_unavailable": "このコンテキストは再試行できません。分岐点からやり直してください。",
     "mark_read_failed": "既読にできませんでした",
@@ -107,6 +132,7 @@
     "archive_all_read_failed": "既読の項目をアーカイブできませんでした",
     "archive_completed_failed": "完了した項目をアーカイブできませんでした",
     "unarchive_failed": "アーカイブ解除に失敗しました",
-    "archived_load_failed": "アーカイブ済み通知を読み込めませんでした"
+    "archived_load_failed": "アーカイブ済み通知を読み込めませんでした",
+    "filters_load_failed": "フィルターを読み込めませんでした"
   }
 }

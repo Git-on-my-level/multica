@@ -7,8 +7,8 @@ import (
 
 // BuiltinRuntime describes a built-in runtime identity that the daemon probes
 // and registers automatically — independent of the custom runtime profile
-// protocol_family whitelist. Multiple runtime identities can share one
-// protocol family (e.g. both "pi" and "omp" use the "pi" protocol backend).
+// protocol_family whitelist. A descriptor may use its own protocol family;
+// the fork keeps OMP on its ACP backend.
 //
 // The descriptor is the single declaration site for a runtime identity:
 // agents_probe.go, config.go, daemon.go display-name overrides, execenv
@@ -54,7 +54,7 @@ type BuiltinRuntime struct {
 	UserSkillsDirWindows string
 
 	// LaunchHeader is the user-visible launch skeleton shown in the UI
-	// (e.g. "omp (json mode)").
+	// (e.g. "omp acp").
 	LaunchHeader string
 
 	// DefaultExecutable is the binary name the backend falls back to when
@@ -77,14 +77,13 @@ type BuiltinRuntime struct {
 
 // ModelDiscoveryFunc discovers available models for a runtime identity.
 // It receives the context and the resolved command — executable plus the
-// runtime's launch prefix — and returns a model catalog. When the binary is
-// missing or too old, it returns an empty slice (ListModels swallows the
-// error and degrades to manual entry).
+// runtime's launch prefix — and returns a model catalog. Discovery failures
+// propagate to the picker, which shows the reason and supports manual entry.
 type ModelDiscoveryFunc func(ctx context.Context, runtimeCmd Command) ([]Model, error)
 
 // BuiltinRuntimes is the registry of built-in runtime identities that are
-// NOT in SupportedTypes (they are protocol-family derivatives, not families
-// themselves). The daemon probes each one independently and dispatches it
+// independently discovered by the daemon. OMP is also in SupportedTypes
+// because this fork provides its own ACP family. The daemon dispatches each one
 // to its protocol family's backend.
 //
 // A runtime identity appears here when it needs its own probe/display/skills
@@ -105,24 +104,6 @@ var BuiltinRuntimes = []BuiltinRuntime{
 		DefaultExecutable: "omp",
 		ProviderLabel:     "omp",
 		ModelDiscovery:    discoverOmpModels,
-	},
-	{
-		// Host-local Devin CLI over ACP. Not cloud Devin VMs / Playbooks / Secrets.
-		// ProtocolFamily is "devin" so ResolveBackend/New dispatch to devinBackend.
-		ID:             "devin",
-		ProtocolFamily: "devin",
-		DefaultCommand: "devin",
-		EnvPrefix:      "MULTICA_DEVIN",
-		DisplayName:    "Devin",
-		SkillsDir:      ".devin/skills",
-		UserSkillsDir:  ".config/devin/skills",
-		// Devin CLI stores user-level skills under %APPDATA%\devin\skills on
-		// Windows; the XDG-style ~/.config path does not exist there.
-		UserSkillsDirWindows: "devin/skills",
-		LaunchHeader:         "devin acp",
-		DefaultExecutable:    "devin",
-		ProviderLabel:        "devin",
-		ModelDiscovery:       discoverDevinModels,
 	},
 }
 
@@ -210,4 +191,21 @@ func NewRuntime(runtimeID string, cfg Config) (Backend, error) {
 	}
 	applicator.applyBuiltinRuntimeOverrides(desc)
 	return backend, nil
+}
+
+// ProfileRuntimeType preserves profiles authored before runtime identity was stored.
+func ProfileRuntimeType(runtimeType, protocolFamily string) string {
+	if runtimeType != "" {
+		return runtimeType
+	}
+	return protocolFamily
+}
+
+// RuntimeProtocolFamily resolves the compatibility target using the same registry
+// as backend construction and model discovery.
+func RuntimeProtocolFamily(runtimeType string) (string, bool) {
+	if desc, ok := BuiltinRuntimeByID(runtimeType); ok {
+		return desc.ProtocolFamily, true
+	}
+	return runtimeType, IsSupportedType(runtimeType)
 }

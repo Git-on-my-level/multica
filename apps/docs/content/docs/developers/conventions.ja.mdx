@@ -30,12 +30,14 @@ Multica のコードを書く、翻訳を変更する、あるいは中国語の
 
 | パッケージ | 依存可能 | 依存禁止 |
 | --- | --- | --- |
-| `packages/core` | アプリ固有でないもののみ | `react-dom`, `localStorage`, `process.env`, `next/*`, UI ライブラリ |
+| `packages/core` | アプリ固有でないもののみ | `react-dom`, `next/*`, UI ライブラリ, `process.env`, `localStorage`・`sessionStorage` の直接利用（永続化は `StorageAdapter` 経由。タブ単位の `sessionStorage` を使うのは `analytics/exception-dedupe.ts` と `appearance/safe-mode.ts` のみ） |
 | `packages/ui` | なし | `@multica/core`, ビジネスロジック |
-| `packages/views` | `core/`, `ui/` | `next/*`, `react-router-dom`, stores |
+| `packages/views` | `core/`, `ui/` | `next/*`, `react-router-dom`, store の定義 |
 | `apps/web/platform/` | `next/*` | 他のアプリ |
 | `apps/desktop/.../platform/` | `react-router-dom`, electron | 他のアプリ |
-| `apps/mobile/` | `@multica/core` の型と純粋関数 | Web/Desktop の React ページ、store、プラットフォーム実装 |
+| `apps/mobile/` | `@multica/core` の型と純粋関数（各モジュール自身のサブパスから import） | Web/Desktop の React ページ、store、プラットフォーム実装、およびそれらを再エクスポートする core の barrel |
+
+パッケージ境界とその限定的な例外は、ルートの `AGENTS.md` を正とします。変更するときは両方を更新してください。`packages/core` の行は `packages/core/eslint.config.mjs`、mobile の core import は `apps/mobile/eslint.config.js` が lint で強制します。
 
 両方のアプリに同じロジックが現れる場合は、必ず共有パッケージに抽出しなければなりません。「ささいな」重複という例外はありません。Mobile は独自の UI、データ層、リリースフローを持ち、型と純粋関数だけを共有します。
 
@@ -62,7 +64,7 @@ Multica のコードを書く、翻訳を変更する、あるいは中国語の
 - 標準の `gofmt` + `go vet`。例外なし。
 - Handler ファイルはドメインを反映する: `agent.go`, `auth.go`, `runtime.go`
 - テスト: `<file>_test.go` を同じ場所に配置
-- handler での UUID パースは、ルートの `CLAUDE.md` のルールに従ってください — 境界の入力には `parseUUIDOrBadRequest`、信頼できる往復には `parseUUID`（panic 版）を使い、error を確認せずに `util.ParseUUID` を直接使用しないでください。
+- handler での UUID パースは、ルートの `AGENTS.md` のルールに従ってください — 境界の入力には `parseUUIDOrBadRequest`、信頼できる往復には `parseUUID`（panic 版）を使い、error を確認せずに `util.ParseUUID` を直接使用しないでください。
 
 ### TypeScript
 
@@ -191,6 +193,7 @@ Multica の製品名詞は 2 つのカテゴリに分かれます。
 
 - ロール: `owner` / `admin` / `member`
 - タスクの状態: `backlog` / `todo` / `in_progress` / `in_review` / `done` / `blocked` / `cancelled`
+- タスクの状態カテゴリ: `unstarted` / `started` / `done` / `closed`
 
 UI ではこれらの値を英語で表示します（必要に応じて `code-style` で囲む）。
 
@@ -307,7 +310,7 @@ i18next は `_one` / `_other` を使います。中国語には文法的な数�
 
 ここのルールを変更した場合は、次も併せて行ってください。
 
-1. 関連する locale JSON / CLAUDE.md / ドキュメントページに適用する
+1. 関連する locale JSON / AGENTS.md / ドキュメントページに適用する
 2. PR の説明に変更点を記録し、レビュアーが下流の一括対応を確認できるようにする
 
 このページが契約です。他の何ものもこれを上書きできません。

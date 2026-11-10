@@ -14,11 +14,12 @@ import {
   Server,
   Trash2,
   X,
-} from "lucide-react";
+} from "@multica/ui/icons";
 import { truncateWithEllipsis } from "@multica/core/utils";
 import { cn } from "@multica/ui/lib/utils";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { Button } from "@multica/ui/components/ui/button";
+import { TooltipHint } from "@multica/ui/components/common/tooltip-hint";
 import {
   Dialog,
   DialogContent,
@@ -257,14 +258,16 @@ export function DaemonPanel({
             </DialogTitle>
             <ContextBadge status={status} runtimeCount={runtimeCount} />
           </div>
-          <button
-            type="button"
-            onClick={() => onOpenChange(false)}
-            aria-label={t(($) => $.desktop.daemon.close)}
-            className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <X className="size-4" />
-          </button>
+          <TooltipHint label={t(($) => $.desktop.daemon.close)} side="bottom">
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              aria-label={t(($) => $.desktop.daemon.close)}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <X className="size-4" />
+            </button>
+          </TooltipHint>
         </div>
 
         {/* Toolbar */}
@@ -651,7 +654,7 @@ function EmptyState({
     subtitle = t(($) => $.desktop.daemon.not_running_description);
   } else if (!hasLogs) {
     title = t(($) => $.desktop.daemon.waiting_logs);
-    subtitle = t(($) => $.desktop.daemon.waiting_logs_description);
+    subtitle = "";
   } else {
     title = "";
     subtitle = "";
@@ -659,7 +662,7 @@ function EmptyState({
   return (
     <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-muted-foreground">
       <p className="text-body">{title}</p>
-      <p className="text-caption text-muted-foreground">{subtitle}</p>
+      {subtitle && <p className="text-caption text-muted-foreground">{subtitle}</p>}
     </div>
   );
 }

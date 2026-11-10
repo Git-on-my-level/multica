@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import { CheckCircle2, MessageSquare, MessagesSquare, Search } from "lucide-react";
+import { CheckCircle2, MessageSquare, MessagesSquare, Search } from "@multica/ui/icons";
 import type { TimelineEntry } from "@multica/core/types";
 import { useActorName } from "@multica/core/workspace/hooks";
 import {
@@ -624,7 +624,7 @@ export function ThreadNavPanel({
               }}
               data-active={filter === pill.id || undefined}
               className={cn(
-                "flex h-7 items-center gap-1 rounded-full px-2 text-caption text-muted-foreground transition-colors",
+                "flex h-7 items-center gap-1 rounded-md px-2 text-caption text-muted-foreground transition-colors",
                 "hover:bg-surface-hover",
                 "data-active:bg-surface-selected data-active:font-medium data-active:text-foreground data-active:hover:bg-surface-selected",
               )}

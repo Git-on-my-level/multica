@@ -202,13 +202,9 @@ func installationConnected(ctx context.Context, q *db.Queries, workspaceID pgtyp
 }
 
 func linkHandoffCandidate(ctx context.Context, q *db.Queries, candidate db.IssuePrHandoffCandidate, pr db.GithubPullRequest) error {
-	if err := q.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
-		IssueID:             candidate.IssueID,
-		PullRequestID:       pr.ID,
-		CloseIntent:         false,
-		PreserveCloseIntent: true,
-		LinkedByType:        pgtype.Text{String: "system", Valid: true},
-		LinkedByID:          pgtype.UUID{},
+	if _, err := q.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
+		IssueID:       candidate.IssueID,
+		PullRequestID: pr.ID,
 	}); err != nil {
 		return err
 	}

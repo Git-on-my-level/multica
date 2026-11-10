@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronRight } from "lucide-react";
+import { CheckCircle2, ChevronRight } from "@multica/ui/icons";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { Card } from "@multica/ui/components/ui/card";
 import type { TimelineEntry } from "@multica/core/types";
@@ -57,7 +57,9 @@ function useAuthorsLabel(entries: TimelineEntry[]): string {
 export function ResolvedThreadBar({ entry, replies, onExpand }: ResolvedThreadBarProps) {
   const { t } = useT("issues");
   const authorsLabel = useAuthorsLabel([entry, ...replies]);
-  const count = 1 + replies.length;
+  // Deleted replies render nothing when the thread is expanded, so the folded
+  // count must not promise them either.
+  const count = 1 + replies.filter((reply) => !isDeletedComment(reply)).length;
 
   return (
     <Card className="!py-0 !gap-0 overflow-hidden">

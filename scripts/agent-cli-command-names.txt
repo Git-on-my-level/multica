@@ -14,6 +14,7 @@ hermes
 kimi
 kiro-cli
 mcode
+muse
 omp
 openclaw
 opencode
@@ -25,4 +26,5 @@ qwenpaw
 reasonix
 traecli
 zeroclaw
+zcode
 zcode-acp-server

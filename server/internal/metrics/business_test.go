@@ -123,6 +123,22 @@ func TestBusinessMetricsLLMPricingAndUnpricedTokens(t *testing.T) {
 	}
 }
 
+func TestBusinessMetricsLLMPricingCursorFastVariant(t *testing.T) {
+	m := NewBusinessMetrics()
+
+	m.RecordLLMUsage("issue", "local", "cursor", "claude-opus-4-7-thinking-high-fast", 1_000_000, 1_000_000, 0, 0, 0)
+
+	if got := testutil.ToFloat64(m.llmCostUSD.WithLabelValues("cursor", "claude-opus-4-7-fast", "input", "local", "issue")); got != 30 {
+		t.Fatalf("cursor fast input cost = %v, want 30", got)
+	}
+	if got := testutil.ToFloat64(m.llmCostUSD.WithLabelValues("cursor", "claude-opus-4-7-fast", "output", "local", "issue")); got != 150 {
+		t.Fatalf("cursor fast output cost = %v, want 150", got)
+	}
+	if got := testutil.ToFloat64(m.llmRequests.WithLabelValues("cursor", "claude-opus-4-7-fast", "local")); got != 1 {
+		t.Fatalf("cursor fast request counter = %v, want 1", got)
+	}
+}
+
 func TestBusinessMetricsRegistryExposesAllFamilies(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	m := NewBusinessMetrics()
@@ -295,6 +311,59 @@ func TestBusinessMetricsFallsBackToRateTableWithoutProviderCost(t *testing.T) {
 	output := testutil.ToFloat64(m.llmCostUSD.WithLabelValues("xai", "grok-4.5", "output", "local", "issue"))
 	if math.Abs(input-2) > 1e-9 || math.Abs(output-6) > 1e-9 {
 		t.Fatalf("estimated cost = (%v, %v), want (2, 6) from the rate table", input, output)
+	}
+}
+
+func TestBusinessMetricsCostOnlyUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		model        string
+		provider     string
+		requestModel string
+	}{
+		{"priced", "grok-4.6", "xai", "grok-4.6"},
+		{"unpriced", "grok-composer-2.5-fast", "grok", "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewBusinessMetrics()
+			const actualUSD = 0.01
+			m.RecordLLMUsage("issue", "local", "grok", tc.model,
+				0, 0, 0, 0, int64(actualUSD*CostUSDTicksPerUSD))
+
+			// Inspect collectors without creating zero-token series in the test.
+			if got := testutil.CollectAndCount(m.llmTokens); got != 0 {
+				t.Errorf("priced token series = %d, want 0", got)
+			}
+			if got := testutil.CollectAndCount(m.llmUnpricedTokens); got != 0 {
+				t.Errorf("unpriced token series = %d, want 0", got)
+			}
+			if got := testutil.CollectAndCount(m.llmCostUSD); got != 1 {
+				t.Errorf("cost series = %d, want 1", got)
+			}
+			got := testutil.ToFloat64(m.llmCostUSD.WithLabelValues(
+				tc.provider, tc.model, "input", "local", "issue"))
+			if math.Abs(got-actualUSD) > 1e-9 {
+				t.Errorf("recorded cost = %v, want %v", got, actualUSD)
+			}
+			if got := testutil.ToFloat64(m.llmRequests.WithLabelValues(tc.provider, tc.requestModel, "local")); got != 1 {
+				t.Errorf("request counter = %v, want 1", got)
+			}
+		})
+	}
+}
+
+func TestBusinessMetricsEmptyPricedUsage(t *testing.T) {
+	m := NewBusinessMetrics()
+	m.RecordLLMUsage("issue", "local", "grok", "grok-4.6", 0, 0, 0, 0, 0)
+
+	if got := testutil.CollectAndCount(m.llmTokens); got != 0 {
+		t.Errorf("token series = %d, want 0", got)
+	}
+	if got := testutil.CollectAndCount(m.llmCostUSD); got != 0 {
+		t.Errorf("cost series = %d, want 0", got)
+	}
+	if got := testutil.ToFloat64(m.llmRequests.WithLabelValues("xai", "grok-4.6", "local")); got != 1 {
+		t.Errorf("request counter = %v, want 1", got)
 	}
 }
 

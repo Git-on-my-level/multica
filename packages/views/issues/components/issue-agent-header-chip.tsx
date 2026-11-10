@@ -9,8 +9,8 @@ import {
 } from "@multica/ui/components/ui/popover";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { cn } from "@multica/ui/lib/utils";
-import { api } from "@multica/core/api";
-import { issueKeys } from "@multica/core/issues/queries";
+import { BorderBeam } from "@multica/ui/components/common/border-beam";
+import { issueTasksOptions } from "@multica/core/issues/queries";
 import type { AgentTask } from "@multica/core/types";
 import { TranscriptButton } from "../../common/task-transcript";
 import { AgentAvatarStack } from "../../agents/components/agent-avatar-stack";
@@ -39,23 +39,21 @@ import { compareActiveIssueTasks } from "./active-task-order";
 // Hovering the chip opens a compact Popover card with the same active rows as
 // the right panel (click / keyboard still toggle it for touch and a11y). Those
 // rows show necessary status/time and task entry actions, but do not render
-// event counts or prefetch task messages for a count.
+// event counts or prefetch task messages for a count. Clicking a row's trigger
+// closes the card and takes the reader to that run's block in the timeline.
 
 interface IssueAgentHeaderChipProps {
   issueId: string;
+  onJumpToRun?: (taskId: string) => void;
 }
 
 export const IssueAgentHeaderChip = memo(function IssueAgentHeaderChip({
   issueId,
+  onJumpToRun,
 }: IssueAgentHeaderChipProps) {
   const { t } = useT("issues");
   // Same query options as ExecutionLogSection so both observe one cache entry.
-  const { data: tasks = [] } = useQuery({
-    queryKey: issueKeys.tasks(issueId),
-    queryFn: () => api.listTasksByIssue(issueId),
-    staleTime: 30_000,
-    refetchOnWindowFocus: true,
-  });
+  const { data: tasks = [] } = useQuery(issueTasksOptions(issueId));
 
   const { running, queued } = useMemo(() => {
     const running: AgentTask[] = [];
@@ -98,6 +96,7 @@ export const IssueAgentHeaderChip = memo(function IssueAgentHeaderChip({
           issueId={issueId}
           running={running}
           queued={queued}
+          onJumpToRun={onJumpToRun}
           onTranscriptOpenChange={(task, open, fromKeyboard) => {
             setOpenedTranscript(open ? { task, fromKeyboard } : null);
           }}
@@ -125,6 +124,7 @@ interface ActiveChipProps {
   issueId: string;
   running: AgentTask[];
   queued: AgentTask[];
+  onJumpToRun?: (taskId: string) => void;
   onTranscriptOpenChange: (
     task: AgentTask,
     open: boolean,
@@ -136,10 +136,12 @@ function ActiveChip({
   issueId,
   running,
   queued,
+  onJumpToRun,
   onTranscriptOpenChange,
 }: ActiveChipProps) {
   const { t } = useT("issues");
   const { getActorName } = useActorName();
+  const [open, setOpen] = useState(false);
 
   const activeTasks = [...running, ...queued];
   const agentIds = [...new Set(activeTasks.map((task) => task.agent_id))];
@@ -165,7 +167,7 @@ function ActiveChip({
 
   return (
     <div className="flex items-center gap-1">
-      <Popover>
+      <Popover open={open} onOpenChange={setOpen}>
         {/* Hover opens the card so the live activity reads as a glanceable
             status surface, not a click target. In Base UI the hover config
             lives on the Trigger (a popover can have multiple triggers), not
@@ -189,7 +191,7 @@ function ActiveChip({
               // motion for work that is genuinely in flight.
               className={cn(
                 "flex h-9 min-w-9 max-w-[11rem] items-center justify-center gap-1.5 rounded-md px-2 text-muted-foreground outline-none transition-colors hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring md:h-7 md:min-w-0 md:justify-start md:px-1.5",
-                anyRunning && "border-beam bg-brand/5",
+                anyRunning && "relative bg-brand/5",
               )}
             />
           }
@@ -208,6 +210,7 @@ function ActiveChip({
           >
             {label}
           </span>
+          {anyRunning && <BorderBeam />}
         </PopoverTrigger>
         <PopoverContent align="end" keepMounted className="w-80">
           <div className="text-caption font-medium text-muted-foreground">
@@ -225,6 +228,14 @@ function ActiveChip({
                 key={task.id}
                 task={task}
                 issueId={issueId}
+                onJump={
+                  onJumpToRun
+                    ? () => {
+                        setOpen(false);
+                        onJumpToRun(task.id);
+                      }
+                    : undefined
+                }
                 onTranscriptOpenChange={(open, fromKeyboard) => {
                   onTranscriptOpenChange(task, open, fromKeyboard === true);
                 }}

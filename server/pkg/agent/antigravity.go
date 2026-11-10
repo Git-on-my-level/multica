@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,11 +51,120 @@ type antigravityStreamUsage struct {
 
 type antigravityStreamStepUpdate struct {
 	ConversationID string                  `json:"conversation_id"`
-	StepIndex      int                     `json:"step_index"`
+	StepIndex      *int                    `json:"step_index"`
 	State          string                  `json:"state"`
 	StepType       string                  `json:"step_type"`
 	TextDelta      string                  `json:"text_delta"`
 	Usage          *antigravityStreamUsage `json:"usage"`
+	ToolName       string                  `json:"tool_name"`
+	ToolInfo       *antigravityStreamTool  `json:"tool_info"`
+}
+
+type antigravityStreamTool struct {
+	Name       string          `json:"name"`
+	Parameters map[string]any  `json:"parameters"`
+	Output     json.RawMessage `json:"output"`
+	Error      *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type antigravityToolState struct {
+	name string
+	done bool
+}
+
+// Normalize the shared transcript input without duplicating commands or file
+// bodies. Preserve collisions and unknown fields, and do not mutate the snapshot.
+func antigravityToolInput(parameters map[string]any) map[string]any {
+	input := maps.Clone(parameters)
+	for _, alias := range []struct {
+		from, to   string
+		allowEmpty bool
+	}{
+		{"CommandLine", "command", false},
+		{"AbsolutePath", "file_path", false},
+		{"TargetFile", "file_path", false},
+		{"CodeContent", "content", true},
+		{"TargetContent", "old_string", true},
+		{"ReplacementContent", "new_string", true},
+	} {
+		if _, exists := input[alias.to]; exists {
+			continue
+		}
+		if value, ok := parameters[alias.from].(string); ok && (value != "" || alias.allowEmpty) {
+			input[alias.to] = value
+			delete(input, alias.from)
+		}
+	}
+	return input
+}
+
+// Each step has one tool lifecycle, even when agy repeats state snapshots or
+// only emits DONE. The existing daemon uploader handles these normal messages;
+// tool output must never be appended to the assistant's final answer.
+func antigravityToolMessages(step *antigravityStreamStepUpdate, states map[int]antigravityToolState) []Message {
+	if step.StepType != "tool" || step.StepIndex == nil || *step.StepIndex < 0 {
+		return nil
+	}
+	active := strings.EqualFold(step.State, "active")
+	done := strings.EqualFold(step.State, "done")
+	if !active && !done {
+		return nil
+	}
+	index := *step.StepIndex
+	state := states[index]
+	if state.done {
+		return nil
+	}
+	callID := fmt.Sprintf("agy-step-%d", index)
+	var messages []Message
+	if state.name == "" {
+		name := step.ToolName
+		var input map[string]any
+		if step.ToolInfo != nil {
+			if name == "" {
+				name = step.ToolInfo.Name
+			}
+			input = antigravityToolInput(step.ToolInfo.Parameters)
+		}
+		if name == "" {
+			return nil // A later snapshot may provide the missing metadata.
+		}
+		state.name = name
+		messages = append(messages, Message{Type: MessageToolUse, Tool: name, CallID: callID, Input: input})
+	}
+	if done {
+		var output string
+		if info := step.ToolInfo; info != nil {
+			if len(info.Output) > 0 && string(info.Output) != "null" {
+				if err := json.Unmarshal(info.Output, &output); err != nil {
+					output = string(info.Output)
+				}
+			}
+			if info.Error != nil {
+				detail := info.Error.Message
+				if info.Error.Type != "" {
+					if detail != "" {
+						detail = info.Error.Type + ": " + detail
+					} else {
+						detail = info.Error.Type
+					}
+				}
+				// The daemon uploads a bounded prefix of tool output. Put the
+				// error first so verbose stdout cannot hide the failure detail.
+				if output != "" {
+					output = "\n" + output
+				}
+				output = "Tool error: " + detail + output
+			}
+		}
+		messages = append(messages, Message{Type: MessageToolResult, Tool: state.name, CallID: callID, Output: output})
+		state.done = true
+	}
+	states[index] = state
+	return messages
 }
 
 type antigravityStreamResult struct {
@@ -75,7 +185,80 @@ type antigravityStreamEvent struct {
 	Result     *antigravityStreamResult     `json:"result"`
 }
 
+type antigravityStepSummary struct {
+	kind, state string
+	hasText     bool
+}
+
+type antigravityTurn struct {
+	start   *int
+	steps   map[int]antigravityStepSummary
+	invalid bool
+}
+
+func (t *antigravityTurn) settledResponse() int {
+	latest := -1
+	for index, step := range t.steps {
+		if step.kind == "agent_response" && index > latest {
+			latest = index
+		}
+	}
+	for index, step := range t.steps {
+		if index > latest && (step.state != "DONE" || step.kind == "error_message" ||
+			step.kind == "tool" || step.kind == "subagent" || step.kind == "agent_response" || step.kind == "user_input") {
+			return -1
+		}
+	}
+	return latest
+}
+
+func (t *antigravityTurn) completed(response string) bool {
+	latest := t.settledResponse()
+	return !t.invalid && strings.TrimSpace(response) != "" && t.start != nil && t.steps[*t.start].state == "DONE" &&
+		latest > *t.start && t.steps[latest].state == "DONE" && t.steps[latest].hasText
+}
+
+// antigravityNetworkIssueError is the provider sentence some agy releases
+// report when a trailing round trip fails. It carries no Go error text, so it
+// has to stay a literal match alongside the transport patterns below.
 const antigravityNetworkIssueError = "There was a network issue connecting to the server, please try again."
+
+// agy 1.4.6 may carry this historical/recovered stream error into a resumed
+// turn's result even when the current final response is DONE (#9528).
+const antigravityStreamInterruptedError = "The stream was interrupted. Please continue the task you were working on."
+
+// antigravityTransportErrorRe matches the causes Go's http client reports when
+// a round trip never produced a response: socket, DNS and TLS failures. These
+// are the strings that appear inside the `*url.Error` agy wraps as
+// `API error (attempt N): request failed: Post "...": <cause>`.
+//
+// Two things are deliberately excluded.
+//
+//   - agy's own `request failed:` prefix. It is tempting to match it directly
+//     since it marks an http.Client failure, but only one spelling has been
+//     observed in the field, and nothing rules out agy reusing the same prefix
+//     for an HTTP status error. Matching the cause keeps a provider rejection
+//     from being read as transport noise.
+//   - Provider-side rejections: quota, capacity, overload, policy and auth all
+//     arrive as an HTTP response, so they are decisions about the request
+//     rather than a failure to deliver it. Those must stay failures the user
+//     sees instead of being smoothed over by a complete-looking answer —
+//     reportTaskResult documents failing closed for exactly that reason.
+var antigravityTransportErrorRe = regexp.MustCompile(`(?i)(\bEOF\b|connection reset by peer|broken pipe|connection refused|connection timed out|i/o timeout|tls handshake timeout|tls: handshake failure|use of closed network connection|network is unreachable|no such host|server misbehaving|malformed HTTP response|http2: client connection lost|http2: server sent GOAWAY)`)
+
+// antigravityTrailingTransportError reports whether agy's provider error
+// describes a transport-level failure rather than a decision the provider made
+// about the request.
+func antigravityTrailingTransportError(providerError string) bool {
+	trimmed := strings.TrimSpace(providerError)
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, antigravityNetworkIssueError) || strings.EqualFold(trimmed, antigravityStreamInterruptedError) {
+		return true
+	}
+	return antigravityTransportErrorRe.MatchString(trimmed)
+}
 
 func (u antigravityStreamUsage) hasTokens() bool {
 	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CacheReadTokens > 0 || u.CacheWriteTokens > 0
@@ -121,8 +304,20 @@ func antigravityResultStatus(status string) string {
 	}
 }
 
-func antigravityCompletedDespiteTrailingNetworkError(providerError, response string, agentResponseDone bool) bool {
-	return strings.EqualFold(strings.TrimSpace(providerError), antigravityNetworkIssueError) &&
+// antigravityCompletedDespiteTrailingNetworkError reports whether a turn that
+// agy ended in an error actually delivered a finished answer first. All three
+// conditions are required: the trailing failure has to be transport-level (a
+// provider-side rejection is a real failure), agy has to have handed back a
+// non-empty canonical response, and the latest agent_response step has to have
+// reached DONE — an ACTIVE step means the answer was still being written when
+// the connection went away. The stream-interrupted sentence also requires a
+// successful process exit, since a DONE step can precede a genuinely interrupted
+// tool call in the same turn.
+func antigravityCompletedDespiteTrailingNetworkError(providerError, response string, agentResponseDone, exitedSuccessfully bool) bool {
+	if strings.EqualFold(strings.TrimSpace(providerError), antigravityStreamInterruptedError) && !exitedSuccessfully {
+		return false
+	}
+	return antigravityTrailingTransportError(providerError) &&
 		strings.TrimSpace(response) != "" &&
 		agentResponseDone
 }
@@ -237,8 +432,8 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		var streamResponse string
 		var streamResultUsage *antigravityStreamUsage
 		streamStepUsage := make(map[int]TokenUsage)
-		streamLatestAgentResponseStep := -1
-		streamLatestAgentResponseDone := false
+		streamTools := make(map[int]antigravityToolState)
+		turn := antigravityTurn{steps: make(map[int]antigravityStepSummary)}
 		finalStatus := "completed"
 		var finalError string
 
@@ -246,6 +441,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 
 		trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
 
+	streamLoop:
 		for scanner.Scan() {
 			line := scanner.Text()
 			var event antigravityStreamEvent
@@ -256,27 +452,44 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 					streamModel = event.Init.Model
 				case "step_update":
 					if event.StepUpdate == nil {
+						turn.invalid = true
 						continue
+					}
+					step := event.StepUpdate
+					if idx := step.StepIndex; idx == nil || *idx < 0 {
+						turn.invalid = true
+					} else {
+						if step.StepType == "user_input" {
+							turn.invalid = turn.invalid || turn.start != nil && *turn.start != *idx
+							turn.start = idx
+						}
+						turn.steps[*idx] = antigravityStepSummary{
+							kind: step.StepType, state: strings.ToUpper(step.State),
+							hasText: turn.steps[*idx].hasText || strings.TrimSpace(step.TextDelta) != "",
+						}
 					}
 					if event.StepUpdate.ConversationID != "" {
 						streamSessionID = event.StepUpdate.ConversationID
 					}
-					if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.StepIndex >= streamLatestAgentResponseStep {
-						// Only the latest response step determines whether the answer
-						// completed. A prior DONE response may be followed by a newer
-						// ACTIVE response that is cut off by the network error.
-						streamLatestAgentResponseStep = event.StepUpdate.StepIndex
-						streamLatestAgentResponseDone = strings.EqualFold(event.StepUpdate.State, "done")
+					for _, message := range antigravityToolMessages(event.StepUpdate, streamTools) {
+						// Tool lifecycle events also drive the daemon's in-flight
+						// counter. Unlike best-effort text, neither half may be
+						// dropped when a transcript consumer temporarily falls behind.
+						select {
+						case msgCh <- message:
+						case <-runCtx.Done():
+							break streamLoop
+						}
 					}
 					if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 						output.WriteString(event.StepUpdate.TextDelta)
 						trySend(msgCh, Message{Type: MessageText, Content: event.StepUpdate.TextDelta})
 					}
-					if strings.EqualFold(event.StepUpdate.State, "done") && event.StepUpdate.Usage != nil && event.StepUpdate.Usage.hasTokens() {
+					if strings.EqualFold(event.StepUpdate.State, "done") && event.StepUpdate.StepIndex != nil && event.StepUpdate.Usage != nil && event.StepUpdate.Usage.hasTokens() {
 						// A step may be re-emitted as its state changes. Keying by
 						// index makes the final DONE snapshot replace, not duplicate,
 						// an earlier copy of the same step.
-						streamStepUsage[event.StepUpdate.StepIndex] = event.StepUpdate.Usage.tokenUsage()
+						streamStepUsage[*event.StepUpdate.StepIndex] = event.StepUpdate.Usage.tokenUsage()
 					}
 				case "result":
 					if event.Result == nil {
@@ -332,11 +545,12 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 			finalStatus = "aborted"
 			finalError = "execution cancelled"
 		} else if status := antigravityResultStatus(streamResultStatus); finalStatus == "completed" && status != "completed" {
-			if antigravityCompletedDespiteTrailingNetworkError(streamResultError, streamResponse, streamLatestAgentResponseDone) {
-				// agy can emit a complete DONE response and only then fail a
-				// follow-up network operation. Preserve the finished answer instead
-				// of presenting that trailing transport error as a failed turn.
-				b.cfg.Logger.Warn("agy reported a trailing network error after a completed response", "err", streamResultError)
+			recovered := strings.EqualFold(strings.TrimSpace(streamResultStatus), "ERROR") && waitErr == nil && turn.completed(streamResponse)
+			if latest := turn.settledResponse(); turn.start == nil && latest >= 0 {
+				recovered = antigravityCompletedDespiteTrailingNetworkError(streamResultError, streamResponse, turn.steps[latest].state == "DONE", waitErr == nil)
+			}
+			if recovered {
+				b.cfg.Logger.Warn("agy reported an error after a completed response", "err", streamResultError)
 			} else {
 				// Prefer the provider's structured error even when agy also exits
 				// non-zero; the process status alone discards the actionable cause.
