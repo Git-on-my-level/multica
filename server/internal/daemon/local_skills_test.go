@@ -139,9 +139,12 @@ func TestListRuntimeLocalSkills_Mcode(t *testing.T) {
 
 func TestListRuntimeLocalSkills_Devin(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestUserHome(t, home)
+	configHome := filepath.Join(home, ".config")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("APPDATA", configHome)
 
-	writeTestLocalSkill(t, filepath.Join(home, ".config", "devin", "skills"), "devin-review", map[string]string{
+	writeTestLocalSkill(t, filepath.Join(configHome, "devin", "skills"), "devin-review", map[string]string{
 		"SKILL.md": "---\nname: Devin Review\ndescription: Review code with Devin\n---\n",
 	})
 
