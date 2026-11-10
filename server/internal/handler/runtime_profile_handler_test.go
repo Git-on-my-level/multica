@@ -474,7 +474,12 @@ func TestCreateRuntimeProfile_RuntimeIdentity(t *testing.T) {
 			if want == "" {
 				want = tc.family
 			}
-			if resp.RuntimeType != want || resp.ProtocolFamily != "pi" || resp.CommandName != "wrapper" || len(resp.FixedArgs) != 1 {
+			// Fork contract: OMP is its own ACP protocol family, not pi.
+			wantFamily := "pi"
+			if want == "omp" {
+				wantFamily = "omp"
+			}
+			if resp.RuntimeType != want || resp.ProtocolFamily != wantFamily || resp.CommandName != "wrapper" || len(resp.FixedArgs) != 1 {
 				t.Fatalf("incorrect identity: %+v", resp)
 			}
 		})

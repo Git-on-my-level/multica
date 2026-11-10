@@ -73,6 +73,9 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"inbox_item":                         workspaceDelete,
 	"instance_telemetry_state":           workspaceDeleteKeep,
 	"issue":                              workspaceDelete,
+	"issue_child_attention":              workspaceDelete, // Cleared by the issue deletion trigger.
+	"issue_create_idempotency":           workspaceDelete, // Fork overlay table (9xxx migration).
+	"issue_pr_handoff_candidate":         workspaceDelete, // Fork overlay table (9xxx migration).
 	"issue_wakeup":                       workspaceDelete,
 	"issue_wakeup_receipt":               workspaceDelete,
 	"issue_child_event":                  workspaceDelete,
@@ -150,6 +153,8 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"webhook_delivery":                   workspaceDelete,
 	"wecom_install_session":              workspaceDelete,
 	"workspace_composio_connection":      workspaceDelete,
+	"workspace_event_cursor":             workspaceDelete, // Fork overlay table (9xxx migration).
+	"workspace_event_outbox":             workspaceDelete, // Fork overlay table (9xxx migration).
 	"agent_app":                          workspaceDelete,
 	"app_action_rule":                    workspaceDelete,
 	"app_action_request":                 workspaceDelete,

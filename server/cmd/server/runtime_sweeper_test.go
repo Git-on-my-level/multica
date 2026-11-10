@@ -1212,13 +1212,18 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	mkIssue := func(label string) string {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+			WITH next AS (
+				SELECT GREATEST(
+					(SELECT issue_counter FROM workspace WHERE id = $1),
+					(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)
+				) + 1 AS number
+			), bumped AS (
+				UPDATE workspace SET issue_counter = next.number
+				FROM next WHERE workspace.id = $1 RETURNING next.number
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
-			SELECT $1, $3, 'todo', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)
-			FROM member m WHERE m.workspace_id = $1 LIMIT 1
+			SELECT $1, $3, 'todo', 'none', 'member', m.user_id, 'agent', $2, bumped.number
+			FROM bumped, member m WHERE m.workspace_id = $1 LIMIT 1
 			RETURNING id
 		`, testWorkspaceID, agentID, label).Scan(&issueID); err != nil {
 			t.Fatalf("failed to create %s issue: %v", label, err)
@@ -1437,13 +1442,18 @@ func TestExpireStaleQueuedTasksRespectsBatchLimit(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+			WITH next AS (
+				SELECT GREATEST(
+					(SELECT issue_counter FROM workspace WHERE id = $1),
+					(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)
+				) + 1 AS number
+			), bumped AS (
+				UPDATE workspace SET issue_counter = next.number
+				FROM next WHERE workspace.id = $1 RETURNING next.number
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
-			SELECT $1, 'Queued TTL batch test', 'todo', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)
-			FROM member m WHERE m.workspace_id = $1 LIMIT 1
+			SELECT $1, 'Queued TTL batch test', 'todo', 'none', 'member', m.user_id, 'agent', $2, bumped.number
+			FROM bumped, member m WHERE m.workspace_id = $1 LIMIT 1
 			RETURNING id
 		`, testWorkspaceID, agentID).Scan(&issueID); err != nil {
 			t.Fatalf("failed to create issue %d: %v", i, err)

@@ -2095,6 +2095,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// Assignee frequency
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
+			// Durable workspace event feed (fork overlay).
+			r.Get("/api/events", h.ListWorkspaceEvents)
+
 			// Local search index sync for Web/Desktop (MUL-7754). Human clients
 			// only: agents search through /api/issues/search.
 			r.Route("/api/search-index", func(r chi.Router) {

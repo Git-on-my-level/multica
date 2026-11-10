@@ -91,7 +91,9 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 				if path != "restart" {
 					dbfx.Exec(t, `UPDATE agent_runtime SET last_seen_at=now()-interval '4 hours' WHERE id=$1`, runtimeID)
 					if path == "offline" {
-						dbfx.Exec(t, `UPDATE agent_runtime SET status='offline' WHERE id=$1`, runtimeID)
+						// Fork contract (SCA-483): the offline grace is measured from
+						// updated_at, the offline-transition stamp, not last_seen_at.
+						dbfx.Exec(t, `UPDATE agent_runtime SET status='offline', updated_at=now()-interval '4 hours' WHERE id=$1`, runtimeID)
 					}
 				}
 				var rows []db.AgentTaskQueue

@@ -267,7 +267,7 @@ func localSkillRootsForProvider(provider string) ([]localSkillRoot, bool, error)
 			// <workDir>/.minimax/skills.
 			providerRoot = filepath.Join(home, ".minimax", "skills")
 		case "devin":
-			providerRoot, additionalProviderRoots = devinLocalSkillRoots(home, runtime.GOOS, os.Getenv("XDG_CONFIG_HOME"), os.Getenv("APPDATA"))
+			providerRoot, additionalProviderRoots = devinLocalSkillRoots(home, localSkillGOOS, os.Getenv("XDG_CONFIG_HOME"), os.Getenv("APPDATA"))
 		case "muse":
 			configHome := os.Getenv("XDG_CONFIG_HOME")
 			if configHome == "" {

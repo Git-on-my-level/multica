@@ -3167,6 +3167,10 @@ type CreateIssueRequest struct {
 
 	AllowDuplicate         bool `json:"allow_duplicate,omitempty"`
 	PRAutoCompleteDisabled bool `json:"pr_auto_complete_disabled,omitempty"`
+	// ClientKey is an optional caller-generated idempotency key in the
+	// canonical sha256:<64 lowercase hex> wire format. A replay returns the
+	// original issue with 200 + Idempotent-Replay: true.
+	ClientKey string `json:"client_key,omitempty"`
 }
 
 // CreateIssueResponse echoes the atomic PR setting without expanding issue reads.
@@ -3310,6 +3314,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Title == "" {
 		writeError(w, http.StatusBadRequest, "title is required")
 		return
+	}
+	if req.ClientKey != "" {
+		if _, err := util.ParseSHA256ClientKey(req.ClientKey); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	workspaceID := h.resolveWorkspaceID(r)
@@ -3604,6 +3614,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Properties:             properties,
 		AllowDuplicate:         req.AllowDuplicate,
 		PRAutoCompleteDisabled: req.PRAutoCompleteDisabled,
+		ClientKey:              req.ClientKey,
 	}, service.IssueCreateOpts{
 		ActorID:          actualCreatorID,
 		AnalyticsAgentID: analyticsAgentID,
@@ -3636,6 +3647,38 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			"error": duplicateIssueMessage(existing),
 			"issue": existing,
 		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyConflict) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "issue_client_key_conflict",
+			"error": "client_key was already used with different issue semantics",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyTargetMissing) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "issue_client_key_target_missing",
+			"error": "client_key is bound to an issue that no longer exists",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyAssignedDispatchUnsupported) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"code":  "issue_client_key_assigned_dispatch_unsupported",
+			"error": "client_key cannot be used with an agent or squad assignment that dispatches immediately; create unassigned or use backlog",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrIssueClientKeyOptionsUnsupported) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"code":  "issue_client_key_options_unsupported",
+			"error": "client_key cannot be combined with source context or deferred assigned runs",
+		})
+		return
+	}
+	if errors.Is(err, service.ErrInvalidIssueClientKey) {
+		writeError(w, http.StatusBadRequest, "client key must use sha256:<64 lowercase hex> format")
 		return
 	}
 	if errors.Is(err, service.ErrParentIssueNotFound) {
@@ -3671,7 +3714,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issue := res.Issue
-	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
+	logMessage := "issue created"
+	if res.Reused {
+		logMessage = "issue create replayed"
+	}
+	slog.Info(logMessage, append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
 	fillCreated(&resp)
@@ -3684,7 +3731,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.PRAutoCompleteDisabled {
 		h.recordPRAutoCompleteActivity(r.Context(), issue, creatorType, actualCreatorID, true)
 	}
-	writeJSON(w, http.StatusCreated, CreateIssueResponse{IssueResponse: resp, PRAutoCompleteDisabled: req.PRAutoCompleteDisabled})
+	statusCode := http.StatusCreated
+	if res.Reused {
+		statusCode = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, statusCode, CreateIssueResponse{IssueResponse: resp, PRAutoCompleteDisabled: req.PRAutoCompleteDisabled})
 }
 
 type UpdateIssueRequest struct {
