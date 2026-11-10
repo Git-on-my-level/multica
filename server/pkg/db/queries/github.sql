@@ -262,7 +262,17 @@ WHERE issue_pull_request.linked_by_type IS DISTINCT FROM 'member';
 -- webhook reconciles only what it created itself.
 SELECT issue_id FROM issue_pull_request
 WHERE pull_request_id = $1
-  AND COALESCE(linked_by_type, 'system') <> 'member';
+  AND COALESCE(linked_by_type, 'system') <> 'member'
+  -- Explicit completion handoffs are durable claims, independent of title parsing.
+  AND NOT EXISTS (
+      SELECT 1 FROM issue_pr_handoff_candidate candidate
+      JOIN github_pull_request pr ON pr.id = issue_pull_request.pull_request_id
+      WHERE candidate.issue_id = issue_pull_request.issue_id
+        AND candidate.state = 'linked'
+        AND candidate.repo_owner = lower(pr.repo_owner)
+        AND candidate.repo_name = lower(pr.repo_name)
+        AND candidate.pr_number = pr.pr_number
+  );
 
 -- name: UnlinkIssueFromPullRequest :execrows
 DELETE FROM issue_pull_request
@@ -301,6 +311,8 @@ INSERT INTO issue_pull_request (
     $1, $2, sqlc.narg('linked_by_type'), sqlc.narg('linked_by_id'), $3
 )
 ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
+    linked_by_type = EXCLUDED.linked_by_type,
+    linked_by_id = EXCLUDED.linked_by_id,
     close_intent = CASE
         WHEN sqlc.arg('preserve_close_intent') THEN issue_pull_request.close_intent
         ELSE EXCLUDED.close_intent

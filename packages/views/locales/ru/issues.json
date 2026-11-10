@@ -133,7 +133,8 @@
     "move_failed": "Не удалось переместить задачу",
     "empty_description": "Задача — это конкретная работа для участника или агента. Назначьте её агенту, и он начнёт работу в вашей среде выполнения.",
     "break_down_with_chat": "Разбить на задачи в чате",
-    "break_down_prompt": "Я хочу выполнить следующее. Задай необходимые вопросы, а затем разбей работу на задачи в этом рабочем пространстве:\n\n"
+    "break_down_prompt": "Я хочу выполнить следующее. Задай необходимые вопросы, а затем разбей работу на задачи в этом рабочем пространстве:\n\n",
+    "empty_hint": "Create an issue to get started."
   },
   "status": {
     "backlog": "Бэклог",
@@ -436,10 +437,12 @@
     },
     "empty": {
       "assigned": {
-        "title": "Нет назначенных задач"
+        "title": "Нет назначенных задач",
+        "description": "Issues assigned here will appear in this view."
       },
       "created": {
-        "title": "Нет созданных задач"
+        "title": "Нет созданных задач",
+        "description": "Issues created here will appear in this view."
       }
     },
     "search_placeholder": "Поиск задач...",
@@ -464,7 +467,9 @@
     "empty_grouping": "Нет подходящих задач",
     "no_value": "Нет значения",
     "ordered_by": "Доска упорядочена по {{field}}",
-    "manual_reorder_hint": "Переключитесь на ручной порядок, чтобы переставлять задачи внутри столбца."
+    "manual_reorder_hint": "Переключитесь на ручной порядок, чтобы переставлять задачи внутри столбца.",
+    "hidden_columns_label": "Hidden columns",
+    "show_column": "Show column"
   },
   "peek": {
     "panel_label": "Превью задачи",
@@ -598,7 +603,36 @@
     "thread_nav_show_replies_many": "Показать {{count}} ответов",
     "not_found_title": "Задача не найдена",
     "load_failed": "Не удалось загрузить задачу.",
-    "load_retry": "Повторить"
+    "load_retry": "Повторить",
+    "pull_requests_empty": "No linked pull requests yet. Put this issue's identifier in a PR's branch name or title, or write it after Closes in the PR body, to auto-link it.",
+    "pull_request_state_open": "Open",
+    "pull_request_checks_failed_named": "{{failed}}/{{total}} failed · {{names}}",
+    "pull_request_merge_unstable": "Unstable",
+    "pull_request_merge_has_hooks": "Has hooks",
+    "thread_nav": {
+      "button_label_one": "Comment threads ({{count}})",
+      "button_label_other": "Comment threads ({{count}})",
+      "search_placeholder": "Search threads or authors",
+      "match_count_one": "{{count}} match",
+      "match_count_other": "{{count}} matches",
+      "filter_all": "All",
+      "filter_unresolved": "Unresolved",
+      "filter_resolved": "Resolved",
+      "filter_mine": "@me",
+      "group": {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "earlier": "Earlier"
+      },
+      "empty": "No threads match",
+      "hint_select": "select",
+      "hint_jump": "jump",
+      "hint_close": "close",
+      "button_label_few": "Comment threads ({{count}})",
+      "button_label_many": "Comment threads ({{count}})",
+      "match_count_few": "{{count}} matches",
+      "match_count_many": "{{count}} matches"
+    }
   },
   "timeline": {
     "loading": "Загрузка...",
@@ -871,7 +905,8 @@
   "filtered_empty": {
     "title": "Нет задач, соответствующих этим фильтрам",
     "clear_button": "Очистить фильтры",
-    "unread_title": "Нет непрочитанных задач"
+    "unread_title": "Нет непрочитанных задач",
+    "hint": "Adjust or clear the filters to see the issues in this view."
   },
   "agent_live": {
     "is_working": "{{name}} работает",
@@ -951,7 +986,9 @@
     "more_runs_few": "Показать ещё {{count}}",
     "more_runs_many": "Показать ещё {{count}}",
     "queued_count_few": "В очереди: {{count}}",
-    "queued_count_many": "В очереди: {{count}}"
+    "queued_count_many": "В очереди: {{count}}",
+    "show_past": "Show past runs ({{count}})",
+    "hide_past": "Hide past runs ({{count}})"
   },
   "runs_timeline": {
     "title": "Запуски",
@@ -1070,7 +1107,8 @@
     "delete_dialog_title_many": "Удалить задачи ({{count}})?",
     "delete_dialog_desc_few": "Это действие нельзя отменить. Выбранные задачи и все связанные с ними данные будут удалены без возможности восстановления.",
     "delete_dialog_desc_many": "Это действие нельзя отменить. Выбранные задачи и все связанные с ними данные будут удалены без возможности восстановления.",
-    "delete_restricted": "Вы можете удалять задачи, созданные вами или вашими агентами. Владельцы и администраторы рабочего пространства могут удалять любые задачи."
+    "delete_restricted": "Вы можете удалять задачи, созданные вами или вашими агентами. Владельцы и администраторы рабочего пространства могут удалять любые задачи.",
+    "delete_dialog_warning": "Any workspace member can delete issues."
   },
   "card": {
     "update_failed": "Не удалось обновить задачу",
@@ -1208,7 +1246,39 @@
     "variant_my_any": "Любое отношение",
     "variant_my_assigned": "Назначено мне",
     "variant_my_created": "Создано мной",
-    "variant_my_involved": "Я участвую"
+    "variant_my_involved": "Я участвую",
+    "title": "Save as view",
+    "hint_workspace": "Based on all workspace issues",
+    "hint_my_any": "Based on My issues · All",
+    "hint_my_assigned": "Based on My issues · Assigned",
+    "hint_my_created": "Based on My issues · Created",
+    "hint_my_involved": "Based on My issues · Involved",
+    "hint_project": "Based on project “{{title}}”, available only on that project page",
+    "hint_project_agents": "Based on project “{{title}}” issues assigned to agents, available only on that project page",
+    "hint_project_members": "Based on project “{{title}}” issues assigned to members, available only on that project page",
+    "my_private_note": "My issues views are visible only to you",
+    "name_label": "Name",
+    "visibility_label": "Visibility",
+    "visibility_private": "Only visible to me",
+    "visibility_workspace": "Visible to workspace members",
+    "filters_label": "Filters",
+    "custom_property": "Custom property",
+    "create": "Create view",
+    "layout_label": "Layout",
+    "display_defaults": "Default display",
+    "default_hint": "How members first see this view; everyone can adjust for themselves afterwards",
+    "add_filter": "Add filter",
+    "name_placeholder": "e.g. Needs review",
+    "cancel": "Cancel",
+    "name_required": "Enter a view name",
+    "toast_created": "View created",
+    "toast_failed": "Failed to create view",
+    "edit_title": "Edit view",
+    "update": "Save changes",
+    "toast_updated": "View updated",
+    "toast_conflict": "Someone else edited this view — reopen it and try again",
+    "hint_workspace_members": "Based on workspace issues assigned to members",
+    "hint_workspace_agents": "Based on workspace issues assigned to agents"
   },
   "plugins": {
     "panels": "Плагины",
@@ -2097,5 +2167,70 @@
     "copy_url": "Копировать URL",
     "copied": "URL скопирован",
     "copy_failed": "Не удалось скопировать URL"
+  },
+  "usage_detail": {
+    "title": "Usage breakdown",
+    "subtitle_one": "{{identifier}} · {{count}} run",
+    "subtitle_other": "{{identifier}} · {{count}} runs",
+    "empty": "No run on this issue has recorded token usage yet.",
+    "kpi_cost": "Cost",
+    "kpi_cost_hint_one": "{{count}} failed run accounts for {{pct}}%",
+    "kpi_cost_hint_other": "{{count}} failed runs account for {{pct}}%",
+    "kpi_cache": "Cache savings",
+    "kpi_cache_hint": "{{pct}}% hit rate · {{reads}} read",
+    "kpi_tokens": "Tokens",
+    "kpi_tokens_hint": "{{input}} in · {{output}} out",
+    "by_agent": "By agent",
+    "by_agent_total": "Total {{cost}}",
+    "col_run": "Run",
+    "col_model": "Model",
+    "col_duration": "Duration",
+    "col_input": "In",
+    "col_output": "Out",
+    "col_cache_read": "Cache R",
+    "col_cache_write": "Cache W",
+    "col_tokens": "Tokens",
+    "col_cost": "Cost",
+    "total": "Total",
+    "note_unpriced_one": "{{count}} run has no recorded usage and is not counted in the total.",
+    "note_unpriced_other": "{{count}} runs have no recorded usage and are not counted in the total.",
+    "note_unmapped": "No price on file for {{models}}; their tokens are counted but their cost is not.",
+    "note_estimate": "Cost is estimated from published model rates, except where the provider reported its own figure.",
+    "subtitle_few": "{{identifier}} · {{count}} runs",
+    "subtitle_many": "{{identifier}} · {{count}} runs",
+    "kpi_cost_hint_few": "{{count}} failed runs account for {{pct}}%",
+    "kpi_cost_hint_many": "{{count}} failed runs account for {{pct}}%",
+    "note_unpriced_few": "{{count}} runs have no recorded usage and are not counted in the total.",
+    "note_unpriced_many": "{{count}} runs have no recorded usage and are not counted in the total."
+  },
+  "view_selector": {
+    "trigger": "Views",
+    "empty": "No saved views yet",
+    "private_group": "Private",
+    "shared_group": "Shared with workspace",
+    "exit": "Exit view",
+    "unavailable": "This view is no longer available",
+    "edit": "Edit view"
+  },
+  "view_bar": {
+    "menu_label": "Views",
+    "menu_new": "New view",
+    "builtin_tag": "Built-in",
+    "drag_handle": "Drag to reorder",
+    "delete": "Delete",
+    "delete_title": "Delete view?",
+    "delete_description": "“{{name}}” will be deleted for everyone who can see it",
+    "toast_deleted": "View deleted",
+    "context_edit": "Edit view",
+    "context_pin": "Pin to sidebar",
+    "context_unpin": "Unpin from sidebar",
+    "row_menu": "More actions",
+    "row_hide": "Hide from bar",
+    "row_show": "Show on bar",
+    "menu_manage": "Manage views",
+    "manage_title": "Manage views",
+    "manage_hint": "Order and visibility only affect you",
+    "visible_toggle": "Show in view bar",
+    "more_label": "More views"
   }
 }

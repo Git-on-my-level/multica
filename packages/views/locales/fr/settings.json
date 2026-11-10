@@ -454,6 +454,10 @@
       "goSettings": {
         "label": "Aller aux paramètres",
         "description": "Ouvrir les paramètres de l'espace de travail."
+      },
+      "openThreadNav": {
+        "label": "Open thread navigator",
+        "description": "List, search, and jump between the comment threads of the open issue."
       }
     },
     "fixed": {

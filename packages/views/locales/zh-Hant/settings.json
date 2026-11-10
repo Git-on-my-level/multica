@@ -450,6 +450,10 @@
       "goSettings": {
         "label": "前往設定",
         "description": "開啟工作區設定。"
+      },
+      "openThreadNav": {
+        "label": "Open thread navigator",
+        "description": "List, search, and jump between the comment threads of the open issue."
       }
     },
     "fixed": {

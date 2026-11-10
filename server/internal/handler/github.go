@@ -1887,7 +1887,7 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 		touched := map[pgtype.UUID]struct{}{}
 		idents := prClaimedIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
 		if autoLink, _ := autoLinkPRsEnabledForWorkspace(ws); autoLink {
-			linkedIssueIDs, touched = h.reconcileAutoLinks(ctx, ws, pr.ID, state, prAutoLinkInput{
+			autoLinkedIssueIDs, autoTouched := h.reconcileAutoLinks(ctx, ws, pr.ID, state, prAutoLinkInput{
 				idents:    idents,
 				permits:   func(id string) bool { return linkPolicy.permits(id, workspaceID) },
 				ambiguous: func(id string) bool { return linkPolicy.ambiguous[id] },
@@ -1901,6 +1901,8 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 					return h.Queries.ListAutoLinkedIssueIDsForPullRequest(ctx, pr.ID)
 				},
 			})
+			linkedIssueIDs = append(linkedIssueIDs, autoLinkedIssueIDs...)
+			touched = autoTouched
 		}
 		// A merge is a PR event for every issue this PR is linked to, manual
 		// links included.

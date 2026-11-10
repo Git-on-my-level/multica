@@ -436,6 +436,10 @@
       "goSettings": {
         "label": "Ir a Configuración",
         "description": "Abre la configuración del espacio de trabajo."
+      },
+      "openThreadNav": {
+        "label": "Open thread navigator",
+        "description": "List, search, and jump between the comment threads of the open issue."
       }
     },
     "fixed": {

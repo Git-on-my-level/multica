@@ -126,7 +126,8 @@
     "move_failed": "No se ha podido mover la tarea",
     "empty_description": "Una tarea es un trabajo concreto para un miembro o un agente. Asígnasela a un agente y empezará a trabajar en tu runtime.",
     "break_down_with_chat": "Desglosar en el chat",
-    "break_down_prompt": "Quiero hacer lo siguiente. Pregúntame lo que necesites saber y después divídelo en tareas de este espacio de trabajo:\n\n"
+    "break_down_prompt": "Quiero hacer lo siguiente. Pregúntame lo que necesites saber y después divídelo en tareas de este espacio de trabajo:\n\n",
+    "empty_hint": "Create an issue to get started."
   },
   "status": {
     "backlog": "Backlog",
@@ -415,10 +416,12 @@
     },
     "empty": {
       "assigned": {
-        "title": "Sin tareas asignadas"
+        "title": "Sin tareas asignadas",
+        "description": "Issues assigned here will appear in this view."
       },
       "created": {
-        "title": "Sin tareas creadas"
+        "title": "Sin tareas creadas",
+        "description": "Issues created here will appear in this view."
       }
     },
     "search_placeholder": "Buscar tareas...",
@@ -443,7 +446,9 @@
     "empty_grouping": "Ninguna tarea coincide",
     "no_value": "Sin valor",
     "ordered_by": "Tablero ordenado por {{field}}",
-    "manual_reorder_hint": "Cambia a la ordenación Manual para reorganizar las tareas dentro de una columna."
+    "manual_reorder_hint": "Cambia a la ordenación Manual para reorganizar las tareas dentro de una columna.",
+    "hidden_columns_label": "Hidden columns",
+    "show_column": "Show column"
   },
   "detail": {
     "not_found": "Esta tarea no existe o se ha eliminado de este espacio de trabajo.",
@@ -566,7 +571,32 @@
     "thread_nav_hide_replies": "Ocultar respuestas",
     "load_failed": "No se pudo cargar la tarea.",
     "load_retry": "Reintentar",
-    "not_found_title": "Tarea no encontrada"
+    "not_found_title": "Tarea no encontrada",
+    "pull_requests_empty": "No linked pull requests yet. Put this issue's identifier in a PR's branch name or title, or write it after Closes in the PR body, to auto-link it.",
+    "pull_request_state_open": "Open",
+    "pull_request_checks_failed_named": "{{failed}}/{{total}} failed · {{names}}",
+    "pull_request_merge_unstable": "Unstable",
+    "pull_request_merge_has_hooks": "Has hooks",
+    "thread_nav": {
+      "button_label_one": "Comment threads ({{count}})",
+      "button_label_other": "Comment threads ({{count}})",
+      "search_placeholder": "Search threads or authors",
+      "match_count_one": "{{count}} match",
+      "match_count_other": "{{count}} matches",
+      "filter_all": "All",
+      "filter_unresolved": "Unresolved",
+      "filter_resolved": "Resolved",
+      "filter_mine": "@me",
+      "group": {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "earlier": "Earlier"
+      },
+      "empty": "No threads match",
+      "hint_select": "select",
+      "hint_jump": "jump",
+      "hint_close": "close"
+    }
   },
   "timeline": {
     "loading": "Cargando...",
@@ -795,7 +825,8 @@
   "filtered_empty": {
     "title": "Ninguna tarea coincide con estos filtros",
     "clear_button": "Limpiar filtros",
-    "unread_title": "No hay tareas sin leer"
+    "unread_title": "No hay tareas sin leer",
+    "hint": "Adjust or clear the filters to see the issues in this view."
   },
   "agent_live": {
     "is_working": "{{name}} está trabajando",
@@ -865,7 +896,9 @@
     "strip_no_usage": "Sin uso registrado",
     "jump_to_run": "Ir a la ejecución",
     "queued_count_one": "{{count}} en cola",
-    "queued_count_other": "{{count}} en cola"
+    "queued_count_other": "{{count}} en cola",
+    "show_past": "Show past runs ({{count}})",
+    "hide_past": "Hide past runs ({{count}})"
   },
   "terminate_dialog": {
     "title": "¿Detener esta ejecución?",
@@ -893,7 +926,8 @@
     "cancel": "Cancelar",
     "update_partial_one": "Actualizada {{updated}} de {{count}} tarea. El resto no admite este cambio y se quedó como estaba.",
     "update_partial_other": "Actualizadas {{updated}} de {{count}} tareas. El resto no admite este cambio y se quedó como estaba.",
-    "delete_restricted": "Puedes eliminar las tareas que hayas creado tú o tus agentes. Los usuarios con rol owner o admin del espacio de trabajo pueden eliminar cualquier tarea."
+    "delete_restricted": "Puedes eliminar las tareas que hayas creado tú o tus agentes. Los usuarios con rol owner o admin del espacio de trabajo pueden eliminar cualquier tarea.",
+    "delete_dialog_warning": "Any workspace member can delete issues."
   },
   "card": {
     "update_failed": "No se ha podido actualizar la tarea",
@@ -1031,7 +1065,39 @@
     "variant_my_any": "Cualquier relación",
     "variant_my_assigned": "Asignadas a mí",
     "variant_my_created": "Creadas por mí",
-    "variant_my_involved": "En las que participo"
+    "variant_my_involved": "En las que participo",
+    "title": "Save as view",
+    "hint_workspace": "Based on all workspace issues",
+    "hint_my_any": "Based on My issues · All",
+    "hint_my_assigned": "Based on My issues · Assigned",
+    "hint_my_created": "Based on My issues · Created",
+    "hint_my_involved": "Based on My issues · Involved",
+    "hint_project": "Based on project “{{title}}”, available only on that project page",
+    "hint_project_agents": "Based on project “{{title}}” issues assigned to agents, available only on that project page",
+    "hint_project_members": "Based on project “{{title}}” issues assigned to members, available only on that project page",
+    "my_private_note": "My issues views are visible only to you",
+    "name_label": "Name",
+    "visibility_label": "Visibility",
+    "visibility_private": "Only visible to me",
+    "visibility_workspace": "Visible to workspace members",
+    "filters_label": "Filters",
+    "custom_property": "Custom property",
+    "create": "Create view",
+    "layout_label": "Layout",
+    "display_defaults": "Default display",
+    "default_hint": "How members first see this view; everyone can adjust for themselves afterwards",
+    "add_filter": "Add filter",
+    "name_placeholder": "e.g. Needs review",
+    "cancel": "Cancel",
+    "name_required": "Enter a view name",
+    "toast_created": "View created",
+    "toast_failed": "Failed to create view",
+    "edit_title": "Edit view",
+    "update": "Save changes",
+    "toast_updated": "View updated",
+    "toast_conflict": "Someone else edited this view — reopen it and try again",
+    "hint_workspace_members": "Based on workspace issues assigned to members",
+    "hint_workspace_agents": "Based on workspace issues assigned to agents"
   },
   "plugins": {
     "panels": "Plugins",
@@ -1939,5 +2005,64 @@
     "copy_url": "Copiar URL",
     "copied": "URL copiada",
     "copy_failed": "No se pudo copiar la URL"
+  },
+  "usage_detail": {
+    "title": "Usage breakdown",
+    "subtitle_one": "{{identifier}} · {{count}} run",
+    "subtitle_other": "{{identifier}} · {{count}} runs",
+    "empty": "No run on this issue has recorded token usage yet.",
+    "kpi_cost": "Cost",
+    "kpi_cost_hint_one": "{{count}} failed run accounts for {{pct}}%",
+    "kpi_cost_hint_other": "{{count}} failed runs account for {{pct}}%",
+    "kpi_cache": "Cache savings",
+    "kpi_cache_hint": "{{pct}}% hit rate · {{reads}} read",
+    "kpi_tokens": "Tokens",
+    "kpi_tokens_hint": "{{input}} in · {{output}} out",
+    "by_agent": "By agent",
+    "by_agent_total": "Total {{cost}}",
+    "col_run": "Run",
+    "col_model": "Model",
+    "col_duration": "Duration",
+    "col_input": "In",
+    "col_output": "Out",
+    "col_cache_read": "Cache R",
+    "col_cache_write": "Cache W",
+    "col_tokens": "Tokens",
+    "col_cost": "Cost",
+    "total": "Total",
+    "note_unpriced_one": "{{count}} run has no recorded usage and is not counted in the total.",
+    "note_unpriced_other": "{{count}} runs have no recorded usage and are not counted in the total.",
+    "note_unmapped": "No price on file for {{models}}; their tokens are counted but their cost is not.",
+    "note_estimate": "Cost is estimated from published model rates, except where the provider reported its own figure."
+  },
+  "view_selector": {
+    "trigger": "Views",
+    "empty": "No saved views yet",
+    "private_group": "Private",
+    "shared_group": "Shared with workspace",
+    "exit": "Exit view",
+    "unavailable": "This view is no longer available",
+    "edit": "Edit view"
+  },
+  "view_bar": {
+    "menu_label": "Views",
+    "menu_new": "New view",
+    "builtin_tag": "Built-in",
+    "drag_handle": "Drag to reorder",
+    "delete": "Delete",
+    "delete_title": "Delete view?",
+    "delete_description": "“{{name}}” will be deleted for everyone who can see it",
+    "toast_deleted": "View deleted",
+    "context_edit": "Edit view",
+    "context_pin": "Pin to sidebar",
+    "context_unpin": "Unpin from sidebar",
+    "row_menu": "More actions",
+    "row_hide": "Hide from bar",
+    "row_show": "Show on bar",
+    "menu_manage": "Manage views",
+    "manage_title": "Manage views",
+    "manage_hint": "Order and visibility only affect you",
+    "visible_toggle": "Show in view bar",
+    "more_label": "More views"
   }
 }

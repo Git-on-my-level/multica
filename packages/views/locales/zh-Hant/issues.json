@@ -134,7 +134,8 @@
     "empty_description": "任務是交給成員或 AI 代理的一件具體工作。指派給 AI 代理後，它會在你的執行時上自己開始。",
     "break_down_with_chat": "用聊天拆解需求",
     "break_down_prompt": "我想完成下面這件事。先問清楚你需要了解的，然後在這個工作區裡把它拆成任務：\n\n",
-    "move_failed": "移動任務失敗"
+    "move_failed": "移動任務失敗",
+    "empty_hint": "Create an issue to get started."
   },
   "status": {
     "backlog": "待規劃",
@@ -419,10 +420,12 @@
     },
     "empty": {
       "assigned": {
-        "title": "沒有已分配的任務"
+        "title": "沒有已分配的任務",
+        "description": "Issues assigned here will appear in this view."
       },
       "created": {
-        "title": "沒有已建立的任務"
+        "title": "沒有已建立的任務",
+        "description": "Issues created here will appear in this view."
       }
     },
     "search_placeholder": "搜尋任務...",
@@ -447,7 +450,9 @@
     "empty_grouping": "沒有匹配的任務",
     "no_value": "未設定",
     "ordered_by": "按{{field}}排序",
-    "manual_reorder_hint": "切換到“手動”排序後，才能調整同一列內的順序。"
+    "manual_reorder_hint": "切換到“手動”排序後，才能調整同一列內的順序。",
+    "hidden_columns_label": "Hidden columns",
+    "show_column": "Show column"
   },
   "peek": {
     "panel_label": "任務預覽",
@@ -575,7 +580,30 @@
     "workdir_path_unavailable": "暫無本地 workdir — 這個任務還沒被本地 AI 代理執行過",
     "unsubscribe_subtree_succeeded": "已取消訂閱此任務及其子任務。",
     "subscription_update_failed": "無法更新訂閱狀態，請重試。",
-    "pull_requests_empty_title": "暫無關聯 PR。"
+    "pull_requests_empty_title": "暫無關聯 PR。",
+    "pull_requests_empty": "No linked pull requests yet. Put this issue's identifier in a PR's branch name or title, or write it after Closes in the PR body, to auto-link it.",
+    "pull_request_state_open": "Open",
+    "pull_request_checks_failed_named": "{{failed}}/{{total}} failed · {{names}}",
+    "pull_request_merge_unstable": "Unstable",
+    "pull_request_merge_has_hooks": "Has hooks",
+    "thread_nav": {
+      "button_label_other": "Comment threads ({{count}})",
+      "search_placeholder": "Search threads or authors",
+      "match_count_other": "{{count}} matches",
+      "filter_all": "All",
+      "filter_unresolved": "Unresolved",
+      "filter_resolved": "Resolved",
+      "filter_mine": "@me",
+      "group": {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "earlier": "Earlier"
+      },
+      "empty": "No threads match",
+      "hint_select": "select",
+      "hint_jump": "jump",
+      "hint_close": "close"
+    }
   },
   "timeline": {
     "loading": "載入中…",
@@ -782,7 +810,8 @@
   "filtered_empty": {
     "title": "沒有符合篩選條件的任務",
     "unread_title": "沒有未讀任務",
-    "clear_button": "清除篩選"
+    "clear_button": "清除篩選",
+    "hint": "Adjust or clear the filters to see the issues in this view."
   },
   "agent_live": {
     "is_working": "{{name}} 在工作",
@@ -847,7 +876,9 @@
     "more_runs_other": "顯示其餘 {{count}} 次執行",
     "strip_aria": "每次執行的費用——開啟執行時間線",
     "strip_no_usage": "沒有用量記錄",
-    "queued_count_other": "{{count}} 個排隊中"
+    "queued_count_other": "{{count}} 個排隊中",
+    "show_past": "Show past runs ({{count}})",
+    "hide_past": "Hide past runs ({{count}})"
   },
   "runs_timeline": {
     "title": "執行記錄",
@@ -933,7 +964,8 @@
     "delete_failed": "刪除任務失敗",
     "delete_dialog_title_other": "刪除 {{count}} 個任務？",
     "delete_dialog_desc_other": "此操作無法撤銷，所選任務及其全部關聯資料都會被永久刪除。",
-    "cancel": "取消"
+    "cancel": "取消",
+    "delete_dialog_warning": "Any workspace member can delete issues."
   },
   "card": {
     "update_failed": "更新任務失敗",
@@ -1071,7 +1103,39 @@
     "variant_my_any": "任何相關",
     "variant_my_assigned": "分配給我",
     "variant_my_created": "我建立的",
-    "variant_my_involved": "我參與的"
+    "variant_my_involved": "我參與的",
+    "title": "Save as view",
+    "hint_workspace": "Based on all workspace issues",
+    "hint_my_any": "Based on My issues · All",
+    "hint_my_assigned": "Based on My issues · Assigned",
+    "hint_my_created": "Based on My issues · Created",
+    "hint_my_involved": "Based on My issues · Involved",
+    "hint_project": "Based on project “{{title}}”, available only on that project page",
+    "hint_project_agents": "Based on project “{{title}}” issues assigned to agents, available only on that project page",
+    "hint_project_members": "Based on project “{{title}}” issues assigned to members, available only on that project page",
+    "my_private_note": "My issues views are visible only to you",
+    "name_label": "Name",
+    "visibility_label": "Visibility",
+    "visibility_private": "Only visible to me",
+    "visibility_workspace": "Visible to workspace members",
+    "filters_label": "Filters",
+    "custom_property": "Custom property",
+    "create": "Create view",
+    "layout_label": "Layout",
+    "display_defaults": "Default display",
+    "default_hint": "How members first see this view; everyone can adjust for themselves afterwards",
+    "add_filter": "Add filter",
+    "name_placeholder": "e.g. Needs review",
+    "cancel": "Cancel",
+    "name_required": "Enter a view name",
+    "toast_created": "View created",
+    "toast_failed": "Failed to create view",
+    "edit_title": "Edit view",
+    "update": "Save changes",
+    "toast_updated": "View updated",
+    "toast_conflict": "Someone else edited this view — reopen it and try again",
+    "hint_workspace_members": "Based on workspace issues assigned to members",
+    "hint_workspace_agents": "Based on workspace issues assigned to agents"
   },
   "plugins": {
     "panels": "Plugins",
@@ -1863,5 +1927,61 @@
     "copy_url": "複製位址",
     "copied": "已複製位址",
     "copy_failed": "無法複製位址"
+  },
+  "usage_detail": {
+    "title": "Usage breakdown",
+    "subtitle_other": "{{identifier}} · {{count}} runs",
+    "empty": "No run on this issue has recorded token usage yet.",
+    "kpi_cost": "Cost",
+    "kpi_cost_hint_other": "{{count}} failed runs account for {{pct}}%",
+    "kpi_cache": "Cache savings",
+    "kpi_cache_hint": "{{pct}}% hit rate · {{reads}} read",
+    "kpi_tokens": "Tokens",
+    "kpi_tokens_hint": "{{input}} in · {{output}} out",
+    "by_agent": "By agent",
+    "by_agent_total": "Total {{cost}}",
+    "col_run": "Run",
+    "col_model": "Model",
+    "col_duration": "Duration",
+    "col_input": "In",
+    "col_output": "Out",
+    "col_cache_read": "Cache R",
+    "col_cache_write": "Cache W",
+    "col_tokens": "Tokens",
+    "col_cost": "Cost",
+    "total": "Total",
+    "note_unpriced_other": "{{count}} runs have no recorded usage and are not counted in the total.",
+    "note_unmapped": "No price on file for {{models}}; their tokens are counted but their cost is not.",
+    "note_estimate": "Cost is estimated from published model rates, except where the provider reported its own figure."
+  },
+  "view_selector": {
+    "trigger": "Views",
+    "empty": "No saved views yet",
+    "private_group": "Private",
+    "shared_group": "Shared with workspace",
+    "exit": "Exit view",
+    "unavailable": "This view is no longer available",
+    "edit": "Edit view"
+  },
+  "view_bar": {
+    "menu_label": "Views",
+    "menu_new": "New view",
+    "builtin_tag": "Built-in",
+    "drag_handle": "Drag to reorder",
+    "delete": "Delete",
+    "delete_title": "Delete view?",
+    "delete_description": "“{{name}}” will be deleted for everyone who can see it",
+    "toast_deleted": "View deleted",
+    "context_edit": "Edit view",
+    "context_pin": "Pin to sidebar",
+    "context_unpin": "Unpin from sidebar",
+    "row_menu": "More actions",
+    "row_hide": "Hide from bar",
+    "row_show": "Show on bar",
+    "menu_manage": "Manage views",
+    "manage_title": "Manage views",
+    "manage_hint": "Order and visibility only affect you",
+    "visible_toggle": "Show in view bar",
+    "more_label": "More views"
   }
 }

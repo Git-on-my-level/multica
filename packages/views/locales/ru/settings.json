@@ -84,7 +84,8 @@
     "workflow_usage_other": "Используется в {{count}} рабочего процесса",
     "workflow_usage_none": "Не используется в рабочих процессах",
     "workflow_usage_few": "Используется в {{count}} рабочих процессах",
-    "workflow_usage_many": "Используется в {{count}} рабочих процессах"
+    "workflow_usage_many": "Используется в {{count}} рабочих процессах",
+    "built_in_dialog": {}
   },
   "wakeups": {
     "description": "Общие правила платформы, применяемые ко всем задачам. Каждая задача может переопределить их в своём разделе «Пробуждения».",
@@ -461,6 +462,10 @@
       "goSettings": {
         "label": "Перейти в настройки",
         "description": "Открыть настройки рабочего пространства."
+      },
+      "openThreadNav": {
+        "label": "Open thread navigator",
+        "description": "List, search, and jump between the comment threads of the open issue."
       }
     },
     "fixed": {
