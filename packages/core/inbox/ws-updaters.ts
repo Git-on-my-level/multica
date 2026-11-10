@@ -1,6 +1,6 @@
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
-import { inboxKeys } from "./queries";
-import type { InboxItem, IssuePriority, IssueStatus } from "../types";
+import { inboxKeys, mapArchivedInboxCache, type ArchivedInboxCache } from "./queries";
+import type { InboxItem, IssueAssigneeType, IssuePriority, IssueStatus } from "../types";
 
 // Re-read a query because the server changed — in a way that is never answered
 // by a request that was already on the wire before the change.
@@ -53,11 +53,11 @@ function patchInboxLists(
   wsId: string,
   patch: (items: InboxItem[]) => InboxItem[],
 ) {
-  for (const queryKey of [inboxKeys.list(wsId), inboxKeys.archived(wsId)]) {
+  for (const queryKey of [inboxKeys.list(wsId), ...qc.getQueryCache().findAll({ queryKey: inboxKeys.archived(wsId) }).map((query) => query.queryKey)]) {
     const invalidated = qc.getQueryState(queryKey)?.isInvalidated === true;
-    qc.setQueryData<InboxItem[]>(queryKey, (old) => {
+    qc.setQueryData<ArchivedInboxCache>(queryKey, (old) => {
       if (!old) return undefined;
-      const next = patch(old);
+      const next = mapArchivedInboxCache(old, patch);
       return next === old ? undefined : next;
     });
     if (invalidated) {
@@ -66,27 +66,54 @@ function patchInboxLists(
   }
 }
 
+/** Issue fields inbox rows mirror for display and filtering. */
+export interface InboxIssueProjectionPatch {
+  status?: IssueStatus;
+  priority?: IssuePriority;
+  project_id?: string | null;
+  assignee_type?: IssueAssigneeType | null;
+  assignee_id?: string | null;
+  due_date?: string | null;
+  label_ids?: string[];
+}
+
 export function patchInboxIssueProjection(
   qc: QueryClient,
   wsId: string,
   issueId: string,
-  patch: { status?: IssueStatus; priority?: IssuePriority },
+  patch: InboxIssueProjectionPatch,
 ) {
   const project = (old: InboxItem[]) => {
     let changed = false;
     const next = old.map((item) => {
       if (item.issue_id !== issueId) return item;
       changed = true;
+      // Do not manufacture a projection on data returned by an older
+      // backend. Capability detection relies on `undefined` continuing to
+      // mean "this endpoint version does not provide the field".
+      const hasIssueFields = item.issue_label_ids !== undefined;
       return {
         ...item,
         ...(patch.status !== undefined
           ? { issue_status: patch.status }
           : {}),
-        // Do not manufacture the projection on data returned by an older
-        // backend. Capability detection relies on `undefined` continuing to
-        // mean "this endpoint version does not provide issue_priority".
         ...(patch.priority !== undefined && item.issue_priority !== undefined
           ? { issue_priority: patch.priority }
+          : {}),
+        ...(hasIssueFields && patch.project_id !== undefined
+          ? { issue_project_id: patch.project_id }
+          : {}),
+        ...(hasIssueFields && patch.assignee_type !== undefined
+          ? { issue_assignee_type: patch.assignee_type }
+          : {}),
+        ...(hasIssueFields && patch.assignee_id !== undefined
+          ? { issue_assignee_id: patch.assignee_id }
+          : {}),
+        ...(hasIssueFields && patch.due_date !== undefined
+          ? { issue_due_date: patch.due_date }
+          : {}),
+        ...(hasIssueFields && patch.label_ids !== undefined
+          ? { issue_label_ids: patch.label_ids }
           : {}),
       };
     });
@@ -111,6 +138,7 @@ export function onInboxIssueStatusChanged(
   issueId: string,
   status: IssueStatus,
 ) {
+  // The issue cache coordinator owns membership invalidation after commit.
   patchInboxIssueStatus(qc, wsId, issueId, status);
 }
 
@@ -123,8 +151,8 @@ export function onInboxIssueStatusChanged(
 // summary rather than these lists, so the summary is refreshed here too. It
 // has to happen inside this updater and not at the call site: deletion is an
 // `issue:*` event, so no `inbox:*` handler runs to pick it up, and the summary
-// query is `staleTime: Infinity` with no refetch on focus — nothing else would
-// ever correct it, leaving the badge stuck above an empty inbox (MUL-6967).
+// query is `staleTime: Infinity`, re-read only once invalidated — nothing else
+// would ever correct it, leaving the badge stuck above an empty inbox (MUL-6967).
 export async function onInboxIssueDeleted(
   qc: QueryClient,
   wsId: string,
@@ -133,7 +161,23 @@ export async function onInboxIssueDeleted(
   patchInboxLists(qc, wsId, (items) =>
     items.filter((i) => i.issue_id !== issueId),
   );
-  await onInboxSummaryInvalidate(qc);
+  await Promise.all([
+    onInboxSummaryInvalidate(qc),
+    refreshInboxQuery(qc, inboxKeys.pages(wsId)),
+    refreshInboxQuery(qc, inboxKeys.lookup(wsId)),
+    refreshInboxQuery(qc, inboxKeys.facets(wsId)),
+  ]);
+}
+
+// An issue field the archive filters and counts on changed. Loaded rows are
+// patched in place, but which groups match and the facet counts are decided
+// by the server: an issue that newly matches a filter would never appear, and
+// with `staleTime: Infinity` an empty result would stay empty. Marked
+// synchronously so an archive that is not mounted re-reads on its next visit.
+export async function refreshArchivedInboxMatches(qc: QueryClient, wsId: string) {
+  const keys = [inboxKeys.pages(wsId), inboxKeys.lookup(wsId), inboxKeys.facets(wsId)];
+  for (const queryKey of keys) void qc.invalidateQueries({ queryKey, refetchType: "none" });
+  await Promise.all(keys.map((queryKey) => refreshInboxQuery(qc, queryKey)));
 }
 
 // Whether a request for either inbox list is out (paused ones included).

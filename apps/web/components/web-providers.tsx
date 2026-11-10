@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { CoreProvider } from "@multica/core/platform";
+import { installUserTimingCap } from "@multica/core/diagnostics";
 import { createBrowserCookieLocaleAdapter } from "@multica/core/i18n/browser";
 import type { LocaleResources, SupportedLocale } from "@multica/core/i18n";
-import { useWelcomeStore } from "@multica/core/onboarding";
 import packageJson from "../package.json";
 import { WebNavigationProvider } from "@/platform/navigation";
 import { WebScrollRestorationProvider } from "@/platform/scroll-restoration";
@@ -67,22 +67,18 @@ export function WebProviders({
     [],
   );
   const localeAdapter = useMemo(() => createBrowserCookieLocaleAdapter(), []);
+  // React's development build never clears its render measures; see
+  // installUserTimingCap.
+  useEffect(() => {
+    if (process.env.NODE_ENV === "development") installUserTimingCap();
+  }, []);
   return (
     <CoreProvider
       apiBaseUrl={apiBaseUrl}
       wsUrl={wsUrl || deriveWsUrl()}
       cookieAuth={cookieAuth}
       onLogin={setLoggedInCookie}
-      onLogout={() => {
-        // welcome-store holds the transient post-onboarding signal. Must
-        // clear on logout so user B logging into the same browser doesn't
-        // inherit user A's signal and have <WelcomeAfterOnboarding /> fire
-        // listAgents / createIssue against a workspace user B doesn't even
-        // belong to. The store's own docstring promises this reset; this
-        // is where it gets wired.
-        useWelcomeStore.getState().reset();
-        clearLoggedInCookie();
-      }}
+      onLogout={clearLoggedInCookie}
       identity={identity}
       locale={locale}
       resources={resources}

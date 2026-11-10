@@ -1,6 +1,7 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { onlineManager, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import { projectKeys } from "./queries";
+import { issueKeys } from "../issues/queries";
 import { useWorkspaceId } from "../hooks";
 import { useRecentContextStore } from "../chat/recent-context-store";
 import { clearIssueSurfaceViewState } from "../issues/stores/surface-view-store";
@@ -50,33 +51,54 @@ export function useUpdateProject() {
     onSettled: (_data, _err, vars) => {
       qc.invalidateQueries({ queryKey: projectKeys.detail(wsId, vars.id) });
       qc.invalidateQueries({ queryKey: projectKeys.list(wsId) });
+      // A project's status is a filter dimension of the issue table, so
+      // changing it moves issues in and out of a filtered window. Nothing
+      // in the issue payload changes, so only this invalidation can
+      // refresh it — the global staleTime is Infinity.
+      if ("status" in vars) {
+        qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
+      }
     },
   });
+}
+
+export class ProjectDeletionOfflineError extends Error {
+  constructor() {
+    super("You're offline. Reconnect and try deleting again.");
+    this.name = "ProjectDeletionOfflineError";
+  }
 }
 
 export function useDeleteProject() {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: (id: string) => api.deleteProject(id),
-    onMutate: async (id) => {
+    // Fail offline deletions instead of queuing a destructive action behind a modal.
+    networkMode: "always",
+    retry: false,
+    mutationFn: (id: string) => {
+      if (!onlineManager.isOnline()) throw new ProjectDeletionOfflineError();
+      return api.deleteProject(id);
+    },
+    onSuccess: async (_data, id) => {
+      // Reads started during DELETE may still contain the removed project.
       await qc.cancelQueries({ queryKey: projectKeys.list(wsId) });
-      const prevList = qc.getQueryData<ListProjectsResponse>(projectKeys.list(wsId));
       qc.setQueryData<ListProjectsResponse>(projectKeys.list(wsId), (old) =>
-        old ? { ...old, projects: old.projects.filter((p) => p.id !== id), total: old.total - 1 } : old,
+        old && old.projects.some((p) => p.id === id)
+          ? { ...old, projects: old.projects.filter((p) => p.id !== id), total: old.total - 1 }
+          : old,
       );
       qc.removeQueries({ queryKey: projectKeys.detail(wsId, id) });
-      return { prevList };
-    },
-    onError: (_err, _id, ctx) => {
-      if (ctx?.prevList) qc.setQueryData(projectKeys.list(wsId), ctx.prevList);
-    },
-    onSuccess: (_data, id) => {
       useRecentContextStore.getState().forgetContext(wsId, { type: "project", id });
       clearIssueSurfaceViewState(issueScopeKey({ type: "project", projectId: id }));
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: projectKeys.list(wsId) });
+      // Deleting a project removes its status from the workspace, so a table
+      // window filtered on that status still holds its issues. The realtime
+      // event invalidates too, but a delivery gap must not leave the window
+      // wrong forever — the global staleTime is Infinity.
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
     },
   });
 }

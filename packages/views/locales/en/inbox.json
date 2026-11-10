@@ -16,11 +16,25 @@
     "status": "Status",
     "priority": "Priority",
     "from": "From",
-    "unread_only": "Unread only",
     "notification_count_one": "{{count}} notification",
     "notification_count_other": "{{count}} notifications",
     "clear": "Clear filters",
-    "empty": "No notifications match your filters"
+    "empty": "No notifications match your filters",
+    "section_notification": "Notification",
+    "section_issue": "Issue",
+    "type": "Type",
+    "received": "Received",
+    "type_mention": "Mentions",
+    "type_comment": "Comments & reactions",
+    "type_assign": "Assignments & subscriptions",
+    "type_review": "Review requests",
+    "type_change": "Issue changes",
+    "type_run": "Agent runs",
+    "type_system": "System",
+    "received_today": "Today",
+    "received_last_7_days": "Last 7 days",
+    "received_last_30_days": "Last 30 days",
+    "agent_idle": "Idle"
   },
   "context_menu": {
     "mark_read": "Mark as read",
@@ -30,6 +44,7 @@
     "open_in_new_tab": "Open in new tab"
   },
   "list": {
+    "loading_selection": "Loading notification…",
     "empty": "No notifications",
     "mark_done_tooltip": "Mark as done",
     "archive_tooltip": "Archive",
@@ -42,7 +57,10 @@
     "archived_title": "Archived",
     "archived_empty": "No archived notifications",
     "unarchive_tooltip": "Unarchive",
-    "actions_aria": "Notification actions"
+    "actions_aria": "Notification actions",
+    "load_more": "Load more",
+    "loading_more": "Loading…",
+    "retry": "Retry"
   },
   "detail": {
     "select_prompt": "Select a notification to view details",
@@ -76,7 +94,12 @@
     "quick_create_failed": "Create with agent failed",
     "quick_create_unconfirmed": "Create with agent unconfirmed",
     "autopilot_paused": "Autopilot paused",
-    "autopilot_quota_exceeded": "Autopilot run limit reached"
+    "children_done": "Sub-issues finished",
+    "autopilot_quota_exceeded": "Autopilot run limit reached",
+    "app_action_requested": "Needs your confirmation",
+    "app_action_reminder": "Confirmation expiring soon",
+    "app_connect_requested": "Connect an app",
+    "app_action_result": "App action result"
   },
   "labels": {
     "set_status_to": "Set status to",
@@ -90,7 +113,8 @@
     "reacted_to_comment": "Reacted {{emoji}} to your comment",
     "created_with_agent": "Created with agent: {{identifier}}",
     "failed_with_detail": "Failed: {{detail}}",
-    "autopilot_quota_blocked": "Run blocked because the limit was reached"
+    "autopilot_quota_blocked": "Run blocked because the limit was reached",
+    "children_done_stage": "Stage {{stage}}'s sub-issues finished"
   },
   "toasts": {
     "source_context_retry_started": "Retry started with the original context",
@@ -98,6 +122,7 @@
     "unarchived": "Notification restored"
   },
   "errors": {
+    "archived_lookup_failed": "Failed to load the linked notification",
     "source_context_retry_failed": "Could not retry with the original context",
     "source_context_retry_unavailable": "This context can no longer be retried. Start again from the branch point.",
     "mark_read_failed": "Failed to mark as read",
@@ -109,6 +134,7 @@
     "archive_all_read_failed": "Failed to archive read items",
     "archive_completed_failed": "Failed to archive completed",
     "unarchive_failed": "Failed to unarchive",
-    "archived_load_failed": "Failed to load archived notifications"
+    "archived_load_failed": "Failed to load archived notifications",
+    "filters_load_failed": "Could not load filters"
   }
 }

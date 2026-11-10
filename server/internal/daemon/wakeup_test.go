@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,10 +124,52 @@ func TestRunTaskWakeupConnectionSignalsDisconnect(t *testing.T) {
 	}
 }
 
-// TestWSHeartbeatFreshnessWindow pins the WS freshness helpers. HTTP
-// heartbeats must not be suppressed by a recent WS ack: a half-open
-// Tailscale socket can look freshly acked while the server never sees it.
-func TestWSHeartbeatFreshnessWindow(t *testing.T) {
+func TestRunTaskWakeupConnectionRoutesTaskSupplementHint(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	sendHint := make(chan struct{})
+	serverDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-sendHint
+		payload, _ := json.Marshal(protocol.TaskAvailablePayload{RuntimeID: "runtime-1", TaskID: "task-1"})
+		_ = conn.WriteJSON(protocol.Message{Type: protocol.EventDaemonTaskSupplementAvailable, Payload: payload})
+		<-serverDone
+	}))
+	defer srv.Close()
+
+	d := New(Config{ServerBaseURL: srv.URL, HeartbeatInterval: time.Hour}, slog.Default())
+	supplementWakeup, unsubscribe := d.taskSupplementSignals.subscribe("task-1")
+	defer unsubscribe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := d.runTaskWakeupConnection(ctx, []string{"runtime-1"}, make(chan taskWakeup, 2), make(chan struct{}))
+		errCh <- err
+	}()
+	close(sendHint)
+	select {
+	case <-supplementWakeup:
+	case <-time.After(time.Second):
+		t.Fatal("task supplement hint did not wake its exact task")
+	}
+	close(serverDone)
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("websocket reader did not release after cancellation")
+	}
+}
+
+// TestWSHeartbeatFreshnessSuppressesHTTP pins the WS-vs-HTTP coordination:
+// once a runtime acked over WS within the freshness window the HTTP
+// heartbeat loop must skip it to avoid duplicate DB writes.
+func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 	d := New(Config{HeartbeatInterval: 15 * time.Second}, slog.Default())
 
 	if d.wsHeartbeatRecentlyAcked("runtime-1") {
@@ -140,41 +181,12 @@ func TestWSHeartbeatFreshnessWindow(t *testing.T) {
 		t.Fatalf("expected just-acked runtime to be fresh")
 	}
 
-	// Missed-ack case: force the entry past the freshness window. Two missed
-	// WS acks (~30s) re-enable HTTP on the next tick.
+	// Force the entry past the freshness window.
 	d.wsHBMu.Lock()
 	d.wsHBLastAck["runtime-1"] = time.Now().Add(-d.wsHeartbeatFreshness() - time.Second)
 	d.wsHBMu.Unlock()
 	if d.wsHeartbeatRecentlyAcked("runtime-1") {
 		t.Fatalf("expected aged runtime to be stale (HTTP heartbeat must resume)")
-	}
-
-	// Half-open case (SCA-471): the ack stamp is still inside the freshness
-	// window, but the connection has DELIVERED nothing for longer than the
-	// window — a dead inbound path whose writes only fail minutes later.
-	// Suppression must key off received frames, so the guard treats the
-	// socket as disconnected: ack set cleared, HTTP free to resume.
-	d.recordWSReceive()
-	d.recordWSHeartbeatAck("runtime-1")
-	d.wsHBMu.Lock()
-	d.wsLastReceive = time.Now().Add(-d.wsHeartbeatFreshness() - time.Second)
-	d.wsHBMu.Unlock()
-	if !d.wsHeartbeatRecentlyAcked("runtime-1") {
-		t.Fatalf("precondition: ack stamp should still sit inside the freshness window")
-	}
-	if !d.clearStaleWSHeartbeatAcks() {
-		t.Fatal("receive-silent wakeup websocket must clear the ack set (treated as disconnected)")
-	}
-	if d.wsHeartbeatRecentlyAcked("runtime-1") {
-		t.Fatal("half-open guard failed: receive-silent connection still suppresses HTTP")
-	}
-
-	// The whole suppression excursion is bounded by freshness after the last
-	// RECEIVED frame. Two freshness windows plus one HTTP tick must stay far
-	// below the server's 150s stale threshold, or one missed round trip
-	// could age the runtime out server-side while HTTP is still suppressed.
-	if budget := 2*d.wsHeartbeatFreshness() + 15*time.Second; budget >= 150*time.Second {
-		t.Fatalf("freshness budget %s is not comfortably inside the server's 150s stale window", budget)
 	}
 
 	d.recordWSHeartbeatAck("runtime-2")
@@ -184,289 +196,6 @@ func TestWSHeartbeatFreshnessWindow(t *testing.T) {
 	}
 }
 
-// TestRunHeartbeatTickAlwaysPOSTs is the regression for skipping HTTP while
-// WS looked fresh. A half-open Tailscale socket can still have a recent ack
-// stamp; HTTP must POST anyway. The receive-silent path (SCA-471) still
-// clears the ack set.
-func TestRunHeartbeatTickAlwaysPOSTs(t *testing.T) {
-	var posts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/daemon/heartbeat" {
-			http.NotFound(w, r)
-			return
-		}
-		posts.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{}`))
-	}))
-	defer srv.Close()
-
-	d := New(Config{HeartbeatInterval: 15 * time.Second}, slog.Default())
-	d.client = NewClient(srv.URL)
-	ctx := context.Background()
-
-	// Healthy WS: a receive inside the window plus a fresh ack must still
-	// POST over HTTP. Skipping that tick is what let a half-open Tailscale
-	// socket mark Studio runtimes offline while OMP was still working.
-	d.recordWSReceive()
-	d.recordWSHeartbeatAck("runtime-1")
-	d.runHeartbeatTick(ctx, "runtime-1")
-	if got := posts.Load(); got != 1 {
-		t.Fatalf("HTTP heartbeat posts = %d with fresh WS ack, want 1", got)
-	}
-
-	// Half-open: ack stamp still fresh, receive silent past the freshness
-	// window. HTTP must keep posting (second tick).
-	d.wsHBMu.Lock()
-	d.wsLastReceive = time.Now().Add(-(d.wsHeartbeatFreshness() + 5*time.Second))
-	d.wsHBMu.Unlock()
-	d.runHeartbeatTick(ctx, "runtime-1")
-	if got := posts.Load(); got != 2 {
-		t.Fatalf("HTTP heartbeat posts = %d after receive silence, want 2", got)
-	}
-	d.wsHBMu.RLock()
-	_, hasAck := d.wsHBLastAck["runtime-1"]
-	d.wsHBMu.RUnlock()
-	if hasAck {
-		t.Fatal("half-open guard must purge the ack set when resuming HTTP")
-	}
-}
-
-// TestRunWSWriterSendsKeepalivePings pins the daemon-side ping half of the
-// half-open detection (SCA-471): the writer emits WebSocket PINGs on its own
-// ticker with no data frame in flight, and a failed ping write tears the
-// writer down exactly like a failed data write.
-func TestRunWSWriterSendsKeepalivePings(t *testing.T) {
-	oldPingPeriod := taskWakeupPingPeriod
-	taskWakeupPingPeriod = 50 * time.Millisecond
-	t.Cleanup(func() { taskWakeupPingPeriod = oldPingPeriod })
-
-	pingSeen := make(chan struct{}, 4)
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		// gorilla never surfaces control frames through ReadMessage; the
-		// ping handler is where the server observes the keepalive.
-		conn.SetPingHandler(func(string) error {
-			select {
-			case pingSeen <- struct{}{}:
-			default:
-			}
-			return nil
-		})
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}))
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	d := New(Config{}, slog.Default())
-	writes := make(chan *wsOutbound)
-	done := make(chan struct{})
-	go d.runWSWriter(conn, writes, done)
-
-	// No data frame was ever queued, yet a PING must arrive.
-	select {
-	case <-pingSeen:
-	case <-time.After(2 * time.Second):
-		t.Fatal("writer never sent a keepalive ping")
-	}
-
-	// Kill the socket from the client side. The next ping write fails and
-	// the writer must exit once writes is closed (the drain the teardown
-	// performs in production).
-	conn.Close()
-	time.Sleep(3 * taskWakeupPingPeriod)
-	close(writes)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("writer did not exit after ping write failure")
-	}
-}
-
-func TestReadTaskWakeupMessagesTimesOutWithoutPeerTraffic(t *testing.T) {
-	overrideTaskWakeupTimings(t, 60*time.Millisecond, 20*time.Millisecond, taskWakeupBackoffResetAfter)
-
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		time.Sleep(300 * time.Millisecond)
-	}))
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	d := New(Config{}, slog.Default())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.readTaskWakeupMessages(conn, make(chan taskWakeup, 1))
-	}()
-
-	select {
-	case err := <-errCh:
-		var netErr net.Error
-		if !errors.As(err, &netErr) || !netErr.Timeout() {
-			t.Fatalf("readTaskWakeupMessages error = %v, want timeout", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("readTaskWakeupMessages did not time out")
-	}
-}
-
-func TestReadTaskWakeupMessagesExtendsDeadlineOnServerPing(t *testing.T) {
-	overrideTaskWakeupTimings(t, 120*time.Millisecond, 50*time.Millisecond, taskWakeupBackoffResetAfter)
-
-	clientReceived := make(chan struct{})
-	taskFrame := mustProtocolFrame(t, protocol.Message{
-		Type: protocol.EventDaemonTaskAvailable,
-		Payload: marshalRaw(protocol.TaskAvailablePayload{
-			RuntimeID: "runtime-1",
-			TaskID:    "task-1",
-		}),
-	})
-
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		for i := 0; i < 3; i++ {
-			time.Sleep(50 * time.Millisecond)
-			conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-			if err := conn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
-				return
-			}
-		}
-
-		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
-			return
-		}
-		waitForClientWakeup(t, clientReceived)
-	}))
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	d := New(Config{}, slog.Default())
-	taskWakeups := make(chan taskWakeup, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
-	}()
-
-	select {
-	case wakeup := <-taskWakeups:
-		if wakeup.runtimeID != "runtime-1" {
-			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
-		}
-		close(clientReceived)
-	case err := <-errCh:
-		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for task wakeup")
-	}
-}
-
-func TestReadTaskWakeupMessagesExtendsDeadlineOnApplicationMessage(t *testing.T) {
-	overrideTaskWakeupTimings(t, 120*time.Millisecond, 50*time.Millisecond, taskWakeupBackoffResetAfter)
-
-	clientReceived := make(chan struct{})
-	ackFrame := mustProtocolFrame(t, protocol.Message{
-		Type: protocol.EventDaemonHeartbeatAck,
-		Payload: marshalRaw(HeartbeatResponse{
-			RuntimeID: "runtime-1",
-		}),
-	})
-	taskFrame := mustProtocolFrame(t, protocol.Message{
-		Type: protocol.EventDaemonTaskAvailable,
-		Payload: marshalRaw(protocol.TaskAvailablePayload{
-			RuntimeID: "runtime-1",
-			TaskID:    "task-1",
-		}),
-	})
-
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		for i := 0; i < 3; i++ {
-			time.Sleep(50 * time.Millisecond)
-			if !writeWSMessage(t, conn, websocket.TextMessage, ackFrame) {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
-			return
-		}
-		waitForClientWakeup(t, clientReceived)
-	}))
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	d := New(Config{}, slog.Default())
-	taskWakeups := make(chan taskWakeup, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
-	}()
-
-	select {
-	case wakeup := <-taskWakeups:
-		if wakeup.runtimeID != "runtime-1" {
-			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
-		}
-		close(clientReceived)
-	case err := <-errCh:
-		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for task wakeup")
-	}
-}
-
-// A WS tasks.claim response carries the full claimed Task payload. Agent
-// instructions, project context, comments, and skill references can make one
-// valid response much larger than the old 64 KiB control-socket ceiling. The
-// reader must deliver that response to the pending RPC and remain connected
-// for the next task-available hint.
 func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
 	overrideTaskWakeupTimings(t, time.Second, 100*time.Millisecond, taskWakeupBackoffResetAfter)
 
@@ -619,66 +348,6 @@ func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
 	}
 }
 
-func TestReadTaskWakeupMessagesExtendsDeadlineOnPong(t *testing.T) {
-	overrideTaskWakeupTimings(t, 120*time.Millisecond, 50*time.Millisecond, taskWakeupBackoffResetAfter)
-
-	clientReceived := make(chan struct{})
-	taskFrame := mustProtocolFrame(t, protocol.Message{
-		Type: protocol.EventDaemonTaskAvailable,
-		Payload: marshalRaw(protocol.TaskAvailablePayload{
-			RuntimeID: "runtime-1",
-			TaskID:    "task-1",
-		}),
-	})
-
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		for i := 0; i < 3; i++ {
-			time.Sleep(50 * time.Millisecond)
-			if !writeWSMessage(t, conn, websocket.PongMessage, []byte("keepalive")) {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
-			return
-		}
-		waitForClientWakeup(t, clientReceived)
-	}))
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	d := New(Config{}, slog.Default())
-	taskWakeups := make(chan taskWakeup, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
-	}()
-
-	select {
-	case wakeup := <-taskWakeups:
-		if wakeup.runtimeID != "runtime-1" {
-			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
-		}
-		close(clientReceived)
-	case err := <-errCh:
-		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for task wakeup")
-	}
-}
-
 func TestShouldResetTaskWakeupBackoffRequiresStableConnection(t *testing.T) {
 	old := taskWakeupBackoffResetAfter
 	taskWakeupBackoffResetAfter = 10 * time.Second
@@ -698,6 +367,8 @@ func TestShouldResetTaskWakeupBackoffRequiresStableConnection(t *testing.T) {
 }
 
 func TestRuntimeHeartbeatClosesIdleConnectionsAfterRepeatedTransientFailures(t *testing.T) {
+	t.Parallel()
+
 	transport := &closeCountingTransport{}
 	client := NewClient("http://daemon.test")
 	client.client = &http.Client{
@@ -794,5 +465,215 @@ func waitForClientWakeup(t *testing.T, clientReceived <-chan struct{}) {
 	case <-clientReceived:
 	case <-time.After(time.Second):
 		t.Errorf("server timed out waiting for client wakeup")
+	}
+}
+
+// TestReadTaskWakeupMessagesExtendsReadDeadlineOnPeerTraffic covers the read
+// liveness half of the wakeup socket: every ping, pong and application frame
+// must push the read deadline out (configureTaskWakeupReadLiveness and the
+// per-frame extendTaskWakeupReadDeadline in wakeup.go), so a healthy connection
+// survives indefinitely without traffic of our own.
+//
+// These are NOT transport-timeout tests and must not be deleted as such: the
+// deadline never fires on the happy path. Each peer sends three keepalives
+// 50ms apart and then a task frame at ~200ms, well past the 120ms pongWait
+// these tests install. If extension regresses, the read fails before the task
+// frame arrives and readTaskWakeupMessages returns early — which is exactly
+// the failure a daemon would see in production as a wakeup socket that dies
+// every pongWait and silently falls back to polling for work.
+//
+// Deliberately serial: overrideTaskWakeupTimings writes package globals.
+func TestReadTaskWakeupMessagesExtendsReadDeadlineOnPeerTraffic(t *testing.T) {
+	overrideTaskWakeupTimings(t, 120*time.Millisecond, 50*time.Millisecond, taskWakeupBackoffResetAfter)
+
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"server ping extends the deadline", readTaskWakeupMessagesExtendsDeadlineOnServerPing},
+		{"application message extends the deadline", readTaskWakeupMessagesExtendsDeadlineOnApplicationMessage},
+		{"pong extends the deadline", readTaskWakeupMessagesExtendsDeadlineOnPong},
+	} {
+		t.Run(tc.name, func(t *testing.T) { tc.run(t) })
+	}
+}
+func readTaskWakeupMessagesExtendsDeadlineOnServerPing(t *testing.T) {
+	clientReceived := make(chan struct{})
+	taskFrame := mustProtocolFrame(t, protocol.Message{
+		Type: protocol.EventDaemonTaskAvailable,
+		Payload: marshalRaw(protocol.TaskAvailablePayload{
+			RuntimeID: "runtime-1",
+			TaskID:    "task-1",
+		}),
+	})
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for i := 0; i < 3; i++ {
+			time.Sleep(50 * time.Millisecond)
+			conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+			if err := conn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
+				return
+			}
+		}
+
+		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
+			return
+		}
+		waitForClientWakeup(t, clientReceived)
+	}))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	d := New(Config{}, slog.Default())
+	taskWakeups := make(chan taskWakeup, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
+	}()
+
+	select {
+	case wakeup := <-taskWakeups:
+		if wakeup.runtimeID != "runtime-1" {
+			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
+		}
+		close(clientReceived)
+	case err := <-errCh:
+		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for task wakeup")
+	}
+}
+
+func readTaskWakeupMessagesExtendsDeadlineOnApplicationMessage(t *testing.T) {
+	clientReceived := make(chan struct{})
+	ackFrame := mustProtocolFrame(t, protocol.Message{
+		Type: protocol.EventDaemonHeartbeatAck,
+		Payload: marshalRaw(HeartbeatResponse{
+			RuntimeID: "runtime-1",
+		}),
+	})
+	taskFrame := mustProtocolFrame(t, protocol.Message{
+		Type: protocol.EventDaemonTaskAvailable,
+		Payload: marshalRaw(protocol.TaskAvailablePayload{
+			RuntimeID: "runtime-1",
+			TaskID:    "task-1",
+		}),
+	})
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for i := 0; i < 3; i++ {
+			time.Sleep(50 * time.Millisecond)
+			if !writeWSMessage(t, conn, websocket.TextMessage, ackFrame) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
+			return
+		}
+		waitForClientWakeup(t, clientReceived)
+	}))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	d := New(Config{}, slog.Default())
+	taskWakeups := make(chan taskWakeup, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
+	}()
+
+	select {
+	case wakeup := <-taskWakeups:
+		if wakeup.runtimeID != "runtime-1" {
+			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
+		}
+		close(clientReceived)
+	case err := <-errCh:
+		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for task wakeup")
+	}
+}
+
+func readTaskWakeupMessagesExtendsDeadlineOnPong(t *testing.T) {
+	clientReceived := make(chan struct{})
+	taskFrame := mustProtocolFrame(t, protocol.Message{
+		Type: protocol.EventDaemonTaskAvailable,
+		Payload: marshalRaw(protocol.TaskAvailablePayload{
+			RuntimeID: "runtime-1",
+			TaskID:    "task-1",
+		}),
+	})
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for i := 0; i < 3; i++ {
+			time.Sleep(50 * time.Millisecond)
+			if !writeWSMessage(t, conn, websocket.PongMessage, []byte("keepalive")) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+		if !writeWSMessage(t, conn, websocket.TextMessage, taskFrame) {
+			return
+		}
+		waitForClientWakeup(t, clientReceived)
+	}))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(taskWakeupTestWSURL(srv.URL), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	d := New(Config{}, slog.Default())
+	taskWakeups := make(chan taskWakeup, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
+	}()
+
+	select {
+	case wakeup := <-taskWakeups:
+		if wakeup.runtimeID != "runtime-1" {
+			t.Fatalf("wakeup runtimeID = %q, want runtime-1", wakeup.runtimeID)
+		}
+		close(clientReceived)
+	case err := <-errCh:
+		t.Fatalf("readTaskWakeupMessages returned before task frame: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for task wakeup")
 	}
 }

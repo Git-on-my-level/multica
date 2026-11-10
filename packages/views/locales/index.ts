@@ -49,6 +49,31 @@ import zhHansUsage from "./zh-Hans/usage.json";
 import zhHansUi from "./zh-Hans/ui.json";
 import zhHansSquads from "./zh-Hans/squads.json";
 import zhHansBilling from "./zh-Hans/billing.json";
+import zhHantCommon from "./zh-Hant/common.json";
+import zhHantAuth from "./zh-Hant/auth.json";
+import zhHantSettings from "./zh-Hant/settings.json";
+import zhHantIssues from "./zh-Hant/issues.json";
+import zhHantAgents from "./zh-Hant/agents.json";
+import zhHantEditor from "./zh-Hant/editor.json";
+import zhHantOnboarding from "./zh-Hant/onboarding.json";
+import zhHantInvite from "./zh-Hant/invite.json";
+import zhHantLabels from "./zh-Hant/labels.json";
+import zhHantMembers from "./zh-Hant/members.json";
+import zhHantMyIssues from "./zh-Hant/my-issues.json";
+import zhHantSearch from "./zh-Hant/search.json";
+import zhHantInbox from "./zh-Hant/inbox.json";
+import zhHantWorkspace from "./zh-Hant/workspace.json";
+import zhHantProjects from "./zh-Hant/projects.json";
+import zhHantAutopilots from "./zh-Hant/autopilots.json";
+import zhHantSkills from "./zh-Hant/skills.json";
+import zhHantChat from "./zh-Hant/chat.json";
+import zhHantModals from "./zh-Hant/modals.json";
+import zhHantRuntimes from "./zh-Hant/runtimes.json";
+import zhHantLayout from "./zh-Hant/layout.json";
+import zhHantUsage from "./zh-Hant/usage.json";
+import zhHantUi from "./zh-Hant/ui.json";
+import zhHantSquads from "./zh-Hant/squads.json";
+import zhHantBilling from "./zh-Hant/billing.json";
 import koCommon from "./ko/common.json";
 import koAuth from "./ko/auth.json";
 import koSettings from "./ko/settings.json";
@@ -99,6 +124,81 @@ import jaUsage from "./ja/usage.json";
 import jaUi from "./ja/ui.json";
 import jaSquads from "./ja/squads.json";
 import jaBilling from "./ja/billing.json";
+import ruCommon from "./ru/common.json";
+import ruAuth from "./ru/auth.json";
+import ruSettings from "./ru/settings.json";
+import ruIssues from "./ru/issues.json";
+import ruAgents from "./ru/agents.json";
+import ruEditor from "./ru/editor.json";
+import ruOnboarding from "./ru/onboarding.json";
+import ruInvite from "./ru/invite.json";
+import ruLabels from "./ru/labels.json";
+import ruMembers from "./ru/members.json";
+import ruMyIssues from "./ru/my-issues.json";
+import ruSearch from "./ru/search.json";
+import ruInbox from "./ru/inbox.json";
+import ruWorkspace from "./ru/workspace.json";
+import ruProjects from "./ru/projects.json";
+import ruAutopilots from "./ru/autopilots.json";
+import ruSkills from "./ru/skills.json";
+import ruChat from "./ru/chat.json";
+import ruModals from "./ru/modals.json";
+import ruRuntimes from "./ru/runtimes.json";
+import ruLayout from "./ru/layout.json";
+import ruUsage from "./ru/usage.json";
+import ruUi from "./ru/ui.json";
+import ruSquads from "./ru/squads.json";
+import ruBilling from "./ru/billing.json";
+import frCommon from "./fr/common.json";
+import frAuth from "./fr/auth.json";
+import frSettings from "./fr/settings.json";
+import frIssues from "./fr/issues.json";
+import frAgents from "./fr/agents.json";
+import frEditor from "./fr/editor.json";
+import frOnboarding from "./fr/onboarding.json";
+import frInvite from "./fr/invite.json";
+import frLabels from "./fr/labels.json";
+import frMembers from "./fr/members.json";
+import frMyIssues from "./fr/my-issues.json";
+import frSearch from "./fr/search.json";
+import frInbox from "./fr/inbox.json";
+import frWorkspace from "./fr/workspace.json";
+import frProjects from "./fr/projects.json";
+import frAutopilots from "./fr/autopilots.json";
+import frSkills from "./fr/skills.json";
+import frChat from "./fr/chat.json";
+import frModals from "./fr/modals.json";
+import frRuntimes from "./fr/runtimes.json";
+import frLayout from "./fr/layout.json";
+import frUsage from "./fr/usage.json";
+import frUi from "./fr/ui.json";
+import frSquads from "./fr/squads.json";
+import frBilling from "./fr/billing.json";
+import esCommon from "./es/common.json";
+import esAuth from "./es/auth.json";
+import esSettings from "./es/settings.json";
+import esIssues from "./es/issues.json";
+import esAgents from "./es/agents.json";
+import esEditor from "./es/editor.json";
+import esOnboarding from "./es/onboarding.json";
+import esInvite from "./es/invite.json";
+import esLabels from "./es/labels.json";
+import esMembers from "./es/members.json";
+import esMyIssues from "./es/my-issues.json";
+import esSearch from "./es/search.json";
+import esInbox from "./es/inbox.json";
+import esWorkspace from "./es/workspace.json";
+import esProjects from "./es/projects.json";
+import esAutopilots from "./es/autopilots.json";
+import esSkills from "./es/skills.json";
+import esChat from "./es/chat.json";
+import esModals from "./es/modals.json";
+import esRuntimes from "./es/runtimes.json";
+import esLayout from "./es/layout.json";
+import esUsage from "./es/usage.json";
+import esUi from "./es/ui.json";
+import esSquads from "./es/squads.json";
+import esBilling from "./es/billing.json";
 
 // Single source of truth for the resource bundle. Both apps (web layout +
 // desktop App.tsx) import from here so adding a locale or namespace happens
@@ -158,6 +258,33 @@ export const RESOURCES: Record<SupportedLocale, LocaleResources> = {
     squads: zhHansSquads,
     billing: zhHansBilling,
   },
+  "zh-Hant": {
+    common: zhHantCommon,
+    auth: zhHantAuth,
+    settings: zhHantSettings,
+    issues: zhHantIssues,
+    agents: zhHantAgents,
+    editor: zhHantEditor,
+    onboarding: zhHantOnboarding,
+    invite: zhHantInvite,
+    labels: zhHantLabels,
+    members: zhHantMembers,
+    "my-issues": zhHantMyIssues,
+    search: zhHantSearch,
+    inbox: zhHantInbox,
+    workspace: zhHantWorkspace,
+    projects: zhHantProjects,
+    autopilots: zhHantAutopilots,
+    skills: zhHantSkills,
+    chat: zhHantChat,
+    modals: zhHantModals,
+    runtimes: zhHantRuntimes,
+    layout: zhHantLayout,
+    usage: zhHantUsage,
+    ui: zhHantUi,
+    squads: zhHantSquads,
+    billing: zhHantBilling,
+  },
   ko: {
     common: koCommon,
     auth: koAuth,
@@ -211,5 +338,86 @@ export const RESOURCES: Record<SupportedLocale, LocaleResources> = {
     ui: jaUi,
     squads: jaSquads,
     billing: jaBilling,
+  },
+  ru: {
+    common: ruCommon,
+    auth: ruAuth,
+    settings: ruSettings,
+    issues: ruIssues,
+    agents: ruAgents,
+    editor: ruEditor,
+    onboarding: ruOnboarding,
+    invite: ruInvite,
+    labels: ruLabels,
+    members: ruMembers,
+    "my-issues": ruMyIssues,
+    search: ruSearch,
+    inbox: ruInbox,
+    workspace: ruWorkspace,
+    projects: ruProjects,
+    autopilots: ruAutopilots,
+    skills: ruSkills,
+    chat: ruChat,
+    modals: ruModals,
+    runtimes: ruRuntimes,
+    layout: ruLayout,
+    usage: ruUsage,
+    ui: ruUi,
+    squads: ruSquads,
+    billing: ruBilling,
+  },
+  fr: {
+    common: frCommon,
+    auth: frAuth,
+    settings: frSettings,
+    issues: frIssues,
+    agents: frAgents,
+    editor: frEditor,
+    onboarding: frOnboarding,
+    invite: frInvite,
+    labels: frLabels,
+    members: frMembers,
+    "my-issues": frMyIssues,
+    search: frSearch,
+    inbox: frInbox,
+    workspace: frWorkspace,
+    projects: frProjects,
+    autopilots: frAutopilots,
+    skills: frSkills,
+    chat: frChat,
+    modals: frModals,
+    runtimes: frRuntimes,
+    layout: frLayout,
+    usage: frUsage,
+    ui: frUi,
+    squads: frSquads,
+    billing: frBilling,
+  },
+  es: {
+    common: esCommon,
+    auth: esAuth,
+    settings: esSettings,
+    issues: esIssues,
+    agents: esAgents,
+    editor: esEditor,
+    onboarding: esOnboarding,
+    invite: esInvite,
+    labels: esLabels,
+    members: esMembers,
+    "my-issues": esMyIssues,
+    search: esSearch,
+    inbox: esInbox,
+    workspace: esWorkspace,
+    projects: esProjects,
+    autopilots: esAutopilots,
+    skills: esSkills,
+    chat: esChat,
+    modals: esModals,
+    runtimes: esRuntimes,
+    layout: esLayout,
+    usage: esUsage,
+    ui: esUi,
+    squads: esSquads,
+    billing: esBilling,
   },
 };

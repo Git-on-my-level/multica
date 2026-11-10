@@ -199,7 +199,7 @@ func newReplica(t *testing.T, pool *pgxpool.Pool, instID string, holdsSocket boo
 		}
 		reg.set(pg, r.conn.autoAck(newWSSender(r.conn, nil)))
 	}
-	o := NewOutbound(db.New(pool), reg,
+	o := NewOutbound(db.New(pool), reg, nil,
 		slog.New(slog.NewTextHandler(r.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		WithOutboundMetrics(r.mx))
 	o.Register(r.bus)
@@ -293,6 +293,11 @@ type fanoutRelay struct {
 	deliverers []*RelayOutbound
 	log        []queued
 	published  int
+	// failAfterFanout makes PublishWithID do its whole fan-out and THEN report
+	// an error: the frame was accepted and delivered, and only the publisher's
+	// view of the call is lost. It is the shape the inbox push must treat as
+	// uncertain rather than as a miss.
+	failAfterFanout bool
 }
 
 func (f *fanoutRelay) register(r *RelayOutbound) {
@@ -302,6 +307,12 @@ func (f *fanoutRelay) register(r *RelayOutbound) {
 }
 
 func (f *fanoutRelay) PublishWithID(_, scopeID, _ string, frame []byte, id string) error {
+	if scopeID == "" {
+		// What the shard reader does with it (ShardedStreamRelay.deliverMessage):
+		// the frame is written and nobody ever reads it. A fake that delivered
+		// it anyway hid that every relayed seal was lost this way.
+		return nil
+	}
 	var decoded relayFrame
 	if err := json.Unmarshal(frame, &decoded); err != nil {
 		return err
@@ -314,7 +325,25 @@ func (f *fanoutRelay) PublishWithID(_, scopeID, _ string, frame []byte, id strin
 	for _, d := range targets {
 		d.DeliverWecomOutbound(scopeID, frame, id)
 	}
+	if f.failAfterFanout {
+		return errors.New("relay: publish response lost")
+	}
 	return nil
+}
+
+// publishedTo counts the frames published for one installation, which is how a
+// test tells "the fallback was never offered" from "it was offered and
+// dropped".
+func (f *fanoutRelay) publishedTo(installationID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, q := range f.log {
+		if q.frame.InstallationID == installationID {
+			n++
+		}
+	}
+	return n
 }
 
 // replayTo re-delivers everything published so far to one node, which is what
@@ -337,6 +366,9 @@ type sharedDedupe struct {
 	values map[string]string
 	fail   bool
 	calls  int
+	// stateReads counts the non-fencing reads the acceptance poll makes, which
+	// is how a test can see how many windows were paid for.
+	stateReads int
 
 	// releaseFails makes Release report failure and keep the key: a DEL that
 	// never reached the server.
@@ -398,6 +430,15 @@ func (d *sharedDedupe) claimCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.calls
+}
+
+// claimStateCount is how many acceptance polls this store answered. One window
+// of a W-wide wait is roughly W/(W/8)+1 of them; two windows are roughly twice
+// that, which is the arithmetic a fallback that waits again would show.
+func (d *sharedDedupe) claimStateCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.stateReads
 }
 
 func (d *sharedDedupe) Release(_ context.Context, key, token string) (bool, error) {
@@ -469,6 +510,29 @@ func (d *sharedDedupe) Resolve(_ context.Context, key string) (claimState, error
 	return claimHeld, nil
 }
 
+// ClaimState is the read the inbox publisher polls to see whether a replica
+// took the delivery. Same answers as Resolve, except a held claim is reported
+// held rather than fenced: the publisher is not resolving an outcome here, it
+// is watching a delivery it must not disturb.
+func (d *sharedDedupe) ClaimState(_ context.Context, key string) (claimState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stateReads++
+	if d.fail {
+		return claimAbsent, errors.New("dedupe unavailable")
+	}
+	v, ok := d.values[key]
+	switch {
+	case !ok:
+		return claimAbsent, nil
+	case v == claimSettledValue:
+		return claimSettled, nil
+	case v == claimLostValue:
+		return claimLost, nil
+	}
+	return claimHeld, nil
+}
+
 // relayReplica is one backend process wired for cross-replica routing.
 type relayReplica struct {
 	*replica
@@ -506,7 +570,7 @@ func newRelayReplicaWith(t *testing.T, pool *pgxpool.Pool, instID string, holdsS
 	t.Cleanup(func() { cancel(); router.Wait() })
 	router.Start(ctx)
 
-	o := NewOutbound(db.New(pool), reg, log, WithOutboundMetrics(base.mx), WithRelay(router))
+	o := NewOutbound(db.New(pool), reg, nil, log, WithOutboundMetrics(base.mx), WithRelay(router))
 	o.Register(base.bus)
 	router.Attach(o)
 	return &relayReplica{replica: base, router: router, reg: reg, instID: pg}
@@ -788,7 +852,7 @@ func TestRelay_AttemptedWriteKeepsTheClaim(t *testing.T) {
 	t.Cleanup(func() { cancel(); router.Wait() })
 	router.Start(ctx)
 	mx := newCountingMetrics()
-	router.Attach(NewOutbound(nil, reg, slog.Default(), WithOutboundMetrics(mx)))
+	router.Attach(NewOutbound(nil, reg, nil, slog.Default(), WithOutboundMetrics(mx)))
 
 	body, _ := json.Marshal(relayFrame{
 		Kind: relayKindReply, InstallationID: util.UUIDToString(instID),
@@ -807,26 +871,91 @@ func TestRelay_AttemptedWriteKeepsTheClaim(t *testing.T) {
 	}
 }
 
-// TestDeliverRelayed_ContextErrorsDoNotRelease — a bare context error is
-// ambiguous: request() returns one both before the write and while waiting for
-// the verdict after it. Treated as possibly-sent, so the outcome must not be
-// the claim-releasing one.
-func TestDeliverRelayed_ContextErrorsDoNotRelease(t *testing.T) {
+// A cancellation is TWO facts on this path, and the relay owes them opposite
+// answers. request raises one before it mints a req_id and one while waiting
+// for the verdict after the frame is on the wire (ws_sender.go); the first is
+// proof of non-delivery, the second is proof of nothing. One test covered both
+// with the possibly-sent answer, which is right for the second and loses the
+// answer on the first — so it is two tests, one per fact.
+//
+// The pre-write half: the socket saw no bytes, so the claim goes back and the
+// dispatcher offers the frame again. Releasing here cannot duplicate anything,
+// and NOT releasing here is a reply nobody ever retries.
+//
+// REVERSE VERIFICATION: return the bare ctx.Err() from request's pre-write
+// check again and this fails with outcomeDone and a record of a reply the chat
+// never saw.
+func TestDeliverRelayed_APreWriteContextErrorReleasesTheClaim(t *testing.T) {
 	t.Parallel()
 	instID := mustTestUUID(t)
 	reg := newSendersRegistry()
 	conn := &recordingConn{}
 	reg.set(instID, conn.autoAck(newWSSender(conn, nil)))
-	o := NewOutbound(nil, reg, slog.Default())
+	o := NewOutbound(nil, reg, nil, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already expired: sendTextCtx fails on its pre-write check
+	cancel() // already over: the chat is free, so request's pre-write check is what fails
 	got := o.deliverRelayed(ctx, relayFrame{
 		Kind: relayKindReply, InstallationID: util.UUIDToString(instID),
 		ChatID: "CHAT_1", ChatType: chatTypeSingleInt, Content: "hello",
 	})
+
+	if n := conn.frameCount(); n != 0 {
+		t.Fatalf("%d frame(s) reached the socket; this test is no longer about a send that never started", n)
+	}
+	if got.outcome != outcomeProvablyNotSent {
+		t.Fatalf("outcome = %v, want outcomeProvablyNotSent — the claim stays held on an answer "+
+			"the socket never saw, and the dispatcher stops offering it", got.outcome)
+	}
+	if got.record != nil {
+		t.Error("a frame still owed another offer carries a record; counting it here counts it once per attempt")
+	}
+}
+
+// The post-write half: the frame is on the wire and only its verdict is
+// missing, so the claim STAYS and the reply files as unconfirmed. Releasing it
+// would let a re-offer put the same answer in the chat a second time, with
+// nothing to undo it with.
+func TestDeliverRelayed_AContextErrorAwaitingTheAckKeepsTheClaim(t *testing.T) {
+	t.Parallel()
+	instID := mustTestUUID(t)
+	reg := newSendersRegistry()
+	conn := &recordingConn{} // no autoAck: the frame goes out and no verdict comes back
+	reg.set(instID, newWSSender(conn, slog.Default()))
+	mx := newCountingMetrics()
+	o := NewOutbound(nil, reg, nil, slog.Default(), WithOutboundMetrics(mx))
+
+	// Cancelled once the frame is ON THE WIRE, so which of request's two
+	// context errors this raises is a fact about the run rather than a race
+	// against a timer.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for conn.frameCount() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	got := o.deliverRelayed(ctx, relayFrame{
+		Kind: relayKindReply, InstallationID: util.UUIDToString(instID),
+		ChatID: "CHAT_1", ChatType: chatTypeSingleInt, Content: "hello",
+	})
+
+	if n := conn.frameCount(); n != 1 {
+		t.Fatalf("%d frame(s) reached the socket, want 1; this test is about a cancellation AFTER the write", n)
+	}
 	if got.outcome == outcomeProvablyNotSent {
-		t.Fatal("a context error released the claim; it is ambiguous and must not")
+		t.Fatal("the claim was released for a frame the peer may already hold; a re-offer prints the answer twice")
+	}
+	if got.record == nil {
+		t.Fatal("a finished frame carries no record, so this reply moves no counter at all")
+	}
+	got.record()
+	if n := mx.get("outbound_unconfirmed"); n != 1 {
+		t.Errorf("outbound_unconfirmed = %d, want 1 — the verdict is missing, which is not the same as a failure", n)
+	}
+	if n := mx.get("outbound_dropped"); n != 0 {
+		t.Errorf("outbound_dropped = %d, want 0 — dropped promises the answer is not coming, and it may already be there", n)
 	}
 }
 
@@ -954,7 +1083,7 @@ func TestRelayedInboxPushDoesNotMoveTheReplyCounters(t *testing.T) {
 	okReg := newSendersRegistry()
 	okReg.set(instID, okConn.autoAck(newWSSender(okConn, nil)))
 	okMx := newCountingMetrics()
-	ok := NewOutbound(nil, okReg, slog.Default(), WithOutboundMetrics(okMx))
+	ok := NewOutbound(nil, okReg, nil, slog.Default(), WithOutboundMetrics(okMx))
 	if got := ok.deliverRelayed(context.Background(), relayFrame{
 		Kind: relayKindInbox, InstallationID: util.UUIDToString(instID),
 		ChatID: "T-USER", ChatType: chatTypeSingleInt, Content: "you were mentioned",
@@ -973,7 +1102,7 @@ func TestRelayedInboxPushDoesNotMoveTheReplyCounters(t *testing.T) {
 	badReg := newSendersRegistry()
 	badReg.set(instID, badConn.autoAck(newWSSender(badConn, nil)))
 	badMx := newCountingMetrics()
-	bad := NewOutbound(nil, badReg, slog.Default(), WithOutboundMetrics(badMx))
+	bad := NewOutbound(nil, badReg, nil, slog.Default(), WithOutboundMetrics(badMx))
 	bad.deliverRelayed(context.Background(), relayFrame{
 		Kind: relayKindInbox, InstallationID: util.UUIDToString(instID),
 		ChatID: "T-USER", ChatType: chatTypeSingleInt, Content: "you were mentioned",

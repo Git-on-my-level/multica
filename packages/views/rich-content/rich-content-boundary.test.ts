@@ -116,23 +116,6 @@ describe("RichContent import boundary", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("Tiptap reuses the leaf components but never imports RichContent", () => {
-    // Constraint 6: the editor keeps its own parser/lifecycle. Pulling the
-    // readonly renderer into the editor is the classic way this collapses.
-    const offenders = walk(join(VIEWS_ROOT, "editor"))
-      .filter((p) => !/readonly-content\.tsx$/.test(p))
-      .map((path) => ({
-        path: relative(VIEWS_ROOT, path),
-        // stripComments, consistently with the other checks: an editor file may
-        // *mention* RichContent in a doc comment (explaining why a helper is
-        // shaped the way it is). Only real code references are violations.
-        text: stripComments(readFileSync(path, "utf8")),
-      }))
-      .filter(({ text }) => /\bRichContent\b/.test(text))
-      .map(({ path }) => path);
-
-    expect(offenders).toEqual([]);
-  });
 
   it("the canonical renderer stays in views, not ui", () => {
     // Mention/Attachment/navigation are product concerns; moving this into

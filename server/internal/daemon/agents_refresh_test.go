@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -119,13 +117,7 @@ func TestDshRuntimeProfileMismatch(t *testing.T) {
 	}
 
 	// Installing the profile makes the two agree.
-	dir := filepath.Join(home, "profiles", dshMulticaProfileName)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	installMulticaProfile(t, home)
 	if d.dshRuntimeProfileMismatch() != dshMismatchNone {
 		t.Fatal("a registered dsh with its profile installed was judged inconsistent")
 	}
@@ -890,18 +882,16 @@ func TestAgentDiscoveryLoop_BacksOffStuckProvider(t *testing.T) {
 		return nil
 	})
 
-	origInterval, origMax := agentDiscoveryInterval, agentConvergeMaxBackoff
-	origRetryDelay := runtimeVersionProbeRetryDelay
-	agentDiscoveryInterval = 2 * time.Millisecond
-	agentConvergeMaxBackoff = 50 * time.Millisecond
 	// Each convergence version-probes the stuck provider up to
-	// runtimeVersionProbeAttempts times; keep that budget short so the
-	// observation window below measures backoff rather than probe latency.
-	runtimeVersionProbeRetryDelay = time.Millisecond
+	// runtimeVersionProbeAttempts times; newBatchFixture keeps the retry delay
+	// short so the observation window below measures backoff rather than probe
+	// latency.
+	origInterval, origMax := agentDiscoveryInterval, agentConvergeMaxBackoff
+	agentDiscoveryInterval = 2 * time.Millisecond
+	agentConvergeMaxBackoff = 20 * time.Millisecond
 	t.Cleanup(func() {
 		agentDiscoveryInterval = origInterval
 		agentConvergeMaxBackoff = origMax
-		runtimeVersionProbeRetryDelay = origRetryDelay
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -931,13 +921,22 @@ func TestAgentDiscoveryLoop_BacksOffStuckProvider(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	start := fx.probeCount("/fake/agy")
-	time.Sleep(400 * time.Millisecond) // ~200 ticks at a 2ms interval
+	windowStart := time.Now()
+	time.Sleep(160 * time.Millisecond) // ~80 ticks at a 2ms interval
 	attempts := fx.probeCount("/fake/agy") - start
-	// Ticks in the window: ~200. Convergences allowed by a 50ms cap: ~8, each
-	// costing runtimeVersionProbeAttempts probes. The point is the order of
-	// magnitude: retries must track the backoff, not the tick rate.
-	if attempts > 40 {
-		t.Errorf("stuck provider was probed %d times in ~200 ticks; backoff is not limiting retries", attempts)
+	window := time.Since(windowStart)
+	// Without backoff every tick converges: ~80 convergences in 160ms. With
+	// it, the doubling reaches the 20ms cap within four convergences and then
+	// allows one per cap, so the limit scales with the window actually
+	// measured — an oversleeping box widens it instead of failing the test —
+	// and the fixed headroom covers the ramp and a convergence in flight at
+	// either edge (40 probes at the nominal 160ms, against ~160 without
+	// backoff). Each convergence costs runtimeVersionProbeAttempts probes. The
+	// point is the order of magnitude: retries must track the backoff, not the
+	// tick rate.
+	limit := runtimeVersionProbeAttempts * (int(window/agentConvergeMaxBackoff) + 12)
+	if attempts > limit {
+		t.Errorf("stuck provider was probed %d times in %s (limit %d); backoff is not limiting retries", attempts, window, limit)
 	}
 	if attempts == 0 {
 		t.Error("stuck provider was never retried; backoff must not give up entirely")

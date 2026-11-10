@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/attributionbackfill"
 	"github.com/multica-ai/multica/server/internal/chatoriginbackfill"
@@ -139,8 +140,79 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
-	"501_issue_child_attention_child_index":                     "issue_child_attention_child_idx",
-	"502_issue_child_attention_due_index":                       "issue_child_attention_due_idx",
+	"9020_issue_child_attention_child_index":                    "issue_child_attention_child_idx",
+	"9021_issue_child_attention_due_index":                      "issue_child_attention_due_idx",
+	"635_issue_environment_issue_idx":                           "idx_issue_environment_issue",
+	"634_issue_environment_task_key_idx":                        "uq_issue_environment_task_key",
+	"632_project_member_user_idx":                               "idx_project_member_workspace_user",
+	"628_app_action_request_chat_idx":                           "idx_app_action_request_chat",
+	"627_app_tool_call_issue_idx":                               "idx_app_tool_call_issue",
+	"626_app_action_request_task_idx":                           "idx_app_action_request_task",
+	"625_app_tool_call_workspace_idx":                           "idx_app_tool_call_workspace",
+	"624_app_action_request_pending_idx":                        "idx_app_action_request_pending",
+	"623_app_action_request_issue_idx":                          "idx_app_action_request_issue",
+	"622_app_action_rule_scope_idx":                             "idx_app_action_rule_scope",
+	"621_agent_app_workspace_toolkit_idx":                       "idx_agent_app_workspace_toolkit",
+	"620_agent_app_agent_toolkit_idx":                           "idx_agent_app_agent_toolkit",
+	"619_workspace_composio_connection_status_idx":              "idx_workspace_composio_connection_status",
+	"618_workspace_composio_connection_account_idx":             "idx_workspace_composio_connection_account",
+	"613_skill_version_index":                                   "idx_skill_version_skill_version",
+	"606_agent_task_queue_runtime_active_index":                 "idx_agent_task_queue_runtime_active",
+	"604_wecom_install_session_begin_rate_idx":                  "idx_wecom_install_session_begin_rate",
+	"603_wecom_install_session_agent_pending_idx":               "idx_wecom_install_session_agent_pending",
+	"602_wecom_install_session_request_idx":                     "idx_wecom_install_session_request",
+	"601_wecom_install_session_due_idx":                         "idx_wecom_install_session_due",
+	"594_agent_task_process_cleanup_index":                      "idx_agent_task_queue_process_cleanup",
+	"563_search_index_change_changed_at_index":                  "idx_search_index_change_changed_at",
+	"562_search_index_change_workspace_index":                   "idx_search_index_change_workspace_xid",
+	"552_agent_task_history_page_index":                         "idx_agent_task_queue_history_page",
+	"535_github_pr_address_index":                               "idx_github_pull_request_pr_owner_repo",
+	"539_task_supplement_request_index":                         "task_supplement_task_request_uidx",
+	"540_task_supplement_capability_index":                      "task_supplement_capability_task_uidx",
+	"541_task_supplement_comment_index":                         "task_supplement_comment_uidx",
+	"546_issue_pr_automation_workspace_index":                   "idx_issue_pr_automation_workspace",
+	"547_issue_pull_request_exclusion_workspace_index":          "idx_issue_pull_request_exclusion_workspace",
+	"548_task_supplement_comment_task_index":                    "task_supplement_comment_task_uidx",
+	"574_issue_workflow_pkey_index":                             "issue_workflow_pkey_uidx",
+	"576_issue_workflow_workspace_name_index":                   "idx_issue_workflow_workspace_name",
+	"582_issue_workflow_default_index":                          "idx_issue_workflow_workspace_default",
+	"554_wakeup_expiry_index":                                   "issue_wakeup_expiry_idx",
+	"556_wakeup_system_rule_index":                              "issue_wakeup_system_rule_idx",
+	"559_issue_child_event_id":                                  "issue_child_event_id_idx",
+	"560_issue_child_event_pending":                             "issue_child_event_pending_idx",
+	"566_channel_typing_reaction_id_idx":                        "channel_typing_reaction_id_idx",
+	"567_channel_typing_reaction_retry_idx":                     "channel_typing_reaction_retry_idx",
+	"568_channel_typing_reaction_gc_idx":                        "channel_typing_reaction_gc_idx",
+	"570_channel_typing_quota_idx":                              "channel_typing_reaction_quota_idx",
+	"571_channel_typing_expiry_idx":                             "channel_typing_reaction_expiry_idx",
+	"572_channel_typing_abandoned_idx":                          "channel_typing_reaction_abandoned_idx",
+	"510_wakeup_id":                                             "issue_wakeup_id_idx",
+	"511_wakeup_issue":                                          "issue_wakeup_issue_idx",
+	"512_wakeup_due":                                            "issue_wakeup_due_idx",
+	"513_wakeup_receipt_id":                                     "issue_wakeup_receipt_id_idx",
+	"514_wakeup_receipt_key":                                    "issue_wakeup_receipt_key_idx",
+	"515_wakeup_receipt_pending":                                "issue_wakeup_receipt_pending_idx",
+	"519_wakeup_event_issue":                                    "idx_wakeup_event_issue",
+	"521_wakeup_workspace_summary":                              "idx_wakeup_workspace_enabled",
+	"522_wakeup_run_lookup":                                     "agent_task_wakeup_lookup_idx",
+	"524_wakeup_workspace_history":                              "issue_wakeup_workspace_history_idx",
+	"525_wakeup_active_runs":                                    "agent_task_wakeup_active_idx",
+	"526_wakeup_terminal_runs":                                  "agent_task_wakeup_terminal_idx",
+	"527_wakeup_receipt_expiry":                                 "issue_wakeup_receipt_expiry_idx",
+	"529_wakeup_pending_event":                                  "issue_wakeup_pending_event_idx",
+	"503_channel_reply_delivery_turn_index":                     "idx_channel_reply_delivery_turn",
+	"504_channel_reply_delivery_installation_index":             "idx_channel_reply_delivery_installation",
+	"505_channel_reply_delivery_binding_index":                  "idx_channel_reply_delivery_binding",
+	"495_issue_to_label_label_id_index":                         "issue_to_label_label_idx",
+	"496_chat_session_agent_id_index":                           "idx_chat_session_agent_id",
+	"497_agent_task_queue_delegated_failure_evidence_index":     "idx_agent_task_queue_delegated_failure_evidence",
+	"498_chat_session_runtime_id_index":                         "idx_chat_session_runtime_id",
+	"486_maintenance_job_id_index":                              "idx_maintenance_job_id",
+	"487_maintenance_job_idempotency_index":                     "idx_maintenance_job_idempotency",
+	"488_maintenance_job_active_index":                          "idx_maintenance_job_active",
+	"587_cloud_agent_connection_provider_index":                 "cloud_agent_connection_provider_index",
+	"590_member_delegation_day_unique_index":                    "member_delegation_day_user_date_uidx",
+	"598_issue_unread_unique_index":                             "issue_unread_workspace_user_issue_uidx",
 	"035_task_queue_issue_id_index":                             "idx_agent_task_queue_issue_id",
 	"067_task_queue_claim_candidate_index":                      "idx_agent_task_queue_claim_candidates",
 	"074_task_usage_updated_at_index":                           "idx_task_usage_updated_at",
@@ -305,6 +377,12 @@ var concurrentIndexCleanups = map[string]string{
 	"460_agent_task_queue_autopilot_run_created_at_index":       "idx_agent_task_queue_autopilot_run_created_at",
 	"465_agent_task_queue_chat_with_session_index":              "idx_agent_task_queue_chat_with_session_created_at",
 	"466_activity_log_member_assignee_frequency_index":          "idx_activity_log_member_assignee_frequency",
+	"472_agent_task_queue_chat_session_index":                   "idx_agent_task_queue_chat_session",
+	"474_dingtalk_bot_identity_workspace_index":                 "idx_dingtalk_bot_identity_workspace",
+	"480_instance_telemetry_state_singleton_index":              "instance_telemetry_state_singleton_uidx",
+	"482_agent_task_queue_telemetry_started_index":              "idx_agent_task_queue_telemetry_started",
+	"484_issue_triage_state_index":                              "idx_issue_triage_state",
+	"537_issue_duplicate_of_index":                              "idx_issue_duplicate_of",
 	// Fork overlay migrations live in 9xxx so they never collide with
 	// upstream's live 3-digit sequence. See FORK.md and forkStemAliases.
 	"9001_issue_pr_handoff_candidate_unique":    "issue_pr_handoff_candidate_task_url_uidx",
@@ -322,6 +400,10 @@ var concurrentIndexCleanups = map[string]string{
 // Applied under the migrate advisory lock before the file loop. New fork-only
 // stems use 9xxx; do not add pairs into the live 3-digit sequence.
 var forkStemAliases = [][2]string{
+	{"503_issue_child_attention_capture", "9022_issue_child_attention_capture"},
+	{"502_issue_child_attention_due_index", "9021_issue_child_attention_due_index"},
+	{"501_issue_child_attention_child_index", "9020_issue_child_attention_child_index"},
+	{"500_issue_child_attention", "9019_issue_child_attention"},
 	{"469_issue_pr_handoff_candidate", "9000_issue_pr_handoff_candidate"},
 	{"470_issue_pr_handoff_candidate_unique", "9001_issue_pr_handoff_candidate_unique"},
 	{"471_issue_pr_handoff_candidate_address", "9002_issue_pr_handoff_candidate_address"},
@@ -365,10 +447,12 @@ var concurrentDownIndexCleanups = map[string]string{
 	"437_drop_agent_runtime_last_seen_at_index":             "idx_agent_runtime_last_seen_at",
 	"450_drop_comment_delegated_failure_pending_index":      "idx_comment_delegated_failure_pending",
 	"453_drop_pending_issue_agent_unique":                   "idx_one_pending_task_per_issue_agent_v2",
+	"548_task_supplement_comment_task_index":                "task_supplement_comment_uidx",
 	"454_drop_comment_content_bigm_index":                   "idx_comment_content_bigm",
 	"455_drop_comment_content_trgm_index":                   "idx_comment_content_trgm",
 	"463_drop_issue_description_bigm_index":                 "idx_issue_description_bigm",
 	"464_drop_issue_description_trgm_index":                 "idx_issue_description_trgm",
+	"473_drop_agent_task_queue_chat_with_session_index":     "idx_agent_task_queue_chat_with_session_created_at",
 }
 
 var preMigrationHooks = func() map[string]preMigrationHook {
@@ -442,6 +526,9 @@ func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQue
 }
 
 var upMigrationConditions = map[string]migrationCondition{
+	// Preserve applied history; pending 469 is superseded by the bounded expand
+	// migration. SaaS backfills separately; self-host converges in 491.
+	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
 	// Current search no longer consumes an issue-description GIN. Fresh installs
 	// should not build the historical fallback only to retire it at migration 464.
 	"139_issue_description_trgm_index": skipMigration("issue description search indexes are retired by migration 464"),
@@ -788,7 +875,13 @@ func main() {
 	}
 
 	startupSettings := dbstartup.SettingsFromEnv()
-	pool, err := dbstartup.NewPool(context.Background(), dbURL, startupSettings.ConnectTimeout)
+	poolConfig, err := dbstartup.ParsePoolConfig(dbURL, startupSettings.ConnectTimeout)
+	if err != nil {
+		slog.Error("unable to connect to database", "error", err)
+		os.Exit(1)
+	}
+	poolConfig.ConnConfig.OnNotice = logMigrationNotice
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)
@@ -849,6 +942,33 @@ func main() {
 	}
 
 	fmt.Println("Done.")
+}
+
+// migrationReportPrefix marks a notice a migration raises on purpose to say
+// what it changed, e.g.
+//
+//	RAISE NOTICE 'migration report: renamed % row(s)', n;
+//
+// Only these reach the migration log. The server's own notices cannot be told
+// apart from a deliberate RAISE by condition code — "does not exist, skipping"
+// and the rename notice of ADD CONSTRAINT ... USING INDEX both carry SQLSTATE
+// 00000 — so the marker is explicit.
+const migrationReportPrefix = "migration report: "
+
+// migrationReport returns the text of a notice raised with
+// migrationReportPrefix, and false for every other notice.
+func migrationReport(notice *pgconn.Notice) (string, bool) {
+	return strings.CutPrefix(notice.Message, migrationReportPrefix)
+}
+
+// logMigrationNotice forwards migration reports to the migration log. pgx
+// drops server notices unless a handler is set, so without it the per-row
+// report a data-repair migration prints (e.g. 476) never reached whoever ran
+// the deploy.
+func logMigrationNotice(_ *pgconn.PgConn, notice *pgconn.Notice) {
+	if report, ok := migrationReport(notice); ok {
+		slog.Info("migration report", "message", report)
+	}
 }
 
 // runMigrations applies (direction="up") or rolls back (direction="down")

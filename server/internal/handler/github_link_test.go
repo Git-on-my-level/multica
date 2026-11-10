@@ -335,6 +335,14 @@ func TestPRHandoffCandidateLinksAfterMirrorWithoutIssueIdentifier(t *testing.T) 
 	if state != "linked" {
 		t.Fatalf("candidate state = %q, want linked", state)
 	}
+	// A later title edit must not reinterpret an explicit handoff as an
+	// automatic title-derived link and remove it.
+	firePullRequestWebhookRaw(t, secret, installationID, owner, repo, number, "edited", "open", false,
+		"Fix another auth redirect", "Still no issue identifier.", "agent/m1-studio/auth-redirect")
+	if got := countLinks(t, issueID); got != 1 {
+		t.Fatalf("links after edited redelivery = %d, want 1", got)
+	}
+
 }
 
 func TestPRHandoffSurvivesLaterCompletedTaskWithoutCandidate(t *testing.T) {

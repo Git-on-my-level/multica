@@ -18,8 +18,8 @@ func TestForkStemAliasesMatchMigrationFiles(t *testing.T) {
 	seenNew := map[string]struct{}{}
 	for _, pair := range forkStemAliases {
 		oldName, newName := pair[0], pair[1]
-		if !strings.HasPrefix(oldName, "46") && !strings.HasPrefix(oldName, "47") && !strings.HasPrefix(oldName, "48") {
-			t.Errorf("old stem %q is not in the 469–486 remap set", oldName)
+		if !strings.HasPrefix(oldName, "46") && !strings.HasPrefix(oldName, "47") && !strings.HasPrefix(oldName, "48") && !strings.HasPrefix(oldName, "50") {
+			t.Errorf("old stem %q is not in the 469–503 remap set", oldName)
 		}
 		if !strings.HasPrefix(newName, "9") {
 			t.Errorf("new stem %q is not in 9xxx", newName)

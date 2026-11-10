@@ -67,13 +67,9 @@ func (h *Handler) linkAwaitingHandoffsForPR(ctx context.Context, workspaceID pgt
 		if err != nil || issue.WorkspaceID != workspaceID {
 			continue
 		}
-		if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
-			IssueID:             candidate.IssueID,
-			PullRequestID:       pr.ID,
-			CloseIntent:         false,
-			PreserveCloseIntent: true,
-			LinkedByType:        strToText("system"),
-			LinkedByID:          pgtype.UUID{},
+		if _, err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
+			IssueID:       candidate.IssueID,
+			PullRequestID: pr.ID,
 		}); err != nil {
 			slog.Warn("github: link awaited PR handoff failed", "error", err)
 			continue

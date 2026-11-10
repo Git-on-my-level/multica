@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import Script from "next/script";
-import { Inter, Geist_Mono, Source_Serif_4 } from "next/font/google";
+import { Inter, Geist_Mono, JetBrains_Mono, Source_Serif_4 } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@multica/ui/components/ui/sonner";
 import { cn } from "@multica/ui/lib/utils";
@@ -13,6 +13,8 @@ import {
   resolveBrowserApiBaseUrl,
   resolveBrowserWsUrl,
 } from "@/config/runtime-urls";
+import { resolveGoogleAnalyticsId } from "@/config/google-analytics";
+import { GoogleAnalytics } from "@/components/google-analytics";
 import "./globals.css";
 
 // Inter is the Latin UI face. next/font produces a hashed family (`__Inter_xxx`)
@@ -30,37 +32,45 @@ import "./globals.css";
 // italic face the ~20 semantic italic labels (chat empty states, model-picker's
 // "Managed by runtime", dashboard/squad placeholders) plus every markdown <em> and
 // blockquote rendered as browser-synthesized oblique. Keep in sync with desktop's
-// `@fontsource-variable/inter/wght-italic.css` import.
+// `@fontsource-variable/inter/opsz-italic.css` import.
+//
+// The `opsz` axis lets Inter draw each size with its own cut: 14px and below
+// keep the open text design, while titles and headings get Inter Display's
+// tighter spacing and finer details automatically (`font-optical-sizing: auto`
+// is the CSS default). Keep in sync with desktop's `opsz.css` import.
 const inter = Inter({
   subsets: ["latin"],
   style: ["normal", "italic"],
+  axes: ["opsz"],
   variable: "--font-inter",
 });
 // Mono font has no explicit CJK fallback: CJK chars in code blocks are inherently
 // non-aligned with a mono grid (Chinese is proportional), so listing CJK fonts
 // here would falsely signal alignment guarantees. Browser default fallback handles
-// the rare mixed case correctly.
+// the rare mixed case correctly. `--font-mono` itself is composed in
+// ./globals.css so the Appearance code font can replace it without losing the
+// Geist family, which the monospace UI font still uses.
 const geistMono = Geist_Mono({
   subsets: ["latin"],
-  variable: "--font-mono",
-  fallback: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
+  variable: "--font-geist-mono",
 });
-// Editorial serif used for onboarding headlines. Italic support for h1 em
-// accents (e.g. "...on one shared board."). Only loaded on routes that
-// render the font; layout-shift-prevention handled by next/font's synthetic
-// fallback metrics, same as Inter.
+// Optional code font from the Appearance settings. Not preloaded: the face is
+// only fetched once something renders with it.
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains-mono",
+  preload: false,
+});
+// Editorial serif used for onboarding headlines and the Appearance "Serif"
+// font. Italic support for h1 em accents (e.g. "...on one shared board.").
+// Only loaded on routes that render the font; layout-shift-prevention handled
+// by next/font's synthetic fallback metrics, same as Inter. No `fallback`:
+// next/font writes it into the variable, and the stacks built on it in
+// ./globals.css differ in whether they may end with a generic family.
 const sourceSerif = Source_Serif_4({
   subsets: ["latin"],
   style: ["normal", "italic"],
-  variable: "--font-serif",
-  fallback: [
-    "ui-serif",
-    "Iowan Old Style",
-    "Apple Garamond",
-    "Baskerville",
-    "Times New Roman",
-    "serif",
-  ],
+  variable: "--font-source-serif",
 });
 
 export const viewport: Viewport = {
@@ -79,7 +89,7 @@ export const metadata: Metadata = {
     template: TITLE_TEMPLATE,
   },
   description:
-    "Open-source platform that turns coding agents into real teammates. Assign tasks, track progress, compound skills.",
+    "Source-available platform that turns coding agents into real teammates. Assign tasks, track progress, compound skills.",
   icons: {
     icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
     shortcut: ["/favicon.svg"],
@@ -128,12 +138,14 @@ export default async function RootLayout({
   const resources = { [locale]: RESOURCES[locale] };
   const apiBaseUrl = resolveBrowserApiBaseUrl(process.env);
   const wsUrl = resolveBrowserWsUrl(process.env);
+  // Opt-in Google Analytics: omitted entirely unless GOOGLE_ANALYTICS_ID is set.
+  const googleAnalyticsId = resolveGoogleAnalyticsId(process.env);
 
   return (
     <html
       lang={HTML_LANG[locale]}
       suppressHydrationWarning
-      className={cn("antialiased font-sans h-full", inter.variable, geistMono.variable, sourceSerif.variable)}
+      className={cn("antialiased font-sans h-full", inter.variable, geistMono.variable, jetbrainsMono.variable, sourceSerif.variable)}
     >
       <body className="h-full overflow-hidden">
         {/*
@@ -165,6 +177,7 @@ export default async function RootLayout({
           </WebProviders>
           <Toaster />
         </ThemeProvider>
+        {googleAnalyticsId && <GoogleAnalytics measurementId={googleAnalyticsId} />}
       </body>
     </html>
   );

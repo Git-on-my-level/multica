@@ -270,6 +270,39 @@ func TestVerifyAssetSHA256(t *testing.T) {
 	})
 }
 
+func TestUpdateDownloadTimeoutOrDefault(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "uses default for zero",
+			timeout: 0,
+			want:    DefaultUpdateDownloadTimeout,
+		},
+		{
+			name:    "uses default for negative",
+			timeout: -1 * time.Second,
+			want:    DefaultUpdateDownloadTimeout,
+		},
+		{
+			name:    "keeps explicit timeout",
+			timeout: 10 * time.Minute,
+			want:    10 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := updateDownloadTimeoutOrDefault(tt.timeout)
+			if got != tt.want {
+				t.Fatalf("timeout = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveGitHubRepo(t *testing.T) {
 	t.Run("defaults to upstream when unset", func(t *testing.T) {
 		dir := t.TempDir()
@@ -342,37 +375,4 @@ func TestShouldSkipBrewUpgrade(t *testing.T) {
 			t.Fatal("expected brew for upstream")
 		}
 	})
-}
-
-func TestUpdateDownloadTimeoutOrDefault(t *testing.T) {
-	tests := []struct {
-		name    string
-		timeout time.Duration
-		want    time.Duration
-	}{
-		{
-			name:    "uses default for zero",
-			timeout: 0,
-			want:    DefaultUpdateDownloadTimeout,
-		},
-		{
-			name:    "uses default for negative",
-			timeout: -1 * time.Second,
-			want:    DefaultUpdateDownloadTimeout,
-		},
-		{
-			name:    "keeps explicit timeout",
-			timeout: 10 * time.Minute,
-			want:    10 * time.Minute,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := updateDownloadTimeoutOrDefault(tt.timeout)
-			if got != tt.want {
-				t.Fatalf("timeout = %s, want %s", got, tt.want)
-			}
-		})
-	}
 }

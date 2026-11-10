@@ -30,12 +30,20 @@ export {
 } from "./attachment-preview-modal";
 export type {
   AttachmentPreviewHandle,
+  PreviewCopyLinkAction,
+  PreviewLocateAction,
   PreviewSequence,
 } from "./attachment-preview-modal";
 export {
-  ImageSequenceProvider,
-  useImageSequencePreview,
-} from "./image-sequence-context";
+  PreviewSequenceProvider,
+  collectPreviewSequence,
+  usePreviewSequence,
+} from "./preview-sequence-context";
+export type {
+  OpenAtOptions,
+  PreviewItemDetails,
+  PreviewSequenceControls,
+} from "./preview-sequence-context";
 export { AttachmentCard } from "./attachment-card";
 export type { AttachmentCardProps } from "./attachment-card";
 export { Attachment } from "./attachment";

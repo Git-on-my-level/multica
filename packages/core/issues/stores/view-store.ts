@@ -4,9 +4,34 @@ import { useEffect, useRef } from "react";
 import { create } from "zustand";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { createJSONStorage, persist } from "zustand/middleware";
-import type { IssueStatus, IssueStatusCategory, IssuePriority, PropertyFilterValue } from "../../types";
+import type { IssueStatus, IssuePriority, ProjectStatus, PropertyFilterValue } from "../../types";
+import { PROJECT_STATUS_ORDER } from "../../projects/config";
 import { createWorkspaceAwareStorage, registerForWorkspaceRehydration } from "../../platform/workspace-storage";
 import { defaultStorage } from "../../platform/storage";
+import {
+  advancedFilterFromSimple,
+  DUE_DATE_FILTERS,
+  EMPTY_SIMPLE_FILTER_FIELDS,
+  foldPropertyFiltersIntoTree,
+  ISSUE_RELATION_FILTERS,
+  NEGATABLE_FILTER_DIMENSIONS,
+  sanitizeAdvancedFilter,
+  simpleFromAdvancedFilter,
+  type AdvancedFilterGroup,
+  type DueDateFilter,
+  type IssueRelationFilter,
+  type NegatableFilterDimension,
+} from "./filter-tree";
+
+export {
+  DUE_DATE_FILTERS,
+  ISSUE_RELATION_FILTERS,
+  NEGATABLE_FILTER_DIMENSIONS,
+  type AdvancedFilterGroup,
+  type DueDateFilter,
+  type IssueRelationFilter,
+  type NegatableFilterDimension,
+};
 
 export type ViewMode = "board" | "list" | "table" | "gantt" | "swimlane";
 export type GanttZoom = "day" | "week" | "month";
@@ -116,8 +141,8 @@ export interface ActorFilterValue {
   id: string;
 }
 
-/** The nine query-defining filter fields as one value — what a saved view
- *  fixes, and what resets restore. */
+/** The query-defining filter fields as one value — what a saved view fixes,
+ *  and what resets restore. */
 export interface FilterSnapshot {
   statusFilters: IssueStatus[];
   priorityFilters: IssuePriority[];
@@ -126,20 +151,62 @@ export interface FilterSnapshot {
   creatorFilters: ActorFilterValue[];
   projectFilters: string[];
   includeNoProject: boolean;
+  projectStatusFilters: ProjectStatus[];
   labelFilters: string[];
+  relationFilters: IssueRelationFilter[];
+  dueDateFilters: DueDateFilter[];
+  negatedFilters: NegatableFilterDimension[];
   propertyFilters: Record<string, PropertyFilterValue[]>;
+  advancedFilter: AdvancedFilterGroup | null;
+  /** Only issues an agent is running on right now. */
+  agentRunningFilter: boolean;
+  /** Only issues with an agent result the viewer has not seen yet. */
+  unreadFilter: boolean;
 }
 
 /** Filter-bar chip dimensions. Date is excluded: `dateFilter` lives outside
  *  the persisted slice and clears through `setDateFilter(null)`. */
-export type FilterDimension =
-  | "status"
-  | "priority"
-  | "assignee"
-  | "creator"
-  | "project"
-  | "label"
-  | `property:${string}`;
+export type FilterDimension = NegatableFilterDimension | `property:${string}`;
+
+/** Whether a negatable dimension has anything selected. */
+export function filterDimensionHasSelection(
+  state: Omit<FilterSnapshot, "negatedFilters" | "propertyFilters" | "advancedFilter">,
+  dimension: NegatableFilterDimension,
+): boolean {
+  switch (dimension) {
+    case "status":
+      return state.statusFilters.length > 0;
+    case "priority":
+      return state.priorityFilters.length > 0;
+    case "assignee":
+      return state.assigneeFilters.length > 0 || state.includeNoAssignee;
+    case "creator":
+      return state.creatorFilters.length > 0;
+    case "project":
+      return state.projectFilters.length > 0 || state.includeNoProject;
+    case "projectStatus":
+      return state.projectStatusFilters.length > 0;
+    case "label":
+      return state.labelFilters.length > 0;
+    case "relation":
+      return state.relationFilters.length > 0;
+    case "dueDate":
+      return state.dueDateFilters.length > 0;
+  }
+}
+
+/**
+ * The negations that actually change the result, in canonical order. "Is
+ * not" on a dimension with nothing selected is a UI state, not a filter.
+ */
+export function effectiveNegatedFilters(
+  state: Omit<FilterSnapshot, "propertyFilters" | "advancedFilter">,
+): NegatableFilterDimension[] {
+  const negated = new Set(state.negatedFilters);
+  return NEGATABLE_FILTER_DIMENSIONS.filter(
+    (dimension) => negated.has(dimension) && filterDimensionHasSelection(state, dimension),
+  );
+}
 
 export const PROPERTY_VIEW_PREFIX = "property:";
 
@@ -189,7 +256,7 @@ export const DEFAULT_CARD_PROPERTIES: Readonly<CardProperties> = {
   labels: false,
 };
 
-export const DEFAULT_HIDDEN_STATUS_CATEGORIES: readonly IssueStatusCategory[] = [
+export const DEFAULT_HIDDEN_STATUSES: readonly IssueStatus[] = [
   "cancelled",
 ];
 
@@ -229,7 +296,7 @@ export function normalizeSortForGrouping(
   sortDirection: SortDirection,
 ): Pick<IssueViewState, "sortBy" | "sortDirection"> {
   return grouping !== "status" && sortBy === "position"
-    ? { sortBy: "created_at", sortDirection: "desc" }
+    ? { sortBy: "updated_at", sortDirection: "desc" }
     : { sortBy, sortDirection };
 }
 
@@ -243,7 +310,22 @@ export interface IssueViewState {
   creatorFilters: ActorFilterValue[];
   projectFilters: string[];
   includeNoProject: boolean;
+  /**
+   * Lifecycle status of the parent project. Its own dimension next to
+   * `projectFilters` (AND across the two, OR within): "show me everything in
+   * the projects that are in progress" without naming them one by one. An
+   * issue with no project never matches.
+   */
+  projectStatusFilters: ProjectStatus[];
   labelFilters: string[];
+  relationFilters: IssueRelationFilter[];
+  dueDateFilters: DueDateFilter[];
+  /**
+   * Dimensions whose selection is excluded instead of matched ("status is
+   * not done"). The selection itself lives in the dimension's own field; an
+   * entry here with nothing selected filters nothing.
+   */
+  negatedFilters: NegatableFilterDimension[];
   /**
    * Custom-property filters: definition id → selected values (checkbox
    * definitions use the pseudo-options "true"/"false"; scalars hold the
@@ -253,13 +335,21 @@ export interface IssueViewState {
    * across definitions, mirroring the other filter groups.
    */
   propertyFilters: Record<string, PropertyFilterValue[]>;
+  /**
+   * Advanced mode: a rule tree that can "or" across dimensions. Non-null
+   * means the surface is in advanced mode; entering moves the simple value
+   * fields into the tree, so they sit empty while it is set. Custom-property
+   * filters stay where they are and still apply.
+   */
+  advancedFilter: AdvancedFilterGroup | null;
   dateFilter: IssueDateFilter | null;
   // When true, the list only shows issues that currently have at least one
-  // agent task in `running` status. Drives the workspace "agents working"
-  // quick filter chip in the issues header. Not persisted across reloads —
-  // running state changes second-to-second, a persisted toggle would let
-  // users return to an empty list with no obvious cause.
+  // agent task in `running` status. Saved into views and persisted like the
+  // other filters.
   agentRunningFilter: boolean;
+  // When true, the list only shows the viewer's unread issues (the sidebar's
+  // unread dot). Saved into views; resolved per viewer.
+  unreadFilter: boolean;
   sortBy: SortField;
   sortDirection: SortDirection;
   /** Last explicit direction per field, so switching fields is reversible. */
@@ -271,9 +361,9 @@ export interface IssueViewState {
   // board / list / swimlane so users can focus on top-level parent issues.
   // Purely a display filter — it never touches the parent/child relationship.
   showSubIssues: boolean;
-  listCollapsedStatuses: IssueStatusCategory[];
+  listCollapsedStatuses: IssueStatus[];
   /**
-   * Board / list columns the user hid, as CATEGORIES.
+   * Board / list columns the user hid, as concrete status keys.
    *
    * Column visibility used to be expressed by writing the surviving statuses
    * into `statusFilters`, which stopped being correct once a category can hold
@@ -282,7 +372,7 @@ export interface IssueViewState {
    * exact-key filter are different questions and now have different fields.
    * (MUL-6243)
    */
-  hiddenStatusCategories: IssueStatusCategory[];
+  hiddenStatuses: IssueStatus[];
   ganttZoom: GanttZoom;
   ganttShowCompleted: boolean;
   /** Active swimlane grouping dimension. */
@@ -312,15 +402,28 @@ export interface IssueViewState {
   toggleCreatorFilter: (value: ActorFilterValue) => void;
   toggleProjectFilter: (projectId: string) => void;
   toggleNoProject: () => void;
+  toggleProjectStatusFilter: (status: ProjectStatus) => void;
   toggleLabelFilter: (labelId: string) => void;
+  toggleRelationFilter: (relation: IssueRelationFilter) => void;
+  toggleDueDateFilter: (bucket: DueDateFilter) => void;
+  setFilterNegated: (dimension: NegatableFilterDimension, negated: boolean) => void;
   togglePropertyFilter: (propertyId: string, optionId: string) => void;
   /** Replace a property's full filter value set (used by scalar value inputs
    *  for text/number/date/url, which build the array including "__none__"). */
   setPropertyFilterValues: (propertyId: string, optionIds: PropertyFilterValue[]) => void;
   setDateFilter: (filter: IssueDateFilter | null) => void;
+  /** Replace the advanced tree; null leaves advanced mode without carrying
+   *  anything back. */
+  setAdvancedFilter: (filter: AdvancedFilterGroup | null) => void;
+  /** Move the simple value filters into a tree and switch to advanced mode. */
+  enterAdvancedFilter: () => void;
+  /** Back to simple mode with the same filter. A no-op when the tree is
+   *  something simple mode cannot say (`simpleFromAdvancedFilter`). */
+  exitAdvancedFilter: () => void;
   toggleAgentRunningFilter: () => void;
-  hideStatus: (category: IssueStatusCategory) => void;
-  showStatus: (category: IssueStatusCategory) => void;
+  toggleUnreadFilter: () => void;
+  hideStatus: (status: IssueStatus) => void;
+  showStatus: (status: IssueStatus) => void;
   clearFilters: () => void;
   /** Clear one filter dimension (a filter-bar chip). `property:<id>` clears
    *  that definition's entry only. Paired boolean flags (no-assignee /
@@ -334,7 +437,7 @@ export interface IssueViewState {
   toggleCardProperty: (key: keyof CardProperties) => void;
   toggleCardPropertyId: (propertyId: string) => void;
   toggleShowSubIssues: () => void;
-  toggleListCollapsed: (category: IssueStatusCategory) => void;
+  toggleListCollapsed: (status: IssueStatus) => void;
   setSwimlaneGrouping: (grouping: SwimlaneGrouping) => void;
   /** Update the lane order for the currently active swimlane grouping. */
   setSwimlaneOrder: (order: string[]) => void;
@@ -360,18 +463,24 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
   creatorFilters: [],
   projectFilters: [],
   includeNoProject: false,
+  projectStatusFilters: [],
   labelFilters: [],
+  relationFilters: [],
+  dueDateFilters: [],
+  negatedFilters: [],
   propertyFilters: {},
+  advancedFilter: null,
   dateFilter: null,
   agentRunningFilter: false,
-  sortBy: "created_at",
+  unreadFilter: false,
+  sortBy: "updated_at",
   sortDirection: "desc",
-  sortDirections: { created_at: "desc" },
+  sortDirections: { updated_at: "desc" },
   cardProperties: { ...DEFAULT_CARD_PROPERTIES },
   cardPropertyIds: [],
   showSubIssues: true,
   listCollapsedStatuses: [],
-  hiddenStatusCategories: [...DEFAULT_HIDDEN_STATUS_CATEGORIES],
+  hiddenStatuses: [...DEFAULT_HIDDEN_STATUSES],
   ganttZoom: "week",
   ganttShowCompleted: false,
   swimlaneGrouping: "assignee",
@@ -453,12 +562,39 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
     })),
   toggleNoProject: () =>
     set((state) => ({ includeNoProject: !state.includeNoProject })),
+  toggleProjectStatusFilter: (status) =>
+    set((state) => ({
+      projectStatusFilters: state.projectStatusFilters.includes(status)
+        ? state.projectStatusFilters.filter((s) => s !== status)
+        : [...state.projectStatusFilters, status],
+    })),
   toggleLabelFilter: (labelId) =>
     set((state) => ({
       labelFilters: state.labelFilters.includes(labelId)
         ? state.labelFilters.filter((id) => id !== labelId)
         : [...state.labelFilters, labelId],
     })),
+  toggleRelationFilter: (relation) =>
+    set((state) => ({
+      relationFilters: state.relationFilters.includes(relation)
+        ? state.relationFilters.filter((r) => r !== relation)
+        : [...state.relationFilters, relation],
+    })),
+  toggleDueDateFilter: (bucket) =>
+    set((state) => ({
+      dueDateFilters: state.dueDateFilters.includes(bucket)
+        ? state.dueDateFilters.filter((b) => b !== bucket)
+        : [...state.dueDateFilters, bucket],
+    })),
+  setFilterNegated: (dimension, negated) =>
+    set((state) => {
+      if (state.negatedFilters.includes(dimension) === negated) return state;
+      return {
+        negatedFilters: negated
+          ? [...state.negatedFilters, dimension]
+          : state.negatedFilters.filter((d) => d !== dimension),
+      };
+    }),
   togglePropertyFilter: (propertyId, optionId) =>
     set((state) => {
       const current = state.propertyFilters[propertyId] ?? [];
@@ -478,17 +614,35 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
       return { propertyFilters };
     }),
   setDateFilter: (filter) => set({ dateFilter: filter }),
+  setAdvancedFilter: (advancedFilter) => set({ advancedFilter }),
+  enterAdvancedFilter: () =>
+    set((state) =>
+      state.advancedFilter
+        ? state
+        : {
+            ...EMPTY_SIMPLE_FILTER_FIELDS,
+            advancedFilter: advancedFilterFromSimple(state, effectiveNegatedFilters(state)),
+          },
+    ),
+  exitAdvancedFilter: () =>
+    set((state) => {
+      if (!state.advancedFilter) return state;
+      const simple = simpleFromAdvancedFilter(state.advancedFilter);
+      return simple ? { ...simple, advancedFilter: null } : state;
+    }),
   toggleAgentRunningFilter: () =>
     set((state) => ({ agentRunningFilter: !state.agentRunningFilter })),
-  hideStatus: (category) =>
+  toggleUnreadFilter: () =>
+    set((state) => ({ unreadFilter: !state.unreadFilter })),
+  hideStatus: (status) =>
     set((state) =>
-      state.hiddenStatusCategories.includes(category)
+      state.hiddenStatuses.includes(status)
         ? state
-        : { hiddenStatusCategories: [...state.hiddenStatusCategories, category] },
+        : { hiddenStatuses: [...state.hiddenStatuses, status] },
     ),
-  showStatus: (category) =>
+  showStatus: (status) =>
     set((state) => ({
-      hiddenStatusCategories: state.hiddenStatusCategories.filter((c) => c !== category),
+      hiddenStatuses: state.hiddenStatuses.filter((key) => key !== status),
     })),
   clearFilters: () =>
     set({
@@ -499,27 +653,40 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
       creatorFilters: [],
       projectFilters: [],
       includeNoProject: false,
+      projectStatusFilters: [],
       labelFilters: [],
+      relationFilters: [],
+      dueDateFilters: [],
+      negatedFilters: [],
       propertyFilters: {},
+      advancedFilter: null,
       dateFilter: null,
       agentRunningFilter: false,
+      unreadFilter: false,
     }),
   resetFiltersTo: (snapshot) => set({ ...snapshot }),
   clearFilterDimension: (dimension) =>
     set((state) => {
+      const negatedFilters = state.negatedFilters.filter((d) => d !== dimension);
       switch (dimension) {
         case "status":
-          return { statusFilters: [] };
+          return { statusFilters: [], negatedFilters };
         case "priority":
-          return { priorityFilters: [] };
+          return { priorityFilters: [], negatedFilters };
         case "assignee":
-          return { assigneeFilters: [], includeNoAssignee: false };
+          return { assigneeFilters: [], includeNoAssignee: false, negatedFilters };
         case "creator":
-          return { creatorFilters: [] };
+          return { creatorFilters: [], negatedFilters };
         case "project":
-          return { projectFilters: [], includeNoProject: false };
+          return { projectFilters: [], includeNoProject: false, negatedFilters };
+        case "projectStatus":
+          return { projectStatusFilters: [], negatedFilters };
         case "label":
-          return { labelFilters: [] };
+          return { labelFilters: [], negatedFilters };
+        case "relation":
+          return { relationFilters: [], negatedFilters };
+        case "dueDate":
+          return { dueDateFilters: [], negatedFilters };
         default: {
           const propertyId = propertyIdFromViewKey(dimension);
           if (!propertyId || !(propertyId in state.propertyFilters)) return state;
@@ -638,11 +805,7 @@ export const viewStorePersistOptions = (name: string) => ({
   name,
   storage: createJSONStorage(() => createWorkspaceAwareStorage(defaultStorage)),
   partialize: (state: IssueViewState) => ({
-    // NOTE: `agentRunningFilter` is intentionally NOT persisted — running
-    // state changes second-to-second, and a stored toggle would let users
-    // return to an unexplained empty list. Keep it ephemeral. See the
-    // field comment on IssueViewState.
-    // `dateFilter` is also intentionally not persisted: relative presets such
+    // `dateFilter` is intentionally not persisted: relative presets such
     // as Today would otherwise become stale after a calendar-day rollover.
     viewMode: state.viewMode,
     grouping: state.grouping,
@@ -653,8 +816,15 @@ export const viewStorePersistOptions = (name: string) => ({
     creatorFilters: state.creatorFilters,
     projectFilters: state.projectFilters,
     includeNoProject: state.includeNoProject,
+    projectStatusFilters: state.projectStatusFilters,
     labelFilters: state.labelFilters,
+    relationFilters: state.relationFilters,
+    dueDateFilters: state.dueDateFilters,
+    negatedFilters: state.negatedFilters,
     propertyFilters: state.propertyFilters,
+    advancedFilter: state.advancedFilter,
+    agentRunningFilter: state.agentRunningFilter,
+    unreadFilter: state.unreadFilter,
     sortBy: state.sortBy,
     sortDirection: state.sortDirection,
     sortDirections: state.sortDirections,
@@ -662,7 +832,7 @@ export const viewStorePersistOptions = (name: string) => ({
     cardPropertyIds: state.cardPropertyIds,
     showSubIssues: state.showSubIssues,
     listCollapsedStatuses: state.listCollapsedStatuses,
-    hiddenStatusCategories: state.hiddenStatusCategories,
+    hiddenStatuses: state.hiddenStatuses,
     ganttZoom: state.ganttZoom,
     ganttShowCompleted: state.ganttShowCompleted,
     swimlaneGrouping: state.swimlaneGrouping,
@@ -693,6 +863,21 @@ export function mergeViewStatePersisted<T extends IssueViewState>(
   current: T,
 ): T {
   const p = (persisted ?? {}) as Partial<T>;
+  // Read the old category-named field once; new snapshots persist exact keys.
+  const legacy = persisted as { hiddenStatusCategories?: unknown } | null;
+  const statusesFromStorage = (value: unknown, fallback: IssueStatus[], legacyCategories = false) => {
+    if (!Array.isArray(value)) return fallback;
+    const aliases: Record<string, string[]> = {
+      unstarted: ["backlog", "todo"],
+      started: ["in_progress", "in_review", "blocked"],
+      completed: ["done"],
+      closed: ["cancelled"],
+      canceled: ["cancelled"],
+    };
+    return [...new Set(value.flatMap((key) =>
+      typeof key === "string" ? (legacyCategories ? aliases[key] ?? [key] : [key]) : [],
+    ))];
+  };
   // `collapsedSwimlanes` changed shape from `string[]` to
   // `Record<SwimlaneGrouping, string[]>`. A snapshot saved in the old
   // shape would otherwise overwrite the default record with an array
@@ -725,6 +910,8 @@ export function mergeViewStatePersisted<T extends IssueViewState>(
   const merged = {
     ...current,
     ...p,
+    hiddenStatuses: statusesFromStorage(p.hiddenStatuses ?? legacy?.hiddenStatusCategories, current.hiddenStatuses, p.hiddenStatuses === undefined),
+    listCollapsedStatuses: statusesFromStorage(p.listCollapsedStatuses, current.listCollapsedStatuses, p.hiddenStatuses === undefined),
     cardProperties: {
       ...current.cardProperties,
       ...(p.cardProperties ?? {}),
@@ -749,7 +936,47 @@ export function mergeViewStatePersisted<T extends IssueViewState>(
     tableCollapsedParents: Array.isArray(p.tableCollapsedParents)
       ? p.tableCollapsedParents
       : current.tableCollapsedParents,
+    // A saved view is a server-owned blob and a persisted snapshot can be
+    // hand-edited, so an unknown member can arrive here. It cannot be
+    // represented: the backend rejects it with a 400 and the filter chip
+    // resolves its dot through PROJECT_STATUS_CONFIG. Drop it, like
+    // `baselineFromQuery` does on the read side.
+    projectStatusFilters: Array.isArray(p.projectStatusFilters)
+      ? p.projectStatusFilters.filter((status): status is ProjectStatus =>
+          (PROJECT_STATUS_ORDER as readonly string[]).includes(status as string),
+        )
+      : current.projectStatusFilters,
+    relationFilters: Array.isArray(p.relationFilters)
+      ? p.relationFilters.filter((relation): relation is IssueRelationFilter =>
+          (ISSUE_RELATION_FILTERS as readonly unknown[]).includes(relation),
+        )
+      : current.relationFilters,
+    dueDateFilters: Array.isArray(p.dueDateFilters)
+      ? [...new Set(p.dueDateFilters.filter((bucket): bucket is DueDateFilter =>
+          (DUE_DATE_FILTERS as readonly unknown[]).includes(bucket),
+        ))]
+      : current.dueDateFilters,
+    advancedFilter: p.advancedFilter === undefined
+      ? current.advancedFilter
+      : sanitizeAdvancedFilter(p.advancedFilter),
+    agentRunningFilter: p.agentRunningFilter === undefined
+      ? current.agentRunningFilter
+      : p.agentRunningFilter === true,
+    unreadFilter: p.unreadFilter === undefined
+      ? current.unreadFilter
+      : p.unreadFilter === true,
+    negatedFilters: Array.isArray(p.negatedFilters)
+      ? [...new Set(p.negatedFilters.filter((dimension): dimension is NegatableFilterDimension =>
+          (NEGATABLE_FILTER_DIMENSIONS as readonly unknown[]).includes(dimension),
+        ))]
+      : current.negatedFilters,
   };
+  // Property filters are conditions in advanced mode; flat ones stored next to
+  // a tree (by an earlier build) would otherwise filter without being shown.
+  if (merged.advancedFilter && Object.keys(merged.propertyFilters ?? {}).length > 0) {
+    const folded = foldPropertyFiltersIntoTree(merged.advancedFilter, merged.propertyFilters);
+    if (folded) Object.assign(merged, { advancedFilter: folded, propertyFilters: {} });
+  }
   return {
     ...merged,
     ...normalizeSortForGrouping(

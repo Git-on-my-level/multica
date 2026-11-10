@@ -1,6 +1,6 @@
+import { resolveGithubRepo } from "./github-release-base";
 import { autoUpdater, type UpdateDownloadedEvent } from "electron-updater";
-import { app, type BrowserWindow, ipcMain } from "electron";
-import { resolveGithubRepo, githubReleasesLatestPageUrl } from "./github-release-base";
+import { app, type BrowserWindow, type MessageBoxOptions, ipcMain } from "electron";
 import type {
   ManualUpdateCheckResult,
   UpdaterPreferences,
@@ -11,6 +11,7 @@ import {
   saveUpdaterPreferences,
   updaterPreferencesPath,
 } from "./updater-preferences";
+import type { DaemonInstallPrep } from "./update-install-gate";
 
 // Silent background updates: electron-updater downloads on its own as soon
 // as `update-available` fires; we only surface UI when the package is fully
@@ -18,11 +19,6 @@ import {
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
 
-/**
- * Pin the GitHub provider feed from resolveGithubRepo() so a wrongly baked
- * upstream app-update.yml (older fork DMGs) cannot keep offering upstream
- * releases. Channel selection below still applies on top of this provider.
- */
 export function configureGithubUpdateFeed(
   updater: { setFeedURL: (options: { provider: "github"; owner: string; repo: string }) => void },
   repoSlug: string = resolveGithubRepo(),
@@ -73,22 +69,49 @@ configureMacX64UpdateChannel(autoUpdater);
 
 const STARTUP_CHECK_DELAY_MS = 5_000;
 const PERIODIC_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+// quitAndInstall only quits once the installer has been spawned. If the app is
+// still running this long afterwards, the install bailed and the daemon we
+// stopped for it must be brought back.
+const INSTALL_QUIT_WATCHDOG_MS = 10_000;
+
+// Injected so the updater does not own the daemon manager's state.
+export interface UpdaterDaemonGate {
+  prepare: (options: {
+    interruptActiveTasks: boolean;
+  }) => Promise<DaemonInstallPrep>;
+  resumeAfterAbortedInstall: () => void;
+  confirmInstallWhileBusy: (activeTasks: number) => Promise<boolean>;
+}
+
+export interface SetupAutoUpdaterOptions {
+  daemonGate?: UpdaterDaemonGate;
+  platform?: NodeJS.Platform;
+}
+
+export function createElectronBusyInstallPrompt(
+  showMessageBox: (
+    options: MessageBoxOptions,
+  ) => Promise<{ response: number }>,
+): (activeTasks: number) => Promise<boolean> {
+  return async (activeTasks) => {
+    const tasks = activeTasks === 1 ? "1 agent task is" : `${activeTasks} agent tasks are`;
+    const { response } = await showMessageBox({
+      type: "question",
+      buttons: ["Install now", "Cancel"],
+      defaultId: 1,
+      cancelId: 1,
+      title: "Install update",
+      message: `${tasks} running on this computer.`,
+      detail: "Installing now stops the local runtime and interrupts these tasks.",
+    });
+    return response === 0;
+  };
+}
 
 type RendererChannel =
   | "updater:update-available"
   | "updater:download-progress"
-  | "updater:update-downloaded"
-  | "updater:update-error";
-
-function isMacCodeSignatureError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const message = err.message;
-  return (
-    message.includes("Code signature") ||
-    message.includes("code requirements") ||
-    message.includes("SQRLCodeSignature")
-  );
-}
+  | "updater:update-downloaded";
 
 function isDestroyedObjectError(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Object has been destroyed");
@@ -140,7 +163,18 @@ function checkForUpdatesOnce(): Promise<unknown> {
   return p;
 }
 
-export function setupAutoUpdater(getMainWindow: () => BrowserWindow | null): void {
+export function setupAutoUpdater(
+  getMainWindows: () => readonly BrowserWindow[],
+  options: SetupAutoUpdaterOptions = {},
+): void {
+  // Every main window mounts the update banner, so each one hears progress.
+  const broadcast = (channel: RendererChannel, payload: unknown) => {
+    for (const win of getMainWindows()) sendToLiveRenderer(win, channel, payload);
+  };
+  const platform = options.platform ?? process.platform;
+  // Only Windows locks a running executable against replacement; macOS and
+  // Linux keep their existing update path untouched.
+  const daemonGate = platform === "win32" ? (options.daemonGate ?? null) : null;
   const preferencesFilePath = updaterPreferencesPath(app.getPath("userData"));
   let automaticUpdatesEnabled =
     DEFAULT_UPDATER_PREFERENCES.automaticUpdates;
@@ -200,23 +234,83 @@ export function setupAutoUpdater(getMainWindow: () => BrowserWindow | null): voi
     }
   };
 
+  let updateReadyToInstall = false;
+  let installFlow: Promise<void> | null = null;
+  let quitRequested = false;
+  let finishing = false;
+  let appQuitting = false;
+
+  const finish = (install: boolean, manual: boolean): void => {
+    finishing = true;
+    const previousAutoInstall = autoUpdater.autoInstallOnAppQuit;
+    if (!install) autoUpdater.autoInstallOnAppQuit = false;
+    setTimeout(() => {
+      if (appQuitting) return;
+      finishing = false;
+      quitRequested = false;
+      autoUpdater.autoInstallOnAppQuit = previousAutoInstall;
+      daemonGate?.resumeAfterAbortedInstall();
+    }, INSTALL_QUIT_WATCHDOG_MS);
+    if (install && manual) autoUpdater.quitAndInstall(false, true);
+    else app.quit();
+  };
+
+  // All entry points join this promise. Once stopping starts, nobody cancels
+  // or replaces its PID wait, and no other flow can resume the daemon.
+  const installWithDaemonGate = (manual: boolean): Promise<void> => {
+    if (installFlow) return installFlow;
+    if (finishing || !daemonGate) return Promise.resolve();
+    installFlow = (async () => {
+      let install = true;
+      try {
+        const prep = await daemonGate.prepare({ interruptActiveTasks: false });
+        if (prep.kind === "busy") {
+          install = manual && await daemonGate.confirmInstallWhileBusy(prep.activeTasks);
+          if (install) await daemonGate.prepare({ interruptActiveTasks: true });
+        }
+      } catch (err) {
+        // Preserve the existing installer fallback if preparation fails.
+        console.error("[updater] daemon preparation failed; installing anyway:", err);
+      }
+      if (install) finish(true, manual);
+      else {
+        daemonGate.resumeAfterAbortedInstall();
+        if (quitRequested) finish(false, false);
+      }
+    })().finally(() => { installFlow = null; });
+    return installFlow;
+  };
+
+  if (daemonGate) {
+    app.on("will-quit", () => { appQuitting = true; });
+    app.on("before-quit", (event) => {
+      if (finishing || !updateReadyToInstall || !autoUpdater.autoInstallOnAppQuit) return;
+      event.preventDefault();
+      quitRequested = true;
+      void installWithDaemonGate(false).catch((err) => {
+        console.error("[updater] quit-time installation failed:", err);
+      });
+    });
+  }
+
   autoUpdater.on("update-available", (info) => {
     // Forwarded for renderer-side state tracking only; the notification UI
     // does not render an "available" affordance with autoDownload=true.
-    sendToLiveRenderer(getMainWindow(), "updater:update-available", {
+    broadcast("updater:update-available", {
       version: info.version,
       releaseNotes: info.releaseNotes,
     });
   });
 
   autoUpdater.on("download-progress", (progress) => {
-    sendToLiveRenderer(getMainWindow(), "updater:download-progress", {
+    broadcast("updater:download-progress", {
       percent: progress.percent,
     });
   });
 
   autoUpdater.on("update-downloaded", (info: UpdateDownloadedEvent) => {
-    sendToLiveRenderer(getMainWindow(), "updater:update-downloaded", {
+    updateReadyToInstall = true;
+    broadcast("updater:update-downloaded", {
       version: info.version,
       releaseNotes: info.releaseNotes,
     });
@@ -224,12 +318,6 @@ export function setupAutoUpdater(getMainWindow: () => BrowserWindow | null): voi
 
   autoUpdater.on("error", (err) => {
     console.error("Auto-updater error:", err);
-    if (process.platform === "darwin" && isMacCodeSignatureError(err)) {
-      sendToLiveRenderer(getMainWindow(), "updater:update-error", {
-        code: "signature_mismatch",
-        message: err.message,
-      });
-    }
   });
 
   // Retained for IPC back-compat with older renderer bundles. With
@@ -238,11 +326,13 @@ export function setupAutoUpdater(getMainWindow: () => BrowserWindow | null): voi
     return autoUpdater.downloadUpdate();
   });
 
-  ipcMain.handle("updater:install", () => {
-    autoUpdater.quitAndInstall(false, true);
+  ipcMain.handle("updater:install", async () => {
+    if (!daemonGate) {
+      autoUpdater.quitAndInstall(false, true);
+      return;
+    }
+    await installWithDaemonGate(true);
   });
-
-  ipcMain.handle("updater:releases-page-url", () => githubReleasesLatestPageUrl());
 
   ipcMain.handle(
     "updater:get-preferences",
