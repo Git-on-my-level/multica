@@ -174,7 +174,7 @@ for (const gate of ["frontend", "backend"]) {
 
 test("the backend gate owns the three-platform installer matrix", () => {
   assert.equal(productionMapping("backend").installer, "installer");
-  assert.match(jobs.installer, /^        os: \[ubuntu-latest, macos-latest, windows-latest\]$/m);
+  assert.match(jobs.installer, /^        os: \[ubuntu-latest, macos-15-intel, windows-latest\]$/m);
   assert.doesNotMatch(jobs.installer, /continue-on-error:/);
 });
 
