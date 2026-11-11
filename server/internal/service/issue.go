@@ -212,9 +212,9 @@ var ErrIssueClientKeyAssignedDispatchUnsupported = errors.New("issue client key 
 
 // ErrIssueClientKeyOptionsUnsupported means a keyed create was combined with
 // inputs the idempotency contract does not cover: a comment SourceContext
-// snapshot or a deferred assigned-agent run. Rejected rather than silently
-// omitted from the stored semantics.
-var ErrIssueClientKeyOptionsUnsupported = errors.New("issue client key does not support source context or deferred assigned runs")
+// snapshot, a deferred assigned-agent run, custom properties or PR
+// auto-complete. Rejected rather than silently omitted from the stored semantics.
+var ErrIssueClientKeyOptionsUnsupported = errors.New("issue client key does not support source context, deferred assigned runs, custom properties or PR auto-complete")
 
 // ErrInvalidIssueClientKey means a non-empty key did not use the canonical
 // sha256:<64 lowercase hex> wire format.
