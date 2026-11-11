@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -47,6 +48,22 @@ func TestIssueCreateClientKeyRejectsUncoveredOptions(t *testing.T) {
 	}, IssueCreateOpts{AssignedAgentRunFireAt: time.Now().Add(time.Hour)})
 	if !errors.Is(err, ErrIssueClientKeyOptionsUnsupported) {
 		t.Errorf("deferred run error = %v, want ErrIssueClientKeyOptionsUnsupported", err)
+	}
+	_, err = (&IssueService{}).Create(context.Background(), IssueCreateParams{
+		ClientKey:  key,
+		Status:     "todo",
+		Properties: map[pgtype.UUID]json.RawMessage{{Valid: true}: json.RawMessage(`"x"`)},
+	}, IssueCreateOpts{})
+	if !errors.Is(err, ErrIssueClientKeyOptionsUnsupported) {
+		t.Errorf("properties error = %v, want ErrIssueClientKeyOptionsUnsupported", err)
+	}
+	_, err = (&IssueService{}).Create(context.Background(), IssueCreateParams{
+		ClientKey:              key,
+		Status:                 "todo",
+		PRAutoCompleteDisabled: true,
+	}, IssueCreateOpts{})
+	if !errors.Is(err, ErrIssueClientKeyOptionsUnsupported) {
+		t.Errorf("pr auto-complete error = %v, want ErrIssueClientKeyOptionsUnsupported", err)
 	}
 }
 

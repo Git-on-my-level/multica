@@ -266,7 +266,10 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		if _, err := util.ParseSHA256ClientKey(p.ClientKey); err != nil {
 			return IssueCreateResult{}, ErrInvalidIssueClientKey
 		}
-		if p.SourceContext != nil || !opts.AssignedAgentRunFireAt.IsZero() {
+		// The replay digest covers neither properties nor PR auto-complete, so a retry
+		// with different values would silently replay the original issue.
+		if p.SourceContext != nil || !opts.AssignedAgentRunFireAt.IsZero() ||
+			len(p.Properties) > 0 || p.PRAutoCompleteDisabled {
 			return IssueCreateResult{}, ErrIssueClientKeyOptionsUnsupported
 		}
 		if p.AssigneeType.Valid && (p.AssigneeType.String == "agent" || p.AssigneeType.String == "squad") &&

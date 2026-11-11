@@ -1208,6 +1208,23 @@ func TestRunIssueCreateRejectsMalformedClientKeyBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestRunIssueCreateRejectsClientKeyWithUncoveredOptions(t *testing.T) {
+	key := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for flag, value := range map[string]string{"property": "Team=Core", "pr-auto-complete": "off"} {
+		cmd := newIssueCreateTestCmd()
+		cmd.Flags().String("pr-auto-complete", "", "")
+		_ = cmd.Flags().Set("title", "Promoted")
+		_ = cmd.Flags().Set("client-key", key)
+		if err := cmd.Flags().Set(flag, value); err != nil {
+			t.Fatalf("set --%s: %v", flag, err)
+		}
+		err := runIssueCreate(cmd, nil)
+		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Fatalf("--%s with --client-key: error = %v, want a combination error", flag, err)
+		}
+	}
+}
+
 func TestRunIssueCreateSendsExistingAttachmentIDs(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1555,6 +1555,13 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 		if _, err := util.ParseSHA256ClientKey(clientKey); err != nil {
 			return fmt.Errorf("--client-key: %w", err)
 		}
+		// The server's replay digest does not cover these, so a keyed retry could not detect a change.
+		if props, _ := cmd.Flags().GetStringArray("property"); len(props) > 0 {
+			return errors.New("--client-key cannot be combined with --property")
+		}
+		if cmd.Flags().Changed("pr-auto-complete") {
+			return errors.New("--client-key cannot be combined with PR auto-complete flags")
+		}
 	}
 
 	client, err := newAPIClient(cmd)
