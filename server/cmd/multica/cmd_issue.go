@@ -679,6 +679,7 @@ func init() {
 	issueCreateCmd.Flags().String("start-date", "", "Start date (calendar day, YYYY-MM-DD)")
 	issueCreateCmd.Flags().String("due-date", "", "Due date (calendar day, YYYY-MM-DD)")
 	issueCreateCmd.Flags().Bool("allow-duplicate", false, "Allow creating an issue even when an active duplicate exists")
+	issueCreateCmd.Flags().String("client-key", "", "Workspace-scoped idempotency key in sha256:<64 lowercase hex> format")
 	issueCreateCmd.Flags().String("output", "json", "Output format: table or json")
 	issueCreateCmd.Flags().StringArray("attachment", nil, "File path to attach (one literal path per flag; repeat --attachment for multiple files). Each file is uploaded and its markdown reference is appended to the description, which is what makes it render on the issue page")
 	issueCreateCmd.Flags().StringSlice("attachment-id", nil, "Existing attachment UUID(s) to bind to the created issue (can be specified multiple times)")
@@ -1549,6 +1550,12 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 	}
+	clientKey, _ := cmd.Flags().GetString("client-key")
+	if clientKey != "" {
+		if _, err := util.ParseSHA256ClientKey(clientKey); err != nil {
+			return fmt.Errorf("--client-key: %w", err)
+		}
+	}
 
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -1588,6 +1595,9 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		body["properties"] = createProperties
+	}
+	if clientKey != "" {
+		body["client_key"] = clientKey
 	}
 	desc, hasDesc, err := resolveTextFlag(cmd, "description")
 	if err != nil {
