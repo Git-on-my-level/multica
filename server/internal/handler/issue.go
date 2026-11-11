@@ -3673,7 +3673,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, service.ErrIssueClientKeyOptionsUnsupported) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"code":  "issue_client_key_options_unsupported",
-			"error": "client_key cannot be combined with source context or deferred assigned runs",
+			"error": "client_key cannot be combined with source context, deferred assigned runs, custom properties or PR auto-complete",
 		})
 		return
 	}
