@@ -32,10 +32,9 @@ var providerHTTP5xxRe = regexp.MustCompile(`(^|[^0-9a-z])5[0-9][0-9]([^0-9a-z]|$
 // errors. That pollutes failure observability: a genuine process crash gets
 // filed under a provider bucket, masking the real cause on failure dashboards.
 // (A misfire here still can't cause a spurious retry: the auth / quota /
-// capacity buckets these regexes guard are all non-retryable. The only
-// agent_error.* reason on internal/service/task.go's retryableReasons
-// allowlist is provider_network — MUL-4910 — and these regexes never route
-// into it.) The 5xx bucket was already anchored for exactly this reason
+// capacity buckets these regexes guard cannot cause a retry on their own.
+// Capacity retries additionally require the explicit per-minute witness.)
+// The 5xx bucket was already anchored for exactly this reason
 // (MUL-1949); these codes were not. #9146 widened every boundary from
 // digits-only to alphanumerics because hex workspace IDs put these digit runs
 // between letters ("...c429f4b...").
@@ -44,6 +43,14 @@ var (
 	httpQuotaCodeRe    = regexp.MustCompile(`(^|[^0-9a-z])402([^0-9a-z]|$)`)
 	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9a-z])(429|529)([^0-9a-z]|$)`)
 )
+
+// PerMinuteRateLimit identifies the explicit transient uncached-input throttle.
+// A generic 429 or quota limit is not enough evidence to retry a provider call.
+func PerMinuteRateLimit(raw string) bool {
+	return perMinuteRateLimitRe.MatchString(strings.ToLower(raw))
+}
+
+var perMinuteRateLimitRe = regexp.MustCompile(`rate limit exceeded\. please slow down your requests\. limit: [0-9]+ uncached input tokens/minute\.`)
 
 // concurrentRequestLimitWitness is emitted by Anthropic-compatible providers
 // that use HTTP 403 for a transient concurrency rejection. Claude Code may
@@ -115,6 +122,9 @@ func Classify(rawError string) Reason {
 	}
 
 	switch {
+	case PerMinuteRateLimit(lower):
+		return ReasonAgentProviderCapacityOrRateLimit
+
 	// A concurrent-request rejection can contain both "access token" and HTTP
 	// 403. Its specific semantic witness must beat the broader context and auth
 	// rules below; this classification does not itself make the reason retryable.
@@ -666,6 +676,13 @@ var legacyUsageLimit403Reasons = map[string]bool{
 // can be deleted once no daemon old enough to produce its wire shape is still
 // reporting.
 func NormalizeDaemonReason(reason, rawError string) Reason {
+	switch Reason(reason) {
+	case ReasonAgentContextOverflow, ReasonAgentUnknown, Reason("agent_error"):
+		if PerMinuteRateLimit(rawError) {
+			return ReasonAgentProviderCapacityOrRateLimit
+		}
+	}
+
 	if legacyConcurrentRequestLimitReasons[reason] &&
 		strings.Contains(strings.ToLower(rawError), concurrentRequestLimitWitness) {
 		return ReasonAgentProviderCapacityOrRateLimit
