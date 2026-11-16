@@ -1,7 +1,12 @@
 package service
 
 import (
+	"context"
 	"strings"
+
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	"testing"
 	"time"
 
@@ -97,6 +102,70 @@ func TestCursorTransientLaunchRetryPolicy(t *testing.T) {
 				if retryEligible(excluded, base) {
 					t.Errorf("excluded reason %s retried", excluded)
 				}
+			}
+		})
+	}
+}
+
+// Exercise the real failure transaction with rows that have no persisted error
+// or session yet, as on both a cold parent row and a newly-created retry row.
+func TestFailTaskCursorTransientLaunchRecovery(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
+	dbfx := testutil.New(pool, workspaceID, userID)
+	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
+	var runtimeID pgtype.UUID
+	if err := pool.QueryRow(ctx, "SELECT runtime_id FROM agent WHERE id = $1", agentID).Scan(&runtimeID); err != nil {
+		t.Fatal(err)
+	}
+	const header = "cursor-agent exited with error: exit status 1 (result_seen=false, exit_code=1, scanner_error=false, event_count=0, invalid_event_count=0, last_event_type=none); actions completed before finalization may already have taken effect; cursor stderr: "
+	for _, witness := range []string{"RetriableError: [unavailable] Error", "Error: getaddrinfo ENOTFOUND api2.cursor.sh"} {
+		t.Run(witness, func(t *testing.T) {
+			parentID := util.MustParseUUID(dbfx.Task(t, agentID, testutil.Cols{
+				"runtime_id": runtimeID, "issue_id": issueID, "status": "running", "attempt": 1, "max_attempts": 2,
+			}))
+			t.Cleanup(func() {
+				pool.Exec(context.Background(), "DELETE FROM agent_task_queue WHERE parent_task_id IN (SELECT id FROM agent_task_queue WHERE parent_task_id = $1)", parentID)
+				pool.Exec(context.Background(), "DELETE FROM agent_task_queue WHERE parent_task_id = $1 OR id = $1", parentID)
+			})
+			before := time.Now()
+			_, transitioned, err := svc.FailTaskWithTransition(ctx, parentID, header+witness, "requested-session", "/tmp/cursor-fixture", "", "agent_error.process_failure", false, "", "")
+			if err != nil || !transitioned {
+				t.Fatalf("FailTaskWithTransition: transitioned=%v, err=%v", transitioned, err)
+			}
+			var childID pgtype.UUID
+			if err := pool.QueryRow(ctx, "SELECT id FROM agent_task_queue WHERE parent_task_id = $1", parentID).Scan(&childID); err != nil {
+				t.Fatal(err)
+			}
+			child, err := q.GetAgentTask(ctx, childID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if child.Attempt != 2 || child.MaxAttempts != 2 || child.Status != "deferred" ||
+				!child.SessionID.Valid || child.SessionID.String != "requested-session" || child.ForceFreshSession ||
+				!child.FireAt.Valid || child.FireAt.Time.Before(before.Add(5*time.Second)) || child.FireAt.Time.After(time.Now().Add(5*time.Second)) {
+				t.Fatalf("incorrect recovery child: %+v", child)
+			}
+			// A duplicate terminal report must not create another deferred child.
+			if _, changed, err := svc.FailTaskWithTransition(ctx, parentID, header+witness, "requested-session", "/tmp/cursor-fixture", "", "", false, "", ""); err != nil || changed {
+				t.Fatalf("duplicate failure report: changed=%v, err=%v", changed, err)
+			}
+			var n int
+			if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_task_queue WHERE parent_task_id = $1", parentID).Scan(&n); err != nil || n != 1 {
+				t.Fatalf("retry count=%d, err=%v", n, err)
+			}
+			// Retry rows start with NULL errors. Clear the stored session too
+			// so this failure report must supply both inputs to the retry gate.
+			if _, err := pool.Exec(ctx, "UPDATE agent_task_queue SET status = 'running', error = NULL, session_id = NULL WHERE id = $1", childID); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := svc.FailTaskWithTransition(ctx, childID, header+witness, "requested-session", "/tmp/cursor-fixture", "", "", false, "", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_task_queue WHERE parent_task_id = $1", childID).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("exhausted child spawned %d retries, err=%v", n, err)
 			}
 		})
 	}
