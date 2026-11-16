@@ -838,6 +838,7 @@ WHERE id = (
             AND recovery.status IN ('deferred', 'queued')
             AND recovery.id <> atq.id
             AND interrupted.failure_reason = 'runtime_recovery'
+            AND interrupted.error LIKE 'daemon shut down while task%'
       )
     ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC
     LIMIT 1

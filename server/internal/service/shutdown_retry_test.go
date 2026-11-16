@@ -205,7 +205,7 @@ func TestRetryEligibleDaemonShutdownPreservesStartupRecovery(t *testing.T) {
 }
 
 func TestRetryEligibleDaemonShutdownChatOrdering(t *testing.T) {
-	for _, release := range []string{"promote", "cancel", "expire"} {
+	for _, release := range []string{"promote", "cancel", "expire", "startup"} {
 		t.Run(release, func(t *testing.T) {
 			ctx := context.Background()
 			pool := sharedTestPool(t)
@@ -224,15 +224,26 @@ func TestRetryEligibleDaemonShutdownChatOrdering(t *testing.T) {
 			followup := fx.Task(t, agent, testutil.Cols{"runtime_id": runtime, "chat_session_id": chat, "status": "queued", "priority": 4})
 			q := db.New(pool)
 			svc := NewTaskService(q, pool, nil, events.New())
-			if _, err := svc.FailTask(ctx, util.MustParseUUID(parent), "daemon shut down while task was in flight", "existing-session", "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {
+			failureMessage, session := "daemon shut down while task was in flight", "existing-session"
+			if release == "startup" {
+				failureMessage, session = "daemon restarted while task was in flight", ""
+			}
+			if _, err := svc.FailTask(ctx, util.MustParseUUID(parent), failureMessage, session, "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {
 				t.Fatal(err)
 			}
 			var recovery pgtype.UUID
 			if err := pool.QueryRow(ctx, `SELECT id FROM agent_task_queue WHERE parent_task_id=$1`, parent).Scan(&recovery); err != nil {
 				t.Fatal(err)
 			}
-			fx.Exec(t, `UPDATE agent_task_queue SET fire_at=now()+interval '1 hour' WHERE id=$1`, recovery)
 			params := db.ClaimAgentTaskParams{AgentID: util.MustParseUUID(agent), RuntimeID: util.MustParseUUID(runtime), PrepareLeaseSecs: 60, RuntimeStaleSecs: 30}
+			if release == "startup" {
+				got, err := q.ClaimAgentTask(ctx, params)
+				if err != nil || got.ID != util.MustParseUUID(followup) {
+					t.Fatalf("startup retry changed existing chat priority: %v, %v", got.ID, err)
+				}
+				return
+			}
+			fx.Exec(t, `UPDATE agent_task_queue SET fire_at=now()+interval '1 hour' WHERE id=$1`, recovery)
 			if got, err := q.ClaimAgentTask(ctx, params); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("follow-up overtook deferred recovery: %v, %v", got.ID, err)
 			}
