@@ -123,7 +123,8 @@ func cursorStartupError(stderr string) string {
 func TestCursorStartupNetworkClassification(t *testing.T) {
 	t.Parallel()
 	for _, stderr := range []string{"RetriableError: [unavailable] Error", "Error: getaddrinfo ENOTFOUND api2.cursor.sh", "getaddrinfo ENOTFOUND api2.cursor.sh"} {
-		for _, raw := range []string{cursorStartupError(stderr), cursorStartupError(stderr + "\n    at transport (/cursor/index.js:500:403)"), strings.ReplaceAll(cursorStartupError(stderr), "event_count=14, invalid_event_count=0, last_event_type=connection", "event_count=0, invalid_event_count=0, last_event_type=none")} {
+		promptWrite := strings.ReplaceAll(cursorStartupError(stderr), "exited with error: exit status 1", "prompt write failed: write |1: broken pipe")
+		for _, raw := range []string{promptWrite, strings.ReplaceAll(promptWrite, "exit_code=1", "exit_code=0"), cursorStartupError(stderr), cursorStartupError(stderr + "\n    at transport (/cursor/index.js:500:403)"), strings.ReplaceAll(cursorStartupError(stderr), "event_count=14, invalid_event_count=0, last_event_type=connection", "event_count=0, invalid_event_count=0, last_event_type=none")} {
 			if !CursorStartupNetworkFailure(raw) || Classify(raw) != ReasonAgentProviderNetwork {
 				t.Errorf("expected isolated network witness: %q (classified %s)", raw, Classify(raw))
 			}
@@ -140,21 +141,22 @@ func TestCursorStartupNetworkScope(t *testing.T) {
 	t.Parallel()
 	base := cursorStartupError("RetriableError: [unavailable] Error")
 	for name, raw := range map[string]string{
-		"bare provider error":   "RetriableError: [unavailable] Error",
-		"post result":           strings.ReplaceAll(base, "result_seen=false", "result_seen=true"),
-		"scanner failure":       strings.ReplaceAll(base, "scanner_error=false", "scanner_error=true"),
-		"invalid event":         strings.ReplaceAll(base, "invalid_event_count=0", "invalid_event_count=1"),
-		"tool boundary":         strings.ReplaceAll(base, "last_event_type=connection", "last_event_type=tool_call"),
-		"missing diagnostics":   "cursor-agent exited with error: exit status 1; cursor stderr: RetriableError: [unavailable] Error",
-		"unrelated process":     strings.ReplaceAll(base, "cursor-agent exited", "local-tool exited"),
-		"tool quote":            strings.ReplaceAll(base, "cursor stderr: ", "cursor stderr: MCP server error: "),
-		"arbitrary unavailable": cursorStartupError("RetriableError: [unavailable] Something else"),
-		"other DNS host":        cursorStartupError("Error: getaddrinfo ENOTFOUND tool.example"),
-		"unrelated exit":        cursorStartupError("arbitrary process failure"),
-		"auth":                  base + "\nAPI Error: 403 Forbidden",
-		"model":                 base + "\nunknown model",
-		"other provider error":  base + "\nAPI Error: request rejected",
-		"cancelled":             strings.ReplaceAll(base, "exited with error: exit status 1", "execution cancelled"),
+		"bare provider error":    "RetriableError: [unavailable] Error",
+		"inconsistent zero exit": strings.ReplaceAll(base, "exit_code=1", "exit_code=0"),
+		"post result":            strings.ReplaceAll(base, "result_seen=false", "result_seen=true"),
+		"scanner failure":        strings.ReplaceAll(base, "scanner_error=false", "scanner_error=true"),
+		"invalid event":          strings.ReplaceAll(base, "invalid_event_count=0", "invalid_event_count=1"),
+		"tool boundary":          strings.ReplaceAll(base, "last_event_type=connection", "last_event_type=tool_call"),
+		"missing diagnostics":    "cursor-agent exited with error: exit status 1; cursor stderr: RetriableError: [unavailable] Error",
+		"unrelated process":      strings.ReplaceAll(base, "cursor-agent exited", "local-tool exited"),
+		"tool quote":             strings.ReplaceAll(base, "cursor stderr: ", "cursor stderr: MCP server error: "),
+		"arbitrary unavailable":  cursorStartupError("RetriableError: [unavailable] Something else"),
+		"other DNS host":         cursorStartupError("Error: getaddrinfo ENOTFOUND tool.example"),
+		"unrelated exit":         cursorStartupError("arbitrary process failure"),
+		"auth":                   base + "\nAPI Error: 403 Forbidden",
+		"model":                  base + "\nunknown model",
+		"other provider error":   base + "\nAPI Error: request rejected",
+		"cancelled":              strings.ReplaceAll(base, "exited with error: exit status 1", "execution cancelled"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if CursorStartupNetworkFailure(raw) || Classify(raw) == ReasonAgentProviderNetwork {

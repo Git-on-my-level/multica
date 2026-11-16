@@ -528,6 +528,11 @@ func CursorStartupNetworkFailure(raw string) bool {
 	if !ok || !cursorStartupFailureHeader.MatchString(header) {
 		return false
 	}
+	// A failed stdin write can accompany a clean process exit. An exit-error
+	// wrapper, however, must still describe a nonzero process exit.
+	if strings.HasPrefix(header, "cursor-agent exited with error: ") && strings.Contains(header, ", exit_code=0,") {
+		return false
+	}
 	lines := strings.Split(strings.TrimSpace(stderr), "\n")
 	switch strings.TrimSpace(lines[0]) {
 	case "retriableerror: [unavailable] error",
@@ -545,7 +550,7 @@ func CursorStartupNetworkFailure(raw string) bool {
 }
 
 var cursorStartupFailureHeader = regexp.MustCompile(
-	`^cursor-agent (?:exited with error: exit status [1-9][0-9]*|prompt write failed: [^\n]+) \(result_seen=false, exit_code=[1-9][0-9]*, scanner_error=false, event_count=[0-9]+, invalid_event_count=0, last_event_type=(?:connection|none)\); actions completed before finalization may already have taken effect$`)
+	`^cursor-agent (?:exited with error: exit status [1-9][0-9]*|prompt write failed: [^\n]+) \(result_seen=false, exit_code=[0-9]+, scanner_error=false, event_count=[0-9]+, invalid_event_count=0, last_event_type=(?:connection|none)\); actions completed before finalization may already have taken effect$`)
 
 func cursorProviderStderr(lower string) (string, bool) {
 	if !strings.HasPrefix(lower, "cursor-agent exited with error: ") &&
