@@ -5825,9 +5825,12 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		return nil, err
 	}
 	if reason == string(taskfailure.ReasonRuntimeOffline) {
-		// Deferred retries do not occupy the queued-task unique slot. Lock the
-		// parent before checking all children, including cancelled recoveries.
-		current, err := qtx.GetAgentTaskForDelegatedFailureUpdate(ctx, parent.ID)
+		// Deferred retries do not occupy the queued-task unique slot. Serialize
+		// by parent without reversing the workspace-to-task teardown lock order.
+		if err := qtx.LockRuntimeOfflineRetryParent(ctx, parent.ID); err != nil {
+			return nil, err
+		}
+		current, err := qtx.GetAgentTask(ctx, parent.ID)
 		if err != nil {
 			return nil, err
 		}

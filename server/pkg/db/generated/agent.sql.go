@@ -4910,7 +4910,7 @@ SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
 `
 
 // A cancelled or completed recovery still consumes the one offline recovery.
-// Call after locking the parent to serialize concurrent reconciliation.
+// Call while holding LockRuntimeOfflineRetryParent.
 func (q *Queries) HasRuntimeOfflineRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, hasRuntimeOfflineRetryForParent, parentTaskID)
 	var exists bool
@@ -7040,6 +7040,17 @@ func (q *Queries) LockAgentTaskStartClaim(ctx context.Context, arg LockAgentTask
 		&i.WorkflowStep,
 	)
 	return i, err
+}
+
+const lockRuntimeOfflineRetryParent = `-- name: LockRuntimeOfflineRetryParent :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':runtime_offline_retry', 0))
+`
+
+// Serialize deferred recovery creation without taking a task-row lock ahead
+// of CreateRetryTask's workspace/owner fence (the teardown lock order).
+func (q *Queries) LockRuntimeOfflineRetryParent(ctx context.Context, taskID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockRuntimeOfflineRetryParent, taskID)
+	return err
 }
 
 const markAgentTaskWaitingLocalDirectory = `-- name: MarkAgentTaskWaitingLocalDirectory :one

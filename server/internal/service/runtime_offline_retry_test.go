@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -72,6 +74,7 @@ func TestRetryEligibleRuntimeOfflineReconciliation(t *testing.T) {
 			ctx := context.Background()
 			q := db.New(pool)
 			workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
+			fx := testutil.New(pool, workspaceID, userID)
 			var runtimeID string
 			if err := pool.QueryRow(ctx, `SELECT runtime_id::text FROM agent WHERE id=$1`, agentID).Scan(&runtimeID); err != nil {
 				t.Fatal(err)
@@ -80,15 +83,9 @@ func TestRetryEligibleRuntimeOfflineReconciliation(t *testing.T) {
 			issue = util.MustParseUUID(issueID)
 			if tc.chat {
 				issue = pgtype.UUID{}
-				if err := pool.QueryRow(ctx, `INSERT INTO chat_session (workspace_id, agent_id, creator_id, title) VALUES ($1,$2,$3,'offline recovery') RETURNING id`, workspaceID, agentID, userID).Scan(&chatID); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id=$1`, chatID) })
+				chatID = util.MustParseUUID(fx.Insert(t, "chat_session", testutil.Cols{"workspace_id": workspaceID, "agent_id": agentID, "creator_id": userID, "title": "offline recovery"}))
 			}
-			var parentID pgtype.UUID
-			if err := pool.QueryRow(ctx, `INSERT INTO agent_task_queue (agent_id,runtime_id,issue_id,chat_session_id,status,attempt,max_attempts,session_id,work_dir) VALUES ($1,$2,$3,$4,'running',1,5,'existing-session','/existing-workdir') RETURNING id`, agentID, runtimeID, issue, chatID).Scan(&parentID); err != nil {
-				t.Fatal(err)
-			}
+			parentID := util.MustParseUUID(fx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": issue, "chat_session_id": chatID, "status": "running", "attempt": 1, "max_attempts": 5, "session_id": "existing-session", "work_dir": "/existing-workdir"}))
 			t.Cleanup(func() {
 				pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id=$1 OR parent_task_id=$1`, parentID)
 			})
@@ -208,11 +205,13 @@ func TestRetryEligibleRuntimeOfflineFailureReport(t *testing.T) {
 			pool := newResolveOriginatorPool(t)
 			ctx := context.Background()
 			q := db.New(pool)
-			_, _, agentID, issueID := seedAttributionFixture(t, pool)
-			var parentID pgtype.UUID
-			if err := pool.QueryRow(ctx, `INSERT INTO agent_task_queue (agent_id,runtime_id,issue_id,status,attempt,max_attempts) SELECT id,runtime_id,$2,'running',1,2 FROM agent WHERE id=$1 RETURNING id`, agentID, issueID).Scan(&parentID); err != nil {
+			workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
+			fx := testutil.New(pool, workspaceID, userID)
+			agent, err := q.GetAgent(ctx, util.MustParseUUID(agentID))
+			if err != nil {
 				t.Fatal(err)
 			}
+			parentID := util.MustParseUUID(fx.Task(t, agentID, testutil.Cols{"runtime_id": agent.RuntimeID, "issue_id": issueID, "status": "running", "attempt": 1, "max_attempts": 2}))
 			t.Cleanup(func() {
 				pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id=$1 OR parent_task_id=$1`, parentID)
 			})
@@ -232,5 +231,69 @@ func TestRetryEligibleRuntimeOfflineFailureReport(t *testing.T) {
 				t.Fatalf("recovery children = %d, want %d", count, want)
 			}
 		})
+	}
+}
+
+func TestRetryEligibleRuntimeOfflineTeardownFence(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q := db.New(pool)
+	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
+	fx := testutil.New(pool, workspaceID, userID)
+	agent, err := q.GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := util.MustParseUUID(fx.Task(t, agentID, testutil.Cols{"runtime_id": agent.RuntimeID, "issue_id": issueID, "status": "failed", "failure_reason": "runtime_offline", "attempt": 1, "max_attempts": 2, "session_id": "existing-session"}))
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, parentID)
+	})
+	parent, err := q.GetAgentTask(ctx, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Rollback(context.Background())
+	var pid int
+	if err := fence.QueryRow(ctx, `SELECT pg_backend_pid() FROM workspace WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewTaskService(q, pool, nil, events.New())
+	type result struct {
+		child *db.AgentTaskQueue
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() { child, err := svc.MaybeRetryFailedTask(ctx, parent); done <- result{child, err} }()
+	defer func() {
+		fence.Rollback(context.Background())
+		r := <-done
+		if r.err != nil || r.child == nil {
+			t.Errorf("recovery after teardown rollback = %v, %v", r.child, r.err)
+		}
+	}()
+	// Wait until recovery is blocked by the workspace teardown fence, then
+	// prove teardown can still lock the parent without waiting on recovery.
+	for {
+		var blocked bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("recovery never reached the teardown fence")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	var locked pgtype.UUID
+	if err := fence.QueryRow(ctx, `SELECT id FROM agent_task_queue WHERE id=$1 FOR UPDATE NOWAIT`, parentID).Scan(&locked); err != nil {
+		t.Fatalf("recovery locked the task before its workspace fence: %v", err)
 	}
 }
