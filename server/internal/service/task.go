@@ -5324,12 +5324,13 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		}
 		if createRetry {
 			child, cerr := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-				NewTaskID:            dbid.NewV7(),
-				ID:                   taskID,
-				FireAt:               retryFireAt,
-				MaxAttempts:          retryMaxAttempts,
-				RuntimeMcpOverlay:    retryOverlay.Overlay,
-				RuntimeConnectedApps: retryOverlay.ConnectedApps,
+				NewTaskID:             dbid.NewV7(),
+				ID:                    taskID,
+				FireAt:                retryFireAt,
+				MaxAttempts:           retryMaxAttempts,
+				CursorStartupRecovery: taskfailure.CursorStartupNetworkFailure(errMsg),
+				RuntimeMcpOverlay:     retryOverlay.Overlay,
+				RuntimeConnectedApps:  retryOverlay.ConnectedApps,
 			})
 			switch {
 			case cerr == nil:
@@ -5600,11 +5601,20 @@ func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
 	return 0
 }
 
+// The marker is stored on the child, so even a different subsequent failure
+// cannot reopen this single-recovery budget through the generic retry policy.
+func isCursorStartupRecovery(task db.AgentTaskQueue) bool {
+	var ctx struct {
+		CursorStartupRecovery bool `json:"cursor_startup_recovery"`
+	}
+	return json.Unmarshal(task.Context, &ctx) == nil && ctx.CursorStartupRecovery
+}
+
 // These Cursor startup witnesses get one delayed recovery within the original
 // budget. Other provider-network failures retain their existing schedule.
 func taskRetryAttemptCeiling(reason string, task db.AgentTaskQueue) int32 {
 	if taskfailure.CursorStartupNetworkFailure(task.Error.String) {
-		return min(task.MaxAttempts, 2)
+		return task.MaxAttempts
 	}
 	return retryAttemptCeiling(reason, task.MaxAttempts)
 }
@@ -5688,10 +5698,10 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
-	return retryableReasons[failureReason] &&
+	return !isCursorStartupRecovery(t) && retryableReasons[failureReason] &&
 		t.Attempt < taskRetryAttemptCeiling(failureReason, t) &&
 		(!taskfailure.CursorStartupNetworkFailure(t.Error.String) ||
-			(t.SessionID.Valid && strings.TrimSpace(t.SessionID.String) != "" &&
+			(t.Attempt < 2 && t.SessionID.Valid && strings.TrimSpace(t.SessionID.String) != "" &&
 				!t.ForceFreshSession && !t.SessionRolloutMissing &&
 				!(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) &&
 				!ResumeUnsafeFailure(failureReason, t.Error.String) &&
@@ -5755,7 +5765,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	// Startup recovery is created atomically by FailTask. Replaying a failed
 	// parent here could duplicate its deferred child (which occupies no queued
 	// slot), resurrect a cancelled recovery, or retry historical runs.
-	if taskfailure.CursorStartupNetworkFailure(parent.Error.String) {
+	if taskfailure.CursorStartupNetworkFailure(parent.Error.String) || isCursorStartupRecovery(parent) {
 		return nil, nil
 	}
 	reason := ""

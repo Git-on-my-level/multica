@@ -2884,17 +2884,20 @@ SELECT
     p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN $2::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
-    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
+    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
+    CASE WHEN $3::boolean
+         THEN COALESCE(p.context, '{}'::jsonb) || '{"cursor_startup_recovery":true}'::jsonb
+         ELSE p.context END,
     CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' THEN NULL ELSE p.session_id END,
     p.work_dir,
-    p.attempt + 1, COALESCE($3::int, p.max_attempts), p.id,
+    p.attempt + 1, COALESCE($4::int, p.max_attempts), p.id,
     p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity',
     p.is_leader_task,
     p.squad_id,
     p.originator_user_id,
     p.accountable_user_id,
-    $4,
     $5,
+    $6,
     p.originator_source, p.delegated_from_task_id, p.rule_version_id,
     p.trigger_evidence_kind, p.trigger_evidence_ref_id, p.id,
     p.chat_input_task_id, $2,
@@ -2905,7 +2908,7 @@ SELECT
     -- A retry continues its parent's work, so it keeps the parent's step (MUL-7420).
     p.workflow_step,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
-    COALESCE($6::uuid, gen_random_uuid())
+    COALESCE($7::uuid, gen_random_uuid())
 FROM agent_task_queue p
 WHERE p.id = $1
   AND lock_task_owner_rows(p.agent_id, p.issue_id, p.runtime_id)
@@ -2916,12 +2919,13 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type CreateRetryTaskParams struct {
-	ID                   pgtype.UUID        `json:"id"`
-	FireAt               pgtype.Timestamptz `json:"fire_at"`
-	MaxAttempts          pgtype.Int4        `json:"max_attempts"`
-	RuntimeMcpOverlay    []byte             `json:"runtime_mcp_overlay"`
-	RuntimeConnectedApps []byte             `json:"runtime_connected_apps"`
-	NewTaskID            pgtype.UUID        `json:"new_task_id"`
+	ID                    pgtype.UUID        `json:"id"`
+	FireAt                pgtype.Timestamptz `json:"fire_at"`
+	CursorStartupRecovery bool               `json:"cursor_startup_recovery"`
+	MaxAttempts           pgtype.Int4        `json:"max_attempts"`
+	RuntimeMcpOverlay     []byte             `json:"runtime_mcp_overlay"`
+	RuntimeConnectedApps  []byte             `json:"runtime_connected_apps"`
+	NewTaskID             pgtype.UUID        `json:"new_task_id"`
 }
 
 // Clone an attempt with inherited attribution, planned comments, and input-batch
@@ -2940,10 +2944,13 @@ type CreateRetryTaskParams struct {
 // Chat retry priority keeps older input ahead of newer turns. A non-NULL fire_at
 // defers dispatch until promotion. max_attempts optionally persists the effective
 // ceiling; it does not re-enable tasks whose retry budget was disabled.
+// Cursor startup recovery marks its child context to prevent a later failure
+// reason from re-enabling retries through the generic network schedule.
 func (q *Queries) CreateRetryTask(ctx context.Context, arg CreateRetryTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, createRetryTask,
 		arg.ID,
 		arg.FireAt,
+		arg.CursorStartupRecovery,
 		arg.MaxAttempts,
 		arg.RuntimeMcpOverlay,
 		arg.RuntimeConnectedApps,

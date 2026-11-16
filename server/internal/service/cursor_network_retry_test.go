@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -65,6 +66,7 @@ func TestCursorStartupRetryPolicy(t *testing.T) {
 			want   bool
 		}{
 			{"issue", func(t *db.AgentTaskQueue) {}, "", true},
+			{"larger budget preserved", func(t *db.AgentTaskQueue) { t.MaxAttempts = 5 }, "", true},
 			{"chat", func(t *db.AgentTaskQueue) { t.ChatSessionID = t.IssueID; t.IssueID = pgtype.UUID{} }, "", true},
 			{"second attempt", func(t *db.AgentTaskQueue) { t.Attempt = 2 }, "", false},
 			{"larger budget still one recovery", func(t *db.AgentTaskQueue) { t.Attempt = 2; t.MaxAttempts = 5 }, "", false},
@@ -98,7 +100,7 @@ func TestCursorStartupRetryPolicy(t *testing.T) {
 					if taskRetryDelay(reason, task) != 5*time.Second {
 						t.Fatal("recovery must be deferred 5 seconds")
 					}
-					if taskRetryAttemptCeiling(reason, task) != 2 {
+					if taskRetryAttemptCeiling(reason, task) != task.MaxAttempts {
 						t.Fatal("recovery must not raise attempt budget")
 					}
 				}
@@ -135,6 +137,7 @@ func TestCursorStartupFailTaskRecovery(t *testing.T) {
 		{"dns pinned session", false, true, 2, true},
 		{"dns incoming resumed session", true, true, 2, true},
 		{"disabled budget", false, false, 1, false},
+		{"larger budget", false, false, 5, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bootstrap := testutil.New(pool, "", "")
@@ -146,7 +149,7 @@ func TestCursorStartupFailTaskRecovery(t *testing.T) {
 			runtimeID := fx.Runtime(t, "Cursor test runtime")
 			agentID := fx.Agent(t, "Cursor test agent", runtimeID)
 			issueID := fx.Issue(t, "Cursor startup failure")
-			cols := testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID, "status": "running", "attempt": 1, "max_attempts": tc.max, "work_dir": "/test/cursor-work"}
+			cols := testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID, "status": "running", "attempt": 1, "max_attempts": tc.max, "work_dir": "/test/cursor-work", "context": `{"existing_context":"kept"}`}
 			if !tc.incomingSession {
 				cols["session_id"] = "existing-cursor-session"
 			}
@@ -201,6 +204,22 @@ func TestCursorStartupFailTaskRecovery(t *testing.T) {
 			if !child.FireAt.Valid || child.FireAt.Time.Before(before.Add(5*time.Second)) || child.FireAt.Time.After(time.Now().Add(5*time.Second)) {
 				t.Fatalf("unexpected backoff: %+v", child.FireAt)
 			}
+			if !isCursorStartupRecovery(child) {
+				t.Fatal("recovery child has no durable cap marker")
+			}
+			var childContext map[string]any
+			if err := json.Unmarshal(child.Context, &childContext); err != nil || childContext["existing_context"] != "kept" {
+				t.Fatalf("recovery lost existing context: %s (%v)", child.Context, err)
+			}
+			// A different network failure must not activate the generic third tier.
+			raw = strings.ReplaceAll(raw, "RetriableError: [unavailable] Error", "RetriableError: Connection stalled")
+			raw = strings.ReplaceAll(raw, "Error: getaddrinfo ENOTFOUND api2.cursor.sh", "RetriableError: Connection stalled")
+			child.Error = pgtype.Text{String: raw, Valid: true}
+			child.FailureReason = pgtype.Text{String: taskfailure.ReasonAgentProviderNetwork.String(), Valid: true}
+			child.Status = "failed"
+			if next, err := svc.MaybeRetryFailedTask(ctx, child); err != nil || next != nil {
+				t.Fatalf("sweeper reopened recovery budget: %v %v", next, err)
+			}
 			fx.Exec(t, `UPDATE agent_task_queue SET status='running' WHERE id=$1`, childID)
 			if _, err := svc.FailTask(ctx, childID, raw, "", "", "", "agent_error.process_failure", false, "", ""); err != nil {
 				t.Fatal(err)
@@ -213,6 +232,23 @@ func TestCursorStartupFailTaskRecovery(t *testing.T) {
 			fx.Exec(t, `UPDATE agent_task_queue SET status='cancelled' WHERE id=$1`, childID)
 			if next, err := svc.MaybeRetryFailedTask(ctx, parent); err != nil || next != nil {
 				t.Fatalf("cancelled recovery resurrected: %v %v", next, err)
+			}
+		})
+	}
+}
+
+func TestCursorStartupRecoveryCannotReopenBudget(t *testing.T) {
+	t.Parallel()
+	task := db.AgentTaskQueue{Status: "failed", Attempt: 2, MaxAttempts: 5, IssueID: pgtype.UUID{Bytes: [16]byte{1}, Valid: true}, Context: []byte(`{"cursor_startup_recovery":true,"other":"preserved"}`)}
+	for reason := range retryableReasons {
+		t.Run(reason, func(t *testing.T) {
+			if retryEligible(reason, task) {
+				t.Fatal("startup recovery cannot receive another automatic attempt")
+			}
+			task.FailureReason = pgtype.Text{String: reason, Valid: true}
+			child, err := (&TaskService{}).MaybeRetryFailedTask(context.Background(), task)
+			if child != nil || err != nil {
+				t.Fatalf("sweeper reopened budget: %v %v", child, err)
 			}
 		})
 	}
