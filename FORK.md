@@ -13,6 +13,9 @@ This is a fork-only operational contract. Preserve it when merging upstream.
 - Manual issue-to-PR linking: authorization, canonical HTTPS URLs, explicit
   `close_intent`, member-owned overrides, already-merged evaluation, sibling
   PR gates, and safe unlinking.
+- Host-scoped custom runtime profiles: a daemon that does not have a profile's
+  command gets no offline runtime row for it (R24, 2026-11-16). A broken
+  per-machine path override is still recorded.
 - Migration collision registrations, fork self-host/Tailnet defaults, and
   `.goreleaser.fork.yml` for CLI releases without upstream Homebrew publishing.
 
@@ -31,8 +34,14 @@ Current isolated overlays:
 | Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
 | Event tables without capture | `9xxx` leftover tables; `9015` drops leftover capture triggers |
+| Host-scoped runtime profiles | `server/internal/handler/daemon_profile_fork.go` + one guard in the `DaemonRegister` failed-profile loop |
 | Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
 | ZCode (Z.ai) ACP family | `server/pkg/agent/zcode.go` + probe for `zcode-acp-server`; migration `9018` (port of upstream #6987, which numbers it 469) |
+
+The durable workspace event stream is **retired** (ruling R24, 2026-11-16), not
+paused: `multica event list|watch` returns nothing after the 2026-09-13 capture
+cutoff, and consumers (agentctl v0.21.13+, skills) read issue and task state
+directly. Do not build new consumers on it.
 
 Leftover `workspace_event_*` tables are fine. Do **not** re-enable
 `9012`/`415` capture triggers: they take a

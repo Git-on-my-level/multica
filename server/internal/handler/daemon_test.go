@@ -806,7 +806,7 @@ func TestDaemonRegister_RecordsRuntimeProfileRegistrationFailure(t *testing.T) {
 			{
 				"profile_id":   profileID,
 				"command_name": "missing-codex",
-				"reason":       "command not found on PATH: missing-codex",
+				"reason":       "Configured path override is not executable: /opt/missing-codex; command not found on PATH or provider discovery: missing-codex",
 			},
 		},
 	})
@@ -832,7 +832,7 @@ func TestDaemonRegister_RecordsRuntimeProfileRegistrationFailure(t *testing.T) {
 	if meta["runtime_profile_registration_error"] != true {
 		t.Fatalf("registration error metadata missing: %#v", meta)
 	}
-	if meta["runtime_profile_failure_reason"] != "command not found on PATH: missing-codex" {
+	if meta["runtime_profile_failure_reason"] != "Configured path override is not executable: /opt/missing-codex; command not found on PATH or provider discovery: missing-codex" {
 		t.Fatalf("failure reason metadata = %#v", meta["runtime_profile_failure_reason"])
 	}
 	// This row is written AFTER the successful runtimes of the same request, so
