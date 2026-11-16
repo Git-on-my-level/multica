@@ -57,6 +57,25 @@ func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
 			}
 		})
 	}
+	for _, signal := range []string{"401 unauthorized", "403 forbidden", "invalid API key", "refresh token expired", "HTTP 402", "monthly usage limit reached", "You've hit your session limit", "You've hit your weekly limit", "insufficient_balance"} {
+		for _, mixed := range []string{signal + ": " + raw, raw + " " + signal} {
+			for _, chat := range []bool{false, true} {
+				task := base
+				task.Error.String = mixed
+				if chat {
+					task.IssueID = pgtype.UUID{}
+					task.ChatSessionID = id
+				}
+				// Test the raw-text guard even when normalization was bypassed and the
+				// stored reason still claims this was a capacity failure.
+				for _, reported := range []string{reason, taskfailure.Classify(mixed).String(), taskfailure.NormalizeDaemonReason("agent_error.context_overflow", mixed).String()} {
+					if retryEligible(reported, task) {
+						t.Errorf("mixed auth/quota retried: reason=%s chat=%v error=%q", reported, chat, mixed)
+					}
+				}
+			}
+		}
+	}
 	for _, text := range []string{"HTTP 429", "monthly usage limit", "You've hit your session limit", "401 unauthorized", "maximum context length: token limit", "Rate limit exceeded", "concurrent request limit"} {
 		task := base
 		task.Error.String = text

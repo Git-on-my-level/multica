@@ -5673,7 +5673,8 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 	if failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) &&
-		(!taskfailure.PerMinuteRateLimit(t.Error.String) || t.Attempt != 1 ||
+		(!taskfailure.PerMinuteRateLimit(t.Error.String) ||
+			taskfailure.Classify(t.Error.String) != taskfailure.ReasonAgentProviderCapacityOrRateLimit || t.Attempt != 1 ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) || ResumeUnsafeFailure(failureReason, t.Error.String)) {
 		return false
 	}

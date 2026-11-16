@@ -44,6 +44,48 @@ var (
 	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9a-z])(429|529)([^0-9a-z]|$)`)
 )
 
+// Share these signals with the per-minute rule so auth/quota exclusions use
+// the same witnesses as the ordinary classifier branches.
+func isProviderAuthOrAccess(lower string) bool {
+	return httpAuthCodeRe.MatchString(lower) ||
+		containsAny(lower,
+			"unauthorized",
+			"login required",
+			"not logged in",
+			"please login again",
+			"refresh token",
+			"invalid api key",
+			"access token",
+			"subscription access",
+			"does not have access",
+			"you may not have access",
+		)
+}
+
+func isProviderQuotaLimit(lower string) bool {
+	return httpQuotaCodeRe.MatchString(lower) ||
+		containsAny(lower,
+			"insufficient_balance",
+			"balance is too low",
+			"monthly usage limit",
+			"usage limit",
+			"you've hit your limit",
+			// Curly apostrophe variant: providers and copy-pasted error
+			// strings sometimes use U+2019 instead of ASCII '. SQL ILIKE
+			// would not match the curly form either, so this is a small
+			// in-flight improvement on top of the SQL classifier.
+			"you\u2019ve hit your limit",
+			// Claude Code's subscription windows: "You've hit your session
+			// limit \u00b7 resets 2pm (UTC)" and "You've hit your weekly limit
+			// \u00b7 resets <date>". Matched without the apostrophe so both
+			// quote forms land here.
+			"hit your session limit",
+			"hit your weekly limit",
+			"credits",
+			"quota",
+		)
+}
+
 // PerMinuteRateLimit identifies the explicit transient uncached-input throttle.
 // A generic 429 or quota limit is not enough evidence to retry a provider call.
 func PerMinuteRateLimit(raw string) bool {
@@ -123,7 +165,18 @@ func Classify(rawError string) Reason {
 
 	switch {
 	case PerMinuteRateLimit(lower):
-		return ReasonAgentProviderCapacityOrRateLimit
+		// The token/minute witness beats the generic token-window heuristic,
+		// but it must never turn an auth or quota failure into a retry.
+		switch {
+		case isUsageLimit403(lower):
+			return ReasonAgentProviderQuotaLimit
+		case isProviderAuthOrAccess(lower):
+			return ReasonAgentProviderAuthOrAccess
+		case isProviderQuotaLimit(lower):
+			return ReasonAgentProviderQuotaLimit
+		default:
+			return ReasonAgentProviderCapacityOrRateLimit
+		}
 
 	// A concurrent-request rejection can contain both "access token" and HTTP
 	// 403. Its specific semantic witness must beat the broader context and auth
@@ -172,44 +225,12 @@ func Classify(rawError string) Reason {
 	//    / lacks access to the model. Status codes use an alphanumeric
 	//    boundary so "4030" / "1401ms" / a hex ID containing "401"
 	//    don't spuriously land here.
-	case httpAuthCodeRe.MatchString(lower),
-		containsAny(lower,
-			"unauthorized",
-			"login required",
-			"not logged in",
-			"please login again",
-			"refresh token",
-			"invalid api key",
-			"access token",
-			"subscription access",
-			"does not have access",
-			"you may not have access",
-		):
+	case isProviderAuthOrAccess(lower):
 		return ReasonAgentProviderAuthOrAccess
 
 	// 4. Quota / billing. 402 / insufficient balance / monthly usage
 	//    limit / credits exhausted.
-	case httpQuotaCodeRe.MatchString(lower),
-		containsAny(lower,
-			"insufficient_balance",
-			"balance is too low",
-			"monthly usage limit",
-			"usage limit",
-			"you've hit your limit",
-			// Curly apostrophe variant: providers and copy-pasted error
-			// strings sometimes use U+2019 instead of ASCII '. SQL ILIKE
-			// would not match the curly form either, so this is a small
-			// in-flight improvement on top of the SQL classifier.
-			"you\u2019ve hit your limit",
-			// Claude Code's subscription windows: "You've hit your session
-			// limit \u00b7 resets 2pm (UTC)" and "You've hit your weekly limit
-			// \u00b7 resets <date>". Matched without the apostrophe so both
-			// quote forms land here.
-			"hit your session limit",
-			"hit your weekly limit",
-			"credits",
-			"quota",
-		):
+	case isProviderQuotaLimit(lower):
 		return ReasonAgentProviderQuotaLimit
 
 	// 5. Capacity / rate limit. 429 / 529 / overloaded / rate limit.
@@ -749,9 +770,9 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 		return ReasonEnvironmentPrepareFailed
 	}
 	switch Reason(reason) {
-	case ReasonAgentContextOverflow, ReasonAgentUnknown, Reason("agent_error"):
+	case ReasonAgentContextOverflow, ReasonAgentUnknown, ReasonAgentProviderCapacityOrRateLimit, Reason("agent_error"):
 		if PerMinuteRateLimit(rawError) {
-			return ReasonAgentProviderCapacityOrRateLimit
+			return Classify(rawError)
 		}
 	}
 
