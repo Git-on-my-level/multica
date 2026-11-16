@@ -1041,6 +1041,7 @@ func (f *delegatedFailureFixture) insertOrphanedWorkerTask(t *testing.T, attempt
 		"accountable_user_id": f.userID,
 		"originator_source":   "direct_human",
 		"failure_reason":      "runtime_recovery",
+		"session_id":          "orphaned-worker-session",
 		"error":               "daemon restarted while task was in flight",
 		"completed_at":        dbfx.Raw("now()"),
 	})
