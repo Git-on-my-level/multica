@@ -5690,7 +5690,7 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 		// Recovery continues one interrupted conversation; never open a fresh
 		// session or extend a chain already on its second attempt.
 		if t.Attempt >= 2 || !t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
-			t.SessionRolloutMissing || t.ForceFreshSession ||
+			t.SessionRolloutMissing || IsFreshRerun(t) || (t.ForceFreshSession && !t.RerunOfTaskID.Valid) ||
 			(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) ||
 			ResumeUnsafeFailure(failureReason, t.Error.String) ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) {

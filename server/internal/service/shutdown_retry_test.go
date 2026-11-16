@@ -53,6 +53,12 @@ func TestRetryEligibleDaemonShutdown(t *testing.T) {
 		{"empty session", func(t *db.AgentTaskQueue) { t.SessionID.String = " " }, false},
 		{"rollout missing", func(t *db.AgentTaskQueue) { t.SessionRolloutMissing = true }, false},
 		{"fresh session", func(t *db.AgentTaskQueue) { t.ForceFreshSession = true }, false},
+		{"ordinary manual rerun", func(t *db.AgentTaskQueue) { t.ForceFreshSession = true; t.RerunOfTaskID.Valid = true }, true},
+		{"explicit fresh rerun", func(t *db.AgentTaskQueue) {
+			t.ForceFreshSession = true
+			t.RerunOfTaskID.Valid = true
+			t.Context = []byte(`{"fresh_rerun":true}`)
+		}, false},
 		{"retired session", func(t *db.AgentTaskQueue) { t.RetiredSessionID = t.SessionID }, false},
 		{"poisoned history", func(t *db.AgentTaskQueue) {
 			t.Error = pgtype.Text{String: "daemon shut down while task was in flight; 400 invalid_request_error", Valid: true}
