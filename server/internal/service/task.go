@@ -5161,7 +5161,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 				// Defer this attempt when the reason's schedule calls for a backoff
 				// (provider_network's final attempt waits ~5s); a zero delay leaves
 				// fire_at NULL so the child is created immediately-claimable.
-				if delay := retryDelayForAttempt(failureReason, parent.Attempt); delay > 0 {
+				if delay := retryDelayForTask(failureReason, parent); delay > 0 {
 					retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 				}
 				if agent, aerr := s.Queries.GetAgent(ctx, parent.AgentID); aerr != nil {
@@ -5662,6 +5662,19 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 	return taskfailure.UnresumableHistory(errorText)
 }
 
+// Startup orphan recovery predates graceful shutdown reports and also handles
+// work that never launched. Keep its sessionless recovery policy unchanged.
+func isDaemonShutdownRecovery(reason string, t db.AgentTaskQueue) bool {
+	return reason == string(taskfailure.ReasonRuntimeRecovery) && strings.HasPrefix(t.Error.String, "daemon shut down while task")
+}
+
+func retryDelayForTask(reason string, t db.AgentTaskQueue) time.Duration {
+	if reason == string(taskfailure.ReasonRuntimeRecovery) && !isDaemonShutdownRecovery(reason, t) {
+		return 0
+	}
+	return retryDelayForAttempt(reason, t.Attempt)
+}
+
 // retryEligible reports whether a failed task qualifies for an automatic retry
 // attempt: an infrastructure-shaped failure_reason, remaining attempt budget,
 // not an autopilot run, not a Triage run, and linked to an issue or chat
@@ -5673,7 +5686,7 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
-	if failureReason == string(taskfailure.ReasonRuntimeRecovery) {
+	if isDaemonShutdownRecovery(failureReason, t) {
 		// Recovery continues one interrupted conversation; never open a fresh
 		// session or extend a chain already on its second attempt.
 		if t.Attempt >= 2 || !t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
@@ -5788,7 +5801,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	// NULL for an immediate child), and write the reason-aware ceiling into the
 	// child's max_attempts so the retry chain stays self-consistent.
 	var retryFireAt pgtype.Timestamptz
-	if delay := retryDelayForAttempt(reason, parent.Attempt); delay > 0 {
+	if delay := retryDelayForTask(reason, parent); delay > 0 {
 		retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	}
 	// Same advisory slot check as FailTask's path, for the same reason: skip the
