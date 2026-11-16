@@ -112,7 +112,7 @@ func TestCursorStartupRetryPolicy(t *testing.T) {
 func TestCursorStartupSweeperDoesNotReplay(t *testing.T) {
 	t.Parallel()
 	svc := &TaskService{}
-	parent := db.AgentTaskQueue{Status: "failed", Attempt: 1, MaxAttempts: 2, Error: pgtype.Text{String: cursorStartupFailure, Valid: true}, FailureReason: pgtype.Text{String: taskfailure.ReasonAgentProviderNetwork.String(), Valid: true}}
+	parent := db.AgentTaskQueue{Status: "failed", Attempt: 1, MaxAttempts: 2, IssueID: pgtype.UUID{Bytes: [16]byte{1}, Valid: true}, SessionID: pgtype.Text{String: "existing-cursor-session", Valid: true}, Error: pgtype.Text{String: cursorStartupFailure, Valid: true}, FailureReason: pgtype.Text{String: taskfailure.ReasonAgentProviderNetwork.String(), Valid: true}}
 	child, err := svc.MaybeRetryFailedTask(context.Background(), parent)
 	if err != nil || child != nil {
 		t.Fatalf("sweeper must not duplicate atomic startup recovery: child=%v err=%v", child, err)
