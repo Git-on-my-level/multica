@@ -22,6 +22,11 @@ func TestClassifyPerMinuteRateLimit(t *testing.T) {
 			}
 		}
 	}
+	for _, old := range []string{"agent_error.context_overflow", "agent_error.unknown", "agent_error"} {
+		if got := NormalizeDaemonReason(old, "prepare execution environment: "+witness); got != ReasonEnvironmentPrepareFailed {
+			t.Errorf("preparation failure lost precedence: %s", got)
+		}
+	}
 	for _, tc := range []struct {
 		raw  string
 		want Reason

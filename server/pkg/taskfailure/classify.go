@@ -676,13 +676,6 @@ var legacyUsageLimit403Reasons = map[string]bool{
 // can be deleted once no daemon old enough to produce its wire shape is still
 // reporting.
 func NormalizeDaemonReason(reason, rawError string) Reason {
-	switch Reason(reason) {
-	case ReasonAgentContextOverflow, ReasonAgentUnknown, Reason("agent_error"):
-		if PerMinuteRateLimit(rawError) {
-			return ReasonAgentProviderCapacityOrRateLimit
-		}
-	}
-
 	if legacyConcurrentRequestLimitReasons[reason] &&
 		strings.Contains(strings.ToLower(rawError), concurrentRequestLimitWitness) {
 		return ReasonAgentProviderCapacityOrRateLimit
@@ -755,6 +748,13 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 	if isAgentSideReason(reason) && hasAnyPrefix(lowerError, legacyEnvironmentPrepareWitnesses...) {
 		return ReasonEnvironmentPrepareFailed
 	}
+	switch Reason(reason) {
+	case ReasonAgentContextOverflow, ReasonAgentUnknown, Reason("agent_error"):
+		if PerMinuteRateLimit(rawError) {
+			return ReasonAgentProviderCapacityOrRateLimit
+		}
+	}
+
 	return Reason(reason)
 }
 
