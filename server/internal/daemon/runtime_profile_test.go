@@ -301,9 +301,11 @@ func TestRegisterRuntimes_ProfileReusesDiscoveredProviderCommand(t *testing.T) {
 	}
 }
 
-// TestRegisterRuntimes_ReportsProfileNotOnPath verifies a profile whose command
-// is missing on this host is reported to the server as a failed profile so the
-// UI can show an actionable registration error.
+// TestRegisterRuntimes_SkipsProfileNotOnPath verifies a profile whose command
+// is missing on this host is not registered and is reported as a failed
+// profile. The fork server drops reports whose reason starts with "command not
+// found on PATH" (handler/daemon_profile_fork.go, R24) instead of storing an
+// offline row, so the reason prefix asserted here is a cross-package contract.
 func TestRegisterRuntimes_SkipsProfileNotOnPath(t *testing.T) {
 	t.Cleanup(stubAgentVersion(t))
 	stubLookPath(t, map[string]string{}) // nothing resolves
@@ -335,6 +337,9 @@ func TestRegisterRuntimes_SkipsProfileNotOnPath(t *testing.T) {
 	}
 	if len(fx.sentFailures) != 1 || fx.sentFailures[0]["profile_id"] != "prof-1" {
 		t.Fatalf("sent failures = %+v, want prof-1", fx.sentFailures)
+	}
+	if reason, _ := fx.sentFailures[0]["reason"].(string); !strings.HasPrefix(reason, "command not found on PATH") {
+		t.Fatalf("missing-command reason = %q; the fork server matches the prefix %q", reason, "command not found on PATH")
 	}
 }
 

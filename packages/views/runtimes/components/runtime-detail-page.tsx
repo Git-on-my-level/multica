@@ -49,6 +49,7 @@ import {
 import { RenameMachineDialog } from "./rename-machine-dialog";
 import { RuntimeProfilesDialog } from "./runtime-profiles-dialog";
 import { pendingRuntimesForProfiles } from "./pending-runtime";
+import { profilesAwaitingFirstSync } from "./pending-runtime-fork";
 import {
   MachineCliSection,
   machineHasCliInfo,
@@ -179,7 +180,7 @@ export function RuntimeDetailPage({
     if (!baseMachine) return [];
     if (baseMachine.mode !== "local") return baseMachine.runtimes;
     return pendingRuntimesForProfiles({
-      pendingProfiles: profileRows,
+      pendingProfiles: profilesAwaitingFirstSync(profileRows, Date.now()),
       runtimes: baseMachine.runtimes,
       localDaemonId: baseMachine.daemonId,
       localMachineName: baseMachine.title,

@@ -14,8 +14,11 @@ This is a fork-only operational contract. Preserve it when merging upstream.
   `close_intent`, member-owned overrides, already-merged evaluation, sibling
   PR gates, and safe unlinking.
 - Host-scoped custom runtime profiles: a daemon that does not have a profile's
-  command gets no offline runtime row for it (R24, 2026-11-16). A broken
-  per-machine path override is still recorded.
+  command gets no offline runtime row for it, and the machine page shows the
+  "waiting for daemon sync" placeholder only for ten minutes after a profile
+  changes (R24, 2026-11-16). A broken per-machine path override is still
+  recorded. A provisioned host that later loses the command is also silent; its
+  old row goes offline through the heartbeat sweeper.
 - Migration collision registrations, fork self-host/Tailnet defaults, and
   `.goreleaser.fork.yml` for CLI releases without upstream Homebrew publishing.
 
@@ -34,7 +37,7 @@ Current isolated overlays:
 | Manual PR link/handoff | `server/internal/handler/github_handoff.go` + link/unlink in `github.go` |
 | Fork install URLs | `MULTICA_GITHUB_*` in handler config / helm / compose |
 | Event tables without capture | `9xxx` leftover tables; `9015` drops leftover capture triggers |
-| Host-scoped runtime profiles | `server/internal/handler/daemon_profile_fork.go` + one guard in the `DaemonRegister` failed-profile loop |
+| Host-scoped runtime profiles | `server/internal/handler/daemon_profile_fork.go` + one guard in the `DaemonRegister` failed-profile loop; `packages/views/runtimes/components/pending-runtime-fork.ts` + one filter in `runtime-detail-page.tsx` |
 | Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
 | ZCode (Z.ai) ACP family | `server/pkg/agent/zcode.go` + probe for `zcode-acp-server`; migration `9018` (port of upstream #6987, which numbers it 469) |
 

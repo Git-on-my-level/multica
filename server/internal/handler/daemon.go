@@ -979,13 +979,14 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		if profileID == "" {
 			continue
 		}
-		if isUnprovisionedProfileFailure(failed.Reason) {
-			// Fork: the host is not provisioned for this profile (daemon_profile_fork.go).
-			continue
-		}
 		profileUUID, pok := parseUUIDOrBadRequest(w, profileID, "profile_id")
 		if !pok {
 			return
+		}
+		if isUnprovisionedProfileFailure(failed.Reason) {
+			// Fork: the host is not provisioned for this profile (daemon_profile_fork.go).
+			logUnprovisionedProfile(req.WorkspaceID, req.DaemonID, profileID, failed.CommandName)
+			continue
 		}
 		reason := strings.TrimSpace(failed.Reason)
 		if reason == "" {
