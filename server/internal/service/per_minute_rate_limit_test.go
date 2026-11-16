@@ -1,15 +1,21 @@
 package service
 
 import (
+	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
+	dbfx "github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
+	t.Run("failure lifecycle and chat ordering", testPerMinuteRateLimitLifecycle)
 	const raw = "provider.rate-limit: Rate limit exceeded. Please slow down your requests. Limit: 24290 uncached input tokens/minute."
 	reason := taskfailure.NormalizeDaemonReason("agent_error.context_overflow", raw).String()
 	if ResumeUnsafeFailure(reason, raw) {
@@ -60,5 +66,74 @@ func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
 		if retryEligible(reason, task) {
 			t.Errorf("capacity reason alone retried: %q", text)
 		}
+	}
+}
+
+// Chat backoff preserves the existing scheduling contract: newer input can run
+// during the cooldown, and the retry retains its original input owner.
+func testPerMinuteRateLimitLifecycle(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL must explicitly select a managed test database")
+	}
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	fx := dbfx.New(pool, workspaceID, userID)
+	var runtimeID string
+	fx.QueryRow(t, `SELECT runtime_id::text FROM agent WHERE id=$1`, agentID).Scan(&runtimeID)
+	fx.Exec(t, `UPDATE agent_runtime SET status='online', last_seen_at=now() WHERE id=$1`, runtimeID)
+	chatID := fx.ChatSession(t, agentID)
+	parentID := fx.Task(t, agentID, dbfx.Cols{
+		"runtime_id": runtimeID, "chat_session_id": chatID, "status": "running",
+		"attempt": 1, "max_attempts": 5, "session_id": "existing-session", "work_dir": "/test/workdir",
+	})
+	fx.Exec(t, `UPDATE agent_task_queue SET chat_input_task_id=id WHERE id=$1`, parentID)
+	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, parentID)
+	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
+	const raw = "provider.rate-limit: Rate limit exceeded. Please slow down your requests. Limit: 24290 uncached input tokens/minute."
+	start := time.Now()
+	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", "agent_error.context_overflow", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var childID string
+	fx.QueryRow(t, `SELECT id::text FROM agent_task_queue WHERE parent_task_id=$1`, parentID).Scan(&childID)
+	child, err := q.GetAgentTask(ctx, util.MustParseUUID(childID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Status != "deferred" || !child.FireAt.Valid || child.FireAt.Time.Before(start.Add(60*time.Second)) {
+		t.Fatalf("retry must be deferred >=60s: status=%s fire_at=%v", child.Status, child.FireAt)
+	}
+	if child.Attempt != 2 || child.MaxAttempts != 5 || child.SessionID.String != "existing-session" || child.ForceFreshSession || child.ChatInputTaskID != util.MustParseUUID(parentID) {
+		t.Fatalf("retry inheritance changed: attempt=%d max=%d session=%s fresh=%v input=%v", child.Attempt, child.MaxAttempts, child.SessionID.String, child.ForceFreshSession, child.ChatInputTaskID)
+	}
+	// A replay of the failure notification must not create another pending child.
+	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", "agent_error.context_overflow", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := fx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, parentID); n != 1 {
+		t.Fatalf("retry children=%d, want 1", n)
+	}
+	newerID := fx.Task(t, agentID, dbfx.Cols{"runtime_id": runtimeID, "chat_session_id": chatID, "status": "queued"})
+	fx.Exec(t, `UPDATE agent_task_queue SET chat_input_task_id=id WHERE id=$1`, newerID)
+	claimed, err := q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{AgentID: util.MustParseUUID(agentID), RuntimeID: util.MustParseUUID(runtimeID), PrepareLeaseSecs: 60, RuntimeStaleSecs: RuntimeClaimFreshnessSeconds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ID != util.MustParseUUID(newerID) {
+		t.Fatalf("claimed %v, want newer turn %s during backoff", claimed.ID, newerID)
+	}
+	if claimed.ChatInputTaskID == child.ChatInputTaskID {
+		t.Fatal("distinct chat turns must keep distinct input owners")
+	}
+	// Even a larger inherited budget must not permit a second throttle retry.
+	fx.Exec(t, `UPDATE agent_task_queue SET status='completed' WHERE id=$1`, newerID)
+	fx.Exec(t, `UPDATE agent_task_queue SET status='running' WHERE id=$1`, childID)
+	if _, err := svc.FailTask(ctx, child.ID, raw, "existing-session", "/test/workdir", "", "", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := fx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, childID); n != 0 {
+		t.Fatalf("unexpected second retry: %d", n)
 	}
 }
