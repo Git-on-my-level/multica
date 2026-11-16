@@ -221,7 +221,7 @@ func TestRetryEligibleDaemonShutdownChatOrdering(t *testing.T) {
 			parent := fx.Task(t, agent, testutil.Cols{"runtime_id": runtime, "chat_session_id": chat, "status": "running", "attempt": 1, "max_attempts": 2})
 			fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, parent)
 			// The queued follow-up exists before the callback inserts its recovery child.
-			followup := fx.Task(t, agent, testutil.Cols{"runtime_id": runtime, "chat_session_id": chat, "status": "queued", "priority": 0})
+			followup := fx.Task(t, agent, testutil.Cols{"runtime_id": runtime, "chat_session_id": chat, "status": "queued", "priority": 4})
 			q := db.New(pool)
 			svc := NewTaskService(q, pool, nil, events.New())
 			if _, err := svc.FailTask(ctx, util.MustParseUUID(parent), "daemon shut down while task was in flight", "existing-session", "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {

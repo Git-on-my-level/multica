@@ -1587,14 +1587,15 @@ WHERE id = (
               )
             )
       )
-      -- A shutdown retry retains the interrupted chat turn's place while
-      -- waiting for health-gated promotion. Follow-up turns must not overtake it.
+      -- A shutdown retry retains the interrupted chat turn's place through
+      -- promotion and claim, even when a follow-up has higher priority.
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue recovery
           JOIN agent_task_queue interrupted ON interrupted.id = recovery.parent_task_id
           WHERE recovery.agent_id = atq.agent_id
             AND recovery.chat_session_id = atq.chat_session_id
-            AND recovery.status = 'deferred'
+            AND recovery.status IN ('deferred', 'queued')
+            AND recovery.id <> atq.id
             AND interrupted.failure_reason = 'runtime_recovery'
       )
     ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC
