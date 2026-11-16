@@ -1,13 +1,20 @@
 package service
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-func TestShutdownRetryUsesExistingBudgetAndSessionPolicy(t *testing.T) {
+func TestRetryEligibleDaemonShutdownBudget(t *testing.T) {
 	for _, tc := range []struct {
 		reason       string
 		attempt, max int32
@@ -18,7 +25,7 @@ func TestShutdownRetryUsesExistingBudgetAndSessionPolicy(t *testing.T) {
 		{"runtime_recovery", 1, 1, false},
 		{"cancelled", 1, 2, false},
 	} {
-		task := db.AgentTaskQueue{Attempt: tc.attempt, MaxAttempts: tc.max, IssueID: pgtype.UUID{Valid: true}}
+		task := db.AgentTaskQueue{Attempt: tc.attempt, MaxAttempts: tc.max, IssueID: pgtype.UUID{Valid: true}, SessionID: pgtype.Text{String: "existing-session", Valid: true}}
 		if got := retryEligible(tc.reason, task); got != tc.want {
 			t.Errorf("retryEligible(%s, %d/%d) = %v, want %v", tc.reason, tc.attempt, tc.max, got, tc.want)
 		}
@@ -28,5 +35,123 @@ func TestShutdownRetryUsesExistingBudgetAndSessionPolicy(t *testing.T) {
 	}
 	if resumeUnsafeFailureReason("runtime_recovery") {
 		t.Fatal("shutdown must preserve the resumable session")
+	}
+}
+
+func TestRetryEligibleDaemonShutdown(t *testing.T) {
+	base := db.AgentTaskQueue{Attempt: 1, MaxAttempts: 2, IssueID: pgtype.UUID{Valid: true}, SessionID: pgtype.Text{String: "existing-session", Valid: true}}
+	for _, tc := range []struct {
+		name   string
+		change func(*db.AgentTaskQueue)
+		want   bool
+	}{
+		{"issue", func(*db.AgentTaskQueue) {}, true},
+		{"chat", func(t *db.AgentTaskQueue) { t.IssueID.Valid = false; t.ChatSessionID.Valid = true }, true},
+		{"missing session", func(t *db.AgentTaskQueue) { t.SessionID.Valid = false }, false},
+		{"empty session", func(t *db.AgentTaskQueue) { t.SessionID.String = " " }, false},
+		{"rollout missing", func(t *db.AgentTaskQueue) { t.SessionRolloutMissing = true }, false},
+		{"fresh session", func(t *db.AgentTaskQueue) { t.ForceFreshSession = true }, false},
+		{"retired session", func(t *db.AgentTaskQueue) { t.RetiredSessionID = t.SessionID }, false},
+		{"poisoned history", func(t *db.AgentTaskQueue) { t.Error = pgtype.Text{String: "400 invalid_request_error", Valid: true} }, false},
+		{"exhausted budget", func(t *db.AgentTaskQueue) { t.Attempt = 2 }, false},
+		{"disabled budget", func(t *db.AgentTaskQueue) { t.MaxAttempts = 1 }, false},
+		{"one recovery even with larger budget", func(t *db.AgentTaskQueue) { t.Attempt = 2; t.MaxAttempts = 5 }, false},
+		{"autopilot", func(t *db.AgentTaskQueue) { t.AutopilotRunID.Valid = true }, false},
+		{"triage", func(t *db.AgentTaskQueue) { t.Context = []byte(`{"type":"triage"}`) }, false},
+		{"unlinked", func(t *db.AgentTaskQueue) { t.IssueID.Valid = false }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := base
+			tc.change(&task)
+			if got := retryEligible("runtime_recovery", task); got != tc.want {
+				t.Fatalf("eligible = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	if delay := retryDelayForAttempt("runtime_recovery", 1); delay <= 0 {
+		t.Fatal("daemon-wide recovery must be deferred")
+	}
+	for _, reason := range []string{"cancelled", "agent_error.unknown", "agent_error.provider_auth"} {
+		if retryEligible(reason, base) {
+			t.Fatalf("unexpected retry for %s", reason)
+		}
+	}
+}
+
+func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
+	for _, callback := range []bool{true, false} {
+		for _, chat := range []bool{false, true} {
+			t.Run(fmt.Sprintf("callback=%v/chat=%v", callback, chat), func(t *testing.T) {
+				ctx := context.Background()
+				pool := sharedTestPool(t)
+				bootstrap := testutil.New(pool, "", "")
+				suffix := time.Now().UnixNano()
+				user := bootstrap.User(t, "shutdown-owner", fmt.Sprintf("shutdown-%d@example.com", suffix))
+				workspace := bootstrap.Workspace(t, "shutdown recovery", fmt.Sprintf("shutdown-%d", suffix))
+				fx := testutil.New(pool, workspace, user)
+				fx.Member(t, workspace, user, "owner")
+				runtime := fx.Runtime(t, "shutdown runtime")
+				agent := fx.Agent(t, "shutdown agent", runtime)
+				cols := testutil.Cols{"runtime_id": runtime, "status": "running", "attempt": 1, "max_attempts": 2}
+				if chat {
+					cols["chat_session_id"] = fx.ChatSession(t, agent)
+				} else {
+					cols["issue_id"] = fx.Issue(t, "interrupted work")
+				}
+				parent := fx.Task(t, agent, cols)
+				fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id = $1`, parent)
+				q := db.New(pool)
+				svc := NewTaskService(q, pool, nil, events.New())
+				parentUUID := util.MustParseUUID(parent)
+				if callback {
+					if _, err := svc.FailTask(ctx, parentUUID, "daemon shut down while task was in flight", "existing-session", "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					fx.Exec(t, `UPDATE agent_task_queue SET session_id = 'existing-session', work_dir = '/tmp/existing-work' WHERE id = $1`, parentUUID)
+					lost, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
+					if err != nil || len(lost) != 1 {
+						t.Fatalf("recover orphan: %v, %v", lost, err)
+					}
+					if child, err := svc.MaybeRetryFailedTask(ctx, lost[0]); err != nil || child == nil {
+						t.Fatalf("recover interrupted attempt: %v, %v", child, err)
+					}
+				}
+				failed, err := q.GetAgentTask(ctx, parentUUID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var wg sync.WaitGroup
+				for i := 0; i < 2; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if child, err := svc.MaybeRetryFailedTask(ctx, failed); err != nil || child != nil {
+							t.Errorf("repeated recovery = %v, %v", child, err)
+						}
+					}()
+				}
+				wg.Wait()
+				var count int
+				fx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id = $1`, parent).Scan(&count)
+				if count != 1 {
+					t.Fatalf("children = %d, want 1", count)
+				}
+				var childID pgtype.UUID
+				fx.QueryRow(t, `SELECT id FROM agent_task_queue WHERE parent_task_id = $1`, parent).Scan(&childID)
+				child, err := q.GetAgentTask(ctx, childID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if child.Status != "deferred" || !child.FireAt.Valid || child.Attempt != 2 || child.MaxAttempts != 2 || child.SessionID.String != "existing-session" || child.WorkDir.String != "/tmp/existing-work" || child.ForceFreshSession || child.RuntimeID != failed.RuntimeID {
+					t.Fatalf("invalid recovery child: %+v", child)
+				}
+				// Explicitly cancelling the child consumes recovery, including for chat.
+				fx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled' WHERE id = $1`, childID)
+				if retry, err := svc.MaybeRetryFailedTask(ctx, failed); err != nil || retry != nil {
+					t.Fatalf("cancelled recovery recreated: %v, %v", retry, err)
+				}
+			})
+		}
 	}
 }

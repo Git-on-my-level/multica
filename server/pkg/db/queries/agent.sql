@@ -747,6 +747,10 @@ SELECT * FROM agent_task_queue
 WHERE id = $1
 FOR UPDATE;
 
+-- name: HasDaemonRecoveryRetry :one
+-- Check after locking the parent; even a cancelled child consumes recovery.
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1);
+
 -- name: HasRetryTaskForParent :one
 -- Defense-in-depth for the recovery path: a delegated failure with any retry
 -- child is still intermediate and must not wake its coordinator.

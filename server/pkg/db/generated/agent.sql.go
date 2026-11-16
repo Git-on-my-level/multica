@@ -4725,6 +4725,18 @@ func (q *Queries) HasActiveTaskForIssueAndAgentInThread(ctx context.Context, arg
 	return has_active, err
 }
 
+const hasDaemonRecoveryRetry = `-- name: HasDaemonRecoveryRetry :one
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
+`
+
+// Check after locking the parent; even a cancelled child consumes recovery.
+func (q *Queries) HasDaemonRecoveryRetry(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasDaemonRecoveryRetry, parentTaskID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const hasPendingTaskForIssue = `-- name: HasPendingTaskForIssue :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND status IN ('queued', 'dispatched')
