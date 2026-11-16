@@ -377,3 +377,26 @@ func TestCursorExecuteStartupNetworkBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestCursorStartupFailurePreservesResumedSession(t *testing.T) {
+	t.Parallel()
+	for _, stderr := range []string{"Error: getaddrinfo ENOTFOUND api2.cursor.sh", "RetriableError: [unavailable] Error"} {
+		t.Run(stderr, func(t *testing.T) {
+			fakePath := filepath.Join(t.TempDir(), "cursor-agent")
+			script := "#!/bin/sh\n" + drainStdin + "\nprintf '%s\\n' '" + stderr + "' >&2\nexit 1\n"
+			writeTestExecutable(t, fakePath, []byte(script))
+			backend, err := New("cursor", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := backend.Execute(t.Context(), "resume", ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: "prior-cursor-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := <-session.Result
+			if result.Status != "failed" || result.SessionID != "prior-cursor-session" || !taskfailure.CursorStartupNetworkFailure(result.Error) {
+				t.Fatalf("empty-stream failure lost the resumed session: %+v", result)
+			}
+		})
+	}
+}

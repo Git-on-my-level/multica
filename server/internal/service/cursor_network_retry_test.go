@@ -133,6 +133,7 @@ func TestCursorStartupFailTaskRecovery(t *testing.T) {
 		{"connection pinned session", false, false, 2, true},
 		{"connection incoming session", true, false, 2, true},
 		{"dns pinned session", false, true, 2, true},
+		{"dns incoming resumed session", true, true, 2, true},
 		{"disabled budget", false, false, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
