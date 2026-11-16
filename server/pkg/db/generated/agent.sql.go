@@ -4905,6 +4905,19 @@ func (q *Queries) HasRetryTaskForParent(ctx context.Context, parentTaskID pgtype
 	return column_1, err
 }
 
+const hasRuntimeOfflineRetryForParent = `-- name: HasRuntimeOfflineRetryForParent :one
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
+`
+
+// A cancelled or completed recovery still consumes the one offline recovery.
+// Call after locking the parent to serialize concurrent reconciliation.
+func (q *Queries) HasRuntimeOfflineRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRuntimeOfflineRetryForParent, parentTaskID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const hasTaskCoveringDelegatedFailureComment = `-- name: HasTaskCoveringDelegatedFailureComment :one
 SELECT count(*) > 0 AS covered
 FROM agent_task_queue
