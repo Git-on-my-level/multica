@@ -38,7 +38,7 @@ type eventPage struct {
 
 var eventCmd = &cobra.Command{
 	Use:   "event",
-	Short: "Read the durable workspace event stream",
+	Short: "Read the retired workspace event stream (no capture since 2026-09-13; read issue/task state instead)",
 }
 
 var eventListCmd = &cobra.Command{

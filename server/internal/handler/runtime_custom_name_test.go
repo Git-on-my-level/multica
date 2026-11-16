@@ -248,7 +248,7 @@ func TestDaemonRegister_FailedProfileInheritsMachineName(t *testing.T) {
 		"daemon_id":    daemonID,
 		"device_name":  "host",
 		"failed_profiles": []map[string]any{
-			{"profile_id": profileID, "command_name": "missing-codex", "reason": "command not found on PATH"},
+			{"profile_id": profileID, "command_name": "missing-codex", "reason": "unsupported runtime_type: missing"},
 		},
 	}, testWorkspaceID, daemonID)
 	testHandler.DaemonRegister(w, req)
