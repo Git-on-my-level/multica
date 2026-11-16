@@ -197,6 +197,10 @@ func (h *Handler) resolveMikaAgent(w http.ResponseWriter, r *http.Request, works
 		return db.Agent{}, false, false
 	}
 
+	if err := h.validateDevinModelSelection(r.Context(), runtime.Provider, uuidToString(runtime.ID), req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return db.Agent{}, false, false
+	}
 	created, err := qtx.CreateSystemUserAgent(r.Context(), db.CreateSystemUserAgentParams{
 		WorkspaceID:        wsUUID,
 		Name:               service.MikaDefaultName,

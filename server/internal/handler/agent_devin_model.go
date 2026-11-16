@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
 )
@@ -10,12 +11,13 @@ import (
 // Validate only explicit routing changes. Unrelated edits must remain possible
 // when a catalog drifts; session confirmation still guards every actual run.
 func (h *Handler) validateDevinModelSelection(ctx context.Context, provider, runtimeID, requested string) error {
+	requested = strings.TrimSpace(requested)
 	if provider != "devin" || requested == "" {
 		return nil
 	}
 	snapshot := h.cachedModelCatalog(ctx, runtimeID)
 	if snapshot == nil {
-		return fmt.Errorf("cannot validate requested Devin model %q: runtime has not reported an available model catalog; open the runtime model picker to discover available IDs and retry", requested)
+		return fmt.Errorf("cannot validate requested Devin model %q: runtime model catalog is unavailable; open the runtime model picker to discover available IDs and retry", requested)
 	}
 	for _, model := range snapshot.Models {
 		if agent.DevinModelIDMatches(requested, model.ID) {
