@@ -146,6 +146,29 @@ func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
 				if child.Status != "deferred" || !child.FireAt.Valid || child.Attempt != 2 || child.MaxAttempts != 2 || child.SessionID.String != "existing-session" || child.WorkDir.String != "/tmp/existing-work" || child.ForceFreshSession || child.RuntimeID != failed.RuntimeID {
 					t.Fatalf("invalid recovery child: %+v", child)
 				}
+				// A healthy runtime wins the expiry race. If it remains offline,
+				// the deferred recovery must terminate after reconnect grace.
+				fx.Exec(t, `UPDATE agent_task_queue SET fire_at = now() - interval '2 hours' WHERE id = $1`, childID)
+				fx.Exec(t, `UPDATE agent_runtime SET status = 'online', last_seen_at = now() WHERE id = $1`, runtime)
+				expiry := db.FailExpiredRuntimeReconnectRetriesParams{ReconnectGraceSecs: 60, RuntimeStaleSecs: 30, MaxPerTick: 100}
+				if _, err := svc.FailExpiredRuntimeReconnectRetries(ctx, expiry); err != nil {
+					t.Fatal(err)
+				}
+				current, err := q.GetAgentTask(ctx, childID)
+				if err != nil || current.Status != "deferred" {
+					t.Fatalf("healthy runtime lost recovery: %v, %v", current.Status, err)
+				}
+				fx.Exec(t, `UPDATE agent_runtime SET status = 'offline', last_seen_at = now() - interval '2 hours' WHERE id = $1`, runtime)
+				if _, err := svc.FailExpiredRuntimeReconnectRetries(ctx, expiry); err != nil {
+					t.Fatal(err)
+				}
+				current, err = q.GetAgentTask(ctx, childID)
+				if err != nil || current.Status != "failed" || current.FailureReason.String != "runtime_reconnect_timeout" {
+					t.Fatalf("offline recovery did not expire: %v, %v, %v", current.Status, current.FailureReason, err)
+				}
+				if retry, err := svc.MaybeRetryFailedTask(ctx, current); err != nil || retry != nil {
+					t.Fatalf("expired recovery retried: %v, %v", retry, err)
+				}
 				// Explicitly cancelling the child consumes recovery, including for chat.
 				fx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled' WHERE id = $1`, childID)
 				if retry, err := svc.MaybeRetryFailedTask(ctx, failed); err != nil || retry != nil {

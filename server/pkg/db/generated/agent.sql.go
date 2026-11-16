@@ -3505,7 +3505,7 @@ WITH victims AS (
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
     WHERE retry.status = 'deferred'
       AND retry.fire_at < now() - make_interval(secs => $1::double precision)
-      AND parent.failure_reason = 'runtime_offline'
+      AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
       AND NOT EXISTS (
           SELECT 1 FROM agent_runtime runtime
           WHERE runtime.id = retry.runtime_id
@@ -3531,7 +3531,7 @@ WHERE retry.id = victims.id
   AND EXISTS (
       SELECT 1 FROM agent_task_queue parent
       WHERE parent.id = retry.parent_task_id
-        AND parent.failure_reason = 'runtime_offline'
+        AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
   )
   AND NOT EXISTS (
       SELECT 1 FROM agent_runtime runtime
@@ -3549,7 +3549,7 @@ type FailExpiredRuntimeReconnectRetriesParams struct {
 	MaxPerTick         int32   `json:"max_per_tick"`
 }
 
-// A runtime_offline retry waits in deferred until its runtime returns healthy.
+// A runtime_offline or runtime_recovery retry waits in deferred until its runtime returns healthy.
 // Give that recovery state a bounded exit: after one full reconnect grace,
 // fail it with a non-retryable reason so issues, agents, and runtime GC can
 // converge. A runtime that is healthy when this query runs wins the race and
