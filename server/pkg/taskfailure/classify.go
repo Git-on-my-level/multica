@@ -502,7 +502,7 @@ func isCursorProviderNetworkError(lower string) bool {
 	if stderr, wrapped := cursorProviderStderr(lower); wrapped {
 		lower = stderr
 	}
-	if strings.HasPrefix(lower, "error: [unavailable] connect etimedout ") {
+	if CursorTransientNetworkError(lower) || strings.HasPrefix(lower, "error: [unavailable] connect etimedout ") {
 		return true
 	}
 	// Node may append a stack trace. Match the exact first-line message, not

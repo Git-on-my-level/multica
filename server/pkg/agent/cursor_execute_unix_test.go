@@ -320,7 +320,7 @@ func TestCursorExecuteConnectTimeoutIsResumeSafe(t *testing.T) {
 	}
 }
 
-func executeFakeCursor(t *testing.T, script string) Result {
+func executeFakeCursor(t *testing.T, script string, resumeSession ...string) Result {
 	t.Helper()
 
 	fakePath := filepath.Join(t.TempDir(), "cursor-agent")
@@ -330,7 +330,11 @@ func executeFakeCursor(t *testing.T, script string) Result {
 	if err != nil {
 		t.Fatalf("New(cursor): %v", err)
 	}
-	session, err := backend.Execute(t.Context(), "hello", ExecOptions{Timeout: 5 * time.Second})
+	opts := ExecOptions{Timeout: 5 * time.Second}
+	if len(resumeSession) > 0 {
+		opts.ResumeSessionID = resumeSession[0]
+	}
+	session, err := backend.Execute(t.Context(), "hello", opts)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -340,4 +344,31 @@ func executeFakeCursor(t *testing.T, script string) Result {
 		t.Fatalf("cursor backend timed out instead of stopping after terminal result; error=%q", result.Error)
 	}
 	return result
+}
+
+func TestCursorExecuteTransientLaunchPreservesRequestedSession(t *testing.T) {
+	t.Parallel()
+	for _, witness := range []string{"RetriableError: [unavailable] Error", "Error: getaddrinfo ENOTFOUND api2.cursor.sh"} {
+		for _, tc := range []struct {
+			name, stream, prior, want string
+			safe                      bool
+		}{
+			{name: "resume before events", prior: "existing-session", want: "existing-session", safe: true},
+			{name: "cold launch", safe: true},
+			{name: "ambiguous connection", stream: `printf '%s\n' '{"type":"connection"}'`, prior: "existing-session"},
+			{name: "invalid output", stream: `printf '%s\n' 'not json'`, prior: "existing-session"},
+			{name: "session event", stream: `printf '%s\n' '{"type":"system","session_id":"reported-session"}'`, prior: "existing-session", want: "reported-session"},
+		} {
+			t.Run(witness+"/"+tc.name, func(t *testing.T) {
+				script := "#!/bin/sh\n" + drainStdin + "\n" + tc.stream + "\nprintf '%s\n' '" + witness + "' >&2\nexit 1\n"
+				result := executeFakeCursor(t, script, tc.prior)
+				if result.Status != "failed" || result.SessionID != tc.want {
+					t.Fatalf("result = %+v, want failed with session %q", result, tc.want)
+				}
+				if got := taskfailure.CursorPreActionNetworkError(result.Error); got != tc.safe {
+					t.Fatalf("pre-action = %v, error = %s", got, result.Error)
+				}
+			})
+		}
+	}
 }

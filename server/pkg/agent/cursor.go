@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // cursorBackend implements Backend by spawning the Cursor Agent CLI
@@ -471,6 +473,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// A partial transcript is not a final answer. Keep it in Messages for
 			// observability, but never expose it as Result.Output on failure.
 			finalOutput = ""
+		}
+
+		// A launch failure emits no session event. Preserve only the session we
+		// actually requested, so the bounded recovery cannot become a cold run.
+		if finalStatus == "failed" && sessionID == "" && taskfailure.CursorPreActionNetworkError(finalError) {
+			sessionID = opts.ResumeSessionID
 		}
 
 		resCh <- Result{
