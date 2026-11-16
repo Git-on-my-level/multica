@@ -5673,14 +5673,16 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
-	// Offline recovery must continue a known session and gets at most one
-	// additional attempt, even when another policy granted a larger budget.
+	// Offline recovery gets at most one additional attempt, even when another
+	// policy granted a larger budget. A missing session pointer alone does not
+	// prove the session unsafe: a daemon may not have reported it yet. Preserve
+	// any reported pointer and reject explicit evidence that it cannot resume.
 	// Keep max_attempts unchanged so other failure policies retain their budget.
 	if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 		if t.Attempt >= 2 || !(t.IssueID.Valid || t.ChatSessionID.Valid) ||
-			!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
+			(t.SessionID.Valid && t.SessionID.String != "" && strings.TrimSpace(t.SessionID.String) == "") ||
 			t.ForceFreshSession || t.SessionRolloutMissing ||
-			(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) ||
+			(t.RetiredSessionID.Valid && t.RetiredSessionID.String != "" && (t.SessionID.String == "" || t.RetiredSessionID.String == t.SessionID.String)) ||
 			ResumeUnsafeFailure(t.FailureReason.String, t.Error.String) {
 			return false
 		}
