@@ -341,3 +341,62 @@ func executeFakeCursor(t *testing.T, script string) Result {
 	}
 	return result
 }
+
+func TestCursorExecuteStartupNetworkBoundary(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, events, stderr string
+		wantNetwork          bool
+		wantStatus           string
+	}{
+		{"connection", `{"type":"connection"}`, "RetriableError: [unavailable] Error", true, "failed"},
+		{"dns", "", "Error: getaddrinfo ENOTFOUND api2.cursor.sh", true, "failed"},
+		{"unrelated exit", "", "arbitrary failure", false, "failed"},
+		{"auth", "", "API Error: 403 Forbidden", false, "failed"},
+		{"model", "", "unknown model", false, "failed"},
+		{"arbitrary provider", "", "RetriableError: [unavailable] Something else", false, "failed"},
+		{"after success", `{"type":"result","subtype":"success","is_error":false,"result":"done"}`, "RetriableError: [unavailable] Error", false, "completed"},
+		{"after error result", `{"type":"result","subtype":"error","is_error":true,"result":"failed hard"}`, "RetriableError: [unavailable] Error", false, "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "#!/bin/sh\n" + drainStdin + "\nprintf '%s\\n' '" + tc.events + "'\nprintf '%s\\n' '" + tc.stderr + "' >&2\nexit 1\n"
+			// An empty event stream must contain no invalid blank stdout event.
+			if tc.events == "" {
+				script = "#!/bin/sh\n" + drainStdin + "\nprintf '%s\\n' '" + tc.stderr + "' >&2\nexit 1\n"
+			}
+			result := executeFakeCursor(t, script)
+			if result.Status != tc.wantStatus {
+				t.Fatalf("status=%s want=%s error=%s", result.Status, tc.wantStatus, result.Error)
+			}
+			if got := taskfailure.CursorStartupNetworkFailure(result.Error); got != tc.wantNetwork {
+				t.Fatalf("startup witness=%v want=%v error=%s", got, tc.wantNetwork, result.Error)
+			}
+			if got := taskfailure.Classify(result.Error) == taskfailure.ReasonAgentProviderNetwork; got != tc.wantNetwork {
+				t.Fatalf("network classification=%v want=%v error=%s", got, tc.wantNetwork, result.Error)
+			}
+		})
+	}
+}
+
+func TestCursorStartupFailurePreservesResumedSession(t *testing.T) {
+	t.Parallel()
+	for _, stderr := range []string{"Error: getaddrinfo ENOTFOUND api2.cursor.sh", "RetriableError: [unavailable] Error"} {
+		t.Run(stderr, func(t *testing.T) {
+			fakePath := filepath.Join(t.TempDir(), "cursor-agent")
+			script := "#!/bin/sh\n" + drainStdin + "\nprintf '%s\\n' '" + stderr + "' >&2\nexit 1\n"
+			writeTestExecutable(t, fakePath, []byte(script))
+			backend, err := New("cursor", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := backend.Execute(t.Context(), "resume", ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: "prior-cursor-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := <-session.Result
+			if result.Status != "failed" || result.SessionID != "prior-cursor-session" || !taskfailure.CursorStartupNetworkFailure(result.Error) {
+				t.Fatalf("empty-stream failure lost the resumed session: %+v", result)
+			}
+		})
+	}
+}

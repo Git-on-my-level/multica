@@ -119,7 +119,9 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		startTime := time.Now()
 		configuredModel := strings.TrimSpace(opts.Model)
 		var output strings.Builder
-		var sessionID string
+		// A startup connection failure can emit no session event. Preserve the
+		// session actually resumed so the failure report can recover it safely.
+		sessionID := opts.ResumeSessionID
 		finalStatus := "completed"
 		var finalError string
 		var protocolError string
