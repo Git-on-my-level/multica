@@ -734,7 +734,13 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				// same dead session on every later turn (GH #8116).
 				finalStatus, finalError, resumeRejected = classifyACPResumeFailure(
 					runCtx, "hermes", "session/resume", err, timeout, b.cfg.Logger)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
+				// Startup has not reached the session. Preserve the existing pointer
+				// for the server's bounded recovery; never mark it as rejected.
+				resumeID := ""
+				if finalStatus == "failed" && taskfailure.HermesGatewayStartingDeadline(finalError) {
+					resumeID = opts.ResumeSessionID
+				}
+				resCh <- Result{Status: finalStatus, Error: finalError, SessionID: resumeID, DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
 				return
 			}
 			sessionResult = result
