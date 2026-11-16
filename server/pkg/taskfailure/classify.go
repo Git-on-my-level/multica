@@ -99,7 +99,8 @@ func Classify(rawError string) Reason {
 	// numbers are not HTTP status codes (event_count=429 is not a rate limit).
 	// Apply the existing precedence to the provider stderr, keeping real auth
 	// or quota evidence there while excluding the adapter's diagnostics.
-	if isCursorProviderNetworkError(lower) {
+	cursorNetwork := isCursorProviderNetworkError(lower)
+	if cursorNetwork {
 		if stderr, wrapped := cursorProviderStderr(lower); wrapped {
 			lower = stderr
 		}
@@ -277,7 +278,7 @@ func Classify(rawError string) Reason {
 	//    Cursor reports connect ETIMEDOUT and mid-stream RetriableError:
 	//    Connection stalled failures. Keep those failed resumes network-safe
 	//    instead of letting the exit-status wrapper trigger a fresh-session retry.
-	case isPiProviderNetworkError(lower), isCursorProviderNetworkError(lower),
+	case isPiProviderNetworkError(lower), cursorNetwork,
 		containsAny(lower,
 			"stream disconnected",
 			opencodeStreamEndedPrefix,
@@ -499,6 +500,9 @@ var legacyEnvironmentPrepareWitnesses = []string{
 // bare or in the adapter's exit/prompt-write wrapper. Do not match transport
 // phrases globally: local tool or MCP failures are not provider evidence.
 func isCursorProviderNetworkError(lower string) bool {
+	if CursorStartupNetworkFailure(lower) {
+		return true
+	}
 	if stderr, wrapped := cursorProviderStderr(lower); wrapped {
 		lower = stderr
 	}
@@ -514,6 +518,34 @@ func isCursorProviderNetworkError(lower string) bool {
 	}
 	return false
 }
+
+// CursorStartupNetworkFailure isolates pre-result connection failures from
+// terminal results, arbitrary unavailable errors, and tool stderr. Only the
+// adapter's complete diagnostic wrapper establishes the interrupted boundary.
+func CursorStartupNetworkFailure(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	header, stderr, ok := strings.Cut(lower, "; cursor stderr: ")
+	if !ok || !cursorStartupFailureHeader.MatchString(header) {
+		return false
+	}
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	switch strings.TrimSpace(lines[0]) {
+	case "retriableerror: [unavailable] error",
+		"error: getaddrinfo enotfound api2.cursor.sh",
+		"getaddrinfo enotfound api2.cursor.sh":
+	default:
+		return false
+	}
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) != "" && !cursorStackFrame(line) {
+			return false
+		}
+	}
+	return true
+}
+
+var cursorStartupFailureHeader = regexp.MustCompile(
+	`^cursor-agent (?:exited with error: exit status [1-9][0-9]*|prompt write failed: [^\n]+) \(result_seen=false, exit_code=[1-9][0-9]*, scanner_error=false, event_count=[0-9]+, invalid_event_count=0, last_event_type=(?:connection|none)\); actions completed before finalization may already have taken effect$`)
 
 func cursorProviderStderr(lower string) (string, bool) {
 	if !strings.HasPrefix(lower, "cursor-agent exited with error: ") &&
