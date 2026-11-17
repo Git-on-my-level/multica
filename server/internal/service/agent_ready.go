@@ -163,6 +163,9 @@ func runtimeVerdict(rt db.AgentRuntime, agent db.Agent) AgentVerdict {
 			Detail:       "agent owner does not have access to the private runtime",
 		}
 	}
+	if reason, ok := parseRuntimeOfflineReason(rt.Metadata); ok && reason.Code == runtimeOfflineCodeNotExecutable && reason.LauncherUnavailable {
+		return AgentVerdict{Availability: AgentBlocked, Reason: dispatch.ReasonRuntimeUnusable, Detail: reason.Detail, LauncherUnavailable: true}
+	}
 	if rt.Status == "online" {
 		return AgentVerdict{Availability: AgentAvailable}
 	}

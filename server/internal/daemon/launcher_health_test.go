@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -80,13 +81,17 @@ func TestLauncherHealthRejectsBeforeTaskInput(t *testing.T) {
 			t.Error("pre-work failure attempted task work")
 		}
 		var body struct {
-			Reason string `json:"failure_reason"`
+			Reason string                  `json:"failure_reason"`
+			Claim  *protocol.LauncherClaim `json:"launcher_claim"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
 		if body.Reason != taskfailure.ReasonRuntimeOffline.String() {
 			t.Errorf("reason=%s", body.Reason)
+		}
+		if body.Claim == nil || body.Claim.DispatchedAt != "2026-11-17T17:00:00Z" || body.Claim.Model != "morph/morph-kimik31" {
+			t.Errorf("pre-input failure lost claim/model proof: %+v", body.Claim)
 		}
 		failed++
 		w.WriteHeader(http.StatusOK)
@@ -99,7 +104,7 @@ func TestLauncherHealthRejectsBeforeTaskInput(t *testing.T) {
 	})
 	rid := fx.runtimeIDFor("ws-1", "opencode")
 	for _, id := range []string{"initial", "independent-fresh"} {
-		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid}, 0)
+		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid, DispatchedAt: "2026-11-17T17:00:00Z", Agent: &AgentData{Model: "morph/morph-kimik31"}}, 0)
 	}
 	if failed != 2 || len(d.claimableRuntimeIDs()) != 0 {
 		t.Fatalf("failed=%d eligible=%v", failed, d.claimableRuntimeIDs())

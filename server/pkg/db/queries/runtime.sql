@@ -260,6 +260,12 @@ UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
 WHERE id = $1;
 
+-- name: SetAgentRuntimeLauncherUnready :exec
+-- Fence new dispatch without interrupting tasks already running on this host.
+UPDATE agent_runtime
+SET metadata = metadata || jsonb_build_object('offline_reason', @offline_reason::jsonb), updated_at = now()
+WHERE id = @id;
+
 -- name: SetAgentRuntimeOfflineWithReason :exec
 -- Takes a runtime offline and records WHY, for the one class of cause the user
 -- has to repair before the runtime can come back (MUL-6164). Everything that

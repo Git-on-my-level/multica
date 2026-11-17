@@ -264,6 +264,7 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
+	launcherClaim  *protocol.LauncherClaim
 	kind           terminalTaskReportKind
 	taskID         string
 	output         string
@@ -3270,7 +3271,7 @@ func (d *Daemon) appendProfileRuntimeEntries(ctx context.Context, workspaceID st
 				if d.cfg.DeviceName != "" {
 					name = fmt.Sprintf("%s (%s)", name, d.cfg.DeviceName)
 				}
-				*runtimes = append(*runtimes, map[string]string{"name": name, "type": runtimeType, "profile_id": profile.ID, "version": previousVersion, "status": "online"})
+				*runtimes = append(*runtimes, map[string]string{"name": name, "type": runtimeType, "profile_id": profile.ID, "version": previousVersion, "status": "online", "failure_code": protocol.LauncherUnavailableCode})
 				return
 			}
 			*failedProfiles = append(*failedProfiles, map[string]string{
@@ -5860,6 +5861,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 	d.mu.Lock()
 	rt, tracked = d.runtimeIndex[task.RuntimeID]
+	launcherFailed := tracked && d.demotedProviders[launcherKey(rt)].launcherUnavailable
 	if tracked && d.runtimeDemotedLocked(rt) {
 		tracked = false
 	}
@@ -5888,9 +5890,19 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// hundred lines later as `no agent configured for provider ""`, which reads
 	// like a misconfigured host and is not retried.
 	if !tracked {
+		var launcherClaim *protocol.LauncherClaim
+		if launcherFailed && task.DispatchedAt != "" {
+			launcherClaim = &protocol.LauncherClaim{DispatchedAt: task.DispatchedAt}
+			if task.Agent != nil {
+				launcherClaim.Model = task.Agent.Model
+				launcherClaim.ThinkingLevel = task.Agent.ThinkingLevel
+				launcherClaim.ServiceTier = task.Agent.ServiceTier
+			}
+		}
 		d.logger.Warn("claimed task targets a runtime this daemon no longer hosts; failing it back for retry",
 			"task", task.ID, "runtime_id", task.RuntimeID)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
+			launcherClaim: launcherClaim,
 			kind:          terminalTaskReportFail,
 			taskID:        task.ID,
 			errorMessage:  "runtime went offline before the run started",
@@ -6664,6 +6676,11 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	case terminalTaskReportComplete:
 		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	case terminalTaskReportFail:
+		if report.launcherClaim != nil {
+			return d.client.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", report.taskID), map[string]any{
+				"error": protocol.LauncherUnavailableDetail, "failure_reason": "runtime_offline", "launcher_claim": report.launcherClaim,
+			}, nil, schedule)
+		}
 		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)

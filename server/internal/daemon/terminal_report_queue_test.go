@@ -16,7 +16,29 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+func TestTerminalReportPreservesLauncherClaim(t *testing.T) {
+	claim := &protocol.LauncherClaim{DispatchedAt: "2026-11-17T17:00:00Z", Model: "morph/morph-kimik31", ThinkingLevel: "high", ServiceTier: "standard"}
+	record, err := persistedTerminalReport(terminalTaskReport{kind: terminalTaskReportFail, taskID: "unstarted", launcherClaim: claim}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored persistedTerminalTaskReport
+	if err := json.Unmarshal(body, &restored); err != nil {
+		t.Fatal(err)
+	}
+	report, err := restored.terminalReport()
+	if err != nil || report.launcherClaim == nil || *report.launcherClaim != *claim {
+		t.Fatalf("launcher claim lost across durable report replay: %+v, %v", report.launcherClaim, err)
+	}
+}
 
 func TestTerminalReportStoreRoundTripAndPermissions(t *testing.T) {
 	store := newTerminalReportStore(Config{

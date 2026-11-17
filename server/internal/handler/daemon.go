@@ -334,7 +334,8 @@ type DaemonRegisterRequest struct {
 		// runtime_profile (MUL-3284). Empty = built-in runtime (legacy path).
 		// Type carries the protocol family for both built-in and custom rows
 		// so task routing (agent.New) is unchanged.
-		ProfileID string `json:"profile_id"`
+		ProfileID   string `json:"profile_id"`
+		FailureCode string `json:"failure_code,omitempty"`
 	} `json:"runtimes"`
 	FailedProfiles []struct {
 		FailureCode string `json:"failure_code"`
@@ -781,6 +782,12 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			"launched_by":  req.LaunchedBy,
 			"capabilities": requestClientCapabilities(r),
 		})
+		if runtime.FailureCode == protocol.LauncherUnavailableCode && provider == "opencode" {
+			var values map[string]any
+			_ = json.Unmarshal(metadata, &values)
+			values["offline_reason"] = map[string]any{"code": "not_executable", "launcher_unavailable": true, "detail": protocol.LauncherUnavailableDetail}
+			metadata, _ = json.Marshal(values)
+		}
 
 		var registered db.AgentRuntime
 		var inserted bool
@@ -5670,11 +5677,12 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 // FailTask marks a running task as failed.
 type TaskFailRequest struct {
-	Error          string `json:"error"`
-	SessionID      string `json:"session_id,omitempty"`
-	WorkDir        string `json:"work_dir,omitempty"`
-	DurableWorkDir string `json:"durable_work_dir,omitempty"`
-	FailureReason  string `json:"failure_reason,omitempty"`
+	LauncherClaim  *protocol.LauncherClaim `json:"launcher_claim,omitempty"`
+	Error          string                  `json:"error"`
+	SessionID      string                  `json:"session_id,omitempty"`
+	WorkDir        string                  `json:"work_dir,omitempty"`
+	DurableWorkDir string                  `json:"durable_work_dir,omitempty"`
+	FailureReason  string                  `json:"failure_reason,omitempty"`
 	// BranchName: a failed run can still have produced a branch — worktree mode
 	// commits whatever the agent left before tearing the worktree down. Report
 	// it so a partially-successful run is still findable.
@@ -5723,7 +5731,22 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// keep a stale mid-flight pin) and flagging the row in the same commit that
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
-	task, transitioned, err := h.TaskService.FailTaskWithTransition(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
+	var task *db.AgentTaskQueue
+	var transitioned bool
+	var err error
+	if req.LauncherClaim != nil {
+		if _, parseErr := time.Parse(time.RFC3339Nano, req.LauncherClaim.DispatchedAt); parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid launcher claim timestamp")
+			return
+		}
+		if req.SessionID != "" || req.WorkDir != "" || req.BranchName != "" || req.DurableWorkDir != "" || req.RetiredSessionID != "" || req.SessionRolloutMissing {
+			writeError(w, http.StatusBadRequest, "launcher recovery requires an unstarted claim")
+			return
+		}
+		task, transitioned, err = h.TaskService.FailUnstartedLauncherClaim(r.Context(), parseUUID(taskID), *req.LauncherClaim)
+	} else {
+		task, transitioned, err = h.TaskService.FailTaskWithTransition(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
+	}
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the

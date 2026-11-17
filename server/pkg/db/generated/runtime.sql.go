@@ -1877,6 +1877,23 @@ func (q *Queries) SelectStaleOnlineRuntimes(ctx context.Context, staleSeconds fl
 	return items, nil
 }
 
+const setAgentRuntimeLauncherUnready = `-- name: SetAgentRuntimeLauncherUnready :exec
+UPDATE agent_runtime
+SET metadata = metadata || jsonb_build_object('offline_reason', $1::jsonb), updated_at = now()
+WHERE id = $2
+`
+
+type SetAgentRuntimeLauncherUnreadyParams struct {
+	OfflineReason []byte      `json:"offline_reason"`
+	ID            pgtype.UUID `json:"id"`
+}
+
+// Fence new dispatch without interrupting tasks already running on this host.
+func (q *Queries) SetAgentRuntimeLauncherUnready(ctx context.Context, arg SetAgentRuntimeLauncherUnreadyParams) error {
+	_, err := q.db.Exec(ctx, setAgentRuntimeLauncherUnready, arg.OfflineReason, arg.ID)
+	return err
+}
+
 const setAgentRuntimeOffline = `-- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
 SET status = 'offline', updated_at = now()

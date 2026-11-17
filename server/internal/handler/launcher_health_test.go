@@ -23,6 +23,15 @@ func TestLauncherHealthProfileRegistrationPersistsAndClearsGate(t *testing.T) {
 	testutil.Call(t, testHandler.DaemonRegister, newOwnerDaemonRequest("POST", "/api/daemon/register", base)).Want(http.StatusOK)
 	var originalID string
 	dbfx.QueryRow(t, `SELECT id::text FROM agent_runtime WHERE daemon_id=$1 AND profile_id=$2`, "launcher-morph-fixture", profileID).Scan(&originalID)
+	// A busy profile keeps existing work online while refusing new claims.
+	base["runtimes"] = []map[string]any{{"name": "Morph fixture", "type": "opencode", "profile_id": profileID, "status": "online", "failure_code": protocol.LauncherUnavailableCode}}
+	testutil.Call(t, testHandler.DaemonRegister, newOwnerDaemonRequest("POST", "/api/daemon/register", base)).Want(http.StatusOK)
+	var busyStatus string
+	var held bool
+	dbfx.QueryRow(t, `SELECT status,metadata->'offline_reason'->>'launcher_unavailable' = 'true' FROM agent_runtime WHERE id=$1`, originalID).Scan(&busyStatus, &held)
+	if busyStatus != "online" || !held {
+		t.Fatalf("busy launcher lost active bookkeeping or new-claim gate: %s held=%v", busyStatus, held)
+	}
 	delete(base, "runtimes")
 	base["failed_profiles"] = []map[string]any{{"profile_id": profileID, "failure_code": protocol.LauncherUnavailableCode, "reason": "setting value must not persist", "command_name": "private-wrapper-setting"}}
 	req := newOwnerDaemonRequest("POST", "/api/daemon/register", base)
