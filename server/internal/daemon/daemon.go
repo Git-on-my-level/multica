@@ -592,6 +592,7 @@ type Daemon struct {
 	// login-shell probe + version detection instead of one per task (MUL-4486).
 	healGroup          singleflight.Group
 	launcherProbeGroup singleflight.Group
+	launcherActive     map[string]int // guarded by mu; tasks past the pre-input fence
 
 	wsHBMu        sync.RWMutex         // guards wsHBLastAck and wsLastReceive
 	wsHBLastAck   map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
@@ -1896,7 +1897,7 @@ func (d *Daemon) clearProviderDemotions(providers []string, sampledAfter uint64)
 			continue
 		}
 		delete(d.demotedProviders, provider)
-		if record.launcherUnavailable {
+		if record.launcherUnavailable && !strings.HasPrefix(provider, "profile:") {
 			d.kickAgentDiscovery()
 		}
 		d.logger.Info("agent CLI is usable again",
@@ -3171,7 +3172,11 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// later transition (zero → first profile added).
 		return profileSetSignature(nil)
 	}
-	for _, profile := range resp.RuntimeProfiles {
+	return d.appendProfileRuntimeEntries(ctx, workspaceID, resp.RuntimeProfiles, runtimes, failedProfiles)
+}
+
+func (d *Daemon) appendProfileRuntimeEntries(ctx context.Context, workspaceID string, profiles []RuntimeProfile, runtimes *[]map[string]string, failedProfiles *[]map[string]string) string {
+	for _, profile := range profiles {
 		runtimeType := agent.ProfileRuntimeType(profile.RuntimeType, profile.ProtocolFamily)
 		if profile.CommandName == "" || profile.ProtocolFamily == "" {
 			d.logger.Warn("skip custom runtime profile: missing command_name or protocol_family",
@@ -3256,7 +3261,10 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		d.mu.Unlock()
 		d.recordProfileLaunch(workspaceID, profile.ID, resolved, previousVersion, profile.FixedArgs)
 		appendHeldProfile := func() {
-			if d.activeTasks.Load() != 0 {
+			d.mu.Lock()
+			busy := d.launcherActive["profile:"+profile.ID] != 0
+			d.mu.Unlock()
+			if busy {
 				// Preserve running siblings; the local hold prevents new launches.
 				name := profile.DisplayName
 				if d.cfg.DeviceName != "" {
@@ -3316,7 +3324,7 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 			"profile_id": profile.ID,
 		})
 	}
-	return profileSetSignature(resp.RuntimeProfiles)
+	return profileSetSignature(profiles)
 }
 
 // profileSetSignature is a stable content hash of the workspace's custom
@@ -5855,7 +5863,23 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	if tracked && d.runtimeDemotedLocked(rt) {
 		tracked = false
 	}
+	if tracked {
+		if d.launcherActive == nil {
+			d.launcherActive = make(map[string]int)
+		}
+		d.launcherActive[launcherKey(rt)]++
+	}
 	d.mu.Unlock()
+	if tracked {
+		defer func() {
+			d.mu.Lock()
+			d.launcherActive[launcherKey(rt)]--
+			if d.launcherActive[launcherKey(rt)] == 0 {
+				delete(d.launcherActive, launcherKey(rt))
+			}
+			d.mu.Unlock()
+		}()
+	}
 	// The runtime can go offline between the batch claim leaving with its ID and
 	// the claimed task arriving here — a below-minimum demotion or a drift
 	// convergence to zero both drop rows while a claim is in flight. Reporting it

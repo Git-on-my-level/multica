@@ -494,20 +494,21 @@ func (d *Daemon) refreshAgentVersions(ctx context.Context) {
 // causes maps each condemned provider to the evidence against it, which is
 // already user-visible in skipped_agents and is what the log below reports.
 func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]runtimeVerdict) {
-	// Serialize with task claiming the way the restart paths do: the barrier
-	// only sets when no claim is in flight and no task is running, so a
-	// runtime is never deregistered under a task that is still executing —
-	// the server's sweep would fail-and-retry that task while the local
-	// process keeps going, and an upgrade-back would revive the runtime ID
-	// into a genuine duplicate execution. A busy daemon defers to the next
-	// refresh tick; the too-old CLI keeps its runtimes a little longer, which
-	// is the pre-demotion status quo, not a new exposure.
-	if !d.trySetClaimBarrier() {
+	// Existing version/protocol verdicts retain the machine-wide barrier.
+	// Launcher holds already fence handleTask under mu, so their per-launcher
+	// active counts can protect existing work without waiting for unrelated tasks.
+	launcherOnly := len(causes) > 0
+	for _, cause := range causes {
+		launcherOnly = launcherOnly && cause.launcherUnavailable
+	}
+	if !launcherOnly && !d.trySetClaimBarrier() {
 		d.logger.Info("defer runtime demotion: task or claim in flight",
 			"providers", causes)
 		return
 	}
-	defer d.releaseClaimBarrier()
+	if !launcherOnly {
+		defer d.releaseClaimBarrier()
+	}
 
 	d.mu.Lock()
 	var demoted []string
@@ -530,6 +531,9 @@ func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]r
 				continue
 			}
 			cause, condemned := causes[rt.Provider]
+			if launcherOnly && d.launcherActive[rt.Provider] != 0 {
+				condemned = false
+			}
 			if !condemned {
 				kept = append(kept, rid)
 				continue
@@ -564,7 +568,9 @@ func (d *Daemon) demoteUnusableRuntimes(ctx context.Context, causes map[string]r
 	// enough: a register sent before this demotion is still in flight, and its
 	// response would re-index the provider the moment it lands. The apply paths
 	// consult this under the same lock, so the two are totally ordered.
-	d.markProvidersDemotedLocked(causes)
+	if !launcherOnly {
+		d.markProvidersDemotedLocked(causes)
+	}
 	d.dshInstallWaits = append(d.dshInstallWaits, installWaits...)
 	d.mu.Unlock()
 

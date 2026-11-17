@@ -280,7 +280,7 @@ func RuntimeUnusableNotice(agentName string, verdict AgentVerdict) string {
 		return runtimeProfileMissingNotice(name)
 	}
 	if verdict.LauncherUnavailable {
-		return fmt.Sprintf("%s could not start: an OpenCode launcher health check exited 127, so this trigger was not queued. Repair the launcher on that machine and verify `opencode --version` succeeds. The daemon must observe a successful check before triggering the agent again.", name)
+		return fmt.Sprintf("%s could not start: an OpenCode launcher health check exited 127, so this trigger was not queued. Repair the configured launcher on that machine and verify its version check succeeds using the profile's command and arguments. The daemon must observe a successful check before triggering the agent again.", name)
 	}
 	if verdict.Repair != nil && verdict.Repair.Command != "" {
 		return fmt.Sprintf(

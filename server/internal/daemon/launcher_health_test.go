@@ -11,10 +11,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/multica-ai/multica/server/pkg/agent"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -138,6 +141,7 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 
 	// The first process failure stays failed; the probe gets no task input.
 	d.activeTasks.Add(1)
+	d.launcherActive = map[string]int{"opencode": 1}
 	d.checkFailedLauncher(context.Background(), rt, taskfailure.ReasonAgentProcessFailure.String())
 	if strings.Contains(diagnostic.String(), "sensitive probe output") {
 		t.Fatal("persisted raw launcher probe diagnostic")
@@ -156,6 +160,7 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 		t.Fatal("demoted under a running task")
 	}
 	d.activeTasks.Add(-1)
+	delete(d.launcherActive, "opencode")
 	d.demoteHeldLaunchers(context.Background())
 	if d.findRuntime(rid) != nil {
 		t.Fatal("idle broken runtime was not demoted")
@@ -232,7 +237,7 @@ func TestLauncherHealthControls(t *testing.T) {
 		{name: "auth", provider: "opencode", reason: taskfailure.ReasonAgentProviderAuthOrAccess.String()},
 		{name: "timeout", provider: "opencode", reason: taskfailure.ReasonTimeout.String()},
 		{name: "cancel", provider: "opencode", reason: taskfailure.ReasonAgentProcessFailure.String(), cancel: true},
-		{name: "custom profile", provider: "opencode", profile: "custom", reason: taskfailure.ReasonAgentProcessFailure.String()},
+		{name: "unavailable profile launch evidence", provider: "opencode", profile: "custom", reason: taskfailure.ReasonAgentProcessFailure.String()},
 		{name: "other provider", provider: "codex", reason: taskfailure.ReasonAgentProcessFailure.String()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -249,5 +254,23 @@ func TestLauncherHealthControls(t *testing.T) {
 				t.Fatal("ordinary failure changed launcher eligibility")
 			}
 		})
+	}
+}
+
+func TestLauncherHealthRealVersionProbePreservesExitEvidence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX launcher fixture")
+	}
+	path := filepath.Join(t.TempDir(), "launcher-fixture")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 127\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := detectAgentVersion
+	t.Cleanup(func() { detectAgentVersion = original })
+	detectAgentVersion = agent.DetectVersion
+	d := freshDaemon("")
+	_, err := d.probeOpenCodeLauncherCommand(context.Background(), agent.NewCommand(path, nil))
+	if !errors.Is(err, errLauncherUnavailable) {
+		t.Fatalf("real version probe lost structured exit-127 evidence: %v", err)
 	}
 }

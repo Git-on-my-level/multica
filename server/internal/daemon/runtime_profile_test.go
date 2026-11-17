@@ -91,10 +91,11 @@ func TestClient_GetRuntimeProfiles_RequestShape(t *testing.T) {
 // configurable set of runtime profiles and captures the runtimes array sent
 // to /api/daemon/register.
 type profileRegisterFixture struct {
-	daemon       *Daemon
-	server       *httptest.Server
-	sentRuntimes []map[string]any
-	sentFailures []map[string]any
+	registerStatus int
+	daemon         *Daemon
+	server         *httptest.Server
+	sentRuntimes   []map[string]any
+	sentFailures   []map[string]any
 }
 
 func newProfileRegisterFixture(t *testing.T, profiles []RuntimeProfile, profilesStatus int) *profileRegisterFixture {
@@ -103,6 +104,10 @@ func newProfileRegisterFixture(t *testing.T, profiles []RuntimeProfile, profiles
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/daemon/register":
+			if fx.registerStatus != 0 {
+				w.WriteHeader(fx.registerStatus)
+				return
+			}
 			var body struct {
 				Runtimes       []map[string]any `json:"runtimes"`
 				FailedProfiles []map[string]any `json:"failed_profiles"`
