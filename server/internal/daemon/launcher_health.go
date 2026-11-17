@@ -11,7 +11,20 @@ const launcherUnavailableDetail = "launcher health check exited 127 before task 
 // A task's exit code cannot establish whether it performed work. A separate,
 // task-free probe can establish launcher health, without replaying that task.
 func (d *Daemon) checkFailedLauncher(ctx context.Context, rt Runtime, reason string) {
-	if ctx.Err() != nil || rt.Provider != "opencode" || rt.ProfileID != "" || reason != taskfailure.ReasonAgentProcessFailure.String() {
+	if reason != taskfailure.ReasonAgentProcessFailure.String() {
+		return
+	}
+	d.checkLauncherHealth(ctx, rt)
+}
+
+func (d *Daemon) checkLauncherHealth(ctx context.Context, rt Runtime) {
+	if ctx.Err() != nil || rt.Provider != "opencode" || rt.ProfileID != "" {
+		return
+	}
+	d.mu.Lock()
+	held := d.providerDemotedLocked(rt.Provider)
+	d.mu.Unlock()
+	if held {
 		return
 	}
 	entry, ok := d.agents()[rt.Provider]

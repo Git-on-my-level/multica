@@ -21,7 +21,6 @@ func TestLauncherHealthIndependentRunsDoNotReplayObservedWork(t *testing.T) {
 	fx := newLauncherHealthFixture(t)
 	d := fx.daemon
 	exit127 := launcherProbeExit(t, 127)
-	fx.setProbeErr(func(string, int) error { return exit127 })
 	var failures []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/fail") {
@@ -41,6 +40,7 @@ func TestLauncherHealthIndependentRunsDoNotReplayObservedWork(t *testing.T) {
 	runs := 0
 	d.runner = taskRunnerFunc(func(_ context.Context, task Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 		runs++
+		fx.setProbeErr(func(string, int) error { return exit127 })
 		if task.TriggerCommentID != "original-comment" {
 			t.Error("lost trigger context")
 		}
@@ -63,6 +63,43 @@ func TestLauncherHealthExitHelper(t *testing.T) {
 	}
 	code, _ := strconv.Atoi(os.Args[len(os.Args)-1])
 	os.Exit(code)
+}
+
+func TestLauncherHealthRejectsBeforeTaskInput(t *testing.T) {
+	fx := newLauncherHealthFixture(t)
+	d := fx.daemon
+	exit127 := launcherProbeExit(t, 127)
+	fx.setProbeErr(func(string, int) error { return exit127 })
+	failed := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/fail") {
+			t.Error("pre-work failure attempted task work")
+		}
+		var body struct {
+			Reason string `json:"failure_reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body.Reason != taskfailure.ReasonRuntimeOffline.String() {
+			t.Errorf("reason=%s", body.Reason)
+		}
+		failed++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	d.client = NewClient(srv.URL)
+	d.runner = taskRunnerFunc(func(context.Context, Task, string, int, *slog.Logger) (TaskResult, error) {
+		t.Fatal("task input reached runner with a broken launcher")
+		return TaskResult{}, nil
+	})
+	rid := fx.runtimeIDFor("ws-1", "opencode")
+	for _, id := range []string{"initial", "independent-fresh"} {
+		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid}, 0)
+	}
+	if failed != 2 || len(d.allRuntimeIDs()) != 0 {
+		t.Fatalf("failed=%d eligible=%v", failed, d.allRuntimeIDs())
+	}
 }
 
 func launcherProbeExit(t *testing.T, code int) error {

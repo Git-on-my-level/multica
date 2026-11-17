@@ -5791,6 +5791,13 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
+	d.mu.Unlock()
+	if tracked {
+		// Probe before preparation, StartTask or passing task input to a backend.
+		d.checkLauncherHealth(ctx, rt)
+	}
+	d.mu.Lock()
+	rt, tracked = d.runtimeIndex[task.RuntimeID]
 	if tracked && rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
 		tracked = false
 	}
