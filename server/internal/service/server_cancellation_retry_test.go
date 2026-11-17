@@ -16,7 +16,7 @@ import (
 // evidence of an involuntary interruption, even with a persisted session.
 func TestServerCancellationDoesNotAuthorizeRecovery(t *testing.T) {
 	for _, chat := range []bool{false, true} {
-		for _, reason := range []string{"cancelled", "agent_error.unknown", "agent_error.provider_auth"} {
+		for _, reason := range []string{"cancelled", "agent_error.unknown", "agent_error.provider_auth_or_access"} {
 			t.Run(fmt.Sprintf("chat=%v/reason=%s", chat, reason), func(t *testing.T) {
 				ctx := context.Background()
 				pool := sharedTestPool(t)
