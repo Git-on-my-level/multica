@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,6 +13,14 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
+
+func TestLauncherHealthNoticeUsesSanitizedDiagnosis(t *testing.T) {
+	v := runtimeVerdict(db.AgentRuntime{Status: "offline", Metadata: []byte(`{"offline_reason":{"code":"not_executable","launcher_unavailable":true,"detail":"secret setting value"}}`)}, db.Agent{})
+	notice := RuntimeUnusableNotice("OpenCode agent", v)
+	if !v.Blocked() || !strings.Contains(notice, "127") || strings.Contains(notice, "secret") || strings.Contains(notice, "Reinstall") {
+		t.Fatalf("launcher diagnosis not represented safely: %q", notice)
+	}
+}
 
 func TestLauncherHealthDoesNotChangeProcessFailureRetryPolicy(t *testing.T) {
 	for _, text := range []string{"opencode exited with error: exit status 127", "opencode exited with error: exit status 1"} {

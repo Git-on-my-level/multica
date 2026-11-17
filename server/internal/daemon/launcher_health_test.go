@@ -52,12 +52,12 @@ func TestLauncherHealthIndependentRunsDoNotReplayObservedWork(t *testing.T) {
 	if runs != 1 || len(failures) != 2 || failures[0] != taskfailure.ReasonAgentProcessFailure.String() || failures[1] != taskfailure.ReasonRuntimeOffline.String() {
 		t.Fatalf("runs=%d failure bookkeeping=%v", runs, failures)
 	}
-	if len(d.allRuntimeIDs()) != 0 {
+	if len(d.claimableRuntimeIDs()) != 0 {
 		t.Fatal("third same-agent dispatch remained eligible")
 	}
 }
 
-func TestLauncherHealthExitHelper(t *testing.T) {
+func runLauncherHealthExitFixture() {
 	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "launcher-health-helper" {
 		return
 	}
@@ -97,14 +97,14 @@ func TestLauncherHealthRejectsBeforeTaskInput(t *testing.T) {
 	for _, id := range []string{"initial", "independent-fresh"} {
 		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid}, 0)
 	}
-	if failed != 2 || len(d.allRuntimeIDs()) != 0 {
-		t.Fatalf("failed=%d eligible=%v", failed, d.allRuntimeIDs())
+	if failed != 2 || len(d.claimableRuntimeIDs()) != 0 {
+		t.Fatalf("failed=%d eligible=%v", failed, d.claimableRuntimeIDs())
 	}
 }
 
 func launcherProbeExit(t *testing.T, code int) error {
 	t.Helper()
-	err := exec.Command(os.Args[0], "-test.run=^TestLauncherHealthExitHelper$", "launcher-health-helper", strconv.Itoa(code)).Run()
+	err := exec.Command(os.Args[0], "-test.run=^$", "launcher-health-helper", strconv.Itoa(code)).Run()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != code {
 		t.Fatalf("fixture exit = %v, want %d", err, code)
@@ -136,8 +136,11 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 	// The first process failure stays failed; the probe gets no task input.
 	d.activeTasks.Add(1)
 	d.checkFailedLauncher(context.Background(), rt, taskfailure.ReasonAgentProcessFailure.String())
+	if ids := d.allRuntimeIDs(); len(ids) != 1 || ids[0] != rid {
+		t.Fatalf("held runtime disappeared from heartbeat/wakeup/shutdown coverage: %v", ids)
+	}
 	for independentEnqueue := 0; independentEnqueue < 2; independentEnqueue++ {
-		if ids := d.allRuntimeIDs(); len(ids) != 0 {
+		if ids := d.claimableRuntimeIDs(); len(ids) != 0 {
 			t.Fatalf("fresh dispatch %d could still claim broken runtime: %v", independentEnqueue, ids)
 		}
 	}
@@ -157,13 +160,31 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 	}
 	// Further failing health evidence cannot revive the runtime.
 	d.convergeRuntimeRegistrations(context.Background())
-	if len(d.allRuntimeIDs()) != 0 {
+	if len(d.claimableRuntimeIDs()) != 0 {
 		t.Fatal("failed probe restored eligibility")
 	}
 	fx.setProbeErr(nil)
 	d.convergeRuntimeRegistrations(context.Background())
-	if ids := d.allRuntimeIDs(); len(ids) != 1 || ids[0] != rid {
+	if ids := d.claimableRuntimeIDs(); len(ids) != 1 || ids[0] != rid {
 		t.Fatalf("successful probe did not restore original runtime: %v", ids)
+	}
+}
+
+func TestLauncherHealthFastInstallRaceRetriesOnlyHealthProbe(t *testing.T) {
+	fx := newLauncherHealthFixture(t)
+	exit127 := launcherProbeExit(t, 127)
+	probes := 0
+	fx.setProbeErr(func(string, int) error {
+		probes++
+		if probes == 1 {
+			return exit127
+		}
+		return nil
+	})
+	rt := *fx.daemon.findRuntime(fx.runtimeIDFor("ws-1", "opencode"))
+	fx.daemon.checkLauncherHealth(context.Background(), rt)
+	if probes != 2 || len(fx.daemon.claimableRuntimeIDs()) != 1 {
+		t.Fatalf("fast install recovery: probes=%d eligible=%v", probes, fx.daemon.claimableRuntimeIDs())
 	}
 }
 
@@ -193,7 +214,7 @@ func TestLauncherHealthControls(t *testing.T) {
 			}
 			fx.daemon.checkFailedLauncher(ctx, Runtime{Provider: tc.provider, ProfileID: tc.profile}, tc.reason)
 			fx.daemon.demoteHeldLaunchers(context.Background())
-			if len(fx.daemon.allRuntimeIDs()) != 1 {
+			if len(fx.daemon.claimableRuntimeIDs()) != 1 {
 				t.Fatal("ordinary failure changed launcher eligibility")
 			}
 		})

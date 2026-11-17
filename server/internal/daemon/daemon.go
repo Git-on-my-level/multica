@@ -2288,6 +2288,18 @@ func (d *Daemon) allRuntimeIDs() []string {
 	defer d.mu.Unlock()
 	var ids []string
 	for _, ws := range d.workspaces {
+		ids = append(ids, ws.runtimeIDs...)
+	}
+	return ids
+}
+
+// Heartbeats and wakeups must continue covering held runtimes until their
+// active tasks settle. Only claims exclude a held provider.
+func (d *Daemon) claimableRuntimeIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var ids []string
+	for _, ws := range d.workspaces {
 		for _, id := range ws.runtimeIDs {
 			rt := d.runtimeIndex[id]
 			if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
@@ -2545,7 +2557,7 @@ func newRuntimeVerdict(verdict builtinProbeVerdict, reason, execPath string, ins
 	switch verdict {
 	case builtinProbeLauncherUnavailable:
 		return runtimeVerdict{launcherUnavailable: true, reason: reason, offline: &RuntimeOfflineReason{
-			Code: RuntimeOfflineCodeNotExecutable, Detail: reason,
+			Code: RuntimeOfflineCodeNotExecutable, Detail: reason, LauncherUnavailable: true,
 		}}
 	case builtinProbeNotExecutable:
 		offline := &RuntimeOfflineReason{Code: RuntimeOfflineCodeNotExecutable, Detail: reason}
@@ -2594,8 +2606,9 @@ func (d *Daemon) probeBuiltinRuntime(ctx context.Context, name string, entry Age
 		return d.probeMuseAppReceptionist(ctx)
 	}
 	var (
-		lastErr  error
-		attempts int
+		lastErr                error
+		attempts               int
+		sawLauncherUnavailable bool
 		// transientReason lets a provider whose probe is not a version probe
 		// name its own failure. The generic tail would otherwise report "version
 		// detection failed" for a dsh that answered --version perfectly well,
@@ -2665,8 +2678,9 @@ probeLoop:
 		if err != nil {
 			var exitErr *exec.ExitError
 			if name == "opencode" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 127 {
-				// Never attach probe output, environment, or executable paths.
-				return "", launcherUnavailableDetail, builtinProbeLauncherUnavailable
+				// POSIX-style exit 127 only; Windows cmd's 9009 is not handled.
+				// Retry health checks, never task input, across a fast install race.
+				sawLauncherUnavailable = true
 			}
 			lastErr = err
 			if time.Since(startedAt) >= runtimeVersionProbeRetryWindow {
@@ -2781,6 +2795,10 @@ probeLoop:
 		}
 		d.logger.Debug("agent version detected", "name", name, "version", version, "path", resolved.Path)
 		return version, "", builtinProbeOK
+	}
+	if sawLauncherUnavailable && ctx.Err() == nil {
+		// Never attach probe output, environment, or executable paths.
+		return "", launcherUnavailableDetail, builtinProbeLauncherUnavailable
 	}
 	// The OS refusing to execute the file is not a failed probe, it is a
 	// finding: the CLI is installed, resolvable, and unrunnable. Report it as
@@ -5451,7 +5469,7 @@ func (d *Daemon) pollLoop(ctx context.Context, taskWakeups <-chan taskWakeup) er
 			d.waitForTaskCleanup(&taskWG, 30*time.Second)
 			return ctx.Err()
 		case <-runtimeSetCh:
-			// The batch poller re-derives allRuntimeIDs() each cycle; nudge it to
+			// The batch poller re-derives claimableRuntimeIDs() each cycle; nudge it to
 			// pick up a registered/removed runtime promptly.
 			nudge()
 		case <-taskWakeups:
@@ -5485,7 +5503,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		}
 		d.demoteHeldLaunchers(pollerCtx)
 
-		runtimeIDs := d.allRuntimeIDs()
+		runtimeIDs := d.claimableRuntimeIDs()
 		if len(runtimeIDs) == 0 {
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return

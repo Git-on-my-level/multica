@@ -36,7 +36,8 @@ const (
 // it: the wire reason code, and — when the daemon reported one — the command
 // that repairs the runtime.
 type AgentVerdict struct {
-	Availability AgentAvailability
+	LauncherUnavailable bool
+	Availability        AgentAvailability
 	// Reason is the dispatch code for a non-available verdict, empty otherwise.
 	Reason dispatch.ReasonCode
 	// Repair is the fix the daemon reported for an unusable runtime: the npm
@@ -70,9 +71,10 @@ type RuntimeRepair struct {
 // runtimeOfflineReason is the daemon's structured explanation, stored on the
 // runtime row's metadata by the deregister handler.
 type runtimeOfflineReason struct {
-	Code   string         `json:"code"`
-	Detail string         `json:"detail"`
-	Repair *RuntimeRepair `json:"repair"`
+	LauncherUnavailable bool           `json:"launcher_unavailable"`
+	Code                string         `json:"code"`
+	Detail              string         `json:"detail"`
+	Repair              *RuntimeRepair `json:"repair"`
 	// Installing: the daemon has an automatic install in flight, so this offline
 	// runtime is expected to come back on its own and work may queue.
 	Installing bool `json:"installing"`
@@ -170,10 +172,11 @@ func runtimeVerdict(rt db.AgentRuntime, agent db.Agent) AgentVerdict {
 		switch {
 		case reason.Code == runtimeOfflineCodeNotExecutable:
 			return AgentVerdict{
-				Availability: AgentBlocked,
-				Reason:       dispatch.ReasonRuntimeUnusable,
-				Repair:       reason.Repair,
-				Detail:       reason.Detail,
+				LauncherUnavailable: reason.LauncherUnavailable,
+				Availability:        AgentBlocked,
+				Reason:              dispatch.ReasonRuntimeUnusable,
+				Repair:              reason.Repair,
+				Detail:              reason.Detail,
 			}
 		// A missing runtime profile is the same shape of finding — the machine
 		// is reachable and its CLI cannot serve work — but its own reason code,
@@ -275,6 +278,9 @@ func RuntimeUnusableNotice(agentName string, verdict AgentVerdict) string {
 	}
 	if verdict.Reason == dispatch.ReasonRuntimeProfileMissing {
 		return runtimeProfileMissingNotice(name)
+	}
+	if verdict.LauncherUnavailable {
+		return fmt.Sprintf("%s could not start: a task-free launcher health check exited 127, so this trigger was not queued. Repair the launcher on that machine; a successful version check must restore eligibility before triggering the agent again.", name)
 	}
 	if verdict.Repair != nil && verdict.Repair.Command != "" {
 		return fmt.Sprintf(
