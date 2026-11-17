@@ -234,8 +234,12 @@ RETURNING id;
 -- Used on the offline→online transition (and on first heartbeat after
 -- registration). Writes status, last_seen_at, and updated_at because the
 -- status flip is a real state change and we want updated_at to reflect it.
+-- A heartbeat establishes liveness, not launcher health. Only a successful
+-- registration probe may clear the not-executable reason and restore claims.
 UPDATE agent_runtime
-SET status = 'online', last_seen_at = now(), updated_at = now()
+SET status = CASE WHEN metadata->'offline_reason'->>'code' = 'not_executable'
+                  THEN status ELSE 'online' END,
+    last_seen_at = now(), updated_at = now()
 WHERE id = $1
 RETURNING *;
 
@@ -246,7 +250,8 @@ RETURNING *;
 -- recovered the runtime.
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
-WHERE id = $1 AND status <> 'online';
+WHERE id = $1 AND status <> 'online'
+  AND (metadata->'offline_reason'->>'code' IS DISTINCT FROM 'not_executable');
 
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime

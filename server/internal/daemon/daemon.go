@@ -1748,9 +1748,10 @@ func (r *revivedRuntimes) add(d *Daemon, runtimeID, provider string) {
 // re-attach it. Without that the server ends up "offline, no reason", which
 // downgrades the refusal back to "wait for the machine" (MUL-6164).
 type demotionRecord struct {
-	evidence string
-	offline  *RuntimeOfflineReason
-	seq      uint64
+	launcherUnavailable bool
+	evidence            string
+	offline             *RuntimeOfflineReason
+	seq                 uint64
 }
 
 // setLifecycleCtx records the context Run was handed.
@@ -1786,9 +1787,10 @@ func (d *Daemon) markProvidersDemotedLocked(providers map[string]runtimeVerdict)
 	d.demotionSeq++
 	for provider, verdict := range providers {
 		d.demotedProviders[provider] = demotionRecord{
-			evidence: verdict.reason,
-			offline:  verdict.offline,
-			seq:      d.demotionSeq,
+			launcherUnavailable: verdict.launcherUnavailable,
+			evidence:            verdict.reason,
+			offline:             verdict.offline,
+			seq:                 d.demotionSeq,
 		}
 	}
 }
@@ -2286,7 +2288,13 @@ func (d *Daemon) allRuntimeIDs() []string {
 	defer d.mu.Unlock()
 	var ids []string
 	for _, ws := range d.workspaces {
-		ids = append(ids, ws.runtimeIDs...)
+		for _, id := range ws.runtimeIDs {
+			rt := d.runtimeIndex[id]
+			if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+				continue
+			}
+			ids = append(ids, id)
+		}
 	}
 	return ids
 }
@@ -2409,6 +2417,8 @@ type builtinProbeVerdict int
 const (
 	builtinProbeOK builtinProbeVerdict = iota
 	builtinProbeUnavailable
+	// A task-free --version invocation could not start its launcher chain.
+	builtinProbeLauncherUnavailable
 	builtinProbeBelowMinimum
 	// builtinProbeProtocolSkew: the backend and its remote counterpart
 	// (e.g. the museapp receptionist) speak different protocol versions.
@@ -2460,7 +2470,7 @@ const (
 // learned this round.
 func demotableBuiltinProbeVerdict(verdict builtinProbeVerdict) bool {
 	switch verdict {
-	case builtinProbeBelowMinimum, builtinProbeProtocolSkew, builtinProbeNotExecutable, builtinProbeMissingProfile, builtinProbeProfileMigration:
+	case builtinProbeBelowMinimum, builtinProbeLauncherUnavailable, builtinProbeProtocolSkew, builtinProbeNotExecutable, builtinProbeMissingProfile, builtinProbeProfileMigration:
 		return true
 	}
 	return false
@@ -2469,17 +2479,11 @@ func demotableBuiltinProbeVerdict(verdict builtinProbeVerdict) bool {
 // builtinProbeNeedsConfirmation reports whether a demotable verdict must
 // reproduce across two probe rounds (confirmCondemned) before it is acted on.
 //
-// Only builtinProbeBelowMinimum does not: it is a pure function of a version
-// string this round already parsed, so a second look reaches the same
-// conclusion. The other demotable verdicts describe deterministic states but
-// rest on an observation that is not — an installer overwriting the bin entry in
-// place (the very repair we tell users to run), a DSH upgrade moving the
-// profile under a probe, or a museapp receptionist mid-upgrade answering one
-// /v1/health with another protocol version. Requiring a second sighting a
-// window later makes those windows impossible to mistake for a verdict, and
-// costs a genuinely broken provider one extra round.
+// Below-minimum is a pure function of a version; launcher-unavailable is a
+// task-free exit-127 observation and immediately fences fresh task dispatch.
+// Other verdicts require confirmation: they can be observed during an install.
 func builtinProbeNeedsConfirmation(verdict builtinProbeVerdict) bool {
-	return verdict != builtinProbeBelowMinimum
+	return verdict != builtinProbeBelowMinimum && verdict != builtinProbeLauncherUnavailable
 }
 
 const dshProfileMigrationReason = "the multica DSH profile needs manual migration; back up the profile, build a compatible " + dshMulticaRuntimePackage + " bundle from https://github.com/multica-ai/dsh-multica-runtime following its README, install the directory or tarball with dsh plugin, and update dsh.profile.bundles to load " + dshMulticaRuntimePackage + " instead of " + dshLegacyRuntimePackage + "; a dependencies entry alone does not load the runtime"
@@ -2522,8 +2526,9 @@ const dshProbeFailedReason = "the DSH runtime profile probe returned no usable a
 // that a reason code is decided at its source and never reverse-engineered from
 // a human-readable string, and this is that source.
 type runtimeVerdict struct {
-	reason  string
-	offline *RuntimeOfflineReason
+	launcherUnavailable bool
+	reason              string
+	offline             *RuntimeOfflineReason
 }
 
 // newRuntimeVerdict pairs a probe verdict with what the server needs to know
@@ -2538,6 +2543,10 @@ type runtimeVerdict struct {
 // file.
 func newRuntimeVerdict(verdict builtinProbeVerdict, reason, execPath string, installing bool) runtimeVerdict {
 	switch verdict {
+	case builtinProbeLauncherUnavailable:
+		return runtimeVerdict{launcherUnavailable: true, reason: reason, offline: &RuntimeOfflineReason{
+			Code: RuntimeOfflineCodeNotExecutable, Detail: reason,
+		}}
 	case builtinProbeNotExecutable:
 		offline := &RuntimeOfflineReason{Code: RuntimeOfflineCodeNotExecutable, Detail: reason}
 		if repair, ok := agent.ExecFormatRepairFor(execPath); ok {
@@ -2654,6 +2663,11 @@ probeLoop:
 		}
 		version, err := detectAgentVersion(ctx, agent.Command{Path: resolved.Path})
 		if err != nil {
+			var exitErr *exec.ExitError
+			if name == "opencode" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 127 {
+				// Never attach probe output, environment, or executable paths.
+				return "", launcherUnavailableDetail, builtinProbeLauncherUnavailable
+			}
 			lastErr = err
 			if time.Since(startedAt) >= runtimeVersionProbeRetryWindow {
 				break
@@ -5469,6 +5483,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		if pollerCtx.Err() != nil {
 			return
 		}
+		d.demoteHeldLaunchers(pollerCtx)
 
 		runtimeIDs := d.allRuntimeIDs()
 		if len(runtimeIDs) == 0 {
@@ -5776,6 +5791,9 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
+	if tracked && rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+		tracked = false
+	}
 	d.mu.Unlock()
 	// The runtime can go offline between the batch claim leaving with its ID and
 	// the claimed task arriving here — a below-minimum demotion or a drift
@@ -5951,6 +5969,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
+		d.checkFailedLauncher(finalCtx, rt, taskRunFailureReason(err))
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
 		// result, especially the actual/preserved workdir and delivered branch.
@@ -6008,6 +6027,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		result.Comment = "daemon shut down while task was in flight"
 	}
 
+	d.checkFailedLauncher(finalCtx, rt, result.FailureReason)
 	d.reportTaskResult(ctx, task.ID, result, taskLog)
 
 	// Write GC metadata after the task finishes so the periodic GC loop
