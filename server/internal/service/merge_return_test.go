@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,7 +85,7 @@ func TestMergeReturnAdmissionAndRetry(t *testing.T) {
 func issueString(id pgtype.UUID) string { return util.UUIDToString(id) }
 
 func TestMergeReturnRefusesChangedAdmission(t *testing.T) {
-	for _, change := range []string{"owner", "revision", "pin", "head", "branch", "ruling", "unlinked", "runtime", "project", "pr-state", "quoted-ruling"} {
+	for _, change := range []string{"owner", "revision", "pin", "head", "branch", "ruling", "unlinked", "runtime", "project", "pr-state", "quoted-ruling", "vcs-link"} {
 		t.Run(change, func(t *testing.T) {
 			f, s, issue, in, pr := mergeReturnFixture(t)
 			w := wakeCreate(t, f, s, issue, in)
@@ -112,6 +113,15 @@ func TestMergeReturnRefusesChangedAdmission(t *testing.T) {
 			case "quoted-ruling":
 				id := f.Comment(t, issueString(issue), "`OWNER:` stop this return")
 				f.Exec(t, "UPDATE comment SET created_at='2026-02-01T00:00:00Z',updated_at='2026-02-01T00:00:00Z' WHERE id=$1", id)
+			case "vcs-link":
+				var vcs string
+				if err := f.Pool.QueryRow(context.Background(), `INSERT INTO vcs_pull_request(workspace_id,connection_id,provider,repo_owner,repo_name,pr_number,title,state,html_url,pr_created_at,pr_updated_at,head_sha)
+				 VALUES($1,gen_random_uuid(),'forgejo','fixture','custody',7,'PR','open','https://vcs.example.test/pr/7',now(),now(),'same-head') RETURNING id`, f.WorkspaceID).Scan(&vcs); err != nil {
+					t.Fatal(err)
+				}
+				f.Cleanup(t, "DELETE FROM vcs_pull_request WHERE id=$1", vcs)
+				f.Cleanup(t, "DELETE FROM issue_vcs_pull_request WHERE pull_request_id=$1", vcs)
+				f.Exec(t, "INSERT INTO issue_vcs_pull_request(issue_id,pull_request_id) VALUES($1,$2)", issue, vcs)
 			}
 			if err := s.dispatch(context.Background(), w); err != nil {
 				t.Fatal(err)
@@ -248,5 +258,65 @@ func TestMergeReturnAmbiguousIdentityDoesNotRegister(t *testing.T) {
 	}
 	if got := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); got != 0 {
 		t.Fatalf("ambiguous author started %d runs", got)
+	}
+}
+
+func TestMergeReturnDoesNotJoinUnguardedCarrier(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		f, s, issue, in, pr := mergeReturnFixture(t)
+		w := wakeCreate(t, f, s, issue, in)
+		carrier := wakeWaitingRun(t, f, issue, in.AgentID, f.UserID)
+		w = wakeTick(t, f, s, w.ID)
+		if w.LastTaskID.Valid {
+			t.Fatal("fixture did not retain input behind existing queued run")
+		}
+		if changed {
+			f.Exec(t, "UPDATE github_pull_request SET head_sha='changed-before-carrier-claim' WHERE id=$1", pr)
+		}
+		if notes := wakeClaim(t, f, s, carrier); notes != "" {
+			t.Fatalf("guarded repair leaked into generic carrier: %s", notes)
+		}
+		if changed {
+			wakeDispatch(t, s, w)
+			if wakeRuns(t, f, w.ID) != 0 {
+				t.Fatal("changed custody started a repair")
+			}
+		} else {
+			f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1", carrier)
+			w = wakeTick(t, f, s, w.ID)
+			if !w.LastTaskID.Valid || wakeRuns(t, f, w.ID) != 1 {
+				t.Fatal("guarded input did not receive its own dispatch")
+			}
+		}
+	}
+}
+
+func TestMergeReturnPreObservationRulingIsNotOrdinaryHistory(t *testing.T) {
+	for _, ruling := range []bool{false, true} {
+		f, s, issue, in, _ := mergeReturnFixture(t)
+		text := "ordinary prior review evidence"
+		if ruling {
+			text = "RULING: owner routing supersedes the old author pin"
+		}
+		if _, err := f.q.CreateComment(context.Background(), db.CreateCommentParams{IssueID: issue, WorkspaceID: parseTestUUID(t, f.WorkspaceID),
+			AuthorType: "member", AuthorID: parseTestUUID(t, f.UserID), Content: text, Type: "comment"}); err != nil {
+			t.Fatal(err)
+		}
+		i, err := f.q.GetIssue(context.Background(), issue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c WakeupCondition
+		_ = json.Unmarshal(in.Condition, &c)
+		custody, _ := readMergeReturnCustody(c.Value)
+		custody.Revision, custody.ObservedAt = i.Revision, time.Now().UTC()
+		in.Condition = condition(t, map[string]any{"type": "merge_return", "value": custody})
+		_, err = s.Create(context.Background(), issue, parseTestUUID(t, f.UserID), pgtype.UUID{}, in)
+		if ruling && (err == nil || !strings.Contains(err.Error(), "newer comment")) {
+			t.Fatalf("pre-observation ruling was ignored: %v", err)
+		}
+		if !ruling && err != nil {
+			t.Fatalf("ordinary pre-observation history blocked repair: %v", err)
+		}
 	}
 }

@@ -134,7 +134,11 @@ func checkMergeReturnIssue(ctx context.Context, tx pgx.Tx, q *db.Queries, w db.I
 	if err != nil {
 		return err
 	}
-	if len(prs) != 1 {
+	vcs, err := q.ListVCSPullRequestsByIssue(ctx, i.ID)
+	if err != nil {
+		return err
+	}
+	if len(prs) != 1 || len(vcs) != 0 {
 		return fmt.Errorf("%w: PR custody is ambiguous", errMergeReturnCustody)
 	}
 	p := prs[0]
