@@ -6,7 +6,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
-const launcherUnavailableDetail = "launcher health check exited 127 before task input; repair the launcher and run a successful version check"
+const launcherUnavailableDetail = "OpenCode launcher health check exited 127; repair the launcher, then verify opencode --version succeeds"
 
 // A task's exit code cannot establish whether it performed work. A separate,
 // task-free probe can establish launcher health, without replaying that task.
@@ -21,6 +21,13 @@ func (d *Daemon) checkLauncherHealth(ctx context.Context, rt Runtime) {
 	if ctx.Err() != nil || rt.Provider != "opencode" || rt.ProfileID != "" {
 		return
 	}
+	_, _, _ = d.launcherProbeGroup.Do(rt.Provider, func() (any, error) {
+		d.probeLauncherHealth(ctx, rt)
+		return nil, nil
+	})
+}
+
+func (d *Daemon) probeLauncherHealth(ctx context.Context, rt Runtime) {
 	d.mu.Lock()
 	held := d.providerDemotedLocked(rt.Provider)
 	d.mu.Unlock()

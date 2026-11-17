@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -128,6 +129,8 @@ func newLauncherHealthFixture(t *testing.T) *batchFixture {
 func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *testing.T) {
 	fx := newLauncherHealthFixture(t)
 	d := fx.daemon
+	var diagnostic bytes.Buffer
+	d.logger = slog.New(slog.NewTextHandler(&diagnostic, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	rid := fx.runtimeIDFor("ws-1", "opencode")
 	rt := *d.findRuntime(rid)
 	exit127 := launcherProbeExit(t, 127)
@@ -136,6 +139,9 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 	// The first process failure stays failed; the probe gets no task input.
 	d.activeTasks.Add(1)
 	d.checkFailedLauncher(context.Background(), rt, taskfailure.ReasonAgentProcessFailure.String())
+	if strings.Contains(diagnostic.String(), "sensitive probe output") {
+		t.Fatal("persisted raw launcher probe diagnostic")
+	}
 	if ids := d.allRuntimeIDs(); len(ids) != 1 || ids[0] != rid {
 		t.Fatalf("held runtime disappeared from heartbeat/wakeup/shutdown coverage: %v", ids)
 	}
@@ -164,6 +170,13 @@ func TestLauncherHealthSuppressesIndependentDispatchUntilSuccessfulProbe(t *test
 		t.Fatal("failed probe restored eligibility")
 	}
 	fx.setProbeErr(nil)
+	d.agentDiscoveryKick = make(chan struct{}, 1)
+	d.refreshAgentVersions(context.Background())
+	select {
+	case <-d.agentDiscoveryKick:
+	default:
+		t.Fatal("successful health evidence did not bypass discovery backoff")
+	}
 	d.convergeRuntimeRegistrations(context.Background())
 	if ids := d.claimableRuntimeIDs(); len(ids) != 1 || ids[0] != rid {
 		t.Fatalf("successful probe did not restore original runtime: %v", ids)

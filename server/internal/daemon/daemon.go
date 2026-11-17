@@ -590,7 +590,8 @@ type Daemon struct {
 	// healGroup coalesces concurrent self-heal re-resolutions per provider so a
 	// just-upgraded agent seen by many queued tasks at once pays for a single
 	// login-shell probe + version detection instead of one per task (MUL-4486).
-	healGroup singleflight.Group
+	healGroup          singleflight.Group
+	launcherProbeGroup singleflight.Group
 
 	wsHBMu        sync.RWMutex         // guards wsHBLastAck and wsLastReceive
 	wsHBLastAck   map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
@@ -1894,6 +1895,9 @@ func (d *Daemon) clearProviderDemotions(providers []string, sampledAfter uint64)
 			continue
 		}
 		delete(d.demotedProviders, provider)
+		if record.launcherUnavailable {
+			d.kickAgentDiscovery()
+		}
 		d.logger.Info("agent CLI is usable again",
 			"provider", provider, "previous_verdict", record.evidence)
 	}
@@ -2681,6 +2685,7 @@ probeLoop:
 				// POSIX-style exit 127 only; Windows cmd's 9009 is not handled.
 				// Retry health checks, never task input, across a fast install race.
 				sawLauncherUnavailable = true
+				err = errors.New(launcherUnavailableDetail)
 			}
 			lastErr = err
 			if time.Since(startedAt) >= runtimeVersionProbeRetryWindow {

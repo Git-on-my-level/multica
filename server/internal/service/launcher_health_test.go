@@ -41,7 +41,7 @@ func TestLauncherHealthHeartbeatCannotRestoreClaims(t *testing.T) {
 	workspaceID := bootstrap.Workspace(t, "launcher health", "launcher-health-"+userID)
 	fx := testutil.New(pool, workspaceID, userID)
 	fx.Member(t, workspaceID, userID, "owner")
-	runtimeID := fx.Runtime(t, "broken launcher")
+	runtimeID := fx.Runtime(t, "broken launcher", testutil.Cols{"daemon_id": "launcher-health-" + uuid.NewString()})
 	agentID := fx.Agent(t, "launcher agent", runtimeID)
 	issueID := fx.Issue(t, "preserve unstarted outcome")
 	taskID := fx.Task(t, agentID, testutil.Cols{
@@ -74,5 +74,23 @@ func TestLauncherHealthHeartbeatCannotRestoreClaims(t *testing.T) {
 	}
 	if status != "queued" || input != "preserve this outcome" || note != "same model only" {
 		t.Fatalf("unstarted outcome changed: %q %q %q", status, input, note)
+	}
+	previous, err := q.GetAgentRuntime(ctx, rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := q.UpsertAgentRuntime(ctx, db.UpsertAgentRuntimeParams{
+		WorkspaceID: previous.WorkspaceID, DaemonID: previous.DaemonID, Name: previous.Name,
+		RuntimeMode: previous.RuntimeMode, Provider: previous.Provider, Status: "online",
+		DeviceInfo: previous.DeviceInfo, Metadata: []byte(`{}`), OwnerID: previous.OwnerID, RequiredOwnerID: previous.OwnerID,
+	})
+	if err != nil || registered.ID != rid {
+		t.Fatalf("health registration: id=%v error=%v", registered.ID, err)
+	}
+	claimed, err := q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
+		AgentID: util.MustParseUUID(agentID), RuntimeID: rid, PrepareLeaseSecs: 60, RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+	})
+	if err != nil || util.UUIDToString(claimed.ID) != taskID {
+		t.Fatalf("healthy registration did not restore original outcome: %v", err)
 	}
 }
