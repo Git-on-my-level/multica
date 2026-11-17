@@ -5150,8 +5150,8 @@ func TestEnsureRepoReadyReturnsNotConfigured(t *testing.T) {
 	d.workspaces["ws-1"] = newWorkspaceState("ws-1", nil, "", nil, nil)
 
 	err := d.ensureRepoReady(context.Background(), "ws-1", "git@example.com:team/api.git")
-	if !errors.Is(err, ErrRepoNotConfigured) {
-		t.Fatalf("expected ErrRepoNotConfigured, got %v", err)
+	if !errors.Is(err, ErrRepoNotConfigured) || !strings.Contains(err.Error(), "git@example.com:team/api.git") {
+		t.Fatalf("expected ErrRepoNotConfigured naming the target, got %v", err)
 	}
 }
 

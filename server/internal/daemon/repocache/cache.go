@@ -847,19 +847,11 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	// to the modern remote-tracking layout on first run, so subsequent fetches
 	// never collide with the refs/heads/agent/* branches that worktree creation
 	// locks in this same bare repo.
-	var fetchErr string
 	if err := gitFetchContext(ctx, barePath); err != nil {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}
-		// Non-fatal: preserve cached state and continue. The agent will
-		// receive an older snapshot than the remote head, so the result
-		// carries the error back to the CLI as well as the daemon log.
-		fetchErr = redact.Text(err.Error())
-		c.logger.Warn("repo checkout: fetch failed, agent will see possibly stale code",
-			"url", params.RepoURL,
-			"error", err,
-		)
+		return nil, fmt.Errorf("fetch target %s: %s", redact.Text(params.RepoURL), redact.Text(err.Error()))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, context.Cause(ctx)
@@ -939,7 +931,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, context.Cause(ctx)
 		}
 
-		result.FetchError = fetchErr
 		c.logCheckoutReady("repo checkout: isolated checkout ready", params.RepoURL, baseRef, result)
 		return result, nil
 	}
@@ -970,7 +961,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, context.Cause(ctx)
 		}
 
-		result.FetchError = fetchErr
 		c.logCheckoutReady("repo checkout: existing worktree updated", params.RepoURL, baseRef, result)
 		return result, nil
 	}
@@ -1009,7 +999,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	return &WorktreeResult{
 		Path:       worktreePath,
 		BranchName: actualBranch,
-		FetchError: fetchErr,
 	}, nil
 }
 

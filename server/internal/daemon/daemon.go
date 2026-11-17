@@ -4018,20 +4018,21 @@ func (d *Daemon) ensureRepoReady(ctx context.Context, workspaceID, repoURL strin
 		return nil
 	}
 
-	resp, err := d.refreshWorkspaceRepos(ctx, workspaceID)
+	_, err := d.refreshWorkspaceRepos(ctx, workspaceID)
 	if err != nil {
-		return fmt.Errorf("refresh workspace repos: %w", err)
+		return fmt.Errorf("refresh workspace repos for %s: %w", repoURL, err)
 	}
 
 	if !d.workspaceRepoAllowed(workspaceID, repoURL) {
-		return ErrRepoNotConfigured
+		return fmt.Errorf("%w: %s", ErrRepoNotConfigured, repoURL)
 	}
 
 	if d.repoCache.Lookup(workspaceID, repoURL) != "" {
 		return nil
 	}
 
-	syncErr := d.syncWorkspaceReposContext(ctx, workspaceID, resp.Repos)
+	// Checkout admission must not clone or fetch unrelated configured repos.
+	syncErr := d.syncWorkspaceReposContext(ctx, workspaceID, []RepoData{{URL: repoURL}})
 	if err := ctx.Err(); err != nil {
 		return context.Cause(ctx)
 	}
@@ -4041,10 +4042,10 @@ func (d *Daemon) ensureRepoReady(ctx context.Context, workspaceID, repoURL strin
 	}
 
 	if syncErr != nil {
-		return fmt.Errorf("repo is configured but not synced: %w", syncErr)
+		return fmt.Errorf("repo is configured but not synced: %w (target: %s)", syncErr, repoURL)
 	}
 
-	return fmt.Errorf("repo is configured but not synced")
+	return fmt.Errorf("repo is configured but not synced: %s", repoURL)
 }
 
 // DefaultTokenRenewalInterval is how often the daemon asks the server to
