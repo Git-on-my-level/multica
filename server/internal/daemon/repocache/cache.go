@@ -779,9 +779,8 @@ type WorktreeResult struct {
 	// that no remote-tracking ref reaches.
 	UncommittedFiles int `json:"uncommitted_files,omitempty"`
 	UnpushedCommits  int `json:"unpushed_commits,omitempty"`
-	// FetchError is set when refreshing the cache from the remote failed and
-	// the checkout was based on what the cache already held, so it may be
-	// behind the remote. It carries the redacted git error for the caller.
+	// FetchError is retained for response-schema compatibility. It is no longer
+	// populated: a failed target fetch aborts the checkout.
 	FetchError string `json:"fetch_error,omitempty"`
 }
 
