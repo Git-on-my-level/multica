@@ -31,7 +31,7 @@ func TestHandleTask_ShutdownDisposition(t *testing.T) {
 		{"legacy message with shutdown provenance", "cancelled", "", "running", "/fail", "runtime_recovery", true, "task cancelled by server"},
 		{"legacy message on terminal server row", "cancelled", "", "cancelled", "/cancel-ack", "", true, "task cancelled by server"},
 		{"explicit cancellation reason during shutdown", "cancelled", "cancelled", "running", "/fail", "cancelled", true, "task cancelled by server"},
-		{"provider error during shutdown", "blocked", "agent_error.provider_auth", "running", "/fail", "agent_error.provider_auth", true, "provider authentication failed"},
+		{"provider error during shutdown", "blocked", "agent_error.provider_auth_or_access", "running", "/fail", "agent_error.provider_auth_or_access", true, "provider authentication failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
