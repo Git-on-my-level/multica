@@ -238,6 +238,7 @@ RETURNING id;
 -- registration probe may clear the not-executable reason and restore claims.
 UPDATE agent_runtime
 SET status = CASE WHEN metadata->'offline_reason'->>'code' = 'not_executable'
+                       AND metadata->'offline_reason'->>'launcher_unavailable' = 'true'
                   THEN status ELSE 'online' END,
     last_seen_at = now(), updated_at = now()
 WHERE id = $1
@@ -251,7 +252,8 @@ RETURNING *;
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1 AND status <> 'online'
-  AND (metadata->'offline_reason'->>'code' IS DISTINCT FROM 'not_executable');
+  AND NOT COALESCE(metadata->'offline_reason'->>'code' = 'not_executable'
+                  AND metadata->'offline_reason'->>'launcher_unavailable' = 'true', false);
 
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime

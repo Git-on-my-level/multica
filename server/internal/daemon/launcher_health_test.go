@@ -201,6 +201,24 @@ func TestLauncherHealthFastInstallRaceRetriesOnlyHealthProbe(t *testing.T) {
 	}
 }
 
+func TestLauncherHealthMixedProbeEvidenceStaysUnknown(t *testing.T) {
+	fx := newLauncherHealthFixture(t)
+	exit127 := launcherProbeExit(t, 127)
+	probes := 0
+	fx.setProbeErr(func(string, int) error {
+		probes++
+		if probes == 1 {
+			return exit127
+		}
+		return errors.New("health evidence unavailable")
+	})
+	rt := *fx.daemon.findRuntime(fx.runtimeIDFor("ws-1", "opencode"))
+	fx.daemon.checkLauncherHealth(context.Background(), rt)
+	if len(fx.daemon.claimableRuntimeIDs()) != 1 {
+		t.Fatal("mixed evidence was recorded as a confirmed exit-127 launcher failure")
+	}
+}
+
 func TestLauncherHealthControls(t *testing.T) {
 	for _, tc := range []struct {
 		name, provider, profile, reason string

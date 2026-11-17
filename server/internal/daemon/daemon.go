@@ -767,9 +767,10 @@ type Daemon struct {
 }
 
 type profileLaunchSpec struct {
-	path      string
-	version   string
-	fixedArgs []string
+	workspaceID string
+	path        string
+	version     string
+	fixedArgs   []string
 }
 
 // New creates a new Daemon instance.
@@ -2306,7 +2307,7 @@ func (d *Daemon) claimableRuntimeIDs() []string {
 	for _, ws := range d.workspaces {
 		for _, id := range ws.runtimeIDs {
 			rt := d.runtimeIndex[id]
-			if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+			if d.runtimeDemotedLocked(rt) {
 				continue
 			}
 			ids = append(ids, id)
@@ -2329,7 +2330,7 @@ func (d *Daemon) findRuntime(id string) *Runtime {
 // args resolved for a custom runtime profile. Called from
 // registerRuntimesForWorkspace. Lazily initializes the map so test fixtures
 // that build a Daemon literal without seeding every map don't panic.
-func (d *Daemon) recordProfileLaunch(profileID, path, version string, fixedArgs []string) {
+func (d *Daemon) recordProfileLaunch(workspaceID, profileID, path, version string, fixedArgs []string) {
 	if profileID == "" || path == "" {
 		return
 	}
@@ -2339,9 +2340,10 @@ func (d *Daemon) recordProfileLaunch(profileID, path, version string, fixedArgs 
 		d.profileLaunchSpecs = make(map[string]profileLaunchSpec)
 	}
 	d.profileLaunchSpecs[profileID] = profileLaunchSpec{
-		path:      path,
-		version:   version,
-		fixedArgs: append([]string(nil), fixedArgs...),
+		workspaceID: workspaceID,
+		path:        path,
+		version:     version,
+		fixedArgs:   append([]string(nil), fixedArgs...),
 	}
 }
 
@@ -2486,7 +2488,7 @@ const (
 // learned this round.
 func demotableBuiltinProbeVerdict(verdict builtinProbeVerdict) bool {
 	switch verdict {
-	case builtinProbeBelowMinimum, builtinProbeLauncherUnavailable, builtinProbeProtocolSkew, builtinProbeNotExecutable, builtinProbeMissingProfile, builtinProbeProfileMigration:
+	case builtinProbeBelowMinimum, builtinProbeProtocolSkew, builtinProbeNotExecutable, builtinProbeMissingProfile, builtinProbeProfileMigration:
 		return true
 	}
 	return false
@@ -2495,11 +2497,10 @@ func demotableBuiltinProbeVerdict(verdict builtinProbeVerdict) bool {
 // builtinProbeNeedsConfirmation reports whether a demotable verdict must
 // reproduce across two probe rounds (confirmCondemned) before it is acted on.
 //
-// Below-minimum is a pure function of a version; launcher-unavailable is a
-// task-free exit-127 observation and immediately fences fresh task dispatch.
-// Other verdicts require confirmation: they can be observed during an install.
+// Below-minimum is a pure function of a parsed version. Other scheduled
+// verdicts require confirmation because they can be observed during an install.
 func builtinProbeNeedsConfirmation(verdict builtinProbeVerdict) bool {
-	return verdict != builtinProbeBelowMinimum && verdict != builtinProbeLauncherUnavailable
+	return verdict != builtinProbeBelowMinimum
 }
 
 const dshProfileMigrationReason = "the multica DSH profile needs manual migration; back up the profile, build a compatible " + dshMulticaRuntimePackage + " bundle from https://github.com/multica-ai/dsh-multica-runtime following its README, install the directory or tarball with dsh plugin, and update dsh.profile.bundles to load " + dshMulticaRuntimePackage + " instead of " + dshLegacyRuntimePackage + "; a dependencies entry alone does not load the runtime"
@@ -2610,9 +2611,8 @@ func (d *Daemon) probeBuiltinRuntime(ctx context.Context, name string, entry Age
 		return d.probeMuseAppReceptionist(ctx)
 	}
 	var (
-		lastErr                error
-		attempts               int
-		sawLauncherUnavailable bool
+		lastErr  error
+		attempts int
 		// transientReason lets a provider whose probe is not a version probe
 		// name its own failure. The generic tail would otherwise report "version
 		// detection failed" for a dsh that answered --version perfectly well,
@@ -2680,13 +2680,6 @@ probeLoop:
 		}
 		version, err := detectAgentVersion(ctx, agent.Command{Path: resolved.Path})
 		if err != nil {
-			var exitErr *exec.ExitError
-			if name == "opencode" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 127 {
-				// POSIX-style exit 127 only; Windows cmd's 9009 is not handled.
-				// Retry health checks, never task input, across a fast install race.
-				sawLauncherUnavailable = true
-				err = errors.New(launcherUnavailableDetail)
-			}
 			lastErr = err
 			if time.Since(startedAt) >= runtimeVersionProbeRetryWindow {
 				break
@@ -2800,10 +2793,6 @@ probeLoop:
 		}
 		d.logger.Debug("agent version detected", "name", name, "version", version, "path", resolved.Path)
 		return version, "", builtinProbeOK
-	}
-	if sawLauncherUnavailable && ctx.Err() == nil {
-		// Never attach probe output, environment, or executable paths.
-		return "", launcherUnavailableDetail, builtinProbeLauncherUnavailable
 	}
 	// The OS refusing to execute the file is not a failed probe, it is a
 	// finding: the CLI is installed, resolvable, and unrunnable. Report it as
@@ -3262,8 +3251,50 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// --version` is Claude Code's version, `ccms --version` is the
 		// wrapper's, and only the former means anything to the min-version
 		// gate (GH #7046).
-		version, verErr := detectAgentVersion(ctx, agent.NewCommand(resolved,
-			agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger)))
+		d.mu.Lock()
+		previousVersion := d.profileLaunchSpecs[profile.ID].version
+		d.mu.Unlock()
+		d.recordProfileLaunch(workspaceID, profile.ID, resolved, previousVersion, profile.FixedArgs)
+		appendHeldProfile := func() {
+			if d.activeTasks.Load() != 0 {
+				// Preserve running siblings; the local hold prevents new launches.
+				name := profile.DisplayName
+				if d.cfg.DeviceName != "" {
+					name = fmt.Sprintf("%s (%s)", name, d.cfg.DeviceName)
+				}
+				*runtimes = append(*runtimes, map[string]string{"name": name, "type": runtimeType, "profile_id": profile.ID, "version": previousVersion, "status": "online"})
+				return
+			}
+			*failedProfiles = append(*failedProfiles, map[string]string{
+				"profile_id": profile.ID, "failure_code": protocol.LauncherUnavailableCode,
+				"reason": launcherUnavailableDetail,
+			})
+		}
+		sampledAfter := d.demotionSeqSnapshot()
+		command := agent.NewCommand(resolved, agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger))
+		var version string
+		var verErr error
+		if runtimeType == "opencode" {
+			version, verErr = d.probeOpenCodeLauncherCommand(ctx, command)
+		} else {
+			version, verErr = detectAgentVersion(ctx, command)
+		}
+		key := "profile:" + profile.ID
+		if runtimeType == "opencode" && errors.Is(verErr, errLauncherUnavailable) {
+			d.holdLauncher(key)
+			appendHeldProfile()
+			continue
+		}
+		if verErr == nil && runtimeType == "opencode" {
+			d.clearProviderDemotions([]string{key}, sampledAfter)
+		}
+		d.mu.Lock()
+		held := d.providerDemotedLocked(key)
+		d.mu.Unlock()
+		if held {
+			appendHeldProfile()
+			continue
+		}
 		if verErr != nil {
 			d.logger.Debug("custom runtime profile: version probe failed (registering with empty version)",
 				"workspace_id", workspaceID, "profile_id", profile.ID, "path", resolved, "error", verErr)
@@ -3273,7 +3304,7 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		if d.cfg.DeviceName != "" {
 			displayName = fmt.Sprintf("%s (%s)", displayName, d.cfg.DeviceName)
 		}
-		d.recordProfileLaunch(profile.ID, resolved, version, profile.FixedArgs)
+		d.recordProfileLaunch(workspaceID, profile.ID, resolved, version, profile.FixedArgs)
 		d.logger.Info("registering custom runtime profile",
 			"workspace_id", workspaceID, "profile_id", profile.ID,
 			"protocol_family", profile.ProtocolFamily, "command_path", resolved)
@@ -5821,7 +5852,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 	d.mu.Lock()
 	rt, tracked = d.runtimeIndex[task.RuntimeID]
-	if tracked && rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+	if tracked && d.runtimeDemotedLocked(rt) {
 		tracked = false
 	}
 	d.mu.Unlock()

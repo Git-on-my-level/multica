@@ -50,7 +50,7 @@ func TestLauncherHealthHeartbeatCannotRestoreClaims(t *testing.T) {
 	})
 	rid := util.MustParseUUID(runtimeID)
 	if err := q.SetAgentRuntimeOfflineWithReason(ctx, db.SetAgentRuntimeOfflineWithReasonParams{
-		ID: rid, OfflineReason: []byte(`{"code":"not_executable","detail":"launcher health check exited 127 before task input"}`),
+		ID: rid, OfflineReason: []byte(`{"code":"not_executable","launcher_unavailable":true,"detail":"launcher health check exited 127 before task input"}`),
 	}); err != nil {
 		t.Fatal(err)
 	}

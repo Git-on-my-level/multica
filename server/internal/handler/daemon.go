@@ -337,6 +337,7 @@ type DaemonRegisterRequest struct {
 		ProfileID string `json:"profile_id"`
 	} `json:"runtimes"`
 	FailedProfiles []struct {
+		FailureCode string `json:"failure_code"`
 		ProfileID   string `json:"profile_id"`
 		CommandName string `json:"command_name"`
 		Reason      string `json:"reason"`
@@ -1022,7 +1023,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				// worktree gates read the newest row. Omitting them made a failed
 				// profile look, for that window, like a daemon that advertises
 				// nothing (and now like a capability-blind server).
-				metadata, _ := json.Marshal(map[string]any{
+				metadataValues := map[string]any{
 					"version":                            "",
 					"cli_version":                        req.CLIVersion,
 					"launched_by":                        req.LaunchedBy,
@@ -1030,7 +1031,13 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 					"runtime_profile_registration_error": true,
 					"runtime_profile_failure_reason":     reason,
 					"command_name":                       resolvedCommandName,
-				})
+				}
+				if failed.FailureCode == protocol.LauncherUnavailableCode && agent.ProfileRuntimeType(profile.RuntimeType, profile.ProtocolFamily) == "opencode" {
+					metadataValues["runtime_profile_failure_reason"] = protocol.LauncherUnavailableDetail
+					delete(metadataValues, "command_name")
+					metadataValues["offline_reason"] = map[string]any{"code": "not_executable", "launcher_unavailable": true, "detail": protocol.LauncherUnavailableDetail}
+				}
+				metadata, _ := json.Marshal(metadataValues)
 				return db.UpsertAgentRuntimeWithProfileParams{
 					WorkspaceID:     wsUUID,
 					DaemonID:        strToText(req.DaemonID),

@@ -1626,6 +1626,7 @@ func (q *Queries) LockWorkspaceForRuntimeMerge(ctx context.Context, runtimeIds [
 const markAgentRuntimeOnline = `-- name: MarkAgentRuntimeOnline :one
 UPDATE agent_runtime
 SET status = CASE WHEN metadata->'offline_reason'->>'code' = 'not_executable'
+                       AND metadata->'offline_reason'->>'launcher_unavailable' = 'true'
                   THEN status ELSE 'online' END,
     last_seen_at = now(), updated_at = now()
 WHERE id = $1
@@ -1668,7 +1669,8 @@ const markAgentRuntimeOnlineIfOffline = `-- name: MarkAgentRuntimeOnlineIfOfflin
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1 AND status <> 'online'
-  AND (metadata->'offline_reason'->>'code' IS DISTINCT FROM 'not_executable')
+  AND NOT COALESCE(metadata->'offline_reason'->>'code' = 'not_executable'
+                  AND metadata->'offline_reason'->>'launcher_unavailable' = 'true', false)
 `
 
 // Reports whether this heartbeat performed an offline -> online transition.

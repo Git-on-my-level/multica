@@ -115,6 +115,7 @@ func (d *Daemon) convergeAgentRuntimes(
 	now time.Time,
 	force bool,
 ) {
+	d.refreshHeldProfileLaunchers(ctx)
 	gained := d.refreshAgentAvailability()
 	missing := d.providersMissingRuntimes()
 	// A forced round runs even with nothing missing: that is the shape of "a
