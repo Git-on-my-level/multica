@@ -1635,6 +1635,8 @@ RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, dev
 // Used on the offline→online transition (and on first heartbeat after
 // registration). Writes status, last_seen_at, and updated_at because the
 // status flip is a real state change and we want updated_at to reflect it.
+// A heartbeat establishes liveness, not launcher health. Only a successful
+// registration probe may clear the not-executable reason and restore claims.
 func (q *Queries) MarkAgentRuntimeOnline(ctx context.Context, id pgtype.UUID) (AgentRuntime, error) {
 	row := q.db.QueryRow(ctx, markAgentRuntimeOnline, id)
 	var i AgentRuntime
