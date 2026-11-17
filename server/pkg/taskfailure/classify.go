@@ -44,8 +44,16 @@ var (
 	httpCapacityCodeRe = regexp.MustCompile(`(^|[^0-9a-z])(429|529)([^0-9a-z]|$)`)
 )
 
-// Share these signals with the per-minute rule so auth/quota exclusions use
+// Share these signals with the per-minute rule so config/auth/quota exclusions use
 // the same witnesses as the ordinary classifier branches.
+func isMissingConfig(lower string) bool {
+	return strings.Contains(lower, "missing environment variable") ||
+		strings.Contains(lower, "missing") && strings.Contains(lower, "api_key") ||
+		strings.Contains(lower, "api key") && strings.Contains(lower, "required") ||
+		strings.Contains(lower, providerUnconfiguredPhrase) ||
+		strings.Contains(lower, "no provider configured")
+}
+
 func isProviderAuthOrAccess(lower string) bool {
 	return httpAuthCodeRe.MatchString(lower) ||
 		containsAny(lower,
@@ -120,7 +128,9 @@ func isUsageLimit403(lower string) bool {
 // when the two diverge, this Go classifier is wrong and should be
 // updated to match. Keeping them in lock-step is required so that
 // in-flight rows and historically backfilled rows share the same
-// taxonomy.
+// taxonomy. The explicit per-minute throttle rule is a deliberate live-classifier
+// exception to this agreement; do not mirror it into the historical backfill SQL.
+// Historical rows retain their existing classification and are outside its scope.
 //
 // Matching is case-insensitive substring against the lowercased input.
 // More-specific rules come before more-generic ones (e.g.
@@ -166,8 +176,10 @@ func Classify(rawError string) Reason {
 	switch {
 	case PerMinuteRateLimit(lower):
 		// The token/minute witness beats the generic token-window heuristic,
-		// but it must never turn an auth or quota failure into a retry.
+		// but it must never turn a config, auth or quota failure into a retry.
 		switch {
+		case isMissingConfig(lower):
+			return ReasonAgentMissingConfig
 		case isUsageLimit403(lower):
 			return ReasonAgentProviderQuotaLimit
 		case isProviderAuthOrAccess(lower):
@@ -214,11 +226,7 @@ func Classify(rawError string) Reason {
 	//    "missing API key" partly overlaps with "invalid api key"
 	//    wording but is structurally a config error, not an auth
 	//    rejection.
-	case strings.Contains(lower, "missing environment variable"),
-		strings.Contains(lower, "missing") && strings.Contains(lower, "api_key"),
-		strings.Contains(lower, "api key") && strings.Contains(lower, "required"),
-		strings.Contains(lower, providerUnconfiguredPhrase),
-		strings.Contains(lower, "no provider configured"):
+	case isMissingConfig(lower):
 		return ReasonAgentMissingConfig
 
 	// 3. Auth / access. 401 / 403 / "Not logged in" / invalid token

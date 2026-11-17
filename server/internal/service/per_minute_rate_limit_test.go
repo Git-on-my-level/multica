@@ -57,7 +57,7 @@ func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
 			}
 		})
 	}
-	for _, signal := range []string{"401 unauthorized", "403 forbidden", "invalid API key", "refresh token expired", "HTTP 402", "monthly usage limit reached", "You've hit your session limit", "You've hit your weekly limit", "insufficient_balance"} {
+	for _, signal := range []string{"An api key is required", "401 unauthorized", "403 forbidden", "invalid API key", "refresh token expired", "HTTP 402", "monthly usage limit reached", "You've hit your session limit", "You've hit your weekly limit", "insufficient_balance"} {
 		for _, mixed := range []string{signal + ": " + raw, raw + " " + signal} {
 			for _, chat := range []bool{false, true} {
 				task := base
@@ -70,7 +70,7 @@ func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
 				// stored reason still claims this was a capacity failure.
 				for _, reported := range []string{reason, taskfailure.Classify(mixed).String(), taskfailure.NormalizeDaemonReason("agent_error.context_overflow", mixed).String()} {
 					if retryEligible(reported, task) {
-						t.Errorf("mixed auth/quota retried: reason=%s chat=%v error=%q", reported, chat, mixed)
+						t.Errorf("mixed config/auth/quota retried: reason=%s chat=%v error=%q", reported, chat, mixed)
 					}
 				}
 			}

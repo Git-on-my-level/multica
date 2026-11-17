@@ -11,6 +11,7 @@ func TestClassifyPerMinuteRateLimit(t *testing.T) {
 		signal string
 		want   Reason
 	}{
+		{"An api key is required", ReasonAgentMissingConfig},
 		{"401 unauthorized", ReasonAgentProviderAuthOrAccess},
 		{"403 forbidden", ReasonAgentProviderAuthOrAccess},
 		{"invalid API key", ReasonAgentProviderAuthOrAccess},
