@@ -705,6 +705,7 @@ func init() {
 	issueUpdateCmd.Flags().Float64("position", 0, "Ordering position within the board column (lower sorts first); prefer `issue reorder` for relative moves")
 	issueUpdateCmd.Flags().Bool("no-start", false, "Apply the update without starting an agent run")
 	issueUpdateCmd.Flags().Int64("expected-revision", 0, "Apply only at this positive issue revision (reject stale custody)")
+	issueUpdateCmd.Flags().String("merge-return-custody", "", "Atomically validate custody JSON before a no-start original-implementer return")
 	issueUpdateCmd.Flags().String("duplicate-of", "", "Mark the issue as a duplicate of this original issue (key like MUL-123, or full UUID) and cancel it; --status, if given, must be cancelled, and description/attachment changes must go in a separate update")
 	issueUpdateCmd.Flags().String("output", "json", "Output format: table or json")
 
@@ -1850,6 +1851,17 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	body := map[string]any{}
+	mergeReturn, _ := cmd.Flags().GetString("merge-return-custody")
+	if mergeReturn != "" {
+		var custody map[string]any
+		if err := json.Unmarshal([]byte(mergeReturn), &custody); err != nil || custody == nil {
+			return fmt.Errorf("--merge-return-custody requires a JSON object")
+		}
+		if !noStart || expectedRevision < 1 {
+			return fmt.Errorf("--merge-return-custody requires --no-start and --expected-revision")
+		}
+		body["merge_return_custody"] = custody
+	}
 	if expectedRevision > 0 {
 		body["expected_revision"] = expectedRevision
 	}
@@ -1980,7 +1992,11 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 
 	var result map[string]any
 	if len(body) > 0 {
-		if err := client.PutJSON(ctx, "/api/issues/"+issueRef.ID, body, &result); err != nil {
+		endpoint := "/api/issues/" + issueRef.ID
+		if mergeReturn != "" {
+			endpoint += "/merge-return"
+		}
+		if err := client.PutJSON(ctx, endpoint, body, &result); err != nil {
 			if len(attachmentIDs) > 0 {
 				return fmt.Errorf("update issue (uploaded IDs: %v): %w", attachmentIDs, err)
 			}

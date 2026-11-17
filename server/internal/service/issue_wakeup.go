@@ -476,9 +476,6 @@ func (s *IssueWakeupService) save(ctx context.Context, issueID, member, source, 
 		if in.Mode != "once" || in.Kind != "event" || existingID.Valid {
 			return out, badCondition("merge return must be a new one-shot event; it cannot be rearmed")
 		}
-		if err = checkMergeReturnCustody(ctx, tx, q, db.IssueWakeup{IssueID: issueID, AgentID: agentID}, custodyCondition.Value); err != nil {
-			return out, fmt.Errorf("%w: %v", ErrWakeupInput, err)
-		}
 		// The issue lock serializes creation, including a lost-response retry.
 		var priorID pgtype.UUID
 		err = tx.QueryRow(ctx, `SELECT id FROM issue_wakeup WHERE issue_id=$1 AND created_by=$2 AND condition=$3::jsonb LIMIT 1`, issueID, member, condition).Scan(&priorID)
@@ -487,10 +484,16 @@ func (s *IssueWakeupService) save(ctx context.Context, issueID, member, source, 
 			if err != nil {
 				return out, err
 			}
+			if out.DisabledAt.Valid || out.LastError.Valid {
+				return out, ErrWakeupConflict
+			}
 			return out, tx.Commit(ctx)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return out, err
+		}
+		if err = checkMergeReturnCustody(ctx, tx, q, db.IssueWakeup{IssueID: issueID, AgentID: agentID}, custodyCondition.Value); err != nil {
+			return out, fmt.Errorf("%w: %v", ErrWakeupInput, err)
 		}
 	}
 	filterAgent, err := wakeupUUID(in.FilterAgentID)
@@ -1526,10 +1529,16 @@ func (s *IssueWakeupService) CheckClaim(ctx context.Context, task db.AgentTaskQu
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if _, err = s.Tasks.Queries.WithTx(tx).LockWakeupIssue(ctx, task.IssueID); err != nil {
+		locked, err := s.Tasks.Queries.WithTx(tx).LockWakeupIssue(ctx, task.IssueID)
+		if err != nil {
 			return err
 		}
 		if err = checkMergeReturnCustody(ctx, tx, s.Tasks.Queries.WithTx(tx), w, repair.Value); err != nil {
+			if errors.Is(err, errMergeReturnCustody) {
+				if refusal := s.refuseMergeReturn(ctx, tx, s.Tasks.Queries.WithTx(tx), locked, w, repair.Value, err); refusal != nil {
+					return refusal
+				}
+			}
 			return errors.Join(ErrWakeupForbidden, err)
 		}
 		if err = tx.Commit(ctx); err != nil {
