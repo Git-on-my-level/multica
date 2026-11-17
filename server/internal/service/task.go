@@ -5147,6 +5147,17 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 				"task_id", util.UUIDToString(taskID), "error", perr)
 		} else {
 			parent.Error = pgtype.Text{String: errMsg, Valid: true}
+			if taskfailure.SelectedModelAtCapacity(errMsg) {
+				// Evaluate the same resume metadata FailAgentTask will persist,
+				// including a session first reported with this failure.
+				if sessionID != "" {
+					parent.SessionID = pgtype.Text{String: sessionID, Valid: true}
+				}
+				parent.SessionRolloutMissing = sessionRolloutMissing
+				if retiredSessionID != "" {
+					parent.RetiredSessionID = pgtype.Text{String: retiredSessionID, Valid: true}
+				}
+			}
 			if retryEligible(failureReason, parent) {
 				wantRetry = true
 				// Persist the reason-aware effective budget into the child so the
@@ -5526,7 +5537,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 // never started, so there is nothing to be idempotent about, and every bundle
 // that did download is already cached on disk — a retry resumes from there
 // instead of re-fetching the whole set (MUL-5370).
-// Capacity/rate-limit retries additionally require PerMinuteRateLimit in
+// Capacity/rate-limit retries additionally require an explicit transient witness in
 // retryEligible; the broad reason alone never authorizes a retry.
 var retryableReasons = map[string]bool{
 	string(taskfailure.ReasonAgentProviderCapacityOrRateLimit): true,
@@ -5549,7 +5560,7 @@ var retryableReasons = map[string]bool{
 // schedule (MUL-4910): first run + immediate retry + one retry deferred ~5s.
 // A blip that survives the immediate retry gets a short cooldown before the
 // final attempt instead of firing back-to-back. Every other retryable reason
-// keeps the task's generic max_attempts ceiling. Per-minute throttles wait
+// keeps the task's generic max_attempts ceiling. Explicit capacity failures wait
 // 60 seconds and only retry the first attempt; other reasons retry immediately.
 const (
 	providerPerMinuteRetryWait    = 60 * time.Second
@@ -5582,7 +5593,7 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 // retryDelayForAttempt reports how long to defer the NEXT attempt after a
 // failure at failedAttempt. runtime_offline always gets a positive fire_at so
 // it waits for the health-gated promotion path. provider_network's final
-// attempt is deferred ~5s; per-minute throttles wait 60s. Other retries remain
+// attempt is deferred ~5s; explicit capacity failures wait 60s. Other retries remain
 // immediate (zero delay →
 // the child is created 'queued', claimable at once). Callers pass the returned
 // delay to CreateRetryTask via fire_at.
@@ -5672,8 +5683,14 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
+	selectedCapacity := taskfailure.SelectedModelAtCapacity(t.Error.String)
+	if selectedCapacity && (!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
+		t.SessionRolloutMissing || t.ForceFreshSession ||
+		(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) || t.Status == "cancelled") {
+		return false
+	}
 	if failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) &&
-		(!taskfailure.PerMinuteRateLimit(t.Error.String) ||
+		(!(taskfailure.PerMinuteRateLimit(t.Error.String) || selectedCapacity) ||
 			taskfailure.Classify(t.Error.String) != taskfailure.ReasonAgentProviderCapacityOrRateLimit || t.Attempt != 1 ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) || ResumeUnsafeFailure(failureReason, t.Error.String)) {
 		return false
