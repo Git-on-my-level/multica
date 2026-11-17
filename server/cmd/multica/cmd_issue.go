@@ -704,6 +704,7 @@ func init() {
 	issueUpdateCmd.Flags().Int("stage", 0, "Stage ordinal (>=1) for this sub-issue; see `issue create --stage`")
 	issueUpdateCmd.Flags().Float64("position", 0, "Ordering position within the board column (lower sorts first); prefer `issue reorder` for relative moves")
 	issueUpdateCmd.Flags().Bool("no-start", false, "Apply the update without starting an agent run")
+	issueUpdateCmd.Flags().Int64("expected-revision", 0, "Apply only at this positive issue revision (reject stale custody)")
 	issueUpdateCmd.Flags().String("duplicate-of", "", "Mark the issue as a duplicate of this original issue (key like MUL-123, or full UUID) and cancel it; --status, if given, must be cancelled, and description/attachment changes must go in a separate update")
 	issueUpdateCmd.Flags().String("output", "json", "Output format: table or json")
 
@@ -1792,6 +1793,10 @@ func activeDuplicateIssueCreateMessage(err error) (string, bool) {
 }
 
 func runIssueUpdate(cmd *cobra.Command, args []string) error {
+	expectedRevision, _ := cmd.Flags().GetInt64("expected-revision")
+	if cmd.Flags().Changed("expected-revision") && expectedRevision < 1 {
+		return fmt.Errorf("--expected-revision must be positive")
+	}
 	prAutoCompleteDisabled, err := issuePRAutoCompleteFlag(cmd)
 	if err != nil {
 		return err
@@ -1845,6 +1850,9 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	body := map[string]any{}
+	if expectedRevision > 0 {
+		body["expected_revision"] = expectedRevision
+	}
 	if cmd.Flags().Changed("title") {
 		v, _ := cmd.Flags().GetString("title")
 		body["title"] = v

@@ -48,6 +48,7 @@ export type WakeupPausedReason = "max_fires" | "loop" | "rate";
 
 /** Structured predicates the platform evaluates (see WakeupCondition in Go). */
 export type WakeupCondition =
+  | { type: "merge_return"; value: { revision: number; agent_id: string; project_id: string; pr: string; head: string; branch: string; observed_at: string; merger_id: string } }
   | { type: "issue_field"; field: "status"; value: string }
   | { type: "issue_field"; field: "assignee"; assignee_type: "member" | "agent" | "squad"; assignee_id: string }
   | { type: "issue_field"; field: "label"; label_id: string }

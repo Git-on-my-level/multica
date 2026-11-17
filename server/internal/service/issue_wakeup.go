@@ -470,6 +470,29 @@ func (s *IssueWakeupService) save(ctx context.Context, issueID, member, source, 
 	if err = s.authorize(ctx, q, issue.WorkspaceID, member, agent); err != nil {
 		return out, err
 	}
+	var custodyCondition WakeupCondition
+	_ = json.Unmarshal(condition, &custodyCondition)
+	if custodyCondition.Type == "merge_return" {
+		if in.Mode != "once" || in.Kind != "event" || existingID.Valid {
+			return out, badCondition("merge return must be a new one-shot event; it cannot be rearmed")
+		}
+		if err = checkMergeReturnCustody(ctx, tx, q, db.IssueWakeup{IssueID: issueID, AgentID: agentID}, custodyCondition.Value); err != nil {
+			return out, fmt.Errorf("%w: %v", ErrWakeupInput, err)
+		}
+		// The issue lock serializes creation, including a lost-response retry.
+		var priorID pgtype.UUID
+		err = tx.QueryRow(ctx, `SELECT id FROM issue_wakeup WHERE issue_id=$1 AND created_by=$2 AND condition=$3::jsonb LIMIT 1`, issueID, member, condition).Scan(&priorID)
+		if err == nil {
+			out, err = q.LockIssueWakeup(ctx, priorID)
+			if err != nil {
+				return out, err
+			}
+			return out, tx.Commit(ctx)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return out, err
+		}
+	}
 	filterAgent, err := wakeupUUID(in.FilterAgentID)
 	if err != nil {
 		return out, err
@@ -1008,6 +1031,16 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 	if w.Revision != prev.Revision {
 		return tx.Commit(ctx)
 	}
+	var repair WakeupCondition
+	_ = json.Unmarshal(w.Condition, &repair)
+	if repair.Type == "merge_return" {
+		if err = checkMergeReturnCustody(ctx, tx, q, w, repair.Value); err != nil {
+			if errors.Is(err, errMergeReturnCustody) {
+				return s.refuseMergeReturn(ctx, tx, q, issue, w, repair.Value, err)
+			}
+			return err
+		}
+	}
 	active, err := wakeupIssueActive(ctx, q, issue)
 	if err != nil {
 		return err
@@ -1484,6 +1517,24 @@ func (s *IssueWakeupService) CheckClaim(ctx context.Context, task db.AgentTaskQu
 	}
 	if w.DisabledAt.Valid || w.Revision != source.Revision || w.IssueID != task.IssueID || w.AgentID != task.AgentID || w.CreatedBy != task.OriginatorUserID {
 		return ErrWakeupForbidden
+	}
+	var repair WakeupCondition
+	_ = json.Unmarshal(w.Condition, &repair)
+	if repair.Type == "merge_return" {
+		tx, err := s.Tasks.TxStarter.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if _, err = s.Tasks.Queries.WithTx(tx).LockWakeupIssue(ctx, task.IssueID); err != nil {
+			return err
+		}
+		if err = checkMergeReturnCustody(ctx, tx, s.Tasks.Queries.WithTx(tx), w, repair.Value); err != nil {
+			return errors.Join(ErrWakeupForbidden, err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return err
+		}
 	}
 	agent, err := s.Tasks.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: w.AgentID, WorkspaceID: w.WorkspaceID})
 	if errors.Is(err, pgx.ErrNoRows) {

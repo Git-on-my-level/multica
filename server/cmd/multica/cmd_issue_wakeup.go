@@ -76,6 +76,7 @@ func newIssueWakeupCommand() *cobra.Command {
 			c.Flags().String("on-timeout", "", "At the deadline: end (default) or wake (event rules run the target once to handle it)")
 			c.Long += " Conditions let the platform check stored facts itself and wake the target only when they hold: use one --until-* flag instead of --event. A condition that already holds fires on the next check, except --until-pr checks, which waits for a newer finished result."
 			c.Flags().String("until-status", "", "Condition: this issue's status becomes KEY")
+			c.Flags().String("until-merge-return", "", "Condition: admit one merge repair only while the captured custody JSON still matches")
 			c.Flags().String("until-assignee", "", "Condition: this issue is assigned to member|agent|squad:ID")
 			c.Flags().String("until-label", "", "Condition: this issue has the label LABEL_ID")
 			c.Flags().String("until-property", "", "Condition: property PROPERTY_ID equals VALUE (PROPERTY_ID=VALUE; VALUE may be JSON)")
@@ -256,6 +257,13 @@ func isWakeupSourceBusy(err error) bool {
 // --until-* flags describe, or nil when none is set.
 func wakeupConditionFromFlags(ctx context.Context, cmd *cobra.Command, client *cli.APIClient) (map[string]any, error) {
 	var conditions []map[string]any
+	if v, _ := cmd.Flags().GetString("until-merge-return"); v != "" {
+		var custody map[string]any
+		if err := json.Unmarshal([]byte(v), &custody); err != nil || custody == nil {
+			return nil, fmt.Errorf("--until-merge-return requires a custody JSON object")
+		}
+		conditions = append(conditions, map[string]any{"type": "merge_return", "value": custody})
+	}
 	if v, _ := cmd.Flags().GetString("until-status"); v != "" {
 		conditions = append(conditions, map[string]any{"type": "issue_field", "field": "status", "value": v})
 	}
