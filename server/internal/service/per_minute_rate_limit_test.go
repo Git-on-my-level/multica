@@ -91,6 +91,10 @@ func TestRetryEligiblePerMinuteRateLimit(t *testing.T) {
 // Chat backoff preserves the existing scheduling contract: newer input can run
 // during the cooldown, and the retry retains its original input owner.
 func testPerMinuteRateLimitLifecycle(t *testing.T) {
+	testTransientCapacityLifecycle(t, "provider.rate-limit: Rate limit exceeded. Please slow down your requests. Limit: 24290 uncached input tokens/minute.", "agent_error.context_overflow")
+}
+
+func testTransientCapacityLifecycle(t *testing.T, raw, legacyReason string) {
 	if os.Getenv("DATABASE_URL") == "" {
 		t.Skip("DATABASE_URL must explicitly select a managed test database")
 	}
@@ -110,9 +114,8 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 	fx.Exec(t, `UPDATE agent_task_queue SET chat_input_task_id=id WHERE id=$1`, parentID)
 	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, parentID)
 	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
-	const raw = "provider.rate-limit: Rate limit exceeded. Please slow down your requests. Limit: 24290 uncached input tokens/minute."
 	start := time.Now()
-	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", "agent_error.context_overflow", false, "", ""); err != nil {
+	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", legacyReason, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	var childID string
@@ -128,7 +131,7 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 		t.Fatalf("retry inheritance changed: attempt=%d max=%d session=%s fresh=%v input=%v", child.Attempt, child.MaxAttempts, child.SessionID.String, child.ForceFreshSession, child.ChatInputTaskID)
 	}
 	// A replay of the failure notification must not create another pending child.
-	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", "agent_error.context_overflow", false, "", ""); err != nil {
+	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", legacyReason, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if n := fx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, parentID); n != 1 {
