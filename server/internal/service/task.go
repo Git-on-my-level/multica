@@ -6266,6 +6266,8 @@ func isInterruptedDaemonRecovery(reason string, t db.AgentTaskQueue) bool {
 // not an autopilot run, not a Triage run, and linked to an issue or chat
 // session. Shared by FailTask's in-transaction retry and the orphan sweeper's
 // MaybeRetryFailedTask so both agree on which failures re-run.
+// Selected-model capacity recovery additionally requires a usable existing
+// session: no missing rollout, fresh-session request, or retired resume pointer.
 //
 // A Triage run is excluded for the reason autopilot runs are (MUL-7189 §5.6):
 // it has its own recovery. Re-triaging reads the entry as it stands now, which
