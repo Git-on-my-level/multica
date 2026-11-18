@@ -156,6 +156,7 @@ func TestPiProfileExecuteKeepsInjectionFallback(t *testing.T) {
 }
 
 func TestOmpExecuteKeepsInjectionFallback(t *testing.T) {
+	t.Skip("fork: omp runs over ACP (omp.go), not the pi stdin protocol this probe drives")
 	s, skillFile := piSkillInvocation(t)
 	stdin := piSkillStdinProbe(t, "omp", ExecOptions{
 		Timeout:         10 * time.Second,
