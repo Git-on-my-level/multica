@@ -3729,10 +3729,11 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		t0 = time.Now()
 		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          agentID,
-			RuntimeID:        claimRuntimeID,
-			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+			AgentID:                   agentID,
+			RuntimeID:                 claimRuntimeID,
+			PrepareLeaseSecs:          prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:          RuntimeClaimFreshnessSeconds,
+			IgnoreCodexModelRejection: !s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true),
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
@@ -5169,11 +5170,22 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		}
 	}
 
+	var rejectedCodexModel string
+	if failureReason == taskfailure.ReasonAPIInvalidRequest.String() &&
+		s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true) {
+		rejectedCodexModel = codexRejectedModel(errMsg)
+	}
+
 	var task db.AgentTaskQueue
 	var retried *db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
+		}
+		if rejectedCodexModel != "" {
+			if err := qtx.LockCodexModelAdmissionAgentForTask(ctx, taskID); err != nil {
+				return fmt.Errorf("lock Codex model admission: %w", err)
+			}
 		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
 			ID:             taskID,
@@ -5195,6 +5207,14 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		}
 		if err != nil {
 			return err
+		}
+		if rejectedCodexModel != "" {
+			if err := qtx.RecordCodexModelAdmissionRejection(ctx, db.RecordCodexModelAdmissionRejectionParams{
+				TaskID:        taskID,
+				RejectedModel: rejectedCodexModel,
+			}); err != nil {
+				return fmt.Errorf("record Codex model rejection: %w", err)
+			}
 		}
 		task = t
 

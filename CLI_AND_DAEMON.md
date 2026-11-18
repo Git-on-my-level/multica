@@ -321,6 +321,21 @@ does not clear those blocks or establish that earlier background processes exite
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### Codex model admission
+
+A Codex provider response that explicitly rejects the agent's pinned model for
+its ChatGPT account holds further queued runs for that agent configuration.
+Already dispatched work remains subject to the usual task lifecycle. Other
+agents can continue claiming work on the same runtime.
+
+After verifying the repair against the runtime's live catalog, a change to the
+reported Codex CLI version or the pinned model permits dispatch again. For a
+catalog repair on the same CLI version, set a new non-secret
+`codex_model_admission_revision` value in the agent's runtime configuration.
+Preserve the other runtime configuration keys when saving that change. A fresh
+provider rejection can hold the new configuration again. Operators can bypass
+this guard with the server feature flag `FF_CODEX_MODEL_ADMISSION=off`.
+
 ### Local Environments
 
 The issue sidebar's **Environments** section lists the servers an issue's runs left running, grouped by the machine they run on. A localhost URL opens only on that machine. The daemon reports environments in two ways:
