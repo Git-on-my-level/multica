@@ -442,6 +442,10 @@ type repoCacheBackend interface {
 
 // Daemon is the local agent runtime that polls for and executes tasks.
 type Daemon struct {
+	// accountPool is the fork's subscription account pool (account_pool_fork.go);
+	// nil when no provider has extra accounts.
+	accountPool *accountPool
+
 	cfg        Config
 	client     *Client
 	repoCache  repoCacheBackend
@@ -816,6 +820,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		activeStores:                make(map[string]int),
 		deletingStores:              make(map[string]bool),
 		localPathLocks:              NewLocalPathLocker(),
+		accountPool:                 newAccountPool(cfg.AccountPools, accountPoolStatePath(cfg.Profile), logger),
 		runtimeGoneInflight:         make(map[string]struct{}),
 		pendingWorkInflight:         make(map[string]struct{}),
 		pendingWorkLastRun:          make(map[string]time.Time),
@@ -8334,6 +8339,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if !ok {
 		return TaskResult{}, fmt.Errorf("no agent configured for provider %q", provider)
 	}
+	// Fork: pick the subscription account before anything reads the resume
+	// pointer, so a task moving accounts builds a cold prompt (account_pool_fork.go).
+	taskAccount := d.selectTaskAccount(provider, &task, usesCustomProfileCommand, taskLog)
+	baseExecutable := entry.Path
+	entry.Path = taskAccount.executable(baseExecutable)
+	defer taskAccount.persist()
 
 	stopPrepareLease := d.startTaskPrepareLeaseExtender(prepareCtx, task, taskLog)
 	defer stopPrepareLease()
@@ -9213,6 +9224,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentCustomEnv = task.Agent.CustomEnv
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if err := taskAccount.applyEnv(agentEnv, env.CodexHome); err != nil {
+		return TaskResult{}, err
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {
@@ -9548,7 +9562,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// MUL-9427: forward the account's rate-limit state the CLI reports, so the
 	// runtime pages show how much of the plan's windows is left.
 	observeRateLimits, stopRateLimitFlush := d.startRateLimitFlush(ctx, task.ID, taskLog)
-	execOpts.OnRateLimits = observeRateLimits
+	execOpts.OnRateLimits = taskAccount.observeRateLimits(observeRateLimits)
 	defer stopRateLimitFlush()
 	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
@@ -9560,36 +9574,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 
-	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
-		firstResult := result
-		firstUsage := result.Usage
-		firstTools := tools
-		if !result.ResumeRejectedTransient {
-			retiredSessionID = task.PriorSessionID
-		}
-		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
-
-		// Rebuild cold-session context before the single retry. The prior
-		// provider transcript is gone (missing, account-mismatched, or —
-		// GH #5975 — carrying history the provider now refuses), so the
-		// fresh process must NOT be told it is resuming a conversation:
-		//   - taskCtx.PriorSessionResumed=false + re-injecting the runtime
-		//     brief rewrites the on-disk AGENTS.md so it no longer claims
-		//     "You're resuming the prior session" (which file-based backends
-		//     like Kiro load themselves).
-		//   - clearing task.PriorSessionID rebuilds the prompt on the cold
-		//     comment-reading path instead of the warm resumed one.
-		//   - PriorSessionResumeUnavailable=true makes BuildPrompt append the
-		//     continuity notice for this surface, so the agent knows not to
-		//     assume continuity it no longer has. This is now the ONLY injector
-		//     on the retry path: the backend's own copy is suppressed below,
-		//     because before MUL-5722 both fired and the turn carried the same
-		//     paragraph twice.
-		// task and taskCtx are local (runTask takes task by value), so these
-		// mutations only affect the retry.
+	// prepareColdRetry rebuilds a cold-session prompt, runtime brief and context
+	// receipt for a re-run that cannot resume the prior conversation; see the
+	// fresh-session retry below. resumeUnavailable adds the continuity notice.
+	prepareColdRetry := func(resumeUnavailable bool) string {
 		execOpts.ResumeSessionID = ""
 		task.PriorSessionID = ""
-		task.PriorSessionResumeUnavailable = true
+		if resumeUnavailable {
+			task.PriorSessionResumeUnavailable = true
+		}
 		execOpts.ResumeContinuityNotice = ""
 		taskCtx.PriorSessionResumed = false
 		runtimeBriefWritten = false
@@ -9620,6 +9613,37 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		receiptInput.Skills = env.SkillReceipts(provider, taskCtx.AgentSkills)
 		receiptInput.ExistingInstructions = execenv.ExistingRuntimeConfigContent(env.WorkDir, provider)
 		d.reportContextReceipt(ctx, task.ID, buildContextReceipt(receiptInput), taskLog)
+		return freshPrompt
+	}
+
+	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
+		firstResult := result
+		firstUsage := result.Usage
+		firstTools := tools
+		if !result.ResumeRejectedTransient {
+			retiredSessionID = task.PriorSessionID
+		}
+		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
+
+		// Rebuild cold-session context before the single retry. The prior
+		// provider transcript is gone (missing, account-mismatched, or —
+		// GH #5975 — carrying history the provider now refuses), so the
+		// fresh process must NOT be told it is resuming a conversation:
+		//   - taskCtx.PriorSessionResumed=false + re-injecting the runtime
+		//     brief rewrites the on-disk AGENTS.md so it no longer claims
+		//     "You're resuming the prior session" (which file-based backends
+		//     like Kiro load themselves).
+		//   - clearing task.PriorSessionID rebuilds the prompt on the cold
+		//     comment-reading path instead of the warm resumed one.
+		//   - PriorSessionResumeUnavailable=true makes BuildPrompt append the
+		//     continuity notice for this surface, so the agent knows not to
+		//     assume continuity it no longer has. This is now the ONLY injector
+		//     on the retry path: the backend's own copy is suppressed below,
+		//     because before MUL-5722 both fired and the turn carried the same
+		//     paragraph twice.
+		// task and taskCtx are local (runTask takes task by value), so these
+		// mutations only affect the retry.
+		freshPrompt := prepareColdRetry(true)
 
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, withPriorTaskUsage(execOpts, firstUsage), taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
@@ -9638,6 +9662,34 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// than being relabeled resumable by a benign-looking second error.
 		result, tools = reconcileFreshRetryResult(firstResult, firstUsage, firstTools, retryResult, retryTools, retryErr)
 	}
+
+	// Fork: a run that failed on a spent plan window re-runs on the next pool
+	// account with headroom (account_pool_fork.go). Its session belonged to
+	// the spent account, so the re-run starts cold.
+	for taskAccount.failover(result, taskLog) {
+		hadSession := task.PriorSessionID != "" || result.SessionID != ""
+		firstUsage := result.Usage
+		if err := taskAccount.applyEnv(agentEnv, env.CodexHome); err != nil {
+			taskLog.Warn("account pool: switching account failed; keeping the quota failure", "error", err)
+			break
+		}
+		backendConfig.ExecutablePath = taskAccount.executable(baseExecutable)
+		switched, err := agent.ResolveBackend(provider, backendConfig)
+		if err != nil {
+			taskLog.Warn("account pool: building backend for the next account failed; keeping the quota failure", "error", err)
+			break
+		}
+		backend = switched
+		freshPrompt := prepareColdRetry(hadSession)
+		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, withPriorTaskUsage(execOpts, firstUsage), taskLog, task.ID, env.CodexHome, &msgSeq)
+		if retryErr != nil {
+			taskLog.Warn("account pool: re-run on the next account failed to start; keeping the quota failure", "error", retryErr)
+			break
+		}
+		retryResult.Usage = mergeUsage(firstUsage, retryResult.Usage)
+		result, tools = retryResult, retryTools
+	}
+	taskAccount.bindSession(result.SessionID)
 
 	// Worktree mode: if the agent finished with its work somewhere Finalize
 	// will refuse to record — squashed past its baseline, or committed off its

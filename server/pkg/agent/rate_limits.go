@@ -23,6 +23,14 @@ type RateLimitSnapshot struct {
 	Credits *RateLimitCredits `json:"credits,omitempty"`
 	// ObservedAt is when the backend last merged an update into the snapshot.
 	ObservedAt time.Time `json:"observed_at"`
+	// Account names the subscription account the snapshot belongs to when the
+	// daemon runs this provider under an account pool (fork overlay, see
+	// daemon/account_pool_fork.go). Empty without a pool.
+	Account string `json:"account,omitempty"`
+	// Accounts is the daemon's latest snapshot of each other pool account, so
+	// the runtime page can show every account and not only the one this task
+	// ran under. Nested snapshots leave Accounts empty.
+	Accounts []RateLimitSnapshot `json:"accounts,omitempty"`
 }
 
 // RateLimitWindow is one limit window, such as the 5-hour session or the

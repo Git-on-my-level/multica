@@ -166,6 +166,11 @@ type Config struct {
 	// prefers a matching, executable override over resolving the profile's
 	// command_name on PATH. nil/empty means "always resolve via PATH".
 	ProfileCommandOverrides map[string]string
+
+	// AccountPools is the fork's subscription account pool configuration
+	// (account_pool_fork.go), from the local CLI config. nil means every
+	// provider runs under its default login only.
+	AccountPools *cli.AccountPoolsConfig
 }
 
 // Overrides allows CLI flags to override environment variables and defaults.
@@ -243,6 +248,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// purely from env-var configuration. We log a warning and proceed with
 	// no overrides.
 	var profileCommandOverrides map[string]string
+	var accountPools *cli.AccountPoolsConfig
 	if cliCfg, err := cli.LoadCLIConfigForProfile(overrides.Profile); err != nil {
 		slog.Warn("could not load CLI config for backend overrides; proceeding without",
 			"profile", overrides.Profile, "err", err)
@@ -261,6 +267,11 @@ func LoadConfig(overrides Overrides) (Config, error) {
 				}
 				profileCommandOverrides[id] = path
 			}
+		}
+		if pools, err := cli.NormalizeAccountPools(cliCfg.AccountPools); err != nil {
+			slog.Warn("ignoring invalid account_pools in CLI config", "profile", overrides.Profile, "err", err)
+		} else {
+			accountPools = pools
 		}
 	}
 
@@ -691,6 +702,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		AmpArgs:                         ampArgs,
 		QwenpawArgs:                     qwenpawArgs,
 		ProfileCommandOverrides:         profileCommandOverrides,
+		AccountPools:                    accountPools,
 	}, nil
 }
 

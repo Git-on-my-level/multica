@@ -25,6 +25,9 @@ const (
 	maxRateLimitString     = 64
 	maxRateLimitPercent    = 1000
 	maxRateLimitWindowMins = 366 * 24 * 60
+	// maxRateLimitAccounts bounds the fork account-pool siblings one report
+	// may carry.
+	maxRateLimitAccounts = 8
 	// rateLimitClockSkew bounds how far in the future a daemon's observation
 	// time may sit before it is pulled back to the server clock, so a fast
 	// daemon clock cannot pin a snapshot no later report can replace.
@@ -55,6 +58,11 @@ type runtimeRateLimitSnapshot struct {
 	Windows    []runtimeRateLimitWindow `json:"windows"`
 	Credits    *runtimeRateLimitCredits `json:"credits,omitempty"`
 	ObservedAt time.Time                `json:"observed_at"`
+	// Fork account pools: Account names the subscription account this
+	// snapshot is for; Accounts carries the other pool accounts' latest
+	// snapshots (one level deep).
+	Account  string                     `json:"account,omitempty"`
+	Accounts []runtimeRateLimitSnapshot `json:"accounts,omitempty"`
 }
 
 type runtimeRateLimitWindow struct {
@@ -75,8 +83,20 @@ type runtimeRateLimitCredits struct {
 // cannot label are dropped rather than rejected, so a newer daemon that learns
 // a new window still reports the ones this server understands.
 func (s *runtimeRateLimitSnapshot) normalize(now time.Time) bool {
+	return s.normalizeAt(now, true)
+}
+
+func (s *runtimeRateLimitSnapshot) normalizeAt(now time.Time, top bool) bool {
 	if s.ObservedAt.IsZero() || len(s.Windows) > maxRateLimitWindows {
 		return false
+	}
+	if len(s.Account) > maxRateLimitString || len(s.Accounts) > maxRateLimitAccounts || (!top && len(s.Accounts) > 0) {
+		return false
+	}
+	for i := range s.Accounts {
+		if s.Accounts[i].Account == "" || !s.Accounts[i].normalizeAt(now, false) {
+			return false
+		}
 	}
 	if len(s.PlanType) > maxRateLimitString || !rateLimitStatuses[s.Status] {
 		return false
