@@ -27,7 +27,7 @@
 // real `git describe` invocation against a throwaway repo.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, realpathSync, rmSync } from "node:fs";
+import { readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +35,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(here, "..");
 const repoRoot = resolve(desktopRoot, "..", "..");
 const bundleCliScript = resolve(here, "bundle-cli.mjs");
+const bundleVoiceEngineScript = resolve(here, "bundle-voice-engine.mjs");
 
 /** This fork's Desktop updater / publish default (matches electron-builder.yml). */
 export const FORK_DEFAULT_GITHUB_REPO = "Git-on-my-level/multica";
@@ -560,6 +561,34 @@ function main() {
         PLATFORM_CONFIG[target.platform].runtimePlatform,
         "--target-arch",
         target.arch,
+      ],
+      {
+        stdio: "inherit",
+        cwd: desktopRoot,
+      },
+    );
+
+    const binary = target.platform === "win" ? "multica.exe" : "multica";
+    const stagedCli = resolve(desktopRoot, "resources", "bin", binary);
+    const artifact = statSync(stagedCli, { throwIfNoEntry: false });
+    if (!artifact?.isFile() || artifact.size === 0) {
+      console.error(
+        `[package] Packaging ${formatTarget(target)} requires a bundled CLI at ${stagedCli}. ` +
+          "Install Go or provide a prebuilt CLI for the target.",
+      );
+      process.exit(1);
+    }
+
+    console.log(`[package] bundling voice engine → ${formatTarget(target)}`);
+    execFileSync(
+      "node",
+      [
+        bundleVoiceEngineScript,
+        "--target-platform",
+        PLATFORM_CONFIG[target.platform].runtimePlatform,
+        "--target-arch",
+        target.arch,
+        "--required",
       ],
       {
         stdio: "inherit",
