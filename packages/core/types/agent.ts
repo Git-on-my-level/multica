@@ -1100,6 +1100,10 @@ export interface RuntimeRateLimits {
   windows: RuntimeRateLimitWindow[];
   credits?: { has_credits: boolean; unlimited: boolean; balance: string };
   observed_at: string;
+  /** Fork account pools: the subscription account this snapshot is for. */
+  account?: string;
+  /** Fork account pools: the other pool accounts' latest snapshots. */
+  accounts?: RuntimeRateLimits[];
 }
 
 export interface RuntimeRateLimitsResponse {

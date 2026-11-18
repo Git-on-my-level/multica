@@ -2341,7 +2341,7 @@ const RuntimeRateLimitWindowSchema = z.object({
   status: RuntimeRateLimitStatusSchema.default(""),
 }).loose();
 
-const RuntimeRateLimitsSchema = z.object({
+const RuntimeRateLimitsBaseSchema = z.object({
   plan_type: z.string().default("").catch(""),
   status: RuntimeRateLimitStatusSchema.default(""),
   windows: z
@@ -2364,6 +2364,24 @@ const RuntimeRateLimitsSchema = z.object({
     .optional()
     .catch(undefined),
   observed_at: z.string(),
+  // Fork account pools: the subscription account this snapshot is for ("" on
+  // a runtime without a pool).
+  account: z.string().default("").catch(""),
+}).loose();
+
+const RuntimeRateLimitsSchema = RuntimeRateLimitsBaseSchema.extend({
+  // Fork account pools: the other pool accounts' latest snapshots. A
+  // malformed sibling is dropped on its own.
+  accounts: z
+    .array(z.unknown())
+    .catch([])
+    .default([])
+    .transform((rows) =>
+      rows.flatMap((row) => {
+        const parsed = RuntimeRateLimitsBaseSchema.safeParse(row);
+        return parsed.success && parsed.data.account ? [parsed.data] : [];
+      }),
+    ),
 }).loose();
 
 export const RuntimeRateLimitsResponseSchema = z.object({

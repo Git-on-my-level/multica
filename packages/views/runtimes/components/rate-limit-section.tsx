@@ -251,14 +251,12 @@ function WindowRow({ view }: { view: RateLimitWindowView }) {
 
 export function RateLimitSection({ runtime }: { runtime: AgentRuntime }) {
   const text = useRateLimitText();
-  const timeAgo = useTimeAgo();
-  const now = useMinuteTick();
   const { data, isLoading } = useQuery(runtimeRateLimitsOptions(runtime.id));
   const rateLimits = data?.rate_limits ?? null;
-  const views = useWindowViews(rateLimits, now);
 
   if (isLoading) return <Skeleton className="h-32 w-full rounded-lg" />;
-  if (!rateLimits || (views.length === 0 && !rateLimits.credits)) {
+  const hasData = (r: RuntimeRateLimits) => r.windows.length > 0 || !!r.credits;
+  if (!rateLimits || !hasData(rateLimits)) {
     return (
       <ObjectSectionEmpty
         icon={Gauge}
@@ -267,18 +265,52 @@ export function RateLimitSection({ runtime }: { runtime: AgentRuntime }) {
       />
     );
   }
+  // Fork account pools: the account the runtime last ran under comes first,
+  // then the pool's other accounts, each with its own windows.
+  const siblings = (rateLimits.accounts ?? []).filter(hasData);
+  return (
+    <div className="space-y-3">
+      <AccountRateLimits rateLimits={rateLimits} caption />
+      {siblings.map((sibling) => (
+        <AccountRateLimits key={sibling.account} rateLimits={sibling} />
+      ))}
+    </div>
+  );
+}
 
+function AccountRateLimits({
+  rateLimits,
+  caption = false,
+}: {
+  rateLimits: RuntimeRateLimits;
+  caption?: boolean;
+}) {
+  const text = useRateLimitText();
+  const timeAgo = useTimeAgo();
+  const now = useMinuteTick();
+  const views = useWindowViews(rateLimits, now);
   const plan = planLabel(rateLimits.plan_type);
   const credits = rateLimits.credits;
+
   return (
     <ObjectSectionCard>
       <div className="flex min-w-0 items-center gap-2 px-4 py-2.5 text-caption text-muted-foreground">
+        {rateLimits.account && (
+          <span
+            data-slot="rate-limit-account"
+            className="min-w-0 max-w-40 shrink truncate font-mono text-foreground"
+          >
+            {rateLimits.account}
+          </span>
+        )}
         {plan && (
           <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 font-medium text-foreground">
             {plan}
           </span>
         )}
-        <span className="min-w-0 truncate">{text.t(($) => $.rate_limits.caption)}</span>
+        {caption && (
+          <span className="min-w-0 truncate">{text.t(($) => $.rate_limits.caption)}</span>
+        )}
         <span className="ml-auto shrink-0 tabular-nums">
           {text.t(($) => $.rate_limits.updated, { ago: timeAgo(rateLimits.observed_at) })}
         </span>
