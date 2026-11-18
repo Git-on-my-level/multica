@@ -179,7 +179,7 @@ func (s *TaskService) recoverChildAttentionParent(ctx context.Context, parentID 
 	// but no pre-commit broadcast or wake. A distinct comment thread preserves
 	// this obligation behind an unrelated queued/dispatched/running parent run.
 	writer := NewTaskService(q, s.TxStarter, nil, events.New())
-	writer.FeatureFlags, writer.Composio, writer.Entitlements = s.FeatureFlags, s.Composio, s.Entitlements
+	writer.FeatureFlags, writer.Composio = s.FeatureFlags, s.Composio
 	var task db.AgentTaskQueue
 	if squadID.Valid {
 		task, err = writer.EnqueueTaskForSquadLeader(ctx, parent, agentID, squadID, comment.ID, OriginDerived)

@@ -40,6 +40,7 @@ interface ConfigState {
   // Older handlers accepted the unknown field and returned success while
   // dropping it, so absent must fail closed.
   agentConversationStartersSupported: boolean;
+  webhookPayloadConditionsSupported: boolean;
   // Whether POST /api/issues atomically persists custom-property values.
   // Older servers silently drop the field, so absent must fail closed.
   issueCreatePropertiesSupported: boolean;
@@ -52,6 +53,10 @@ interface ConfigState {
   githubBranch: string;
   docsBaseUrl: string;
   changelogUrl: string;
+  // Whether the server serves the community theme store. Absent on older
+  // servers and off when the operator turned it off: no Browse entry, no
+  // store requests.
+  themeStoreEnabled: boolean;
   setCdnConfig: (config: { cdnDomain: string; cdnSigned?: boolean }) => void;
   setAttachmentPublicUrl: (url?: string) => void;
   setAuthConfig: (config: {
@@ -70,6 +75,7 @@ interface ConfigState {
   setServerVersion: (version?: string) => void;
   setLocalWorktreeSupported: (supported?: boolean) => void;
   setAgentConversationStartersSupported: (supported?: boolean) => void;
+  setWebhookPayloadConditionsSupported: (supported?: boolean) => void;
   setIssueCreatePropertiesSupported: (supported?: boolean) => void;
   setCommentDeleteKeepRepliesSupported: (supported?: boolean) => void;
   setGithubConfig: (config: {
@@ -80,6 +86,7 @@ interface ConfigState {
     docsBaseUrl?: string;
     changelogUrl?: string;
   }) => void;
+  setThemeStoreEnabled: (enabled?: boolean) => void;
 }
 
 export const configStore = createStore<ConfigState>((set) => ({
@@ -98,12 +105,14 @@ export const configStore = createStore<ConfigState>((set) => ({
   serverVersion: "",
   localWorktreeSupported: false,
   agentConversationStartersSupported: false,
+  webhookPayloadConditionsSupported: false,
   issueCreatePropertiesSupported: false,
   commentDeleteKeepRepliesSupported: false,
   githubRepo: "",
   githubBranch: "",
   docsBaseUrl: "",
   changelogUrl: "",
+  themeStoreEnabled: false,
   setCdnConfig: ({ cdnDomain, cdnSigned = false }) => set({ cdnDomain, cdnSigned }),
   setAttachmentPublicUrl: (url = "") => set({ attachmentPublicUrl: url }),
   setAuthConfig: ({
@@ -129,6 +138,8 @@ export const configStore = createStore<ConfigState>((set) => ({
     set({ localWorktreeSupported: supported === true }),
   setAgentConversationStartersSupported: (supported = false) =>
     set({ agentConversationStartersSupported: supported === true }),
+  setWebhookPayloadConditionsSupported: (supported = false) =>
+    set({ webhookPayloadConditionsSupported: supported === true }),
   setIssueCreatePropertiesSupported: (supported = false) =>
     set({ issueCreatePropertiesSupported: supported === true }),
   setCommentDeleteKeepRepliesSupported: (supported = false) =>
@@ -137,6 +148,7 @@ export const configStore = createStore<ConfigState>((set) => ({
     set({ githubRepo, githubBranch }),
   setDocsConfig: ({ docsBaseUrl = "", changelogUrl = "" }) =>
     set({ docsBaseUrl, changelogUrl }),
+  setThemeStoreEnabled: (enabled = false) => set({ themeStoreEnabled: enabled === true }),
 }));
 
 export function useConfigStore(): ConfigState;

@@ -39,6 +39,13 @@ func TestDaemonRegister_SkipsUnprovisionedProfileFailure(t *testing.T) {
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE profile_id = ANY($1::uuid[])`, []string{missing, broken})
 	})
+	// Profiles are bound to one machine (MUL-9425); an unscoped legacy profile
+	// may only refresh instances that already exist, so bind these to the
+	// registering daemon.
+	if _, err := testPool.Exec(ctx, `UPDATE runtime_profile SET daemon_id = $1 WHERE id = ANY($2::uuid[])`,
+		"test-daemon-unprovisioned-profile", []string{missing, broken}); err != nil {
+		t.Fatalf("bind profiles to the daemon: %v", err)
+	}
 
 	req := newOwnerDaemonRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id": testWorkspaceID,
