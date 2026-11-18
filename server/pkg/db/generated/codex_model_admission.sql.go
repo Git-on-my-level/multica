@@ -11,6 +11,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const isCodexModelAdmissionRejected = `-- name: IsCodexModelAdmissionRejected :one
+SELECT EXISTS (
+    SELECT 1
+    FROM codex_model_admission_config c
+    JOIN agent a ON a.id = c.agent_id
+    WHERE c.agent_id = $1 AND c.runtime_id = $2
+      AND a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration)
+)
+`
+
+type IsCodexModelAdmissionRejectedParams struct {
+	AgentID   pgtype.UUID `json:"agent_id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
+func (q *Queries) IsCodexModelAdmissionRejected(ctx context.Context, arg IsCodexModelAdmissionRejectedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isCodexModelAdmissionRejected, arg.AgentID, arg.RuntimeID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const lockCodexModelAdmissionAgentForTask = `-- name: LockCodexModelAdmissionAgentForTask :exec
 SELECT a.id
 FROM agent a
@@ -26,7 +48,7 @@ func (q *Queries) LockCodexModelAdmissionAgentForTask(ctx context.Context, taskI
 	return err
 }
 
-const recordCodexModelAdmissionRejection = `-- name: RecordCodexModelAdmissionRejection :exec
+const recordCodexModelAdmissionRejection = `-- name: RecordCodexModelAdmissionRejection :execrows
 UPDATE agent a
 SET codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration)
 FROM codex_model_admission_config c
@@ -36,6 +58,7 @@ WHERE a.id = c.agent_id
   AND t.started_at IS NOT NULL
   AND c.model = $2::text
   AND c.configuration = t.context->'codex_model_admission'
+  AND a.codex_model_admission_rejection IS DISTINCT FROM jsonb_build_array(c.runtime_id, c.configuration)
 `
 
 type RecordCodexModelAdmissionRejectionParams struct {
@@ -45,7 +68,10 @@ type RecordCodexModelAdmissionRejectionParams struct {
 
 // Match the provider's rejected model and the original dispatch snapshot.
 // A late failure from a superseded configuration must not block the new one.
-func (q *Queries) RecordCodexModelAdmissionRejection(ctx context.Context, arg RecordCodexModelAdmissionRejectionParams) error {
-	_, err := q.db.Exec(ctx, recordCodexModelAdmissionRejection, arg.TaskID, arg.RejectedModel)
-	return err
+func (q *Queries) RecordCodexModelAdmissionRejection(ctx context.Context, arg RecordCodexModelAdmissionRejectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordCodexModelAdmissionRejection, arg.TaskID, arg.RejectedModel)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -7,7 +7,7 @@ WHERE t.id = @task_id
   AND t.context ? 'codex_model_admission'
 FOR UPDATE OF a;
 
--- name: RecordCodexModelAdmissionRejection :exec
+-- name: RecordCodexModelAdmissionRejection :execrows
 -- Match the provider's rejected model and the original dispatch snapshot.
 -- A late failure from a superseded configuration must not block the new one.
 UPDATE agent a
@@ -18,4 +18,14 @@ WHERE a.id = c.agent_id
   AND t.id = @task_id
   AND t.started_at IS NOT NULL
   AND c.model = @rejected_model::text
-  AND c.configuration = t.context->'codex_model_admission';
+  AND c.configuration = t.context->'codex_model_admission'
+  AND a.codex_model_admission_rejection IS DISTINCT FROM jsonb_build_array(c.runtime_id, c.configuration);
+
+-- name: IsCodexModelAdmissionRejected :one
+SELECT EXISTS (
+    SELECT 1
+    FROM codex_model_admission_config c
+    JOIN agent a ON a.id = c.agent_id
+    WHERE c.agent_id = $1 AND c.runtime_id = $2
+      AND a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration)
+);

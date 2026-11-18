@@ -17,6 +17,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
+const codexUnsupportedSolMessage = "The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account."
 const codexUnsupportedSol = `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account.","code":"model_not_found"}}`
 
 func TestCodexRejectedModel(t *testing.T) {
@@ -24,6 +25,11 @@ func TestCodexRejectedModel(t *testing.T) {
 		name, message, want string
 	}{
 		{"live provider payload", codexUnsupportedSol, "gpt-6.2-sol"},
+		{"legacy daemon wrapper", "API error 400: " + codexUnsupportedSol, "gpt-6.2-sol"},
+		{"Codex transport wrapper", "Error running turn: unexpected status 400 Bad Request, body: " + codexUnsupportedSol + ", url: https://chatgpt.com/backend-api/codex/responses", "gpt-6.2-sol"},
+		{"adapter extracts only message", codexUnsupportedSolMessage, "gpt-6.2-sol"},
+		{"ordinary message about rejection", "The log read: " + codexUnsupportedSolMessage, ""},
+		{"non-400 wrapper", "API error 503: " + codexUnsupportedSol, ""},
 		{"other 400", strings.Replace(codexUnsupportedSol, "model_not_found", "invalid_model", 1), ""},
 		{"generic model not found", strings.Replace(codexUnsupportedSol, " is not supported when using Codex with a ChatGPT account.", " does not exist.", 1), ""},
 		{"transient status", strings.Replace(codexUnsupportedSol, "400", "503", 1), ""},
@@ -88,14 +94,14 @@ func TestCodexModelAdmissionDispatch(t *testing.T) {
 	rejected := queue(sol, "Unsupported configured model")
 	claim(sol, rejected)
 	start(rejected)
-	fail(rejected, codexUnsupportedSol, taskfailure.ReasonAPIInvalidRequest)
+	fail(rejected, "API error 400: "+codexUnsupportedSol, taskfailure.ReasonAPIInvalidRequest)
 
 	waiting := queue(sol, "Wait for model admission")
 	peer := queue(luna, "Supported model on the same runtime")
 	runtimeUUID := util.MustParseUUID(runtimeID)
 	for poll := range 3 {
 		claim(sol, pgtype.UUID{})
-		got, err := service.ClaimTasksForRuntimes(ctx, []pgtype.UUID{runtimeUUID}, 4)
+		got, _, err := service.ClaimTasksForRuntimes(ctx, []pgtype.UUID{runtimeUUID}, 4)
 		if err != nil || (poll == 0 && (len(got) != 1 || got[0].ID != peer)) || (poll > 0 && len(got) != 0) {
 			t.Fatalf("batch poll %d = %v, %v", poll, got, err)
 		}
@@ -110,7 +116,7 @@ func TestCodexModelAdmissionDispatch(t *testing.T) {
 	start(waiting)
 	// The replacement configuration can be tested. If it also fails, it is
 	// quarantined independently until a verified repair changes the revision.
-	fail(waiting, codexUnsupportedSol, taskfailure.ReasonAPIInvalidRequest)
+	fail(waiting, "Error running turn: unexpected status 400 Bad Request, body: "+codexUnsupportedSol, taskfailure.ReasonAgentModelNotFoundOrUnavailable)
 	repaired := queue(sol, "Same-version catalog repair")
 	claim(sol, pgtype.UUID{})
 	fx.Exec(t, `UPDATE agent SET runtime_config = '{"codex_model_admission_revision":"catalog-repair-1"}' WHERE id = $1`, sol)
@@ -133,10 +139,11 @@ func TestCodexModelAdmissionDispatch(t *testing.T) {
 	}
 	claim(sol, queue(sol, "Dispatch continues after successful admission"))
 
-	// Rollback bypasses the rejected configuration without changing routing.
+	// Restoring the rejected pin does not clear its hold.
 	fx.Exec(t, `UPDATE agent SET model = 'gpt-6.2-sol' WHERE id = $1`, sol)
 	rollback := queue(sol, "Breaker disabled")
 	claim(sol, pgtype.UUID{})
+	// The flag bypasses the hold without changing the configured model.
 	flags := featureflag.NewStaticProvider()
 	flags.Set(featureflags.CodexModelAdmission, featureflag.Rule{Default: false})
 	service.FeatureFlags = featureflag.NewService(flags)
