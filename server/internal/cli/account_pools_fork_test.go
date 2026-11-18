@@ -53,3 +53,13 @@ func TestNormalizeAccountPools(t *testing.T) {
 		t.Fatalf("duplicate ids must be rejected, got %v", err)
 	}
 }
+
+func TestNormalizeAccountPoolsCapsAccounts(t *testing.T) {
+	var specs []AccountSpec
+	for i := 0; i <= MaxExtraAccounts; i++ {
+		specs = append(specs, AccountSpec{ID: "codex-" + string(rune('a'+i)), Home: "/h/" + string(rune('a'+i))})
+	}
+	if _, err := NormalizeAccountPools(&AccountPoolsConfig{Accounts: map[string][]AccountSpec{"codex": specs}}); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("over-cap pool must be rejected, got %v", err)
+	}
+}

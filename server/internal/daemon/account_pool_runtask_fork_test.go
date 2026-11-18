@@ -94,3 +94,63 @@ cat >/dev/null
 		t.Fatalf("session binding = %+v", b)
 	}
 }
+
+// A resumed run whose resume is rejected retries fresh; when that fresh run
+// hits the plan limit, the quota failure still drives failover even though
+// the kept result is the rejected resume.
+func TestRunTaskFailsOverWhenFreshRetryHitsQuota(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script agent fixture is POSIX-only")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	write := func(name, body string) string {
+		path := filepath.Join(t.TempDir(), name)
+		writeTestExecutable(t, path, []byte(`#!/bin/sh
+case "$*" in *--version*) echo '2.1.292'; exit 0;; esac
+IFS= read -r input
+case "$input" in
+  *'"type":"control_request"'*)
+    printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"multica-supplement-initialize","response":{"commands":[]}}}'
+    IFS= read -r input;;
+esac
+`+body+`
+cat >/dev/null
+`))
+		return path
+	}
+	spent := write("claude-default", `case "$*" in
+  *--resume*) printf '%s\n' 'No conversation found with session ID: old-session' >&2
+    printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true}';;
+  *) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your session limit · resets 2pm (UTC)"}';;
+esac`)
+	second := write("claude-2", `printf '%s\n' '{"type":"result","subtype":"success","session_id":"s-second","result":"done"}'`)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	d := &Daemon{
+		client: NewClient(srv.URL), logger: logger,
+		workspaces: make(map[string]*workspaceState), activeEnvRoots: make(map[string]int),
+		runtimeIndex: map[string]Runtime{"test-rt": {ID: "test-rt", Provider: "claude"}},
+		cfg: Config{
+			WorkspacesRoot: t.TempDir(), AgentTimeout: 5 * time.Second, ServerBaseURL: srv.URL,
+			Agents: map[string]AgentEntry{"claude": {Path: spent}},
+		},
+		accountPool: newAccountPool(&cli.AccountPoolsConfig{Accounts: map[string][]cli.AccountSpec{
+			"claude": {{ID: "claude-2", Executable: second}},
+		}}, "", logger),
+	}
+	task := Task{
+		ID: "pool-task-2", WorkspaceID: "test-ws", RuntimeID: "test-rt",
+		AgentID: "test-agent", AuthToken: "mat_test_pool", ChatSessionID: "test-chat",
+		ChatMessage: "hello", PriorSessionID: "old-session",
+		Agent: &AgentData{ID: "test-agent", Name: "test"},
+	}
+	res, err := d.runTask(t.Context(), task, "claude", 0, logger)
+	if err != nil || res.Status != "completed" || res.SessionID != "s-second" {
+		t.Fatalf("run = %+v, err = %v", res, err)
+	}
+}

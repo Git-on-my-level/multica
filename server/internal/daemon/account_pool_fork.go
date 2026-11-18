@@ -476,7 +476,7 @@ func (t *taskAccount) observeRateLimits(next func(agent.RateLimitSnapshot)) func
 			if spec.ID == t.spec.ID {
 				continue
 			}
-			if other := p.state.Accounts[accountKey(t.provider, spec.ID)]; other != nil && other.Snapshot != nil {
+			if other := p.state.Accounts[accountKey(t.provider, spec.ID)]; other != nil && other.Snapshot != nil && len(siblings) < cli.MaxExtraAccounts {
 				siblings = append(siblings, *other.Snapshot)
 			}
 		}
@@ -552,9 +552,46 @@ func (t *taskAccount) failover(result agent.Result, taskLog *slog.Logger) bool {
 		return false
 	}
 	taskLog.Info("account pool: failing over", "provider", t.provider, "from", t.spec.ID, "to", next.spec.ID)
+	// A late rate-limit callback from the finished run reads t.spec under
+	// the pool mutex.
+	p.mu.Lock()
 	t.spec = next.spec
+	p.mu.Unlock()
 	t.tried[next.spec.ID] = true
 	return true
+}
+
+// claudeLookupEnv returns childEnv with this account's CLAUDE_CONFIG_DIR, for
+// daemon-side lookups of the account's Claude session files that run before
+// the task env is assembled (worktree transcript migration).
+func (t *taskAccount) claudeLookupEnv(childEnv map[string]string) map[string]string {
+	if t == nil || t.provider != "claude" || t.spec.ConfigDir == "" {
+		return childEnv
+	}
+	out := make(map[string]string, len(childEnv)+1)
+	for k, v := range childEnv {
+		out[k] = v
+	}
+	out["CLAUDE_CONFIG_DIR"] = t.spec.ConfigDir
+	return out
+}
+
+// registerTaskAccount makes the lease reachable from executeAndDrain, which
+// binds a session to its account as soon as the run reports it, so a daemon
+// crash mid-run cannot leave a pinned session unattributed. The returned func
+// unregisters.
+func (d *Daemon) registerTaskAccount(taskID string, t *taskAccount) func() {
+	if t == nil {
+		return func() {}
+	}
+	d.taskAccounts.Store(taskID, t)
+	return func() { d.taskAccounts.Delete(taskID) }
+}
+
+func (d *Daemon) bindTaskAccountSession(taskID, sessionID string) {
+	if v, ok := d.taskAccounts.Load(taskID); ok {
+		v.(*taskAccount).bindSession(sessionID)
+	}
 }
 
 // accountPoolStatePath is where a profile's pool state lives.

@@ -27,6 +27,11 @@ const DefaultAccountID = "default"
 // account stops being preferred. Matches agentctl's capacity pools.
 const DefaultAccountSwitchThreshold = 0.95
 
+// MaxExtraAccounts caps a provider's extra accounts: a rate-limit report
+// carries every other account's snapshot and the server accepts at most this
+// many siblings.
+const MaxExtraAccounts = 8
+
 // AccountPoolsConfig is the per-profile account pool configuration.
 type AccountPoolsConfig struct {
 	// SwitchThreshold overrides DefaultAccountSwitchThreshold when in (0, 1].
@@ -119,6 +124,9 @@ func NormalizeAccountPools(cfg *AccountPoolsConfig) (*AccountPoolsConfig, error)
 	for provider, specs := range cfg.Accounts {
 		if len(specs) == 0 {
 			continue
+		}
+		if len(specs) > MaxExtraAccounts {
+			return nil, fmt.Errorf("%s: at most %d extra accounts, got %d", provider, MaxExtraAccounts, len(specs))
 		}
 		seen := map[string]bool{}
 		for _, spec := range specs {

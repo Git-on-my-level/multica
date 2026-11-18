@@ -445,6 +445,8 @@ type Daemon struct {
 	// accountPool is the fork's subscription account pool (account_pool_fork.go);
 	// nil when no provider has extra accounts.
 	accountPool *accountPool
+	// taskAccounts maps a running task ID to its *taskAccount lease.
+	taskAccounts sync.Map
 
 	cfg        Config
 	client     *Client
@@ -8342,6 +8344,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Fork: pick the subscription account before anything reads the resume
 	// pointer, so a task moving accounts builds a cold prompt (account_pool_fork.go).
 	taskAccount := d.selectTaskAccount(provider, &task, usesCustomProfileCommand, taskLog)
+	defer d.registerTaskAccount(task.ID, taskAccount)()
 	baseExecutable := entry.Path
 	entry.Path = taskAccount.executable(baseExecutable)
 	defer taskAccount.persist()
@@ -9078,7 +9081,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// custom_env; taskMulticaEnvironment below does not override its config or
 	// home variables. Apply the same blocklist as the eventual child env.
 	claudeResumeReady := provider == "claude" && migrateClaudeWorktreeTranscript(
-		env, task.PriorSessionID, env.WorkDir, task.PriorWorkDir, sanitizeAgentEnv(agentEnvOverrides), taskLog,
+		env, task.PriorSessionID, env.WorkDir, task.PriorWorkDir, taskAccount.claudeLookupEnv(sanitizeAgentEnv(agentEnvOverrides)), taskLog,
 	)
 	resumeReachable := gateResumeToReachableSession(
 		&task, &taskCtx, provider, env.WorkDir,
@@ -9616,6 +9619,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return freshPrompt
 	}
 
+	lastAttempt := result
 	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
@@ -9661,12 +9665,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// session keeps firstResult so the bad session stays excluded rather
 		// than being relabeled resumable by a benign-looking second error.
 		result, tools = reconcileFreshRetryResult(firstResult, firstUsage, firstTools, retryResult, retryTools, retryErr)
+		if retryErr == nil {
+			// The fresh run's own failure decides failover even when the
+			// poisoned first result is the one kept.
+			lastAttempt = retryResult
+		}
 	}
 
 	// Fork: a run that failed on a spent plan window re-runs on the next pool
 	// account with headroom (account_pool_fork.go). Its session belonged to
 	// the spent account, so the re-run starts cold.
-	for taskAccount.failover(result, taskLog) {
+	for taskAccount.failover(lastAttempt, taskLog) {
 		hadSession := task.PriorSessionID != "" || result.SessionID != ""
 		firstUsage := result.Usage
 		if err := taskAccount.applyEnv(agentEnv, env.CodexHome); err != nil {
@@ -9687,7 +9696,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			break
 		}
 		retryResult.Usage = mergeUsage(firstUsage, retryResult.Usage)
-		result, tools = retryResult, retryTools
+		result, tools, lastAttempt = retryResult, retryTools, retryResult
 	}
 	taskAccount.bindSession(result.SessionID)
 
@@ -10599,6 +10608,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					// Non-Codex providers (codexHome == "") pin immediately.
 					if msg.SessionID != "" && !sessionPinned.Swap(true) {
 						sid := msg.SessionID
+						d.bindTaskAccountSession(taskID, sid)
 						wd := opts.Cwd
 						go func() {
 							if !waitCodexRolloutPresent(drainCtx, codexHome, sid) {

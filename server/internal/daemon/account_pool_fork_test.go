@@ -317,3 +317,53 @@ func TestAccountPoolStatePersists(t *testing.T) {
 		t.Fatalf("exhausted until = %v", until)
 	}
 }
+
+func TestClaudeLookupEnvUsesAccountConfigDir(t *testing.T) {
+	p, _ := newTestPool(t, "claude", "claude-2")
+	lease := &taskAccount{pool: p, provider: "claude", spec: p.providers["claude"][1], tried: map[string]bool{}}
+	base := map[string]string{"FOO": "1"}
+	got := lease.claudeLookupEnv(base)
+	if got["CLAUDE_CONFIG_DIR"] != lease.spec.ConfigDir || got["FOO"] != "1" {
+		t.Fatalf("lookup env = %v", got)
+	}
+	if _, leaked := base["CLAUDE_CONFIG_DIR"]; leaked {
+		t.Fatal("claudeLookupEnv must not mutate its input")
+	}
+	var none *taskAccount
+	if got := none.claudeLookupEnv(base); len(got) != 1 {
+		t.Fatalf("nil lease lookup env = %v", got)
+	}
+}
+
+func TestSessionBindsWhileTaskRuns(t *testing.T) {
+	p, _ := newTestPool(t, "codex", "codex-2")
+	d := &Daemon{accountPool: p}
+	lease := &taskAccount{pool: p, provider: "codex", spec: p.providers["codex"][1], tried: map[string]bool{}}
+	unregister := d.registerTaskAccount("task-1", lease)
+	d.bindTaskAccountSession("task-1", "thread-9")
+	unregister()
+	d.bindTaskAccountSession("task-1", "thread-10") // after the run: ignored
+	if b := p.state.Sessions[accountKey("codex", "thread-9")]; b.Account != "codex-2" {
+		t.Fatalf("binding = %+v", b)
+	}
+	if _, ok := p.state.Sessions[accountKey("codex", "thread-10")]; ok {
+		t.Fatal("an unregistered task must not bind sessions")
+	}
+}
+
+func TestObserveCapsSiblings(t *testing.T) {
+	ids := []string{}
+	for i := 0; i < cli.MaxExtraAccounts; i++ {
+		ids = append(ids, "codex-"+string(rune('a'+i)))
+	}
+	p, _ := newTestPool(t, "codex", ids...)
+	for _, spec := range p.providers["codex"] {
+		setSnapshot(p, "codex", spec.ID, &agent.RateLimitSnapshot{Account: spec.ID, ObservedAt: poolTestNow})
+	}
+	lease := &taskAccount{pool: p, provider: "codex", spec: p.providers["codex"][0], tried: map[string]bool{}}
+	var got agent.RateLimitSnapshot
+	lease.observeRateLimits(func(s agent.RateLimitSnapshot) { got = s })(agent.RateLimitSnapshot{ObservedAt: poolTestNow})
+	if len(got.Accounts) > cli.MaxExtraAccounts {
+		t.Fatalf("%d siblings exceed the server limit %d", len(got.Accounts), cli.MaxExtraAccounts)
+	}
+}
