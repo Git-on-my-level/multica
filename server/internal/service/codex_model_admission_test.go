@@ -3,6 +3,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +93,49 @@ func TestCodexModelAdmissionDispatch(t *testing.T) {
 	claim(sol, transient)
 	start(transient)
 	fail(transient, "API error 429: too many requests", taskfailure.ReasonAgentProviderCapacityOrRateLimit)
+
+	t.Run("unparseable wrapped rejection", func(t *testing.T) {
+		id := queue(sol, "Unparseable Codex rejection")
+		claimed, err := service.ClaimTask(ctx, util.MustParseUUID(sol))
+		if err != nil || claimed == nil || claimed.ID != id {
+			t.Fatalf("claim unparseable rejection fixture: %v, %v", claimed, err)
+		}
+		if _, err := service.StartTask(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+
+		path := filepath.Join(t.TempDir(), "failure.log")
+		logFile, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = logFile.Close() })
+		previous := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(logFile, nil)))
+		t.Cleanup(func() { slog.SetDefault(previous) })
+
+		const damaged = `API error 400: {"code":"model_not_found","message":"` + codexUnsupportedSolMessage
+		failed, err := service.FailTask(ctx, id, damaged, "", "", "", taskfailure.ReasonAPIInvalidRequest.String(), false, "", "")
+		if err != nil || failed == nil || failed.Status != "failed" ||
+			failed.FailureReason.String != taskfailure.ReasonAPIInvalidRequest.String() || failed.Error.String != damaged {
+			t.Fatalf("expected ordinary failure with its existing diagnosis: %v, %v", failed, err)
+		}
+		agent, err := service.Queries.GetAgent(ctx, util.MustParseUUID(sol))
+		if err != nil || len(agent.CodexModelAdmissionRejection) != 0 {
+			t.Fatalf("unparseable failure recorded a model rejection: %s, %v", agent.CodexModelAdmissionRejection, err)
+		}
+		logs, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(logs), "\n") {
+			if strings.Contains(line, "level=WARN") && strings.Contains(line, "unrecognized Codex model rejection format") &&
+				strings.Contains(line, "task_id="+util.UUIDToString(id)) && strings.Contains(line, "agent_id="+sol) {
+				return
+			}
+		}
+		t.Fatalf("missing warning for the unparseable failure: %s", logs)
+	})
 
 	rejected := queue(sol, "Unsupported configured model")
 	claim(sol, rejected)

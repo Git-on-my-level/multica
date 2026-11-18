@@ -11,6 +11,67 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getCodexAgentForClaimDelivery = `-- name: GetCodexAgentForClaimDelivery :one
+SELECT a.id, a.workspace_id, a.name, a.avatar_url, a.runtime_mode, a.runtime_config, a.visibility, a.status, a.max_concurrent_tasks, a.owner_id, a.created_at, a.updated_at, a.description, a.runtime_id, a.instructions, a.archived_at, a.archived_by, a.custom_env, a.custom_args, a.mcp_config, a.model, a.thinking_level, a.composio_toolkit_allowlist, a.permission_mode, a.kind, a.system_key, a.disabled_runtime_skills, a.service_tier, a.conversation_starters, a.codex_model_admission_rejection,
+       c.configuration IS NOT DISTINCT FROM ($1::jsonb->'codex_model_admission') AS admission_matches
+FROM agent a
+LEFT JOIN codex_model_admission_config c ON c.agent_id = a.id AND c.runtime_id = $2
+WHERE a.id = $3
+`
+
+type GetCodexAgentForClaimDeliveryParams struct {
+	ClaimContext []byte      `json:"claim_context"`
+	RuntimeID    pgtype.UUID `json:"runtime_id"`
+	AgentID      pgtype.UUID `json:"agent_id"`
+}
+
+type GetCodexAgentForClaimDeliveryRow struct {
+	Agent            Agent `json:"agent"`
+	AdmissionMatches bool  `json:"admission_matches"`
+}
+
+// Read the launch agent and its admission configuration in the same snapshot.
+// A legacy or reclaimed claim with a different configuration must be claimed
+// again before its payload can use the new one.
+func (q *Queries) GetCodexAgentForClaimDelivery(ctx context.Context, arg GetCodexAgentForClaimDeliveryParams) (GetCodexAgentForClaimDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, getCodexAgentForClaimDelivery, arg.ClaimContext, arg.RuntimeID, arg.AgentID)
+	var i GetCodexAgentForClaimDeliveryRow
+	err := row.Scan(
+		&i.Agent.ID,
+		&i.Agent.WorkspaceID,
+		&i.Agent.Name,
+		&i.Agent.AvatarUrl,
+		&i.Agent.RuntimeMode,
+		&i.Agent.RuntimeConfig,
+		&i.Agent.Visibility,
+		&i.Agent.Status,
+		&i.Agent.MaxConcurrentTasks,
+		&i.Agent.OwnerID,
+		&i.Agent.CreatedAt,
+		&i.Agent.UpdatedAt,
+		&i.Agent.Description,
+		&i.Agent.RuntimeID,
+		&i.Agent.Instructions,
+		&i.Agent.ArchivedAt,
+		&i.Agent.ArchivedBy,
+		&i.Agent.CustomEnv,
+		&i.Agent.CustomArgs,
+		&i.Agent.McpConfig,
+		&i.Agent.Model,
+		&i.Agent.ThinkingLevel,
+		&i.Agent.ComposioToolkitAllowlist,
+		&i.Agent.PermissionMode,
+		&i.Agent.Kind,
+		&i.Agent.SystemKey,
+		&i.Agent.DisabledRuntimeSkills,
+		&i.Agent.ServiceTier,
+		&i.Agent.ConversationStarters,
+		&i.Agent.CodexModelAdmissionRejection,
+		&i.AdmissionMatches,
+	)
+	return i, err
+}
+
 const isCodexModelAdmissionRejected = `-- name: IsCodexModelAdmissionRejected :one
 SELECT EXISTS (
     SELECT 1

@@ -29,3 +29,13 @@ SELECT EXISTS (
     WHERE c.agent_id = $1 AND c.runtime_id = $2
       AND a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration)
 );
+
+-- name: GetCodexAgentForClaimDelivery :one
+-- Read the launch agent and its admission configuration in the same snapshot.
+-- A legacy or reclaimed claim with a different configuration must be claimed
+-- again before its payload can use the new one.
+SELECT sqlc.embed(a),
+       c.configuration IS NOT DISTINCT FROM (sqlc.narg(claim_context)::jsonb->'codex_model_admission') AS admission_matches
+FROM agent a
+LEFT JOIN codex_model_admission_config c ON c.agent_id = a.id AND c.runtime_id = @runtime_id
+WHERE a.id = @agent_id;

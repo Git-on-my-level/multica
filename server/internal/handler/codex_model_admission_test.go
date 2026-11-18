@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -82,5 +83,69 @@ func TestCodexModelAdmissionFailureAndAgentUpdate(t *testing.T) {
 	got, err := svc.ClaimTask(ctx, parseUUID(agentID))
 	if err != nil || got == nil || uuidToString(got.ID) != nextID {
 		t.Fatalf("claim after catalog revision update: %v, %v", got, err)
+	}
+}
+
+func TestCodexModelAdmissionClaimRequeuesOnConfigDrift(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, model, revision string
+	}{
+		{name: "model changed", model: "gpt-6-luna", revision: "original"},
+		{name: "revision changed", model: "gpt-6.2-sol", revision: "updated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtimeID := dbfx.Runtime(t, "Codex "+tc.name, testutil.Cols{"provider": "codex"})
+			runtime, err := testHandler.Queries.GetAgentRuntime(ctx, parseUUID(runtimeID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			agentID := dbfx.Agent(t, "Admission "+tc.name, runtimeID, testutil.Cols{
+				"model": "gpt-6.2-sol", "runtime_config": testutil.Raw(`'{"codex_model_admission_revision":"original"}'::jsonb`),
+			})
+			issueID := dbfx.Issue(t, "Admission "+tc.name)
+			taskID := dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID})
+			claim := func() *db.AgentTaskQueue {
+				t.Helper()
+				task, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID))
+				if err != nil || task == nil || uuidToString(task.ID) != taskID {
+					t.Fatalf("claim task: %v, %v", task, err)
+				}
+				return task
+			}
+			claimed := claim()
+
+			req := withURLParam(newRequest(http.MethodPut, "/api/agents/"+agentID, map[string]any{
+				"model":          tc.model,
+				"runtime_config": map[string]string{"codex_model_admission_revision": tc.revision},
+			}), "id", agentID)
+			testutil.Call(t, testHandler.UpdateAgent, req).Want(http.StatusOK)
+
+			claimReq := newOwnerDaemonRequest(http.MethodPost, "/claim", nil)
+			resp, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(claimReq, claimed, runtime, runtimeID, testWorkspaceID)
+			if failure == nil || !failure.settled || failure.outcome != "codex_model_configuration_changed" || resp.Agent != nil {
+				t.Fatalf("stale claim must not contain launch settings: agent=%+v failure=%+v", resp.Agent, failure)
+			}
+			task, err := testHandler.Queries.GetAgentTask(ctx, claimed.ID)
+			if err != nil || task.Status != "queued" || task.DispatchedAt.Valid || task.StartedAt.Valid {
+				t.Fatalf("expected unstarted requeued task: %v, %v", task, err)
+			}
+
+			reclaimed := claim()
+			if reclaimed.DispatchedAt == claimed.DispatchedAt {
+				t.Fatal("claim did not acquire a new dispatch generation")
+			}
+			resp, _, _, _, _, failure = testHandler.buildClaimedTaskResponse(claimReq, reclaimed, runtime, runtimeID, testWorkspaceID)
+			if failure != nil || resp.Agent == nil || resp.Agent.Model != tc.model {
+				t.Fatalf("updated claim: agent=%+v failure=%+v", resp.Agent, failure)
+			}
+			var config map[string]string
+			if err := json.Unmarshal(resp.Agent.RuntimeConfig, &config); err != nil || config["codex_model_admission_revision"] != tc.revision {
+				t.Fatalf("updated launch revision: %v, %v", config, err)
+			}
+		})
 	}
 }
