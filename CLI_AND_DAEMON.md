@@ -325,6 +325,33 @@ does not clear those blocks or establish that earlier background processes exite
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### Subscription Account Pools (fork)
+
+When a machine has more than one Claude Code or Codex subscription, the daemon can spread work across them and fail over when one runs out. The provider's own login is always in the pool as `default`. Add each extra login you created on this machine:
+
+```bash
+# Claude: a launcher that runs Claude Code as the account, plus its config dir
+multica runtime accounts add claude --id claude-2 \
+  --executable ~/.local/bin/claude-2 --config-dir ~/.claude-2
+# Claude without a launcher: just the config dir (the login must live there)
+multica runtime accounts add claude --id claude-3 --config-dir ~/.claude-3
+# Codex: the account's CODEX_HOME (only its auth.json is used)
+multica runtime accounts add codex --id codex-2 --home ~/.codex-2
+
+multica runtime accounts list          # usage, reset time and state per account
+multica runtime accounts threshold 0.9 # optional, default 0.95
+multica daemon restart
+```
+
+How the daemon chooses:
+
+- **At launch.** It reads the plan windows each account's CLI last reported (the same data as the runtime page's Limits section). Among the accounts whose most-used window stays at least 5% below the switch threshold, it takes the one whose limiting window **resets soonest**, so capacity that is about to reset gets used first. After those come accounts with no usage seen yet, then accounts over the threshold (least used first), then exhausted accounts. An account whose login is missing on disk is skipped.
+- **Sessions stay on their account.** A follow-up that would resume a session stays on that session's account while it has headroom. If the daemon has to move the task to another account, it starts a fresh session with the usual continuity notice: Claude refuses to resume another account's session.
+- **Failover.** If a run fails because the account's session or weekly limit is spent, the daemon marks that account exhausted until its window resets (an hour if the reset time is unknown). It then re-runs the task right away on the next account that has headroom, trying each account at most once per task.
+- **Pinned agents bypass the pool.** That covers custom runtime profiles and agents whose `custom_env` sets their own login or API key (`CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and similar).
+
+The runtime page's Limits section shows the account the runtime last ran under, followed by every other account in the pool. Pool configuration and state stay on the machine: the config lives in the profile's `config.json` under `account_pools`, and the state in `account-pools-state.json` next to it. Credentials are never copied or sent to the server.
+
 ### Local Environments
 
 The issue sidebar's **Environments** section lists the servers and desktop apps associated with an issue's runs, grouped by the machine they run on. A localhost URL opens only on that machine. The daemon reports environments in two ways:
