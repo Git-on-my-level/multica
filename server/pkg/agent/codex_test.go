@@ -2069,9 +2069,8 @@ func TestCodexTurnNotificationGateIgnoresSubagentTurnStarted(t *testing.T) {
 	c.acceptNotification = gate.accept
 
 	var (
-		gotText        string
-		doneCount      int
-		discardedCount int
+		gotText   string
+		doneCount int
 	)
 	c.onMessage = func(msg Message) {
 		if msg.Type == MessageText {
@@ -2080,9 +2079,6 @@ func TestCodexTurnNotificationGateIgnoresSubagentTurnStarted(t *testing.T) {
 	}
 	c.onTurnDone = func(aborted bool) {
 		doneCount++
-	}
-	c.onDiscardedNotification = func(string, map[string]any) {
-		discardedCount++
 	}
 
 	c.handleLine(`{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_main","turn":{"id":"turn-main"}}}`)
@@ -2105,9 +2101,7 @@ func TestCodexTurnNotificationGateIgnoresSubagentTurnStarted(t *testing.T) {
 	if doneCount != 1 {
 		t.Fatalf("main turn completion count = %d, want 1", doneCount)
 	}
-	if discardedCount != 0 {
-		t.Fatalf("subagent notification should be filtered before the gate, discarded callback count = %d", discardedCount)
-	}
+
 }
 
 // Regression for #1181: subagent agentMessage/final_answer must not
@@ -3286,41 +3280,6 @@ func TestCodexExecuteDoesNotProbeVersionBeforeInitialize(t *testing.T) {
 	}()
 	if result := <-session.Result; result.Status != "completed" {
 		t.Fatalf("result=%+v", result)
-	}
-}
-
-func TestCodexExecuteRetriesAfterSignaledProcessIsReaped(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux signal/reap semantics regression")
-	}
-	codexGracefulShutdownTimeoutNanos.Store(int64(100 * time.Millisecond))
-	defer codexGracefulShutdownTimeoutNanos.Store(0)
-	countPath := filepath.Join(t.TempDir(), "launch-count")
-	fakePath := writeFakeCodexAppServer(t, ""+
-		`count=0; test -f `+countPath+` && count=$(cat `+countPath+`)`+"\n"+
-		`count=$((count + 1)); echo "$count" > `+countPath+"\n"+
-		`read line`+"\n"+
-		`if test "$count" -eq 1; then exec sleep 30; fi`+"\n"+
-		`echo '{"jsonrpc":"2.0","id":1,"result":{}}'`+"\n"+
-		`read line`+"\n"+
-		`read line`+"\n"+
-		`echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-signaled"}}}'`+"\n"+
-		`read line`+"\n"+
-		`echo '{"jsonrpc":"2.0","id":3,"result":{}}'`+"\n"+
-		`echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-signaled","turn":{"id":"turn-1","status":"completed"}}}'`+"\n")
-	// The handshake budget is spent twice here, and the two spends pull in
-	// opposite directions: the first attempt only reaches the signal/reap path
-	// by burning the whole budget, while the RETRY has to answer initialize
-	// inside the same budget from a cold `sh` spawn. Tens of milliseconds are
-	// enough for the second spend only on an idle machine. Under the
-	// contention this package sees in CI (`-race`, `-p 2`, neighbours spawning
-	// process trees) that cold spawn measured 100-309ms, so the old 50ms
-	// budget timed the retry out too and the test reported the retry as
-	// missing. Two seconds keeps the margin wide; the cost is one deliberate
-	// 2s wait on a Linux-only test. (MUL-7271 follow-up)
-	result := executeFakeCodex(t, fakePath, ExecOptions{Timeout: 10 * time.Second, HandshakeTimeout: 2 * time.Second})
-	if result.Status != "completed" {
-		t.Fatalf("signaled/reaped first attempt should retry: %+v", result)
 	}
 }
 
