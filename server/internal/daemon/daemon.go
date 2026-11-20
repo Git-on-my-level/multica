@@ -9953,6 +9953,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// fact.
 			failureReason = taskfailure.Classify(errMsg).String()
 		}
+		if provider == "codex" && strings.TrimSpace(errMsg) == taskfailure.CodexSafetyRefusalDiagnostic {
+			failureReason = taskfailure.ReasonCodexSafetyRefusal.String()
+			retiredSessionID = result.SessionID
+			if retiredSessionID == "" {
+				retiredSessionID = execOpts.ResumeSessionID
+			}
+		}
 		// After the classifiers above have read errMsg. Each hint is fixed
 		// prose chosen to match none of the resume guards (see its const), so
 		// ordering is not what makes it safe — but it keeps the machine

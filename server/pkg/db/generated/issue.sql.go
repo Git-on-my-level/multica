@@ -471,6 +471,14 @@ const deleteIssue = `-- name: DeleteIssue :exec
 WITH target AS (
     SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
 ),
+cleared_member_rescope_receipts AS (
+    DELETE FROM member_rescope_receipt WHERE issue_id IN (SELECT id FROM target)
+),
+cleared_member_rescope_directives AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (
+        SELECT comment.id FROM comment JOIN target ON target.id = comment.issue_id
+    )
+),
 cleared_wakeup_receipts AS (
  DELETE FROM issue_wakeup_receipt WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE issue_id IN (SELECT target.id FROM target))
 ),

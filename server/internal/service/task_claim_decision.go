@@ -51,6 +51,7 @@ const (
 	claimOutcomeErrorClaim              = "error_claim"
 	claimOutcomeErrorReanchorChatInput  = "error_reanchor_chat_input"
 	claimOutcomeErrorTransaction        = "error_transaction"
+	claimOutcomeMemberRescopeRequired   = "member_rescope_required"
 )
 
 // Outcomes of claim polls (ClaimTaskForRuntime and the batch
@@ -137,6 +138,8 @@ func claimReasonFor(outcome string, scope claimScope) string {
 		return claimReasonAgentRebound
 	case claimOutcomeNoRuntime:
 		return claimReasonAgentUnbound
+	case claimOutcomeMemberRescopeRequired:
+		return memberRescopeRequired
 	case claimOutcomeClaimed:
 		return claimReasonClaimed
 	case claimOutcomeEmptyCacheHit:

@@ -1319,6 +1319,12 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
@@ -1495,6 +1501,12 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	params := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
@@ -3742,7 +3754,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
-	var claimed *db.AgentTaskQueue
+	var claimed, blocked *db.AgentTaskQueue
 	var reclaimCheckAfter time.Time
 	var decisionDetail claimDecisionDetail
 	defer func() {
@@ -3750,7 +3762,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		s.recordClaimDecision(agentID, runtimeID, outcome, scope, decisionDetail)
 	}()
 
-	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+	err := s.runInTaskTx(ctx, func(qtx *db.Queries, tx pgx.Tx) error {
 		t0 := time.Now()
 		agent, err := qtx.GetAgentForClaimUpdate(ctx, agentID)
 		getAgentMs = time.Since(t0).Milliseconds()
@@ -3858,6 +3870,21 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			return fmt.Errorf("claim task: %w", err)
 		}
 
+		task, err = s.guardMemberRescopeClaim(ctx, tx, task)
+		if err != nil {
+			outcome = claimOutcomeErrorClaim
+			return fmt.Errorf("check member re-scope: %w", err)
+		}
+		if task.Status == "cancelled" {
+			if err := SettleTerminalTaskState(ctx, qtx, task); err != nil {
+				outcome = claimOutcomeErrorClaim
+				return err
+			}
+			blocked = &task
+			outcome = claimOutcomeMemberRescopeRequired
+			return nil
+		}
+
 		// An idle task-owned direct-chat row may already be visible as the
 		// positional queue head. Normal completion reanchors a successor beside
 		// the assistant outcome before commit; this claim-time query is the
@@ -3888,6 +3915,12 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			outcome = "error_transaction"
 		}
 		return nil, err
+	}
+	if blocked != nil {
+		s.captureTaskCancelled(ctx, *blocked)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, *blocked, map[string]any{
+			"error": blocked.Error.String, "failure_reason": memberRescopeRequired,
+		})
 	}
 	if claimed == nil {
 		return nil, nil
@@ -5420,6 +5453,9 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			newCodexModelHold = changed > 0
 		}
 		task = t
+		if err := recordMemberRescopeRefusal(ctx, qtx, task); err != nil {
+			return fmt.Errorf("arm member re-scope receipt: %w", err)
+		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.
@@ -5843,7 +5879,7 @@ func resumeUnsafeFailureReason(reason string) bool {
 	// codex_resume_oversized is the strongest member of this set: a codex
 	// rollout only ever grows, so a thread whose resume response already
 	// overflowed the reader will overflow on every future attempt too.
-	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew":
+	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew", taskfailure.ReasonCodexSafetyRefusal.String():
 		return true
 	default:
 		return false
@@ -7375,15 +7411,21 @@ func (s *TaskService) dispatchDelegatedFailureRecoveryComment(ctx context.Contex
 // (e.g. some tests construct TaskService directly), fn runs against the
 // regular Queries handle without transactional guarantees.
 func (s *TaskService) runInTx(ctx context.Context, fn func(*db.Queries) error) error {
+	return s.runInTaskTx(ctx, func(q *db.Queries, _ pgx.Tx) error {
+		return fn(q)
+	})
+}
+
+func (s *TaskService) runInTaskTx(ctx context.Context, fn func(*db.Queries, pgx.Tx) error) error {
 	if s.TxStarter == nil {
-		return fn(s.Queries)
+		return fn(s.Queries, nil)
 	}
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	if err := fn(s.Queries.WithTx(tx)); err != nil {
+	if err := fn(s.Queries.WithTx(tx), tx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

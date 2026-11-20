@@ -230,6 +230,9 @@ const (
 	// failures, DNS failures, i/o timeout. Transient.
 	ReasonAgentProviderNetwork Reason = "agent_error.provider_network"
 
+	// ReasonCodexSafetyRefusal is a terminal refusal explicitly reported by Codex.
+	ReasonCodexSafetyRefusal Reason = "agent_error.codex_safety_refusal"
+
 	// ReasonAgentProcessFailure: agent subprocess exited non-zero,
 	// crashed, or returned an unexpected signal. Runner / backend
 	// quality issue.
@@ -311,6 +314,7 @@ var allReasons = []Reason{
 	ReasonAgentProviderCapacityOrRateLimit,
 	ReasonAgentProviderServerError,
 	ReasonAgentProviderNetwork,
+	ReasonCodexSafetyRefusal,
 
 	// Agent process side: agent / runner errors.
 	ReasonAgentProcessFailure,
@@ -357,3 +361,6 @@ func AllReasons() []Reason {
 	copy(out, allReasons)
 	return out
 }
+
+// CodexSafetyRefusalDiagnostic is the exact provider diagnostic for this disposition.
+const CodexSafetyRefusalDiagnostic = "This request was blocked by our safety systems. Reason: Potentially unintended activity."
