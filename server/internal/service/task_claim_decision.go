@@ -39,17 +39,18 @@ import (
 
 // Outcomes produced inside claimTask, shared by every caller.
 const (
-	claimOutcomeClaimed                = "claimed"
-	claimOutcomeNoTasks                = "no_tasks"
-	claimOutcomeNoCapacity             = "no_capacity"
-	claimOutcomeRuntimeNoCapacity      = "runtime_no_capacity"
-	claimOutcomeNoRuntime              = "no_runtime"
-	claimOutcomeRuntimeMismatch        = "runtime_mismatch"
-	claimOutcomeErrorGetAgent          = "error_get_agent"
-	claimOutcomeErrorCountRunning      = "error_count_running"
-	claimOutcomeErrorClaim             = "error_claim"
-	claimOutcomeErrorReanchorChatInput = "error_reanchor_chat_input"
-	claimOutcomeErrorTransaction       = "error_transaction"
+	claimOutcomeClaimed                 = "claimed"
+	claimOutcomeNoTasks                 = "no_tasks"
+	claimOutcomeCodexModelAdmissionHeld = "codex_model_admission_held"
+	claimOutcomeNoCapacity              = "no_capacity"
+	claimOutcomeRuntimeNoCapacity       = "runtime_no_capacity"
+	claimOutcomeNoRuntime               = "no_runtime"
+	claimOutcomeRuntimeMismatch         = "runtime_mismatch"
+	claimOutcomeErrorGetAgent           = "error_get_agent"
+	claimOutcomeErrorCountRunning       = "error_count_running"
+	claimOutcomeErrorClaim              = "error_claim"
+	claimOutcomeErrorReanchorChatInput  = "error_reanchor_chat_input"
+	claimOutcomeErrorTransaction        = "error_transaction"
 )
 
 // Outcomes of claim polls (ClaimTaskForRuntime and the batch
@@ -126,6 +127,8 @@ func claimReasonFor(outcome string, scope claimScope) string {
 			return claimReasonUnknownCandidates
 		}
 		return claimReasonNoVisibleCandidates
+	case claimOutcomeCodexModelAdmissionHeld:
+		return claimOutcomeCodexModelAdmissionHeld
 	case claimOutcomeNoCapacity:
 		return claimReasonAgentConcurrencyCap
 	case claimOutcomeRuntimeNoCapacity:

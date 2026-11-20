@@ -325,6 +325,24 @@ does not clear those blocks or establish that earlier background processes exite
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### Codex model admission
+
+A Codex provider response that explicitly rejects the agent's pinned model for
+its ChatGPT account holds further queued runs for that agent configuration.
+Already dispatched work remains subject to the usual task lifecycle. Other
+agents can continue claiming work on the same runtime. Held runs retain the
+normal queue expiry. Operators can identify the affected agent and runtime in
+the `queued Codex dispatch held after model rejection` warning and monitor
+the `codex_model_admission_held` claim outcome.
+
+After verifying the repair against the runtime's live catalog, a change to the
+reported Codex CLI version or the pinned model permits dispatch again. For a
+catalog repair on the same CLI version, set a new non-secret
+`codex_model_admission_revision` value in the agent's runtime configuration.
+Preserve the other runtime configuration keys when saving that change. A fresh
+provider rejection can hold the new configuration again. Operators can bypass
+this guard with the server feature flag `FF_CODEX_MODEL_ADMISSION=off`.
+
 ### Subscription Account Pools (fork)
 
 When a machine has more than one Claude Code or Codex subscription, the daemon can spread work across them and fail over when one runs out. The provider's own login is always in the pool as `default`. Add each extra login you created on this machine:

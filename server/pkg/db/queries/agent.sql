@@ -824,15 +824,30 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 -- otherwise a user mashing the create button could fire concurrent quick-creates
 -- whose completion lookup would race over "most recent issue by this agent".
+WITH codex_config AS MATERIALIZED (
+    SELECT c.configuration,
+           a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration) AS rejected
+    FROM codex_model_admission_config c
+    JOIN agent a ON a.id = c.agent_id
+    WHERE c.agent_id = @agent_id AND c.runtime_id = @runtime_id
+)
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
+    context = COALESCE(
+        (SELECT COALESCE(context, '{}'::jsonb) || jsonb_build_object('codex_model_admission', configuration)
+         FROM codex_config),
+        context - 'codex_model_admission'
+    ),
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.agent_id = @agent_id
       AND atq.runtime_id = @runtime_id
       AND atq.status = 'queued'
+      AND (@ignore_codex_model_rejection::boolean OR NOT EXISTS (
+          SELECT 1 FROM codex_config WHERE rejected
+      ))
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
