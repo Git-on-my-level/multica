@@ -10139,7 +10139,9 @@ func (d *Daemon) repairWorktreeDelivery(ctx context.Context, backend agent.Backe
 	opts := withPriorTaskUsage(execOpts, result.Usage)
 	// Continue the conversation when there is one, so the agent knows what it
 	// just did; the prompt is self-contained for the backends that cannot.
-	opts.ResumeSessionID = result.SessionID
+	if !opts.RequireCursorResume {
+		opts.ResumeSessionID = result.SessionID
+	}
 	opts.ResumeContinuityNotice = ""
 	// No additional messages during housekeeping. The repair turn's reply is
 	// discarded (mergeWorktreeRepairResult keeps the task's own), so a

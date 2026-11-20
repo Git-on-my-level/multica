@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -42,7 +41,13 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	runCtx, cancel := runContext(ctx, timeout)
 
 	args := buildCursorArgs(opts, b.cfg.Logger)
-	cmd, _, _ := b.cfg.commandAt(execName).execVia(runCtx, chooseCursorInvocation, lookedUp, args, b.cfg.Logger)
+	command := b.cfg.commandAt(execName)
+	if opts.RequireCursorResume {
+		command = command.withFilteredPrefix(func(prefix []string) []string {
+			return filterCustomArgs(prefix, cursorRecoveryBlockedArgs, b.cfg.Logger)
+		})
+	}
+	cmd, _, _ := command.execVia(runCtx, chooseCursorInvocation, lookedUp, args, b.cfg.Logger)
 	hideAgentWindow(cmd)
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 500 * time.Millisecond
@@ -1070,6 +1075,16 @@ var cursorBlockedArgs = map[string]blockedArgMode{
 	"--yolo":          blockedStandalone, // auto-approval for autonomous operation
 }
 
+// Recovery owns the session and working directory even when a runtime profile
+// or task supplied flags for a different conversation.
+var cursorRecoveryBlockedArgs = map[string]blockedArgMode{
+	"--resume":    blockedOptionalValue,
+	"-r":          blockedOptionalValue,
+	"--continue":  blockedStandalone,
+	"-c":          blockedStandalone,
+	"--workspace": blockedWithValue,
+}
+
 // buildCursorArgs assembles the argv for a one-shot cursor-agent invocation.
 //
 // Usage: cursor-agent -p --output-format stream-json
@@ -1107,15 +1122,10 @@ func buildCursorArgs(opts ExecOptions, logger *slog.Logger) []string {
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
-	blocked := cursorBlockedArgs
+	customArgs := opts.CustomArgs
 	if opts.RequireCursorResume {
-		blocked = maps.Clone(cursorBlockedArgs)
-		blocked["--resume"] = blockedOptionalValue
-		blocked["-r"] = blockedOptionalValue
-		blocked["--continue"] = blockedStandalone
-		blocked["-c"] = blockedStandalone
-		blocked["--workspace"] = blockedWithValue
+		customArgs = filterCustomArgs(customArgs, cursorRecoveryBlockedArgs, logger)
 	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, blocked, logger)...)
+	args = append(args, filterCustomArgs(customArgs, cursorBlockedArgs, logger)...)
 	return args
 }
