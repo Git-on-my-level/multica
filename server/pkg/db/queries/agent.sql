@@ -570,7 +570,11 @@ SELECT
     p.agent_id, COALESCE(a.runtime_id, p.runtime_id), p.issue_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN sqlc.narg(fire_at)::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
-    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
+    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
+    CASE WHEN sqlc.narg(required_resume_session_id)::text IS NULL THEN p.context
+         ELSE COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('cursor_recovery', jsonb_build_object(
+             'runtime_id', p.runtime_id, 'session_id', p.session_id))
+    END,
     CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity'
               OR COALESCE(a.runtime_id, p.runtime_id) IS DISTINCT FROM p.runtime_id THEN NULL
          ELSE p.session_id END,
@@ -597,6 +601,17 @@ SELECT
 FROM agent_task_queue p
 LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = $1
+  -- A Cursor recovery is safe only on the parent session and runtime.
+  -- The agent enqueue lock serializes this insert with runtime rebinding.
+  AND (sqlc.narg(required_resume_session_id)::text IS NULL OR (
+      p.status = 'failed'
+      AND p.failure_reason = 'agent_error.provider_network'
+      AND p.session_id = sqlc.narg(required_resume_session_id)::text
+      AND p.runtime_id = sqlc.narg(required_resume_runtime_id)::uuid
+      AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
+      AND p.retired_session_id IS DISTINCT FROM p.session_id
+      AND COALESCE(a.runtime_id, p.runtime_id) = p.runtime_id
+  ))
   AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
 ON CONFLICT (issue_id, agent_id, (COALESCE(comment_thread_id, '00000000-0000-0000-0000-000000000000'::uuid))) WHERE status IN ('queued', 'dispatched')
        OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')

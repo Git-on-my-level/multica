@@ -5498,12 +5498,14 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			_, cerr := qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
 			if cerr == nil {
 				child, cerr = qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-					NewTaskID:            dbid.NewV7(),
-					ID:                   taskID,
-					FireAt:               retryFireAt,
-					MaxAttempts:          retryMaxAttempts,
-					RuntimeMcpOverlay:    retryOverlay.Overlay,
-					RuntimeConnectedApps: retryOverlay.ConnectedApps,
+					NewTaskID:               dbid.NewV7(),
+					ID:                      taskID,
+					FireAt:                  retryFireAt,
+					MaxAttempts:             retryMaxAttempts,
+					RequiredResumeSessionID: cursorRetrySession(t.Error.String, sessionID),
+					RequiredResumeRuntimeID: t.RuntimeID,
+					RuntimeMcpOverlay:       retryOverlay.Overlay,
+					RuntimeConnectedApps:    retryOverlay.ConnectedApps,
 				})
 			}
 			switch {
@@ -5881,6 +5883,11 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
+	if required, _ := CursorRecoverySession(t); required {
+		// A recovery is already the last attempt, even if its next failure
+		// would ordinarily qualify for a raised provider-network budget.
+		return false
+	}
 	if taskfailure.CursorTransientNetworkError(t.Error.String) {
 		if failureReason != taskfailure.ReasonAgentProviderNetwork.String() ||
 			!taskfailure.CursorPreActionNetworkError(t.Error.String) ||
@@ -6032,12 +6039,14 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	_, err = qtx.LockAgentForTaskEnqueue(ctx, parent.AgentID)
 	if err == nil {
 		child, err = qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-			NewTaskID:            dbid.NewV7(),
-			ID:                   parent.ID,
-			FireAt:               retryFireAt,
-			MaxAttempts:          pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
-			RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-			RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
+			NewTaskID:               dbid.NewV7(),
+			ID:                      parent.ID,
+			FireAt:                  retryFireAt,
+			MaxAttempts:             pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
+			RequiredResumeSessionID: cursorRetrySession(parent.Error.String, parent.SessionID.String),
+			RequiredResumeRuntimeID: parent.RuntimeID,
+			RuntimeMcpOverlay:       runtimeMCPOverlay.Overlay,
+			RuntimeConnectedApps:    runtimeMCPOverlay.ConnectedApps,
 		})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {

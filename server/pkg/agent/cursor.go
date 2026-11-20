@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -25,6 +26,9 @@ type cursorBackend struct {
 }
 
 func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	if opts.RequireCursorResume && strings.TrimSpace(opts.ResumeSessionID) == "" {
+		return nil, fmt.Errorf("Cursor recovery requires the original session")
+	}
 	execName := b.cfg.ExecutablePath
 	if execName == "" {
 		execName = "cursor-agent"
@@ -1103,6 +1107,15 @@ func buildCursorArgs(opts ExecOptions, logger *slog.Logger) []string {
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, cursorBlockedArgs, logger)...)
+	blocked := cursorBlockedArgs
+	if opts.RequireCursorResume {
+		blocked = maps.Clone(cursorBlockedArgs)
+		blocked["--resume"] = blockedOptionalValue
+		blocked["-r"] = blockedOptionalValue
+		blocked["--continue"] = blockedStandalone
+		blocked["-c"] = blockedStandalone
+		blocked["--workspace"] = blockedWithValue
+	}
+	args = append(args, filterCustomArgs(opts.CustomArgs, blocked, logger)...)
 	return args
 }

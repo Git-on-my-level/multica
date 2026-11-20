@@ -939,3 +939,14 @@ func TestCursorNonTranscriptEventType(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildCursorArgsRecoveryPinsResume(t *testing.T) {
+	t.Parallel()
+	args := buildCursorArgs(ExecOptions{
+		Cwd: "/tmp/original", ResumeSessionID: "pinned", RequireCursorResume: true,
+		CustomArgs: []string{"--resume", "other", "--continue", "--workspace=/tmp/other", "--extra", "value"},
+	}, slog.Default())
+	if got := strings.Join(args, " "); got != "-p --output-format stream-json --yolo --workspace /tmp/original --resume pinned --extra value" {
+		t.Fatalf("unexpected recovery arguments: %s", got)
+	}
+}
