@@ -244,12 +244,6 @@ func (t ownedProcessTree) activeProcesses() (uint32, error) {
 	return info.ActiveProcesses, nil
 }
 
-// codexInitializeRetrySupported reports whether descendant termination can be
-// positively confirmed. Owning the tree in a Job Object is what makes that
-// possible; when ownership was not taken, waitProcessGroupGone returns false and
-// the caller's cleanup_confirmed gate suppresses the retry anyway.
-func codexInitializeRetrySupported() bool { return true }
-
 // signalProcessGroup terminates the whole owned process tree. Windows has no
 // SIGTERM/SIGKILL distinction and no process-group signalling, so the signal is
 // ignored and the Job Object is terminated; the caller's grace window still
