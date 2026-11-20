@@ -5377,7 +5377,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 	var task db.AgentTaskQueue
 	var retried *db.AgentTaskQueue
 	var queuedChat []db.AgentTaskQueue
-	if err := s.runInTaskTx(ctx, func(qtx *db.Queries, tx pgx.Tx) error {
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
@@ -5403,7 +5403,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			return err
 		}
 		task = t
-		if err := s.recordMemberRescopeRefusal(ctx, tx, task); err != nil {
+		if err := recordMemberRescopeRefusal(ctx, qtx, task); err != nil {
 			return fmt.Errorf("arm member re-scope receipt: %w", err)
 		}
 
@@ -5821,7 +5821,7 @@ func resumeUnsafeFailureReason(reason string) bool {
 	// codex_resume_oversized is the strongest member of this set: a codex
 	// rollout only ever grows, so a thread whose resume response already
 	// overflowed the reader will overflow on every future attempt too.
-	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew":
+	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew", taskfailure.ReasonCodexSafetyRefusal.String():
 		return true
 	default:
 		return false

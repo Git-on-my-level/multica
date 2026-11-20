@@ -140,26 +140,13 @@ func (s *TaskService) guardMemberRescopeClaim(ctx context.Context, tx pgx.Tx, ta
 	return outcome, check.Commit(ctx)
 }
 
-func (s *TaskService) recordMemberRescopeRefusal(ctx context.Context, tx pgx.Tx, task db.AgentTaskQueue) error {
-	if tx == nil || !qualifiesForMemberRescope(task) {
+func recordMemberRescopeRefusal(ctx context.Context, q *db.Queries, task db.AgentTaskQueue) error {
+	if !qualifiesForMemberRescope(task) {
 		return nil
 	}
-	check, err := tx.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer check.Rollback(ctx)
-	err = s.Queries.WithTx(check).ArmMemberRescopeReceipt(ctx, db.ArmMemberRescopeReceiptParams{
+	// The failure transition and the hold must commit together. Otherwise a
+	// successful failure report can leave a race for the next ordinary claim.
+	return q.ArmMemberRescopeReceipt(ctx, db.ArmMemberRescopeReceiptParams{
 		IssueID: task.IssueID, AgentID: task.AgentID, RefusalTaskID: task.ID,
 	})
-	if err != nil {
-		if rollbackErr := check.Rollback(ctx); rollbackErr != nil {
-			return rollbackErr
-		}
-		// The provider failure is the authoritative record. A storage
-		// problem writing the derived receipt must not roll it back.
-		slog.Warn("member re-scope receipt could not be armed", "task_id", util.UUIDToString(task.ID))
-		return nil
-	}
-	return check.Commit(ctx)
 }

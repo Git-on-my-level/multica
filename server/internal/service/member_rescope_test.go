@@ -173,6 +173,7 @@ func TestMemberRescopeUnreadableAuthorizationCannotClearKnownHold(t *testing.T) 
 type rescopeSavepointFixture struct {
 	pgx.Tx
 	readErr    error
+	writeErr   error
 	queries    int
 	writes     int
 	commits    int
@@ -192,7 +193,7 @@ func (f *rescopeSavepointFixture) QueryRow(context.Context, string, ...any) pgx.
 
 func (f *rescopeSavepointFixture) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	f.writes++
-	return pgconn.NewCommandTag("INSERT 0 1"), nil
+	return pgconn.NewCommandTag("INSERT 0 1"), f.writeErr
 }
 
 func (f *rescopeSavepointFixture) Commit(context.Context) error {
@@ -218,7 +219,7 @@ func TestMemberRescopeUnreadableReceiptFailsOpen(t *testing.T) {
 
 func TestMemberRescopeFirstFailureRecording(t *testing.T) {
 	f := &rescopeSavepointFixture{}
-	s := &TaskService{Queries: db.New(f)}
+	q := db.New(f)
 	task := newRescopeFixture().task
 	task.Status = "failed"
 	task.Attempt, task.MaxAttempts = 1, 2
@@ -227,19 +228,30 @@ func TestMemberRescopeFirstFailureRecording(t *testing.T) {
 	if !retryEligible(task.FailureReason.String, task) {
 		t.Fatal("ordinary transient error lost its retry")
 	}
-	if err := s.recordMemberRescopeRefusal(t.Context(), f, task); err != nil || f.writes != 0 {
+	if err := recordMemberRescopeRefusal(t.Context(), q, task); err != nil || f.writes != 0 {
 		t.Fatal("transient error armed a receipt")
 	}
 	task.Error.String = taskfailure.CodexSafetyRefusalDiagnostic
-	if err := s.recordMemberRescopeRefusal(t.Context(), f, task); err != nil || f.writes != 0 {
+	if err := recordMemberRescopeRefusal(t.Context(), q, task); err != nil || f.writes != 0 {
 		t.Fatal("untyped diagnostic armed a receipt")
 	}
 	task.FailureReason.String = taskfailure.ReasonCodexSafetyRefusal.String()
-	if err := s.recordMemberRescopeRefusal(t.Context(), f, task); err != nil || f.writes != 1 || f.commits != 1 {
+	if err := recordMemberRescopeRefusal(t.Context(), q, task); err != nil || f.writes != 1 {
 		t.Fatalf("first typed refusal did not arm a receipt: %v", err)
+	}
+	f.writeErr = errors.New("synthetic receipt write error")
+	if err := recordMemberRescopeRefusal(t.Context(), q, task); !errors.Is(err, f.writeErr) {
+		t.Fatalf("receipt write failure did not propagate to the failure transaction: %v", err)
 	}
 	if task.Error.String != taskfailure.CodexSafetyRefusalDiagnostic || retryEligible(task.FailureReason.String, task) {
 		t.Fatal("first refusal diagnostic or terminality changed")
+	}
+}
+
+func TestMemberRescopeRefusedSessionIsNotResumable(t *testing.T) {
+	reason := taskfailure.ReasonCodexSafetyRefusal.String()
+	if !ResumeUnsafeFailure(reason, taskfailure.CodexSafetyRefusalDiagnostic) {
+		t.Fatal("refused session was eligible for a subsequent claim")
 	}
 }
 
