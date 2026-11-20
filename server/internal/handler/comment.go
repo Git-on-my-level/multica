@@ -3601,10 +3601,11 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 				AttachmentIds: attachmentIDs,
 			})
 			if err == nil && changed > 0 && oldContent == req.Content {
-				comment, err = qtx.BumpCommentRevision(r.Context(), db.BumpCommentRevisionParams{
+				bumped, bumpErr := qtx.BumpCommentRevision(r.Context(), db.BumpCommentRevisionParams{
 					ID:          comment.ID,
 					WorkspaceID: existing.WorkspaceID,
 				})
+				comment, err = db.Comment(bumped), bumpErr
 			}
 		}
 		if err == nil {

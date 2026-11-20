@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -251,4 +253,65 @@ func TestResolveComment_ReResolveIsIdempotent(t *testing.T) {
 	if got := cap.countFor(protocol.EventCommentResolved, fx.A1); got != 1 {
 		t.Fatalf("re-resolve no-op must not emit a second comment:resolved (got %d)", got)
 	}
+}
+
+func TestMemberRescopeDirectiveSurvivesResolutionAndRevokesOnEdit(t *testing.T) {
+	ctx := t.Context()
+	q := testHandler.Queries
+	issueID := parseUUID(dbfx.Issue(t, "Re-scope directive fixture"))
+	workspaceID := parseUUID(testWorkspaceID)
+	authorID := parseUUID(testUserID)
+	const original = "RESCOPE: Draft a synthetic note."
+
+	createDirective := func() pgtype.UUID {
+		t.Helper()
+		comment, err := q.CreateComment(ctx, db.CreateCommentParams{
+			IssueID: issueID, WorkspaceID: workspaceID, AuthorID: authorID,
+			AuthorType: "member", Type: "comment", Content: original,
+			MemberRescopeDirective: pgtype.Bool{Bool: true, Valid: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return comment.ID
+	}
+	checkEligible := func(id pgtype.UUID, want bool) {
+		t.Helper()
+		trigger, err := q.GetMemberRescopeTrigger(ctx, db.GetMemberRescopeTriggerParams{
+			CommentID: id, IssueID: issueID, OriginatorUserID: authorID,
+		})
+		if err != nil || !trigger.Eligible.Valid || trigger.Eligible.Bool != want {
+			t.Fatalf("eligible = %v, want %t, err = %v", trigger.Eligible, want, err)
+		}
+	}
+	id := createDirective()
+	checkEligible(id, true)
+	resolved, err := q.ResolveComment(ctx, db.ResolveCommentParams{
+		ID: id, ResolvedByID: authorID, ResolvedByType: pgtype.Text{String: "member", Valid: true},
+	})
+	if err != nil || resolved.Revision <= 1 {
+		t.Fatalf("resolution did not advance the comment revision: %v", err)
+	}
+	checkEligible(id, true)
+	if _, err := q.UnresolveComment(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	checkEligible(id, true)
+
+	if _, err := q.UpdateComment(ctx, db.UpdateCommentParams{ID: id, Content: original}); err != nil {
+		t.Fatal(err)
+	}
+	checkEligible(id, true)
+	for _, content := range []string{"RESCOPE: Draft a different synthetic note.", original} {
+		if _, err := q.UpdateComment(ctx, db.UpdateCommentParams{ID: id, Content: content}); err != nil {
+			t.Fatal(err)
+		}
+		checkEligible(id, false)
+	}
+
+	id = createDirective()
+	if _, err := q.BumpCommentRevision(ctx, db.BumpCommentRevisionParams{ID: id, WorkspaceID: workspaceID}); err != nil {
+		t.Fatal(err)
+	}
+	checkEligible(id, false)
 }

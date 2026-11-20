@@ -1930,13 +1930,13 @@ WHERE id = (
               SELECT 1 FROM member_rescope_directive d
               JOIN comment c ON c.id = d.comment_id
               WHERE d.comment_id = t.trigger_comment_id
-                AND c.revision = 1 AND c.deleted_at IS NULL
+                AND c.deleted_at IS NULL
           )
           AND NOT EXISTS (
               SELECT 1 FROM member_rescope_directive d
               JOIN comment c ON c.id = d.comment_id
               WHERE d.comment_id = @new_trigger_comment_id::uuid
-                AND c.revision = 1 AND c.deleted_at IS NULL
+                AND c.deleted_at IS NULL
           )
           AND COALESCE((
               SELECT r.admitted_task_id IS NULL

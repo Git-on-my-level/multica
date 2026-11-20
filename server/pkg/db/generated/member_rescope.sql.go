@@ -162,7 +162,7 @@ func (q *Queries) GetMemberRescopeReceipt(ctx context.Context, arg GetMemberResc
 
 const getMemberRescopeTrigger = `-- name: GetMemberRescopeTrigger :one
 SELECT c.created_at,
-       (d.comment_id IS NOT NULL AND c.author_type = 'member' AND c.revision = 1 AND c.deleted_at IS NULL AND c.author_id = $1) AS eligible
+       (d.comment_id IS NOT NULL AND c.author_type = 'member' AND c.deleted_at IS NULL AND c.author_id = $1) AS eligible
 FROM comment c
 LEFT JOIN member_rescope_directive d ON d.comment_id = c.id
 WHERE c.id = $2 AND c.issue_id = $3

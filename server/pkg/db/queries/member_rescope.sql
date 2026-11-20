@@ -31,7 +31,7 @@ RETURNING t.*;
 
 -- name: GetMemberRescopeTrigger :one
 SELECT c.created_at,
-       (d.comment_id IS NOT NULL AND c.author_type = 'member' AND c.revision = 1 AND c.deleted_at IS NULL AND c.author_id = sqlc.arg(originator_user_id)) AS eligible
+       (d.comment_id IS NOT NULL AND c.author_type = 'member' AND c.deleted_at IS NULL AND c.author_id = sqlc.arg(originator_user_id)) AS eligible
 FROM comment c
 LEFT JOIN member_rescope_directive d ON d.comment_id = c.id
 WHERE c.id = sqlc.arg(comment_id) AND c.issue_id = sqlc.arg(issue_id);
