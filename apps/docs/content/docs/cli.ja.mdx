@@ -427,6 +427,8 @@ multica autopilot trigger-update <autopilot-id> <trigger-id> --clear-event-filte
 
 その他のリソースの `list` コマンドは通常、コピーできる短い ID を表示し、`--full-id` で完全な UUID を出力できます。短い ID が一意に定まらない場合、CLI は文字の追加か完全な UUID への切り替えを求めます。実行の短い ID は、所属するタスクを `--issue` で指定する必要もあります。
 
+`issue list --project` と `issue search --project` には、UUID、UUID プレフィックス、または大文字と小文字を区別した正確なプロジェクト名を指定できます。例：`multica issue list --project "Goal: Churn" --limit 1 --output json`。名前は、アーカイブ済みを含め、選択したワークスペースで閲覧できるプロジェクトのうち 1 件だけに一致する必要があります。空の値や、不明、部分一致、重複する名前はエラーになります。UUID または UUID プレフィックスの形式は ID として扱われます。
+
 多くのコマンドが構造化出力をサポートします:
 
 ```bash
