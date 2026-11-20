@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -5339,30 +5340,47 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		retryFireAt      pgtype.Timestamptz
 		retryMaxAttempts pgtype.Int4
 	)
-	if retryableReasons[failureReason] {
+	if retryableReasons[failureReason] || taskfailure.HermesGatewayStartingDeadline(errMsg) {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
-		} else if retryEligible(failureReason, parent) {
-			wantRetry = true
-			// Persist the reason-aware effective budget into the child so the
-			// retry chain self-describes (e.g. provider_network → max_attempts=3),
-			// rather than leaking a contradictory attempt=N/max_attempts=2 row.
-			retryMaxAttempts = pgtype.Int4{Int32: retryAttemptCeiling(failureReason, parent.MaxAttempts), Valid: true}
-			// Defer this attempt when the reason's schedule calls for a backoff
-			// (provider_network's final attempt waits ~5s); a zero delay leaves
-			// fire_at NULL so the child is created immediately-claimable.
-			if delay := retryDelayForAttempt(failureReason, parent.Attempt); delay > 0 {
-				retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
+		} else {
+			// Evaluate the callback's session state, which FailAgentTask persists
+			// below. The startup failure occurs before any session-start event.
+			if sessionID != "" {
+				parent.SessionID = pgtype.Text{String: sessionID, Valid: true}
 			}
-			if agent, aerr := s.Queries.GetAgent(ctx, parent.AgentID); aerr != nil {
-				// Best-effort: a missing overlay is not retry-fatal — the child
-				// simply runs without the Composio overlay.
-				slog.Warn("fail task auto-retry: load agent for overlay failed",
-					"task_id", util.UUIDToString(taskID),
-					"agent_id", util.UUIDToString(parent.AgentID), "error", aerr)
-			} else {
-				retryOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
+			parent.SessionRolloutMissing = sessionRolloutMissing
+			if retiredSessionID != "" {
+				parent.RetiredSessionID = pgtype.Text{String: retiredSessionID, Valid: true}
+			}
+			startupRecovery := hermesGatewayResumeRetryEligible(failureReason, errMsg, parent)
+			if retryEligible(failureReason, parent) || startupRecovery {
+				wantRetry = true
+				// Persist the reason-aware effective budget into the child so the
+				// retry chain self-describes (e.g. provider_network → max_attempts=3),
+				// rather than leaking a contradictory attempt=N/max_attempts=2 row.
+				retryMaxAttempts = pgtype.Int4{Int32: retryAttemptCeiling(failureReason, parent.MaxAttempts), Valid: true}
+				// Defer this attempt when the reason's schedule calls for a backoff
+				// (provider_network's final attempt waits ~5s); a zero delay leaves
+				// fire_at NULL so the child is created immediately-claimable.
+				if delay := retryDelayForAttempt(failureReason, parent.Attempt); delay > 0 {
+					retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
+				}
+				if startupRecovery {
+					// A positive fire_at uses normal deferred promotion. Jitter avoids
+					// synchronizing tasks waiting on the same starting gateway.
+					retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(hermesGatewayRetryDelay()), Valid: true}
+				}
+				if agent, aerr := s.Queries.GetAgent(ctx, parent.AgentID); aerr != nil {
+					// Best-effort: a missing overlay is not retry-fatal — the child
+					// simply runs without the Composio overlay.
+					slog.Warn("fail task auto-retry: load agent for overlay failed",
+						"task_id", util.UUIDToString(taskID),
+						"agent_id", util.UUIDToString(parent.AgentID), "error", aerr)
+				} else {
+					retryOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
+				}
 			}
 		}
 	}
@@ -5496,6 +5514,10 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// can never abort this transaction — which also carries the parent's
 		// failed status.
 		createRetry := wantRetry
+		if taskfailure.HermesGatewayStartingDeadline(errMsg) &&
+			!hermesGatewayResumeRetryEligible(failureReason, errMsg, t) {
+			createRetry = false
+		}
 		if createRetry {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
 			if herr != nil {
@@ -5748,6 +5770,24 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 	s.broadcastTaskFailedEvent(ctx, task, errMsg, failureReason, retried != nil)
 
 	return &task, true, nil
+}
+
+// hermesGatewayResumeRetryEligible is deliberately only used by the live
+// failure transaction. Orphan sweeping must not revive historical failures.
+func hermesGatewayResumeRetryEligible(reason, raw string, t db.AgentTaskQueue) bool {
+	return reason == taskfailure.ReasonAgentProviderServerError.String() &&
+		taskfailure.HermesGatewayStartingDeadline(raw) &&
+		(t.Status == "running" || t.Status == "dispatched" || t.Status == "failed") &&
+		t.Attempt == 1 && t.Attempt < t.MaxAttempts &&
+		!t.AutopilotRunID.Valid && !IsTriageTask(t) &&
+		(t.IssueID.Valid || t.ChatSessionID.Valid) &&
+		t.SessionID.Valid && t.SessionID.String != "" &&
+		!t.ForceFreshSession && !t.SessionRolloutMissing && !t.RetiredSessionID.Valid &&
+		!ResumeUnsafeFailure(reason, raw)
+}
+
+func hermesGatewayRetryDelay() time.Duration {
+	return 5*time.Second + time.Duration(rand.Int64N(int64(5*time.Second)))
 }
 
 // retryableReasons enumerates failure reasons that the auto-retry path is

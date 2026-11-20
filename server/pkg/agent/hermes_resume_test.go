@@ -12,6 +12,44 @@ import (
 	"time"
 )
 
+func TestHermesGatewayDeadlinePreservesExistingSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX fixture")
+	}
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+ id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ case "$line" in
+  *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":true}}}}\n' "$id" ;;
+  *'"method":"session/resume"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"Gateway starting: deadline"}}}\n' "$id" ;;
+  *'"method":"session/new"'*|*'"method":"session/prompt"'*) exit 97 ;;
+ esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "continue", ExecOptions{ResumeSessionID: "ses_existing", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range session.Messages {
+	}
+	result := <-session.Result
+	if result.Status != "failed" || result.SessionID != "ses_existing" || result.ResumeRejected {
+		t.Fatalf("result = %+v", result)
+	}
+	const want = `hermes session/resume failed: session/resume: Internal error (code=-32603, data={"details":"Gateway starting: deadline"})`
+	if result.Error != want {
+		t.Fatalf("error = %q", result.Error)
+	}
+}
+
 func TestResolveHermesResumedSessionIDPrefersTopLevelID(t *testing.T) {
 	t.Parallel()
 
