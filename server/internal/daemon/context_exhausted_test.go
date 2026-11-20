@@ -68,6 +68,8 @@ func retryableFromDaemonPerspective(reason string) bool {
 	switch reason {
 	case "runtime_offline", "runtime_recovery", "timeout", "codex_semantic_inactivity",
 		string(taskfailure.ReasonAgentProviderNetwork),
+		// Capacity is only retryable with the explicit per-minute witness.
+		string(taskfailure.ReasonAgentProviderCapacityOrRateLimit),
 		string(taskfailure.ReasonSkillBundleUnavailable):
 		return true
 	default:
