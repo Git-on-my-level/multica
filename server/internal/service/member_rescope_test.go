@@ -110,7 +110,17 @@ func TestMemberRescopeClaimDecisions(t *testing.T) {
 		{"agent with inherited member originator", func(f *rescopeFixture) { f.task.DelegatedFromTaskID = rescopeID(7) }, "cancelled", 0},
 		{"automation with member author label", func(f *rescopeFixture) { f.trigger.Eligible.Bool = false }, "cancelled", 0},
 		{"stale member directive", func(f *rescopeFixture) { f.trigger.CreatedAt = f.receipt.ArmedAt }, "cancelled", 0},
-		{"manual rerun reusing member directive", func(f *rescopeFixture) { f.task.RerunOfTaskID = rescopeID(7) }, "cancelled", 0},
+		{"manual rerun reusing member directive", func(f *rescopeFixture) {
+			f.task.RerunOfTaskID = rescopeID(7)
+			f.task.TriggerEvidenceKind.String = "rerun"
+			f.task.TriggerEvidenceRefID = f.task.RerunOfTaskID
+		}, "cancelled", 0},
+		{"queued manual rerun with a new coalesced directive", func(f *rescopeFixture) {
+			f.task.RerunOfTaskID = rescopeID(7)
+		}, "dispatched", 1},
+		{"automated retry copying member evidence", func(f *rescopeFixture) {
+			f.task.RetryOfTaskID = rescopeID(7)
+		}, "cancelled", 0},
 		{"unrelated issue", func(f *rescopeFixture) { f.task.IssueID = rescopeID(7) }, "dispatched", 0},
 		{"unrelated agent", func(f *rescopeFixture) { f.task.AgentID = rescopeID(7) }, "dispatched", 0},
 		{"unreadable receipt fields", func(f *rescopeFixture) { f.receipt.ArmedAt.Valid = false }, "dispatched", 0},

@@ -1319,6 +1319,12 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
@@ -1495,6 +1501,12 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	params := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),

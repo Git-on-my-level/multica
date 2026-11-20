@@ -35,10 +35,13 @@ func qualifiesForMemberRescope(task db.AgentTaskQueue) bool {
 }
 
 func isDirectMemberComment(task db.AgentTaskQueue) bool {
+	// Manual reruns are stamped with rerun evidence. A merge can replace
+	// that evidence with a new comment while preserving the rerun lineage.
+	// Automatic retries can copy comment evidence without a new member action.
 	return task.TriggerCommentID.Valid && task.TriggerEvidenceRefID == task.TriggerCommentID &&
 		task.OriginatorUserID.Valid && task.OriginatorSource.String == string(attribution.SourceDirectHuman) &&
 		task.TriggerEvidenceKind.String == string(attribution.EvidenceComment) &&
-		!task.DelegatedFromTaskID.Valid && !task.RetryOfTaskID.Valid && !task.RerunOfTaskID.Valid
+		!task.DelegatedFromTaskID.Valid && !task.RetryOfTaskID.Valid
 }
 
 type memberRescopeStore interface {

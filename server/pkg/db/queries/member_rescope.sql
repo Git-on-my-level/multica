@@ -23,6 +23,11 @@ WITH consumed AS (
 )
 UPDATE agent_task_queue AS t
 SET force_fresh_session = true,
+    -- Exact-source reruns consult fresh_rerun before looking up the source.
+    -- Keep the audit lineage while skipping both session and workdir reuse.
+    context = CASE WHEN t.rerun_of_task_id IS NOT NULL
+                   THEN COALESCE(t.context, '{}'::jsonb) || '{"fresh_rerun":true}'::jsonb
+                   ELSE t.context END,
     coalesced_comment_ids = '{}',
     handoff_note = NULL
 FROM consumed
