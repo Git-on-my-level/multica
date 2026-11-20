@@ -658,7 +658,7 @@ func init() {
 	issueListCmd.Flags().String("priority", "", "Filter by priority")
 	issueListCmd.Flags().String("assignee", "", "Filter by assignee name (member, agent, or squad; fuzzy match)")
 	issueListCmd.Flags().String("assignee-id", "", "Filter by assignee UUID — member, agent, or squad (mutually exclusive with --assignee)")
-	issueListCmd.Flags().String("project", "", "Filter by project ID")
+	issueListCmd.Flags().String("project", "", "Filter by project UUID, UUID prefix, or exact unique title (case-sensitive)")
 	issueListCmd.Flags().String("updated-since", "", "Include issues updated at or after this RFC3339 timestamp; requires --updated-until (keep both bounds fixed across pages)")
 	issueListCmd.Flags().String("updated-until", "", "Include issues updated before this RFC3339 timestamp; requires --updated-since")
 	issueListCmd.Flags().StringSlice("metadata", nil, "Filter by metadata key=value (repeatable; combined with AND). Value is JSON-parsed: 'true'/'false' → bool, numbers → number, otherwise string. Wrap as '\"42\"' to force a string when the value would otherwise sniff as a number.")
@@ -812,7 +812,7 @@ func init() {
 	// issue search
 	issueSearchCmd.Flags().Int("limit", 20, "Maximum number of results to return")
 	issueSearchCmd.Flags().Bool("include-closed", false, "Include done and cancelled issues")
-	issueSearchCmd.Flags().String("project", "", "Filter by project ID")
+	issueSearchCmd.Flags().String("project", "", "Filter by project UUID, UUID prefix, or exact unique title (case-sensitive)")
 	issueSearchCmd.Flags().String("output", "table", "Output format: table or json")
 
 	// issue subscriber list
@@ -899,7 +899,8 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 	if hasAssignee {
 		params.Set("assignee_id", aID)
 	}
-	if v, _ := cmd.Flags().GetString("project"); v != "" {
+	if cmd.Flags().Changed("project") {
+		v, _ := cmd.Flags().GetString("project")
 		project, err := resolveProjectID(ctx, client, v)
 		if err != nil {
 			return err
@@ -3442,7 +3443,8 @@ func runIssueSearch(cmd *cobra.Command, args []string) error {
 	if v, _ := cmd.Flags().GetBool("include-closed"); v {
 		params.Set("include_closed", "true")
 	}
-	if projectInput, _ := cmd.Flags().GetString("project"); projectInput != "" {
+	if cmd.Flags().Changed("project") {
+		projectInput, _ := cmd.Flags().GetString("project")
 		if client.WorkspaceID == "" {
 			if _, err := requireWorkspaceID(cmd); err != nil {
 				return err

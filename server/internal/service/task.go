@@ -3840,16 +3840,30 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 
 		t0 = time.Now()
 		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
+		guardEnabled := s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          agentID,
-			RuntimeID:        claimRuntimeID,
-			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+			AgentID:                   agentID,
+			RuntimeID:                 claimRuntimeID,
+			PrepareLeaseSecs:          prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:          RuntimeClaimFreshnessSeconds,
+			IgnoreCodexModelRejection: !guardEnabled,
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				outcome = "no_tasks"
+				outcome = claimOutcomeNoTasks
+				if guardEnabled && len(agent.CodexModelAdmissionRejection) != 0 {
+					held, err := qtx.IsCodexModelAdmissionRejected(ctx, db.IsCodexModelAdmissionRejectedParams{
+						AgentID: agentID, RuntimeID: claimRuntimeID,
+					})
+					if err != nil {
+						outcome = claimOutcomeErrorClaim
+						return fmt.Errorf("read Codex model admission hold: %w", err)
+					}
+					if held {
+						outcome = claimOutcomeCodexModelAdmissionHeld
+					}
+				}
 				return nil
 			}
 			outcome = "error_claim"
@@ -5386,12 +5400,26 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		}
 	}
 
+	var rejectedCodexModel string
+	var unparsedCodexRejection bool
+	if s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true) &&
+		(strings.Contains(errMsg, "model_not_found") || strings.Contains(errMsg, codexChatGPTRejection)) {
+		rejectedCodexModel = codexRejectedModel(errMsg)
+		unparsedCodexRejection = rejectedCodexModel == "" && strings.Contains(errMsg, codexChatGPTRejection)
+	}
+	var newCodexModelHold bool
+
 	var task db.AgentTaskQueue
 	var retried *db.AgentTaskQueue
 	var queuedChat []db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
+		}
+		if rejectedCodexModel != "" {
+			if err := qtx.LockCodexModelAdmissionAgentForTask(ctx, taskID); err != nil {
+				return fmt.Errorf("lock Codex model admission: %w", err)
+			}
 		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
 			ID:             taskID,
@@ -5413,6 +5441,16 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		}
 		if err != nil {
 			return err
+		}
+		if rejectedCodexModel != "" {
+			changed, err := qtx.RecordCodexModelAdmissionRejection(ctx, db.RecordCodexModelAdmissionRejectionParams{
+				TaskID:        taskID,
+				RejectedModel: rejectedCodexModel,
+			})
+			if err != nil {
+				return fmt.Errorf("record Codex model rejection: %w", err)
+			}
+			newCodexModelHold = changed > 0
 		}
 		task = t
 		if err := recordMemberRescopeRefusal(ctx, qtx, task); err != nil {
@@ -5653,6 +5691,14 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		return nil, false, fmt.Errorf("fail task: %w", err)
 	}
 
+	if newCodexModelHold {
+		slog.Warn("queued Codex dispatch held after model rejection",
+			"task_id", util.UUIDToString(task.ID), "agent_id", util.UUIDToString(task.AgentID),
+			"runtime_id", util.UUIDToString(task.RuntimeID), "model", rejectedCodexModel)
+	} else if unparsedCodexRejection {
+		slog.Warn("unrecognized Codex model rejection format",
+			"task_id", util.UUIDToString(task.ID), "agent_id", util.UUIDToString(task.AgentID))
+	}
 	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
 	s.captureTaskFailed(ctx, task)
 	s.publishRequeuedChatTasks(ctx, queuedChat)

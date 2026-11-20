@@ -429,6 +429,8 @@ multica autopilot trigger-update <autopilot-id> <trigger-id> --clear-event-filte
 
 其他资源的 `list` 命令通常显示可复制的短 ID，并支持 `--full-id` 输出完整 UUID。短 ID 不唯一时，CLI 会要求增加字符或改用完整 UUID。运行的短 ID 还需要通过 `--issue` 指明所属任务。
 
+`issue list --project` 和 `issue search --project` 接受 UUID、UUID 前缀或区分大小写的完整项目标题，例如 `multica issue list --project "Goal: Churn" --limit 1 --output json`。标题必须在所选工作区内恰好匹配一个你可见的项目，包括已归档项目。CLI 会拒绝空值以及未知、不完整或重复的标题。符合 UUID 或 UUID 前缀格式的值会被当作 ID。
+
 许多命令支持结构化输出：
 
 ```bash

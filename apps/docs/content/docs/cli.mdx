@@ -444,6 +444,8 @@ Issues use keys like `MUL-123` or full UUIDs; short UUID prefixes are not accept
 
 `list` commands for other resources usually print copyable short IDs and support `--full-id` for the full UUID. When a short ID is ambiguous, the CLI asks for more characters or the full UUID. Short task IDs also require `--issue` to identify the owning issue.
 
+For `issue list --project` and `issue search --project`, use a UUID, a UUID prefix, or the exact, case-sensitive project title, such as `multica issue list --project "Goal: Churn" --limit 1 --output json`. A title must match exactly one project visible to you in the selected workspace, including archived projects. The CLI rejects blank selectors, unknown or partial titles, and duplicate titles. If the selector has UUID or UUID-prefix syntax, it is treated as an ID.
+
 Many commands support structured output:
 
 ```bash
