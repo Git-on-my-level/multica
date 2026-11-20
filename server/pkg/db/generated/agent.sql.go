@@ -7296,6 +7296,13 @@ WHERE id = (
           OR (NOT t.is_leader_task AND t.squad_id IS NULL)
       )
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id($1::uuid)
+      -- A claim returned to the queue after delivery failure must keep its
+      -- original member directive until that same admitted attempt settles.
+      AND NOT EXISTS (
+          SELECT 1 FROM member_rescope_receipt r
+          WHERE r.issue_id = t.issue_id AND r.agent_id = t.agent_id
+            AND r.admitted_task_id = t.id
+      )
       -- A queued member-authored re-scope owns its one permitted attempt.
       -- Ordinary comments must not replace it while the receipt is armed.
       AND NOT (

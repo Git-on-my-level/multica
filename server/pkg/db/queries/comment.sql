@@ -753,20 +753,30 @@ RETURNING *;
 -- Removes a comment that has no replies. The NOT EXISTS guard keeps this
 -- statement from ever reaching the legacy parent_id cascade: a comment with a
 -- reply is tombstoned instead, never deleted with its replies.
-DELETE FROM comment
-WHERE comment.id = @id AND comment.workspace_id = @workspace_id
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id;
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = @id AND comment.workspace_id = @workspace_id
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed;
 
 -- name: DeleteReplylessCommentTombstone :one
 -- Removes a tombstone whose last reply is gone. The delete transaction calls
 -- this for each ancestor in turn, so a chain of placeholders never outlives
 -- the replies it kept attached.
-DELETE FROM comment
-WHERE comment.id = @id AND comment.workspace_id = @workspace_id
-  AND comment.deleted_at IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id;
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = @id AND comment.workspace_id = @workspace_id
+      AND comment.deleted_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed;
 
 -- name: TouchIssueForCommentDelete :one
 -- A delete counts as activity on its issue, like CreateComment and

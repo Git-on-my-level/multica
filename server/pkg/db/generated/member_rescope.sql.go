@@ -14,9 +14,11 @@ import (
 const admitMemberRescopeTask = `-- name: AdmitMemberRescopeTask :one
 WITH consumed AS (
     UPDATE member_rescope_receipt AS r
-    SET admitted_task_id = $1, admitted_at = clock_timestamp()
-    WHERE r.issue_id = $2 AND r.agent_id = $3
-      AND r.armed_at = $4 AND r.refusal_task_id = $5
+    SET admitted_task_id = $1,
+        admitted_comment_id = $2,
+        admitted_at = clock_timestamp()
+    WHERE r.issue_id = $3 AND r.agent_id = $4
+      AND r.armed_at = $5 AND r.refusal_task_id = $6
       AND r.admitted_task_id IS NULL
     RETURNING admitted_task_id
 )
@@ -31,6 +33,7 @@ RETURNING t.id, t.agent_id, t.issue_id, t.status, t.priority, t.dispatched_at, t
 
 type AdmitMemberRescopeTaskParams struct {
 	TaskID        pgtype.UUID        `json:"task_id"`
+	CommentID     pgtype.UUID        `json:"comment_id"`
 	IssueID       pgtype.UUID        `json:"issue_id"`
 	AgentID       pgtype.UUID        `json:"agent_id"`
 	ArmedAt       pgtype.Timestamptz `json:"armed_at"`
@@ -42,6 +45,7 @@ type AdmitMemberRescopeTaskParams struct {
 func (q *Queries) AdmitMemberRescopeTask(ctx context.Context, arg AdmitMemberRescopeTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, admitMemberRescopeTask,
 		arg.TaskID,
+		arg.CommentID,
 		arg.IssueID,
 		arg.AgentID,
 		arg.ArmedAt,
@@ -130,7 +134,7 @@ func (q *Queries) ArmMemberRescopeReceipt(ctx context.Context, arg ArmMemberResc
 }
 
 const getMemberRescopeReceipt = `-- name: GetMemberRescopeReceipt :one
-SELECT issue_id, agent_id, refusal_task_id, armed_at, admitted_task_id, admitted_at FROM member_rescope_receipt
+SELECT issue_id, agent_id, refusal_task_id, armed_at, admitted_task_id, admitted_comment_id, admitted_at FROM member_rescope_receipt
 WHERE issue_id = $1 AND agent_id = $2
 ORDER BY armed_at DESC, refusal_task_id DESC
 LIMIT 1
@@ -150,6 +154,7 @@ func (q *Queries) GetMemberRescopeReceipt(ctx context.Context, arg GetMemberResc
 		&i.RefusalTaskID,
 		&i.ArmedAt,
 		&i.AdmittedTaskID,
+		&i.AdmittedCommentID,
 		&i.AdmittedAt,
 	)
 	return i, err

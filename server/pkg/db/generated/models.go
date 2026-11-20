@@ -1502,12 +1502,13 @@ type MemberRescopeDirective struct {
 }
 
 type MemberRescopeReceipt struct {
-	IssueID        pgtype.UUID        `json:"issue_id"`
-	AgentID        pgtype.UUID        `json:"agent_id"`
-	RefusalTaskID  pgtype.UUID        `json:"refusal_task_id"`
-	ArmedAt        pgtype.Timestamptz `json:"armed_at"`
-	AdmittedTaskID pgtype.UUID        `json:"admitted_task_id"`
-	AdmittedAt     pgtype.Timestamptz `json:"admitted_at"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	AgentID           pgtype.UUID        `json:"agent_id"`
+	RefusalTaskID     pgtype.UUID        `json:"refusal_task_id"`
+	ArmedAt           pgtype.Timestamptz `json:"armed_at"`
+	AdmittedTaskID    pgtype.UUID        `json:"admitted_task_id"`
+	AdmittedCommentID pgtype.UUID        `json:"admitted_comment_id"`
+	AdmittedAt        pgtype.Timestamptz `json:"admitted_at"`
 }
 
 type NotificationPreference struct {

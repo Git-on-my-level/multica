@@ -63,10 +63,8 @@ func applyMemberRescope(ctx context.Context, store memberRescopeStore, task db.A
 	if err != nil {
 		return task, true, err
 	}
-	if !receipt.ArmedAt.Valid || receipt.AdmittedTaskID.Valid != receipt.AdmittedAt.Valid {
-		return task, false, nil
-	}
-	if receipt.AdmittedTaskID == task.ID {
+	if !receipt.ArmedAt.Valid || receipt.AdmittedTaskID.Valid != receipt.AdmittedAt.Valid ||
+		receipt.AdmittedCommentID.Valid != receipt.AdmittedAt.Valid {
 		return task, false, nil
 	}
 
@@ -84,7 +82,13 @@ func applyMemberRescope(ctx context.Context, store memberRescopeStore, task db.A
 		}
 	}
 
-	if receipt.AdmittedAt.Valid {
+	authorized := trigger.Eligible.Valid && trigger.Eligible.Bool && trigger.CreatedAt.Valid &&
+		trigger.CreatedAt.Time.After(receipt.ArmedAt.Time)
+	if receipt.AdmittedTaskID == task.ID {
+		if authorized && receipt.AdmittedCommentID == task.TriggerCommentID {
+			return task, false, nil
+		}
+	} else if receipt.AdmittedAt.Valid {
 		// A queued predecessor or replay of an older comment cannot ride
 		// through a different task's one-shot authorization. A fresh comment
 		// can replace an older queued task through normal comment coalescing.
@@ -95,14 +99,14 @@ func applyMemberRescope(ctx context.Context, store memberRescopeStore, task db.A
 		if !created.Valid || created.Time.After(receipt.AdmittedAt.Time) {
 			return task, false, nil
 		}
-	} else if trigger.Eligible.Valid && trigger.Eligible.Bool && trigger.CreatedAt.Valid &&
-		trigger.CreatedAt.Time.After(receipt.ArmedAt.Time) {
+	} else if authorized {
 		admitted, err := store.AdmitMemberRescopeTask(ctx, db.AdmitMemberRescopeTaskParams{
 			IssueID:       task.IssueID,
 			AgentID:       task.AgentID,
 			RefusalTaskID: receipt.RefusalTaskID,
 			ArmedAt:       receipt.ArmedAt,
 			TaskID:        task.ID,
+			CommentID:     task.TriggerCommentID,
 		})
 		return admitted, false, err
 	}

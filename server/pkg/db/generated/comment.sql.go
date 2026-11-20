@@ -348,10 +348,15 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 }
 
 const deleteLeafComment = `-- name: DeleteLeafComment :one
-DELETE FROM comment
-WHERE comment.id = $1 AND comment.workspace_id = $2
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed
 `
 
 type DeleteLeafCommentParams struct {
@@ -375,11 +380,16 @@ func (q *Queries) DeleteLeafComment(ctx context.Context, arg DeleteLeafCommentPa
 }
 
 const deleteReplylessCommentTombstone = `-- name: DeleteReplylessCommentTombstone :one
-DELETE FROM comment
-WHERE comment.id = $1 AND comment.workspace_id = $2
-  AND comment.deleted_at IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+      AND comment.deleted_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed
 `
 
 type DeleteReplylessCommentTombstoneParams struct {

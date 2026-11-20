@@ -13,7 +13,9 @@ LIMIT 1;
 -- so recovering an undelivered claim can dispatch that same task again.
 WITH consumed AS (
     UPDATE member_rescope_receipt AS r
-    SET admitted_task_id = sqlc.arg(task_id), admitted_at = clock_timestamp()
+    SET admitted_task_id = sqlc.arg(task_id),
+        admitted_comment_id = sqlc.arg(comment_id),
+        admitted_at = clock_timestamp()
     WHERE r.issue_id = sqlc.arg(issue_id) AND r.agent_id = sqlc.arg(agent_id)
       AND r.armed_at = sqlc.arg(armed_at) AND r.refusal_task_id = sqlc.arg(refusal_task_id)
       AND r.admitted_task_id IS NULL

@@ -49,11 +49,12 @@ func (f *rescopeFixture) GetMemberRescopeTrigger(_ context.Context, input db.Get
 func (f *rescopeFixture) AdmitMemberRescopeTask(_ context.Context, input db.AdmitMemberRescopeTaskParams) (db.AgentTaskQueue, error) {
 	if input.IssueID != f.receipt.IssueID || input.AgentID != f.receipt.AgentID ||
 		input.RefusalTaskID != f.receipt.RefusalTaskID || input.ArmedAt != f.receipt.ArmedAt ||
-		input.TaskID != f.task.ID || f.receipt.AdmittedTaskID.Valid {
+		input.TaskID != f.task.ID || input.CommentID != f.task.TriggerCommentID || f.receipt.AdmittedTaskID.Valid {
 		return db.AgentTaskQueue{}, pgx.ErrNoRows
 	}
 	f.admitted++
 	f.receipt.AdmittedTaskID = input.TaskID
+	f.receipt.AdmittedCommentID = input.CommentID
 	f.receipt.AdmittedAt = pgtype.Timestamptz{Time: f.trigger.CreatedAt.Time.Add(time.Second), Valid: true}
 	outcome := f.task
 	outcome.ForceFreshSession = true
@@ -145,6 +146,9 @@ func TestMemberRescopeOneShotAndRearm(t *testing.T) {
 	}
 	f.task = first
 	claim("dispatched") // Recover the same committed claim if delivery was lost.
+	f.task.TriggerCommentID, f.task.TriggerEvidenceRefID = rescopeID(9), rescopeID(9)
+	claim("cancelled") // Even a different valid marker cannot spend the original claim.
+	f.task = first
 	f.task.ID = rescopeID(8)
 	f.task.CreatedAt.Time = f.receipt.AdmittedAt.Time.Add(time.Second)
 	claim("cancelled") // A fresh queue row does not make its old trigger fresh.
@@ -155,8 +159,9 @@ func TestMemberRescopeOneShotAndRearm(t *testing.T) {
 	f.receipt.RefusalTaskID = f.task.ID
 	f.receipt.AdmittedAt = pgtype.Timestamptz{}
 	f.receipt.AdmittedTaskID = pgtype.UUID{}
+	f.receipt.AdmittedCommentID = pgtype.UUID{}
 	claim("cancelled")
-	if f.admitted != 1 || f.cancelled != 3 {
+	if f.admitted != 1 || f.cancelled != 4 {
 		t.Fatalf("consumed=%d, cancelled=%d", f.admitted, f.cancelled)
 	}
 }
