@@ -42,6 +42,7 @@ func TestSupportedTypesMatchesMigrationWhitelist(t *testing.T) {
 		"pi": true, "cursor": true, "kimi": true, "reasonix": true, "dsh": true, "kiro": true, "antigravity": true,
 		"qoder": true, "qoderclicn": true, "traecli": true, "grok": true, "qwen": true, "qwenpaw": true, "mcode": true,
 		"muse": true, "museapp": true, "dim": true, "codearts": true, "zeroclaw": true, "omp": true, "devin": true, "zcode": true,
+		"droid": true, "amp": true,
 	}
 	if len(SupportedTypes) != len(want) {
 		t.Fatalf("SupportedTypes has %d entries, migration whitelist has %d; keep them in lockstep", len(SupportedTypes), len(want))

@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +42,7 @@ func TestCheckoutTargetIgnoresUnrelatedCredentialFailure(t *testing.T) {
 	}
 	checkout := func(task string) *repocache.WorktreeResult {
 		t.Helper()
-		if err := d.ensureRepoReady(context.Background(), "ws-1", target); err != nil {
+		if _, err := d.ensureRepoReady(context.Background(), "ws-1", target); err != nil {
 			t.Fatal(err)
 		}
 		result, err := d.repoCache.CreateWorktree(repocache.WorktreeParams{WorkspaceID: "ws-1", RepoURL: target, WorkDir: filepath.Join(dir, "work"), AgentName: "Test", TaskID: task})
@@ -84,11 +86,54 @@ func TestCheckoutTargetIgnoresUnrelatedCredentialFailure(t *testing.T) {
 	if kept.Kept == "" || kept.BranchName != result.BranchName || git("rev-parse", "HEAD") != head || err != nil || string(data) != "keep me\n" {
 		t.Fatalf("dirty checkout not kept: %+v, %v", kept, err)
 	}
-	err = d.ensureRepoReady(context.Background(), "ws-1", unrelated)
-	if err == nil || !strings.Contains(err.Error(), unrelated) || !strings.Contains(err.Error(), "Permission denied") || strings.Contains(err.Error(), target) {
+	_, err = d.ensureRepoReady(context.Background(), "ws-1", unrelated)
+	if err == nil || !strings.Contains(err.Error(), "ssh://unrelated.invalid/team/unavailable.git") || !strings.Contains(err.Error(), "Permission denied") || strings.Contains(err.Error(), target) {
 		t.Fatalf("target failure identity: %v", err)
 	}
 	if d.repoCache.Lookup("ws-1", unrelated) != "" {
 		t.Fatal("inaccessible target was cached")
+	}
+}
+
+type checkoutCloneFailureCache struct {
+	recordingRepoCache
+}
+
+func (c *checkoutCloneFailureCache) Lookup(_, _ string) string {
+	return ""
+}
+
+func (c *checkoutCloneFailureCache) Sync(_ string, repos []repocache.RepoInfo) error {
+	return fmt.Errorf("git clone --bare: authentication failed for %q", repos[0].URL)
+}
+
+func TestRepoCheckoutReadinessErrorOmitsURLUserinfo(t *testing.T) {
+	const workspaceID = "ws-1"
+	const target = "https://example.invalid/team/repo.git"
+	const registered = "https://registered-user:registered-pass@example.invalid/team/repo.git"
+	const requested = "https://requested-user:requested-pass@example.invalid/team/repo.git"
+
+	workDir := t.TempDir()
+	cache := &checkoutCloneFailureCache{}
+	d := newRepoCheckoutTestDaemon(t, workspaceID, registered, workDir, cache)
+	body, err := json.Marshal(repoCheckoutRequest{
+		URL: requested, WorkspaceID: workspaceID, WorkDir: workDir, TaskID: "task-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	d.repoCheckoutHandler().ServeHTTP(rec, authorizedRepoCheckoutRequest(strings.NewReader(string(body))))
+	message := rec.Body.String()
+	if rec.Code != http.StatusInternalServerError ||
+		!strings.Contains(message, "authentication failed for "+fmt.Sprintf("%q", target)) ||
+		!strings.Contains(message, "(target: "+target+")") {
+		t.Fatalf("expected a target-specific sync failure, got HTTP %d: %s", rec.Code, message)
+	}
+	for _, credential := range []string{"requested-user", "requested-pass", "registered-user", "registered-pass"} {
+		if strings.Contains(message, credential) {
+			t.Errorf("checkout readiness response exposed synthetic userinfo: %s", message)
+		}
 	}
 }
