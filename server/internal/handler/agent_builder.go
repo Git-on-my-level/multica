@@ -88,6 +88,10 @@ func (h *Handler) CreateAgentBuilderSession(w http.ResponseWriter, r *http.Reque
 	flowID := uuid.NewString()
 	ownerUUID := parseUUID(userID)
 	model := strings.TrimSpace(req.Model)
+	if err := h.validateDevinModelSelection(r.Context(), runtime.Provider, uuidToString(runtime.ID), model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to start agent builder session")
