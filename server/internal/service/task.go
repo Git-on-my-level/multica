@@ -5393,8 +5393,11 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			}
 			ordinaryRetry := retryEligible(failureReason, parent) &&
 				(failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg))
-			if ordinaryRetry || (launcherClaim != nil && launcherHandoffEligible(parent)) {
-				wantRetry = true
+			wantRetry = ordinaryRetry
+			if launcherClaim != nil {
+				wantRetry = launcherRecoveryEligible(parent, ordinaryRetry)
+			}
+			if wantRetry {
 				// Persist the reason-aware effective budget into the child so the
 				// retry chain self-describes (e.g. provider_network → max_attempts=3),
 				// rather than leaking a contradictory attempt=N/max_attempts=2 row.
@@ -5563,7 +5566,9 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		// can never abort this transaction — which also carries the parent's
 		// failed status.
 		createRetry := wantRetry
-		if failureReason == string(taskfailure.ReasonRuntimeOffline) && (launcherClaim == nil || !launcherHandoffEligible(t)) {
+		if createRetry && launcherClaim != nil {
+			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
+		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 			createRetry = createRetry && retryEligible(failureReason, t)
 		}
 		if createRetry && launcherClaim == nil {

@@ -17,7 +17,7 @@ import (
 )
 
 func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
-	for _, mode := range []string{"healthy-peer", "source-successor", "busy-peer", "no-peer", "wrong-model", "wrong-options", "unauthorized-peer", "same-host", "stale-peer", "held-peer", "started", "message", "session", "workdir", "branch", "result", "cancelled", "stale-claim"} {
+	for _, mode := range []string{"healthy-peer", "legacy-no-context", "accepted-triage", "ambiguous-context", "source-successor", "busy-peer", "no-peer", "wrong-model", "wrong-options", "unauthorized-peer", "same-host", "stale-peer", "held-peer", "started", "message", "session", "workdir", "branch", "result", "cancelled", "stale-claim"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			pool := sharedTestPool(t)
@@ -60,13 +60,25 @@ func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
 					}
 				}
 			}
-			issueID := fx.Issue(t, "preserve requested outcome")
+			issueCols := testutil.Cols{}
+			if mode == "accepted-triage" {
+				issueCols["triage_state"] = "pending"
+			}
+			issueID := fx.Issue(t, "preserve requested outcome", issueCols)
 			stamp := time.Now().UTC().Truncate(time.Microsecond)
 			cols := testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID, "status": "dispatched", "dispatched_at": stamp, "attempt": 1, "max_attempts": 1,
 				"originator_user_id": userID, "accountable_user_id": userID, "originator_source": "direct_human",
 				"context": `{"input":"exact preserved input","nested":{"value":42}}`, "handoff_note": "preserve the outcome", "trigger_summary": "original trigger"}
 			observed := false
 			switch mode {
+			case "legacy-no-context":
+				cols["context"] = nil
+			case "accepted-triage":
+				cols["context"] = `{"type":"triage","input":"stale Triage context"}`
+				cols["max_attempts"] = 2
+			case "ambiguous-context":
+				cols["context"] = `{"type":null,"input":"ambiguous task context"}`
+				cols["max_attempts"] = 2
 			case "started":
 				cols["started_at"] = stamp
 				cols["status"] = "running"
@@ -91,6 +103,9 @@ func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
 			}
 			taskID := fx.Task(t, agentID, cols)
 			fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, taskID)
+			if mode == "accepted-triage" {
+				fx.Exec(t, `UPDATE issue SET triage_state = NULL WHERE id = $1`, issueID)
+			}
 			if mode == "busy-peer" {
 				fx.Task(t, peerAgent, testutil.Cols{"runtime_id": peerRuntime, "issue_id": issueID, "status": "queued"})
 			}
@@ -126,6 +141,20 @@ func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
 				}
 				return
 			}
+			if mode == "accepted-triage" || mode == "ambiguous-context" {
+				if !transitioned || parent.Status != "failed" || parent.FailureReason.String != "runtime_offline" || count != 0 {
+					t.Fatalf("ineligible context replayed: parent=%+v transitioned=%v children=%d", parent, transitioned, count)
+				}
+				if eligible := retryEligible("runtime_offline", *parent); eligible != (mode == "ambiguous-context") {
+					t.Fatalf("ordinary retry eligibility = %v for %s", eligible, mode)
+				}
+				var fenced bool
+				fx.QueryRow(t, `SELECT metadata->'offline_reason'->>'launcher_unavailable' = 'true' FROM agent_runtime WHERE id=$1`, parent.RuntimeID).Scan(&fenced)
+				if !fenced {
+					t.Fatal("failed launcher was not fenced")
+				}
+				return
+			}
 			if !transitioned || parent.Status != "failed" || parent.FailureReason.String != "runtime_offline" || count != 1 {
 				t.Fatalf("recovery not atomic: parent=%+v transitioned=%v children=%d", parent, transitioned, count)
 			}
@@ -141,7 +170,7 @@ func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
 			if string(child.Context) != string(parent.Context) || child.HandoffNote != parent.HandoffNote || child.TriggerSummary != parent.TriggerSummary || child.OriginatorUserID != parent.OriginatorUserID || child.AccountableUserID != parent.AccountableUserID || child.OriginatorSource != parent.OriginatorSource || child.Attempt != 1 {
 				t.Fatalf("unstarted outcome changed: %+v", child)
 			}
-			if mode == "healthy-peer" || mode == "source-successor" {
+			if mode == "healthy-peer" || mode == "legacy-no-context" || mode == "source-successor" {
 				if util.UUIDToString(child.AgentID) != peerAgent || util.UUIDToString(child.RuntimeID) != peerRuntime || child.Status != "queued" || !child.ForceFreshSession {
 					t.Fatalf("not routed to healthy same-model host: %+v", child)
 				}
@@ -193,5 +222,16 @@ func TestLauncherHandoffPreservesUnstartedOutcome(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLauncherHandoffRejectsMissingTask(t *testing.T) {
+	pool := sharedTestPool(t)
+	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+	claim := protocol.LauncherClaim{DispatchedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	missingID := util.MustParseUUID(uuid.NewString())
+	task, transitioned, err := svc.FailUnstartedLauncherClaim(context.Background(), missingID, claim)
+	if task != nil || transitioned || !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("missing claim task: task=%v transitioned=%v err=%v", task, transitioned, err)
 	}
 }

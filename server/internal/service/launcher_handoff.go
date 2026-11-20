@@ -37,15 +37,19 @@ func (s *TaskService) FailUnstartedLauncherClaim(ctx context.Context, id pgtype.
 	return s.failTaskWithTransition(ctx, id, protocol.LauncherUnavailableDetail, "", "", "", "runtime_offline", false, "", "", &claim, pgtype.Timestamptz{Time: stamp, Valid: true})
 }
 
-func launcherHandoffEligible(task db.AgentTaskQueue) bool {
-	return task.IssueID.Valid && !task.AutopilotRunID.Valid && !task.IsLeaderTask && !task.SquadID.Valid
+func launcherRecoveryEligible(task db.AgentTaskQueue, ordinaryRetry bool) bool {
+	// The issue may have left Triage while this claim was in flight. Use the
+	// task's own marker before either launcher recovery or its retry fallback.
+	triage, known := taskTriageState(task)
+	return known && !triage && (ordinaryRetry ||
+		(task.IssueID.Valid && !task.AutopilotRunID.Valid && !task.IsLeaderTask && !task.SquadID.Valid))
 }
 
 // A peer must be independently healthy and invocable by the original human.
 // Agent/runtime bindings, model options and privacy principals are preserved;
 // there is no cross-owner, cross-model or host-pinned-directory fallback.
 func (s *TaskService) launcherPeer(ctx context.Context, q *db.Queries, task db.AgentTaskQueue, claim protocol.LauncherClaim, only pgtype.UUID) (*db.Agent, error) {
-	if !launcherHandoffEligible(task) || strings.TrimSpace(claim.Model) == "" {
+	if !launcherRecoveryEligible(task, false) || strings.TrimSpace(claim.Model) == "" {
 		return nil, nil
 	}
 	source, err := q.GetAgent(ctx, task.AgentID)
