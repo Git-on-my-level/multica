@@ -20,7 +20,7 @@ import (
 // Draining stdin before answering mirrors the real CLI: with no positional
 // prompt and a non-TTY stdin, cursor-agent reads stdin to EOF and uses it as
 // the prompt.
-func cursorStdinProbe(t *testing.T, prompt string) ([]string, string, Result) {
+func cursorStdinProbe(t *testing.T, prompt string, prefix []string, opts ExecOptions) ([]string, string, Result) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -39,11 +39,12 @@ printf '%%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"
 	fakePath := filepath.Join(dir, "cursor-agent")
 	writeTestExecutable(t, fakePath, []byte(script))
 
-	backend, err := New("cursor", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	backend, err := New("cursor", Config{ExecutablePath: fakePath, LaunchPrefix: prefix, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("New(cursor): %v", err)
 	}
-	session, err := backend.Execute(t.Context(), prompt, ExecOptions{Timeout: 30 * time.Second})
+	opts.Timeout = 30 * time.Second
+	session, err := backend.Execute(t.Context(), prompt, opts)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -77,7 +78,7 @@ func TestCursorExecuteSendsPromptOnStdinNotArgv(t *testing.T) {
 		`go build -ldflags "-X main.version=foo -X main.commit=bar" -o bin/server ./cmd/server` + "\n" +
 		"Thanks."
 
-	argv, stdinGot, result := cursorStdinProbe(t, prompt)
+	argv, stdinGot, result := cursorStdinProbe(t, prompt, nil, ExecOptions{})
 
 	if stdinGot != prompt {
 		t.Errorf("prompt did not arrive on stdin intact:\n got  %q\n want %q", stdinGot, prompt)
@@ -226,12 +227,21 @@ func TestCursorExecuteWritesPromptVerbatim(t *testing.T) {
 
 	prompt := "\n  leading and trailing whitespace  \n\n"
 
-	_, stdinGot, result := cursorStdinProbe(t, prompt)
+	_, stdinGot, result := cursorStdinProbe(t, prompt, nil, ExecOptions{})
 
 	if stdinGot != prompt {
 		t.Errorf("prompt was mutated before write:\n got  %q\n want %q", stdinGot, prompt)
 	}
 	if result.Status != "completed" {
 		t.Fatalf("status = %q, want completed; error=%q", result.Status, result.Error)
+	}
+}
+
+func TestCursorRecoveryFiltersRuntimePrefix(t *testing.T) {
+	argv, _, _ := cursorStdinProbe(t, "recover", []string{
+		"wrapper-arg", "--continue", "--resume=other-session", "--workspace", "/other",
+	}, ExecOptions{ResumeSessionID: "pinned-session", RequireCursorResume: true})
+	if got := strings.Join(argv, " "); got != "wrapper-arg -p --output-format stream-json --yolo --resume pinned-session" {
+		t.Fatalf("unexpected recovery argv: %s", got)
 	}
 }
