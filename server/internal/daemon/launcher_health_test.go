@@ -52,8 +52,8 @@ func TestLauncherHealthIndependentRunsDoNotReplayObservedWork(t *testing.T) {
 		return TaskResult{Status: "blocked", Comment: "opencode exited with error: exit status 127", SessionID: "observed-session", WorkDir: "preserved-work", FailureReason: taskfailure.ReasonAgentProcessFailure.String()}, nil
 	})
 	rid := fx.runtimeIDFor("ws-1", "opencode")
-	d.handleTask(context.Background(), Task{ID: "first", RuntimeID: rid, TriggerCommentID: "original-comment"}, 0)
-	d.handleTask(context.Background(), Task{ID: "independent-second", RuntimeID: rid}, 0)
+	d.handleTask(context.Background(), Task{ID: "first", RuntimeID: rid, TriggerCommentID: "original-comment"}, newTestTaskSlot(0))
+	d.handleTask(context.Background(), Task{ID: "independent-second", RuntimeID: rid}, newTestTaskSlot(0))
 	if runs != 1 || len(failures) != 2 || failures[0] != taskfailure.ReasonAgentProcessFailure.String() || failures[1] != taskfailure.ReasonRuntimeOffline.String() {
 		t.Fatalf("runs=%d failure bookkeeping=%v", runs, failures)
 	}
@@ -104,7 +104,7 @@ func TestLauncherHealthRejectsBeforeTaskInput(t *testing.T) {
 	})
 	rid := fx.runtimeIDFor("ws-1", "opencode")
 	for _, id := range []string{"initial", "independent-fresh"} {
-		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid, DispatchedAt: "2026-11-17T17:00:00Z", Agent: &AgentData{Model: "morph/morph-kimik31"}}, 0)
+		d.handleTask(context.Background(), Task{ID: id, RuntimeID: rid, DispatchedAt: "2026-11-17T17:00:00Z", Agent: &AgentData{Model: "morph/morph-kimik31"}}, newTestTaskSlot(0))
 	}
 	if failed != 2 || len(d.claimableRuntimeIDs()) != 0 {
 		t.Fatalf("failed=%d eligible=%v", failed, d.claimableRuntimeIDs())

@@ -45,7 +45,7 @@ func TestLauncherHealthMorphProfileSuppressesFreshRunsAndRecovers(t *testing.T) 
 		return TaskResult{}, nil
 	})
 	broken = true
-	d.handleTask(ctx, Task{ID: "initial", RuntimeID: rt.ID}, 0)
+	d.handleTask(ctx, Task{ID: "initial", RuntimeID: rt.ID}, newTestTaskSlot(0))
 	d.activeTasks.Add(1)
 	d.launcherActive = map[string]int{launcherKey(rt): 1}
 	if _, _, _, err := d.registerRuntimesForWorkspaceLocked(ctx, "ws-1"); err != nil {
@@ -57,7 +57,7 @@ func TestLauncherHealthMorphProfileSuppressesFreshRunsAndRecovers(t *testing.T) 
 	delete(d.launcherActive, launcherKey(rt))
 	defer d.activeTasks.Add(-1) // unrelated runtime stays busy throughout recovery
 	checksAfterFailure := probes
-	d.handleTask(ctx, Task{ID: "independent-fresh", RuntimeID: rt.ID}, 0)
+	d.handleTask(ctx, Task{ID: "independent-fresh", RuntimeID: rt.ID}, newTestTaskSlot(0))
 	if len(d.claimableRuntimeIDs()) != 0 || probes != checksAfterFailure {
 		t.Fatal("independent fresh run retried held profile launcher")
 	}

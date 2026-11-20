@@ -29,8 +29,9 @@ func (d *Daemon) runtimeDemotedLocked(rt Runtime) bool {
 
 func (d *Daemon) holdLauncher(key string) {
 	d.mu.Lock()
+	probe := builtinProbeResult{verdict: builtinProbeLauncherUnavailable, reason: launcherUnavailableDetail}
 	d.markProvidersDemotedLocked(map[string]runtimeVerdict{
-		key: newRuntimeVerdict(builtinProbeLauncherUnavailable, launcherUnavailableDetail, "", false),
+		key: newRuntimeVerdict(probe, "", false),
 	})
 	d.mu.Unlock()
 	d.logger.Warn("launcher health check failed; suppressing new launches", "launcher", key, "detail", launcherUnavailableDetail)
@@ -134,7 +135,7 @@ func (d *Daemon) refreshHeldProfileLaunchers(ctx context.Context) {
 }
 
 func (d *Daemon) refreshHeldProfilesForWorkspace(ctx context.Context, workspaceID string) error {
-	snapshot, err := d.client.GetRuntimeProfiles(ctx, workspaceID)
+	snapshot, err := d.client.GetRuntimeProfiles(ctx, workspaceID, d.cfg.DaemonID)
 	if err != nil {
 		return err
 	}
