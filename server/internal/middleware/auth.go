@@ -15,6 +15,15 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+type memberSessionKey struct{}
+
+// IsMemberSession reports authentication with a signed-in member session.
+// Personal, cloud and task access tokens do not carry this provenance.
+func IsMemberSession(ctx context.Context) bool {
+	valid, _ := ctx.Value(memberSessionKey{}).(bool)
+	return valid
+}
+
 func uuidToString(u pgtype.UUID) string { return util.UUIDToString(u) }
 
 func rejectTemporarilyDisabledUser(w http.ResponseWriter, r *http.Request, userID, email, authPath string) bool {
@@ -299,7 +308,7 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			// (MUL-7436).
 			r = renewCookieSession(w, r, claims, fromCookie, cfSigner)
 
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), memberSessionKey{}, true)))
 		})
 	}
 }

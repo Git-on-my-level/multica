@@ -325,6 +325,26 @@ does not clear those blocks or establish that earlier background processes exite
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### Codex refusals on issue tasks
+
+An exact terminal Codex safety refusal is recorded on the failed run and arms a
+receipt for that issue and agent. While the receipt is armed, subsequent work
+for that pair is cancelled before the daemon receives it. The cancellation
+shows the provider diagnostic and the required action.
+
+To request genuinely different work, sign in to Multica and post a **new**
+comment with a first line that begins `RESCOPE:` and describes the new task.
+Use the issue's normal agent mention or comment routing. The comment admits
+one claim and starts a fresh provider session. Edits, wakeups, reruns of old
+comments, and personal, task or cloud access tokens cannot supply the
+directive. A subsequent qualifying refusal arms a new receipt.
+
+The receipt contains issue, agent, task and timing metadata. The directive
+record contains only the comment ID. The server does not compare prompts or
+transcripts or copy comment content into either record. A server and daemon
+that both support this disposition are required. Existing failed runs keep
+their original classification.
+
 ### Subscription Account Pools (fork)
 
 When a machine has more than one Claude Code or Codex subscription, the daemon can spread work across them and fail over when one runs out. The provider's own login is always in the pool as `default`. Add each extra login you created on this machine:

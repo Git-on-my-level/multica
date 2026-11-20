@@ -184,6 +184,9 @@ func TestAuth_TaskTokenWorkspaceSelectors(t *testing.T) {
 			var called bool
 			var gotWorkspace, gotSource string
 			handler := Auth(queries, nil, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if IsMemberSession(r.Context()) {
+					t.Error("task token was treated as a member session")
+				}
 				called = true
 				gotWorkspace = r.Header.Get("X-Workspace-ID")
 				gotSource = r.Header.Get("X-Actor-Source")

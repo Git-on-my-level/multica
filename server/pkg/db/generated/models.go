@@ -1497,6 +1497,19 @@ type MemberDelegationDay struct {
 	ActivityDate pgtype.Date `json:"activity_date"`
 }
 
+type MemberRescopeDirective struct {
+	CommentID pgtype.UUID `json:"comment_id"`
+}
+
+type MemberRescopeReceipt struct {
+	IssueID        pgtype.UUID        `json:"issue_id"`
+	AgentID        pgtype.UUID        `json:"agent_id"`
+	RefusalTaskID  pgtype.UUID        `json:"refusal_task_id"`
+	ArmedAt        pgtype.Timestamptz `json:"armed_at"`
+	AdmittedTaskID pgtype.UUID        `json:"admitted_task_id"`
+	AdmittedAt     pgtype.Timestamptz `json:"admitted_at"`
+}
+
 type NotificationPreference struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`

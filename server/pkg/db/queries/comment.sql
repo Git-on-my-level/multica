@@ -528,6 +528,12 @@ WITH touched_issue AS (
     SELECT ti.id, ti.workspace_id, sqlc.arg(author_type), sqlc.arg(author_id), sqlc.arg(content), sqlc.arg(type), sqlc.narg(parent_id), sqlc.narg(source_task_id), sqlc.narg(quick_action_id), sqlc.narg(via_plugin_id), sqlc.narg(suppressed_agent_ids)::uuid[], COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING *
+), stamped_directive AS (
+    INSERT INTO member_rescope_directive (comment_id)
+    SELECT id FROM inserted_comment
+    WHERE COALESCE(sqlc.narg(member_rescope_directive)::boolean, false)
+      AND author_type = 'member' AND type = 'comment' AND source_task_id IS NULL
+      AND via_plugin_id IS NULL
 )
 SELECT inserted_comment.*, touched_issue.revision AS issue_revision
 FROM inserted_comment

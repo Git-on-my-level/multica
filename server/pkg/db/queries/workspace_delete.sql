@@ -329,6 +329,14 @@ deleted_orphan_task_supplement_capabilities AS (
 deleted_orphan_task_context_receipts AS (
     DELETE FROM task_context_receipt WHERE workspace_id = $1
 ),
+deleted_member_rescope_receipts AS (
+    DELETE FROM member_rescope_receipt WHERE issue_id IN (SELECT id FROM ws_issues)
+),
+deleted_member_rescope_directives AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (
+        SELECT id FROM comment WHERE workspace_id = $1
+    )
+),
 deleted_hourly_dirty AS (
     DELETE FROM task_usage_hourly_dirty WHERE workspace_id = $1
 ),

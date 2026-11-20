@@ -39,6 +39,7 @@ import (
 
 // Outcomes produced inside claimTask, shared by every caller.
 const (
+	claimOutcomeMemberRescopeRequired  = "member_rescope_required"
 	claimOutcomeClaimed                = "claimed"
 	claimOutcomeNoTasks                = "no_tasks"
 	claimOutcomeNoCapacity             = "no_capacity"
@@ -134,6 +135,8 @@ func claimReasonFor(outcome string, scope claimScope) string {
 		return claimReasonAgentRebound
 	case claimOutcomeNoRuntime:
 		return claimReasonAgentUnbound
+	case claimOutcomeMemberRescopeRequired:
+		return memberRescopeRequired
 	case claimOutcomeClaimed:
 		return claimReasonClaimed
 	case claimOutcomeEmptyCacheHit:
