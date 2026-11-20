@@ -394,3 +394,38 @@ func TestCursorExecuteTransientPromptWritePreservesSession(t *testing.T) {
 		t.Fatalf("unexpected prompt-write failure: %+v", result)
 	}
 }
+
+func TestCursorRecoveryRejectsDifferentSession(t *testing.T) {
+	t.Parallel()
+	for _, scenario := range []struct {
+		name, events, wantStatus string
+	}{
+		{"matching identity", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","result":"done"}'`, "completed"},
+		{"substitution at init", `'{"type":"system","subtype":"init","session_id":"another-session"}' '{"type":"result","result":"done"}'`, "failed"},
+		{"substitution at result", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","session_id":"another-session","result":"done"}'`, "failed"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fake := filepath.Join(t.TempDir(), "cursor-agent")
+			writeTestExecutable(t, fake, []byte("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' "+scenario.events+"\n"))
+			backend, err := New("cursor", Config{ExecutablePath: fake, Logger: slog.Default()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := backend.Execute(t.Context(), "recover", ExecOptions{
+				ResumeSessionID: "pinned-session", RequireCursorResume: true, Timeout: 10 * time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range session.Messages {
+			}
+			result := <-session.Result
+			if result.Status != scenario.wantStatus || result.SessionID != "pinned-session" {
+				t.Fatalf("recovery changed session or outcome: %+v", result)
+			}
+			if result.Status == "failed" && (!strings.Contains(result.Error, "reported a different session") || result.Output != "") {
+				t.Fatalf("unexpected session was accepted: %+v", result)
+			}
+		})
+	}
+}

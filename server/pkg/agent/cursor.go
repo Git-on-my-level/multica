@@ -134,6 +134,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		finalStatus := "completed"
 		var finalError string
 		var protocolError string
+		recoverySessionMismatch := false
 		resultSeen := false
 		resultIsError := false
 		resultBytes := 0
@@ -186,6 +187,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			lastEventType = observedCursorEventType(evt.Type)
 
 			if sid := evt.readSessionID(); sid != "" {
+				if opts.RequireCursorResume && sid != opts.ResumeSessionID {
+					recoverySessionMismatch = true
+					background.ObserveTerminal()
+					cancel()
+					break scanLoop
+				}
 				sessionID = sid
 				supplements.activate(sid)
 			}
@@ -393,6 +400,9 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			}
 		} else {
 			switch {
+			case recoverySessionMismatch:
+				finalStatus = "failed"
+				finalError = "Cursor recovery reported a different session; earlier actions may have taken effect"
 			case runCtx.Err() == context.DeadlineExceeded:
 				finalStatus = "timeout"
 				finalError = fmt.Sprintf("cursor-agent timed out after %s", timeout)
@@ -486,7 +496,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		// A launch failure emits no session event. Preserve only the session we
 		// actually requested, so the bounded recovery cannot become a cold run.
-		if finalStatus == "failed" && sessionID == "" && taskfailure.CursorPreActionNetworkError(finalError) {
+		if opts.RequireCursorResume || (finalStatus == "failed" && sessionID == "" && taskfailure.CursorPreActionNetworkError(finalError)) {
 			sessionID = opts.ResumeSessionID
 		}
 
