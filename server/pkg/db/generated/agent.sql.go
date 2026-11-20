@@ -1605,6 +1605,18 @@ WHERE id = (
               )
             )
       )
+      -- A shutdown retry retains the interrupted chat turn's place through
+      -- promotion and claim, even when a follow-up has higher priority.
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_task_queue recovery
+          JOIN agent_task_queue interrupted ON interrupted.id = recovery.parent_task_id
+          WHERE recovery.agent_id = atq.agent_id
+            AND recovery.chat_session_id = atq.chat_session_id
+            AND recovery.status IN ('deferred', 'queued')
+            AND recovery.id <> atq.id
+            AND interrupted.failure_reason = 'runtime_recovery'
+            AND interrupted.error LIKE 'daemon shut down while task%'
+      )
     ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -3569,7 +3581,7 @@ WITH victims AS (
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
     WHERE retry.status = 'deferred'
       AND retry.fire_at < now() - make_interval(secs => $1::double precision)
-      AND parent.failure_reason = 'runtime_offline'
+      AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
       AND NOT EXISTS (
           SELECT 1 FROM agent_runtime runtime
           WHERE runtime.id = retry.runtime_id
@@ -3595,7 +3607,7 @@ WHERE retry.id = victims.id
   AND EXISTS (
       SELECT 1 FROM agent_task_queue parent
       WHERE parent.id = retry.parent_task_id
-        AND parent.failure_reason = 'runtime_offline'
+        AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
   )
   AND NOT EXISTS (
       SELECT 1 FROM agent_runtime runtime
@@ -3613,7 +3625,7 @@ type FailExpiredRuntimeReconnectRetriesParams struct {
 	MaxPerTick         int32   `json:"max_per_tick"`
 }
 
-// A runtime_offline retry waits in deferred until its runtime returns healthy.
+// A runtime_offline or runtime_recovery retry waits in deferred until its runtime returns healthy.
 // Give that recovery state a bounded exit: after one full reconnect grace,
 // fail it with a non-retryable reason so issues, agents, and runtime GC can
 // converge. A runtime that is healthy when this query runs wins the race and
@@ -4795,6 +4807,18 @@ func (q *Queries) HasActiveTaskForIssueAndAgentInThread(ctx context.Context, arg
 	var has_active bool
 	err := row.Scan(&has_active)
 	return has_active, err
+}
+
+const hasDaemonRecoveryRetry = `-- name: HasDaemonRecoveryRetry :one
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
+`
+
+// Check after locking the parent; even a cancelled child consumes recovery.
+func (q *Queries) HasDaemonRecoveryRetry(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasDaemonRecoveryRetry, parentTaskID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const hasPendingTaskForIssue = `-- name: HasPendingTaskForIssue :one
