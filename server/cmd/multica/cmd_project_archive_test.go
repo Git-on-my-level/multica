@@ -138,13 +138,15 @@ func TestResolveProjectIDPrefersLiveProjectOnSharedPrefix(t *testing.T) {
 		}
 	}
 
-	ref, err := resolveProjectID(ctx, client, "22222222")
-	if err != nil || ref.ID != shelved || !ref.Archived {
-		t.Fatalf("read of an archived-only prefix = %+v, %v; want the archived project", ref, err)
-	}
-	if _, err := resolveProjectIDForNewWork(ctx, client, "22222222"); err == nil ||
-		!strings.Contains(err.Error(), "archived") || !strings.Contains(err.Error(), "multica project restore "+shelved) {
-		t.Fatalf("new work into an archived-only prefix: err = %v, want the restore hint", err)
+	for _, selector := range []string{"22222222", "Shelved"} {
+		ref, err := resolveProjectID(ctx, client, selector)
+		if err != nil || ref.ID != shelved || !ref.Archived {
+			t.Fatalf("read of %q = %+v, %v; want the archived project", selector, ref, err)
+		}
+		if _, err := resolveProjectIDForNewWork(ctx, client, selector); err == nil ||
+			!strings.Contains(err.Error(), "archived") || !strings.Contains(err.Error(), "multica project restore "+shelved) {
+			t.Fatalf("new work into %q: err = %v, want the restore hint", selector, err)
+		}
 	}
 }
 

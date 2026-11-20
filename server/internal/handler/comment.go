@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -1857,6 +1858,10 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		// The author's "don't start" choices outlive this call: completion
 		// replay skips the agents it names.
 		SuppressedAgentIds: suppressAgentIDs,
+		MemberRescopeDirective: pgtype.Bool{
+			Bool:  middleware.IsMemberSession(r.Context()) && service.HasMemberRescopeDirective(req.Content),
+			Valid: true,
+		},
 	}
 	var created db.CreateCommentRow
 	var err error
@@ -3596,10 +3601,11 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 				AttachmentIds: attachmentIDs,
 			})
 			if err == nil && changed > 0 && oldContent == req.Content {
-				comment, err = qtx.BumpCommentRevision(r.Context(), db.BumpCommentRevisionParams{
+				bumped, bumpErr := qtx.BumpCommentRevision(r.Context(), db.BumpCommentRevisionParams{
 					ID:          comment.ID,
 					WorkspaceID: existing.WorkspaceID,
 				})
+				comment, err = db.Comment(bumped), bumpErr
 			}
 		}
 		if err == nil {

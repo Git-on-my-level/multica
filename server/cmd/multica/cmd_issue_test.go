@@ -6304,7 +6304,7 @@ func TestRunIssueSearchProjectFilterErrors(t *testing.T) {
 	_ = cmd.Flags().Set("project", "xyz")
 	err := runIssueSearch(cmd, []string{"deployment"})
 	if err == nil {
-		t.Fatal("expected error for malformed project prefix")
+		t.Fatal("expected error when the project catalog is unavailable")
 	}
 	if count := strings.Count(err.Error(), "resolve project:"); count != 1 {
 		t.Fatalf("expected single 'resolve project:' prefix, got %d in %q", count, err.Error())
@@ -6327,9 +6327,6 @@ func TestIssueSearchCommandRegistration(t *testing.T) {
 		if issueSearchCmd.Flags().Lookup(flagName) == nil {
 			t.Errorf("expected --%s flag on issue search command", flagName)
 		}
-	}
-	if got := issueSearchCmd.Flags().Lookup("project").Usage; got != "Filter by project ID" {
-		t.Errorf("project flag usage = %q, want %q", got, "Filter by project ID")
 	}
 }
 

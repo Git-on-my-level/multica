@@ -139,6 +139,8 @@ Le préfixe `agent_error.` est omis dans ce tableau.
 
 ## Relance manuelle
 
+La relance manuelle est indisponible après un refus de sécurité définitif de Codex sur une tâche. Pour demander un travail réellement différent, connectez-vous à Multica et publiez un nouveau commentaire sur la même tâche. Commencez la première ligne par `RESCOPE:` et décrivez le nouveau travail sur cette ligne. Utilisez la mention ou le routage habituel des commentaires pour joindre l’agent. La directive autorise une tentative dans une nouvelle session. Une modification de commentaire ou une publication avec un jeton d’accès ne peut pas fournir cette directive.
+
 Cliquer sur le bouton Relancer l'exécution d'une ligne du journal d'exécution invoque **l'agent qui a traité cette exécution à ce moment-là**. Même si la tâche a été réassignée depuis, la relance ne bascule pas vers le nouvel assigné.
 
 Une relance conserve autant que possible les fichiers que l'exécution précédente a déjà écrits dans le répertoire local. Si la session d'origine est toujours sûre et que le même runtime prend en charge la relance, celle-ci poursuit aussi la session précédente. Les erreurs qui corrompent la session, comme un dépassement de contexte ou des requêtes invalides, démarrent plutôt une nouvelle session dans le répertoire de travail d'origine. Lorsque le répertoire d'origine n'existe plus, un nouveau répertoire de travail est utilisé.
@@ -181,7 +183,7 @@ La relance automatique ne couvre que les défaillances transitoires ci-dessous, 
 | Échec du téléchargement du bundle de skills | 2 par défaut (le processus de l'agent n'a pas encore démarré à ce stade ; les bundles déjà téléchargés proviennent du cache local) |
 | Interruption réseau de l'outil | Jusqu'à 3 ; la dernière tentative démarre après un délai d'environ 5 secondes |
 
-Tous les autres motifs d'échec (authentification, quota, configuration, modèle, etc.) ne sont jamais relancés automatiquement ; corrigez d'abord la cause, puis relancez manuellement.
+Pour les autres échecs, par exemple d’authentification, de quota, de configuration ou de modèle, corrigez la cause avant de relancer manuellement. Un refus de sécurité définitif de Codex sur une tâche exige le nouveau commentaire décrit ci-dessus.
 
 ## Étapes suivantes
 

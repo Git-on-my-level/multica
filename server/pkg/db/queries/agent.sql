@@ -820,6 +820,16 @@ FROM agent_task_queue
 WHERE parent_task_id = $1
   AND status <> 'cancelled';
 
+-- name: HasRuntimeOfflineRetryForParent :one
+-- A cancelled or completed recovery still consumes the one offline recovery.
+-- Call while holding LockRuntimeOfflineRetryParent.
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1);
+
+-- name: LockRuntimeOfflineRetryParent :exec
+-- Serialize deferred recovery creation without taking a task-row lock ahead
+-- of CreateRetryTask's workspace/owner fence (the teardown lock order).
+SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg('task_id')::uuid::text || ':runtime_offline_retry', 0));
+
 -- name: GetAgentTaskInWorkspace :one
 -- Loads a task only when its owning agent lives in the given workspace.
 -- agent_id is NOT NULL on every task row (and ON DELETE CASCADE, so the agent
@@ -843,15 +853,30 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 -- otherwise a user mashing the create button could fire concurrent quick-creates
 -- whose completion lookup would race over "most recent issue by this agent".
+WITH codex_config AS MATERIALIZED (
+    SELECT c.configuration,
+           a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration) AS rejected
+    FROM codex_model_admission_config c
+    JOIN agent a ON a.id = c.agent_id
+    WHERE c.agent_id = @agent_id AND c.runtime_id = @runtime_id
+)
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
+    context = COALESCE(
+        (SELECT COALESCE(context, '{}'::jsonb) || jsonb_build_object('codex_model_admission', configuration)
+         FROM codex_config),
+        context - 'codex_model_admission'
+    ),
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.agent_id = @agent_id
       AND atq.runtime_id = @runtime_id
       AND atq.status = 'queued'
+      AND (@ignore_codex_model_rejection::boolean OR NOT EXISTS (
+          SELECT 1 FROM codex_config WHERE rejected
+      ))
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
@@ -1191,7 +1216,7 @@ WHERE session_id NOT IN (SELECT session_id FROM retired_sessions)
     status IN ('completed', 'cancelled')
     OR (
       status = 'failed'
-      AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow', 'codex_resume_oversized', 'opencode_clock_skew')
+      AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow', 'codex_resume_oversized', 'opencode_clock_skew', 'agent_error.codex_safety_refusal')
       AND NOT (COALESCE(error, '') ILIKE '%400%' AND COALESCE(error, '') ILIKE '%invalid_request_error%')
       AND NOT (COALESCE(error, '') ILIKE '%image dimensions exceed max allowed size%' AND COALESCE(error, '') ILIKE '%image.source.base64.data%')
       -- A provider credential-resolution failure ("Could not resolve
@@ -1945,6 +1970,36 @@ WHERE id = (
           OR (NOT t.is_leader_task AND t.squad_id IS NULL)
       )
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(@new_trigger_comment_id::uuid)
+      -- A claim returned to the queue after delivery failure must keep its
+      -- original member directive until that same admitted attempt settles.
+      AND NOT EXISTS (
+          SELECT 1 FROM member_rescope_receipt r
+          WHERE r.issue_id = t.issue_id AND r.agent_id = t.agent_id
+            AND r.admitted_task_id = t.id
+      )
+      -- A queued member-authored re-scope owns its one permitted attempt.
+      -- Ordinary comments must not replace it while the receipt is armed.
+      AND NOT (
+          EXISTS (
+              SELECT 1 FROM member_rescope_directive d
+              JOIN comment c ON c.id = d.comment_id
+              WHERE d.comment_id = t.trigger_comment_id
+                AND c.deleted_at IS NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM member_rescope_directive d
+              JOIN comment c ON c.id = d.comment_id
+              WHERE d.comment_id = @new_trigger_comment_id::uuid
+                AND c.deleted_at IS NULL
+          )
+          AND COALESCE((
+              SELECT r.admitted_task_id IS NULL
+              FROM member_rescope_receipt r
+              WHERE r.issue_id = t.issue_id AND r.agent_id = t.agent_id
+              ORDER BY r.armed_at DESC, r.refusal_task_id DESC
+              LIMIT 1
+          ), false)
+      )
       AND (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')

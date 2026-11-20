@@ -1002,11 +1002,9 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
-			// discarded attempt's thread (initialize retries fail before any
-			// thread exists; catalog retries clear ResumeSessionID below), so
-			// forwarding its pin would leave the resume pointer aimed at a
-			// thread that never produced a turn (MUL-5110). The first non-pin
-			// message means the attempt is live: flush and stream from then on.
+			// discarded attempt's thread, so forwarding its pin could point a
+			// future resume at a thread that never produced a turn (MUL-5110).
+			// The first non-pin message means the attempt is live: flush and stream from then on.
 			var heldPins []Message
 			holdingPins := true
 			flushHeldPins := func() {
@@ -1032,40 +1030,24 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
 				return
 			}
-			retryReason := ""
-			switch {
-			case result.codexInitializeRetrySafe:
-				retryReason = "initialize"
-			case result.codexStartupRefreshRetrySafe:
-				retryReason = "model_catalog_refresh"
-			}
-			if retryReason == "" || attempt == 2 {
+			if !result.codexStartupRefreshRetrySafe || attempt == 2 {
 				flushHeldPins()
 				resCh <- result
 				return
 			}
-			// The model catalog refresh reaches the network, so give the
-			// transient failure a little more room than the local initialize
-			// handshake gets. Both stay well inside the task timeout, and
-			// ctx.Done() below keeps the retry from extending it.
-			backoff := 75*time.Millisecond + time.Duration(time.Now().UnixNano()%50)*time.Millisecond
-			if retryReason == "model_catalog_refresh" {
-				backoff = codexCatalogRetryBackoff + time.Duration(time.Now().UnixNano()%1000)*(2*codexCatalogRetryBackoff/1000)
-				// The stalled attempt already reached turn/started, so the prior
-				// thread may hold the submitted input or an unfinished turn.
-				// Resuming it again could duplicate that input; start a fresh
-				// thread instead and keep ResumeExpected so codexTurnInput
-				// prepends the caller's continuity notice about the lost
-				// context.
-				if attemptOpts.ResumeSessionID != "" {
-					b.cfg.Logger.Warn("codex retry dropping resume pointer after model catalog refresh failure",
-						"prior_thread_id", attemptOpts.ResumeSessionID,
-					)
-					attemptOpts.ResumeSessionID = ""
-					attemptOpts.ResumeExpected = true
-				}
+			backoff := codexCatalogRetryBackoff + time.Duration(time.Now().UnixNano()%1000)*(2*codexCatalogRetryBackoff/1000)
+			// The stalled attempt already reached turn/started, so the prior
+			// thread may hold the submitted input or an unfinished turn.
+			// Resuming it again could duplicate that input; start a fresh
+			// thread and preserve the continuity notice if a resume was expected.
+			if attemptOpts.ResumeSessionID != "" {
+				b.cfg.Logger.Warn("codex retry dropping resume pointer after model catalog refresh failure",
+					"prior_thread_id", attemptOpts.ResumeSessionID,
+				)
+				attemptOpts.ResumeSessionID = ""
+				attemptOpts.ResumeExpected = true
 			}
-			b.cfg.Logger.Warn("codex retry scheduled", "reason", retryReason, "attempt", attempt, "next_attempt", attempt+1, "backoff", backoff.String())
+			b.cfg.Logger.Warn("codex retry scheduled", "reason", "model_catalog_refresh", "attempt", attempt, "next_attempt", attempt+1, "backoff", backoff.String())
 			select {
 			case <-ctx.Done():
 				flushHeldPins()
@@ -1251,7 +1233,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// Every agent message still flows to msgCh, so the transcript is unchanged —
 	// only what the daemon forwards to a chat/channel reply narrows (GH #6006).
 	var output codexOutputSelection
-	var semanticObserved atomic.Bool
 	turnNotificationGate := &codexTurnNotificationGate{}
 	firstItemWait := &codexFirstItemWaitObservation{}
 
@@ -1267,9 +1248,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			firstItemWait.start(time.Now(), c.activeTurnID())
 		}
 		trySendString(semanticActivityCh, activity)
-		if activity != "" {
-			semanticObserved.Store(true)
-		}
 	}
 
 	c = &codexClient{
@@ -1292,12 +1270,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				"task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID,
 				"failure_count", codexGuardianRateLimitThreshold)
 			guardianRateLimitTrip <- struct{}{}
-		},
-		onDiscardedNotification: func(string, map[string]any) {
-			// Any app-server notification proves the process made semantic
-			// progress, even when it is intentionally excluded from the active
-			// turn. Preserve initialize-retry safety without replaying content.
-			semanticObserved.Store(true)
 		},
 		onMessage: func(msg Message) {
 			observeMessage(msg)
@@ -1328,7 +1300,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			outputMu.Unlock()
 		},
 		onSemanticActivity: func(description string) {
-			semanticObserved.Store(true)
 			b.cfg.Logger.Debug("codex semantic activity observed", "activity", description)
 			trySendString(semanticActivityCh, description)
 		},
@@ -1536,14 +1507,14 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				// still records bounded byte/truncation metadata.
 				finalError = withAgentStderr(finalError, "codex", sanitizeCodexDiagnostic(stderrBuf.Tail()))
 			}
-			retrySafe := timedOut && !semanticObserved.Load() && cleanupConfirmed && codexInitializeRetrySupported()
+			// Codex loads managed configuration and authentication before
+			// answering initialize. Silence and a reaped process tree cannot
+			// establish that startup performed zero work.
 			if timedOut && !cleanupConfirmed {
 				finalError += "; retry suppressed: process cleanup/reap not confirmed"
-			} else if timedOut && cleanupConfirmed && !codexInitializeRetrySupported() {
-				finalError += "; retry suppressed: process-tree cleanup cannot be confirmed on this platform"
 			}
-			b.cfg.Logger.Warn("codex lifecycle", "phase", "initialize_failure", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "attempt", attempt, "latency", initializeLatency.Round(time.Millisecond).String(), "semantic_activity", semanticObserved.Load(), "cleanup_confirmed", cleanupConfirmed, "retry_safe", retrySafe)
-			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), codexInitializeRetrySafe: retrySafe}
+			b.cfg.Logger.Warn("codex lifecycle", "phase", "initialize_failure", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "attempt", attempt, "latency", initializeLatency.Round(time.Millisecond).String(), "cleanup_confirmed", cleanupConfirmed, "retry_safe", false)
+			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 			return
 		}
 		b.cfg.Logger.Info("codex lifecycle", "phase", "initialize_response", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "attempt", attempt, "latency", time.Since(initializeStarted).Round(time.Millisecond).String())
@@ -1839,14 +1810,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// A first turn that produced no semantic progress because Codex could
 		// not load its model catalog is a startup-only failure: no tool ran and
 		// no content reached the user, so replaying the prompt cannot duplicate
-		// side effects. Reuse the same process-tree evidence initialize retries
-		// require (cleanupConfirmed plus platform support) rather than a bare
-		// ProcessState check: on Windows the daemon cannot prove the whole tree
-		// is gone, and a surviving app-server would race the retry.
+		// side effects. Confirm the process tree is gone before starting over.
 		startupRefreshRetrySafe := timeoutDiagnostic.Kind == codexTimeoutFirstTurnNoProgress &&
 			!firstTurnProgressObserved &&
 			strings.Contains(stderrTail, codexModelCatalogRefreshFailureSignal) &&
-			cleanupConfirmed && codexInitializeRetrySupported()
+			cleanupConfirmed
 		if startupRefreshRetrySafe {
 			b.cfg.Logger.Warn("codex startup model catalog refresh failure is retry safe",
 				"pid", cmd.Process.Pid,
@@ -2455,10 +2423,6 @@ type codexClient struct {
 	// replay emitted while thread/resume is restoring prior conversation.
 	// Unit-level protocol tests leave it nil and exercise dispatch directly.
 	acceptNotification func(method string, params map[string]any) bool
-	// onDiscardedNotification preserves out-of-band safety signals (such as
-	// suppressing an initialize retry after observed activity) without letting
-	// filtered history mutate current-turn output or lifecycle state.
-	onDiscardedNotification func(method string, params map[string]any)
 	// agentMessageStreams tracks raw-v2 agent text on the single stdout reader.
 	// The first delta is handed off immediately; subsequent deltas are aggregated
 	// into bounded chunks and reconciled against item/completed. delivered is
@@ -3062,9 +3026,6 @@ func (c *codexClient) handleNotification(raw map[string]json.RawMessage) {
 		return
 	}
 	if c.acceptNotification != nil && !c.acceptNotification(method, params) {
-		if c.onDiscardedNotification != nil {
-			c.onDiscardedNotification(method, params)
-		}
 		return
 	}
 

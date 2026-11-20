@@ -24,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/featureflags"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -2998,7 +2999,18 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if composioMCPEnabled {
 		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
 	}
-	agent, err := h.Queries.GetAgent(r.Context(), task.AgentID)
+	var agent db.Agent
+	var err error
+	admissionMatches := true
+	if runtime.Provider == "codex" && h.TaskService.FeatureFlags.IsEnabled(r.Context(), featureflags.CodexModelAdmission, true) {
+		var launch db.GetCodexAgentForClaimDeliveryRow
+		launch, err = h.Queries.GetCodexAgentForClaimDelivery(r.Context(), db.GetCodexAgentForClaimDeliveryParams{
+			AgentID: task.AgentID, RuntimeID: task.RuntimeID, ClaimContext: task.Context,
+		})
+		agent, admissionMatches = launch.Agent, launch.AdmissionMatches
+	} else {
+		agent, err = h.Queries.GetAgent(r.Context(), task.AgentID)
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The current schema cascades agent deletion to task rows, so a
@@ -3062,6 +3074,19 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			taskfailure.ReasonRuntimeAccessDenied,
 			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
 		)
+	}
+	if !admissionMatches {
+		// Reuse the dispatched-at CAS so a slow builder cannot requeue a
+		// newer claim. The next claim will validate and stamp the new config.
+		if _, err := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("daemon claim: requeue after Codex model configuration changed",
+				"task_id", uuidToString(task.ID), "error", err)
+			return resp, nil, nil, 0, 0, &claimBuildFailure{
+				outcome: "error_codex_model_requeue", status: http.StatusInternalServerError,
+				message: "failed to requeue claim after Codex model configuration changed",
+			}
+		}
+		return resp, nil, nil, 0, 0, &claimBuildFailure{outcome: "codex_model_configuration_changed", settled: true}
 	}
 	useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 	// A daemon older than the multica-platform merge assembles a brief that

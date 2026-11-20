@@ -827,6 +827,7 @@ type claimDecisionSeriesKey struct{ claimPath, outcome, reason string }
 func claimDecisionSeries() []claimDecisionSeriesKey {
 	claimTaskOutcomes := []claimDecisionSeriesKey{
 		{"", "claimed", "claimed"},
+		{"", "codex_model_admission_held", "codex_model_admission_held"},
 		{"", "no_capacity", "agent_concurrency_cap"},
 		{"", "runtime_no_capacity", "runtime_concurrency_cap"},
 		{"", "no_runtime", "agent_unbound"},

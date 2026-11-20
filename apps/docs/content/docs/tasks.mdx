@@ -139,6 +139,8 @@ The `agent_error.` prefix is omitted in this table.
 
 ## Manual retry
 
+For an issue run that ended in a terminal Codex safety refusal, manual retry is unavailable. To request genuinely different work, sign in to Multica and post a new comment on the same issue. Start its first line with `RESCOPE:` and describe the new task on that line. Use the issue’s usual agent mention or comment routing. The directive authorizes one attempt in a fresh session. Editing an existing comment or posting with an access token cannot supply the directive.
+
 Clicking the retry button on a row in the execution log invokes **the agent that handled that run at the time**. Even if the issue has since been reassigned, the retry does not switch to the new assignee.
 
 A retry keeps the files the previous run already wrote to the local directory whenever possible. If the original session is still safe and the same runtime claims the retry, it continues that session. Errors that poison the session, such as context overflow or invalid requests, start a new session on top of the original working directory instead. When the original directory no longer exists, a fresh working directory is used.
@@ -181,7 +183,7 @@ Automatic retry covers only the transient faults below, and only applies to runs
 | Skill bundle download failure | 2 by default (the agent process has not started at this point; already-downloaded bundles come from the local cache) |
 | Tool network interruption | Up to 3; the final attempt starts after a delay of about 5 seconds |
 
-All other failure reasons (auth, quota, configuration, model, and so on) never retry automatically; fix the cause first, then retry manually.
+For other failures such as authentication, quota, configuration, or model errors, fix the cause before retrying manually. A terminal Codex safety refusal on an issue run requires the new member comment described above.
 
 ## Next steps
 

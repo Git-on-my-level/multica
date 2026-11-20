@@ -325,6 +325,44 @@ does not clear those blocks or establish that earlier background processes exite
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### Codex model admission
+
+A Codex provider response that explicitly rejects the agent's pinned model for
+its ChatGPT account holds further queued runs for that agent configuration.
+Already dispatched work remains subject to the usual task lifecycle. Other
+agents can continue claiming work on the same runtime. Held runs retain the
+normal queue expiry. Operators can identify the affected agent and runtime in
+the `queued Codex dispatch held after model rejection` warning and monitor
+the `codex_model_admission_held` claim outcome.
+
+After verifying the repair against the runtime's live catalog, a change to the
+reported Codex CLI version or the pinned model permits dispatch again. For a
+catalog repair on the same CLI version, set a new non-secret
+`codex_model_admission_revision` value in the agent's runtime configuration.
+Preserve the other runtime configuration keys when saving that change. A fresh
+provider rejection can hold the new configuration again. Operators can bypass
+this guard with the server feature flag `FF_CODEX_MODEL_ADMISSION=off`.
+
+### Codex refusals on issue tasks
+
+An exact terminal Codex safety refusal is recorded on the failed run and arms a
+receipt for that issue and agent. While the receipt is armed, subsequent work
+for that pair is cancelled before the daemon receives it. The cancellation
+shows the provider diagnostic and the required action.
+
+To request genuinely different work, sign in to Multica and post a **new**
+comment with a first line that begins `RESCOPE:` and describes the new task.
+Use the issue's normal agent mention or comment routing. The comment admits
+one claim and starts a fresh provider session. Edits, wakeups, reruns of old
+comments, and personal, task or cloud access tokens cannot supply the
+directive. A subsequent qualifying refusal arms a new receipt.
+
+The receipt contains issue, agent, task and timing metadata. The directive
+record contains only the comment ID. The server does not compare prompts or
+transcripts or copy comment content into either record. A server and daemon
+that both support this disposition are required. Existing failed runs keep
+their original classification.
+
 ### Subscription Account Pools (fork)
 
 When a machine has more than one Claude Code or Codex subscription, the daemon can spread work across them and fail over when one runs out. The provider's own login is always in the pool as `default`. Add each extra login you created on this machine:
@@ -1055,14 +1093,21 @@ multica project delete <id>
 ### Associating Issues with Projects
 
 Use the `--project` flag on `issue create` / `issue update` to attach an issue to a
-project, or on `issue list` / `issue search` to filter issues by project:
+project, or on `issue list` / `issue search` to filter issues by project.
 
 ```bash
 multica issue create --title "Login bug" --project <project-id>
 multica issue update <issue-id> --project <project-id>
-multica issue list --project <project-id>
+multica issue list --project "Goal: Churn" --limit 1 --output json
 multica issue search "Login" --project <project-id>
 ```
+
+The project selector accepts a full UUID, a UUID prefix, or the exact,
+case-sensitive title. Titles must be unique among projects visible in the
+selected workspace, including archived projects. Unknown, partial, and
+duplicate titles return an error. UUID and UUID-prefix syntax takes precedence
+over titles. Use the full project UUID to choose between identically titled
+projects.
 
 ## Setup
 
