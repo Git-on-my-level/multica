@@ -395,14 +395,15 @@ func TestCursorExecuteTransientPromptWritePreservesSession(t *testing.T) {
 	}
 }
 
-func TestCursorRecoveryRejectsDifferentSession(t *testing.T) {
+func TestCursorRecoveryRequiresSessionConfirmation(t *testing.T) {
 	t.Parallel()
 	for _, scenario := range []struct {
-		name, events, wantStatus string
+		name, events, wantError string
 	}{
-		{"matching identity", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","result":"done"}'`, "completed"},
-		{"substitution at init", `'{"type":"system","subtype":"init","session_id":"another-session"}' '{"type":"result","result":"done"}'`, "failed"},
-		{"substitution at result", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","session_id":"another-session","result":"done"}'`, "failed"},
+		{"matching identity", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","result":"done"}'`, ""},
+		{"substitution at init", `'{"type":"system","subtype":"init","session_id":"another-session"}' '{"type":"result","result":"done"}'`, "reported a different session"},
+		{"no session evidence", `'{"type":"result","result":"done"}'`, "did not confirm the original session"},
+		{"substitution at result", `'{"type":"system","subtype":"init","session_id":"pinned-session"}' '{"type":"result","session_id":"another-session","result":"done"}'`, "reported a different session"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			fake := filepath.Join(t.TempDir(), "cursor-agent")
@@ -420,11 +421,15 @@ func TestCursorRecoveryRejectsDifferentSession(t *testing.T) {
 			for range session.Messages {
 			}
 			result := <-session.Result
-			if result.Status != scenario.wantStatus || result.SessionID != "pinned-session" {
-				t.Fatalf("recovery changed session or outcome: %+v", result)
+			if result.SessionID != "pinned-session" {
+				t.Fatalf("recovery changed the pinned session: %+v", result)
 			}
-			if result.Status == "failed" && (!strings.Contains(result.Error, "reported a different session") || result.Output != "") {
-				t.Fatalf("unexpected session was accepted: %+v", result)
+			if scenario.wantError == "" {
+				if result.Status != "completed" || result.Output != "done" {
+					t.Fatalf("confirmed session did not complete: %+v", result)
+				}
+			} else if result.Status != "failed" || !strings.Contains(result.Error, scenario.wantError) || result.Output != "" {
+				t.Fatalf("unconfirmed session was accepted: %+v", result)
 			}
 		})
 	}

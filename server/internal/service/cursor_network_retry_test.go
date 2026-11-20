@@ -195,12 +195,13 @@ func TestCursorRecoveryRetryInsertionCustody(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			for _, tc := range []struct {
 				name               string
-				rebound            bool
+				rebound, unbound   bool
 				errorText, session string
 				wantChild          bool
 			}{
 				{name: "original runtime", errorText: preAction, session: sessionID, wantChild: true},
 				{name: "rebound runtime", rebound: true, errorText: preAction, session: sessionID},
+				{name: "unbound runtime", unbound: true, errorText: preAction, session: sessionID},
 				{name: "missing session", errorText: preAction},
 				{name: "post action", errorText: postAction, session: sessionID},
 				{name: "ordinary network retry still follows rebind", rebound: true, errorText: "API Error: Connection closed mid-response.", session: sessionID, wantChild: true},
@@ -209,6 +210,9 @@ func TestCursorRecoveryRetryInsertionCustody(t *testing.T) {
 					newRuntime := agent.RuntimeID
 					if tc.rebound {
 						newRuntime = util.MustParseUUID(otherRuntime)
+					}
+					if tc.unbound {
+						newRuntime = pgtype.UUID{}
 					}
 					if _, err := pool.Exec(ctx, "UPDATE agent SET runtime_id = $1 WHERE id = $2", newRuntime, agentID); err != nil {
 						t.Fatal(err)

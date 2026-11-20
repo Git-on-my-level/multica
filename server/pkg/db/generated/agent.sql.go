@@ -2949,7 +2949,7 @@ WHERE p.id = $1
       AND p.runtime_id = $8::uuid
       AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
       AND p.retired_session_id IS DISTINCT FROM p.session_id
-      AND COALESCE(a.runtime_id, p.runtime_id) = p.runtime_id
+      AND a.runtime_id = p.runtime_id
   ))
   AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
 ON CONFLICT (issue_id, agent_id, (COALESCE(comment_thread_id, '00000000-0000-0000-0000-000000000000'::uuid))) WHERE status IN ('queued', 'dispatched')

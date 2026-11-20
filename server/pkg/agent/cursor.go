@@ -432,6 +432,10 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			}
 		}
 
+		if opts.RequireCursorResume && finalStatus == "completed" && sessionID == "" {
+			finalStatus = "failed"
+			finalError = "Cursor recovery did not confirm the original session; earlier actions may have taken effect"
+		}
 		if finalError != "" {
 			finalError = sanitizeAgentDiagnostic(finalError)
 		}
@@ -494,8 +498,9 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			finalOutput = ""
 		}
 
-		// A launch failure emits no session event. Preserve only the session we
-		// actually requested, so the bounded recovery cannot become a cold run.
+		// Keep custody on the requested session, including when recovery fails.
+		// The initial pre-action failure also needs the requested session to
+		// schedule a same-session recovery because it emitted no session event.
 		if opts.RequireCursorResume || (finalStatus == "failed" && sessionID == "" && taskfailure.CursorPreActionNetworkError(finalError)) {
 			sessionID = opts.ResumeSessionID
 		}
