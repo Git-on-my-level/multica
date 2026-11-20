@@ -427,6 +427,8 @@ Les tâches utilisent des clés comme `MUL-123` ou des UUID complets ; les préf
 
 Pour les autres ressources, les commandes `list` affichent généralement des ID courts copiables et prennent en charge `--full-id` pour obtenir l'UUID complet. Lorsqu'un ID court est ambigu, le CLI demande davantage de caractères ou l'UUID complet. Les ID courts d'exécution exigent aussi `--issue` pour identifier la tâche à laquelle ils appartiennent.
 
+Avec `issue list --project` et `issue search --project`, utilisez un UUID, un préfixe d’UUID ou le titre exact du projet, en respectant la casse. Exemple : `multica issue list --project "Goal: Churn" --limit 1 --output json`. Le titre doit correspondre à un seul projet visible dans l’espace de travail sélectionné, y compris les projets archivés. La CLI refuse les valeurs vides et les titres inconnus, partiels ou en double. Une valeur au format UUID ou préfixe d’UUID est traitée comme un identifiant.
+
 De nombreuses commandes prennent en charge une sortie structurée :
 
 ```bash

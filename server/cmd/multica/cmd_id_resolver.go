@@ -366,13 +366,40 @@ func resolveAutopilotTriggerID(ctx context.Context, client *cli.APIClient, autop
 }
 
 func resolveProjectID(ctx context.Context, client *cli.APIClient, input string) (resolvedID, error) {
-	return resolveIDByPrefix(ctx, client, "project", input, fetchProjectCandidates)
+	if strings.TrimSpace(input) == "" {
+		return resolvedID{}, fmt.Errorf("project selector is required")
+	}
+	// Keep existing UUID and short-ID inputs authoritative, even if a
+	// project's title has the same spelling.
+	if _, err := normalizeUUIDPrefix(input); err == nil {
+		return resolveIDByPrefix(ctx, client, "project", input, fetchProjectCandidates)
+	}
+
+	candidates, err := fetchProjectCandidates(ctx, client)
+	if err != nil {
+		return resolvedID{}, fmt.Errorf("resolve project: %w", err)
+	}
+
+	var match resolvedID
+	for _, candidate := range candidates {
+		if candidate.ID == "" || candidate.Display != input {
+			continue
+		}
+		if match.ID != "" {
+			return resolvedID{}, fmt.Errorf("ambiguous project title %q; more than one visible project has this title. Pass the full project UUID", input)
+		}
+		match = resolvedID{ID: candidate.ID, Display: candidate.Display, Archived: candidate.Archived}
+	}
+	if match.ID == "" {
+		return resolvedID{}, fmt.Errorf("no visible project with exact title %q; check the selected workspace and title, or use the project UUID", input)
+	}
+	return match, nil
 }
 
 // resolveProjectIDForNewWork resolves --project on creates that file new work
 // into a project (issue create, autopilot create). Updates use
-// resolveProjectID: the server alone knows whether the project changes. A prefix that
-// only matches an archived project is refused here with the restore command,
+// resolveProjectID: the server alone knows whether the project changes. An
+// archived title or prefix match is refused here with the restore command,
 // instead of round-tripping to the server's 409 project_archived.
 func resolveProjectIDForNewWork(ctx context.Context, client *cli.APIClient, input string) (resolvedID, error) {
 	ref, err := resolveProjectID(ctx, client, input)
@@ -387,34 +414,42 @@ func resolveProjectIDForNewWork(ctx context.Context, client *cli.APIClient, inpu
 
 func fetchProjectCandidates(ctx context.Context, client *cli.APIClient) ([]idCandidate, error) {
 	if client.WorkspaceID == "" {
-		return nil, fmt.Errorf("workspace_id is required to resolve project id prefixes")
+		return nil, fmt.Errorf("workspace_id is required to resolve project selectors")
 	}
-	// Archived projects are candidates too, so get / restore / issue list
-	// --project still reach them; resolveIDByPrefix prefers live projects.
+	// The catalog is unpaginated by default. Honor a continuation if the
+	// server caps the response so title uniqueness covers the full catalog.
 	params := url.Values{"workspace_id": {client.WorkspaceID}, "include_archived": {"true"}}
-	var result map[string]any
-	if err := client.GetJSON(ctx, "/api/projects?"+params.Encode(), &result); err != nil {
-		return nil, err
-	}
-	projectsRaw, _ := result["projects"].([]any)
-	candidates := make([]idCandidate, 0, len(projectsRaw))
-	for _, raw := range projectsRaw {
-		p, ok := raw.(map[string]any)
-		if !ok {
-			continue
+	var candidates []idCandidate
+	for {
+		var page struct {
+			Projects []map[string]any `json:"projects"`
+			HasMore  bool             `json:"has_more"`
 		}
-		detail := strVal(p, "status")
-		if strVal(p, "archived_at") != "" {
-			detail += ", archived"
+		if err := client.GetJSON(ctx, "/api/projects?"+params.Encode(), &page); err != nil {
+			return nil, err
 		}
-		candidates = append(candidates, idCandidate{
-			ID:       strVal(p, "id"),
-			Display:  strVal(p, "title"),
-			Detail:   detail,
-			Archived: strVal(p, "archived_at") != "",
-		})
+
+		for _, p := range page.Projects {
+			archived := strVal(p, "archived_at") != ""
+			detail := strVal(p, "status")
+			if archived {
+				detail += ", archived"
+			}
+			candidates = append(candidates, idCandidate{
+				ID:       strVal(p, "id"),
+				Display:  strVal(p, "title"),
+				Detail:   detail,
+				Archived: archived,
+			})
+		}
+		if !page.HasMore {
+			return candidates, nil
+		}
+		if len(page.Projects) == 0 {
+			return nil, fmt.Errorf("project catalog returned an empty page with more results")
+		}
+		params.Set("offset", strconv.Itoa(len(candidates)))
 	}
-	return candidates, nil
 }
 
 func resolveProjectResourceID(ctx context.Context, client *cli.APIClient, projectID, input string) (resolvedID, error) {

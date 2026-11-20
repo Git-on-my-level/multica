@@ -114,6 +114,18 @@ run in place. Saving `worktree` is refused (HTTP 422, code
 advertise the capability — the fix is updating the Multica app there, then
 retrying. Pass an empty value to clear it back to the default.
 
+## Filter an issue queue by project
+
+```bash
+multica issue list --project "Goal: Churn" --limit 1 --output json
+```
+
+Use a full UUID, UUID prefix, or exact, case-sensitive project title. The
+title must match one visible project in the selected workspace, including
+archived projects. Blank, unknown, partial, and duplicate titles fail.
+Selectors with UUID or UUID-prefix syntax are treated as IDs. Use a full
+UUID to select a project with a duplicate title.
+
 ## Archived projects
 
 Archiving is separate from status: a `completed` or `cancelled` project can be
