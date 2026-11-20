@@ -78,7 +78,9 @@ func applyMemberRescope(ctx context.Context, store memberRescopeStore, task db.A
 			OriginatorUserID: task.OriginatorUserID,
 		})
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return task, true, err
+			// An armed receipt is known. A broken authorization lookup
+			// cannot be treated as permission to consume or bypass it.
+			return task, false, err
 		}
 	}
 

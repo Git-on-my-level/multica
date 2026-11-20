@@ -161,6 +161,15 @@ func TestMemberRescopeOneShotAndRearm(t *testing.T) {
 	}
 }
 
+func TestMemberRescopeUnreadableAuthorizationCannotClearKnownHold(t *testing.T) {
+	f := newRescopeFixture()
+	f.triggerErr = errors.New("synthetic directive read error")
+	_, readFailed, err := applyMemberRescope(t.Context(), f, f.task)
+	if !errors.Is(err, f.triggerErr) || readFailed || f.admitted != 0 || f.cancelled != 0 {
+		t.Fatalf("known hold did not reject unreadable authorization: %v", err)
+	}
+}
+
 type rescopeSavepointFixture struct {
 	pgx.Tx
 	readErr    error
