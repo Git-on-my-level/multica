@@ -176,6 +176,8 @@ var (
 		"qoder":         "qoder",
 		"qoderclicn":    "qoderclicn",
 		"qwen":          "qwen",
+		"droid":         "droid",
+		"amp":           "amp",
 		"traecli":       "traecli",
 		"zcode":         "zcode",
 		"other":         "other",

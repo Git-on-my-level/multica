@@ -175,6 +175,11 @@ type CLIConfig struct {
 	// intentionally local-only (it is never sent to the server) because the
 	// path is a property of this machine, not of the shared profile.
 	ProfileCommandOverrides map[string]string `json:"profile_command_overrides,omitempty"`
+
+	// AccountPools is the fork's per-machine subscription account pool
+	// configuration (account_pools_fork.go). Local-only, never sent to the
+	// server.
+	AccountPools *AccountPoolsConfig `json:"account_pools,omitempty"`
 }
 
 // BackendOverrides holds per-backend configuration overrides. Each field is

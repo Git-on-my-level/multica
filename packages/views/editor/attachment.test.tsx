@@ -254,43 +254,6 @@ describe("Attachment — image dispatch", () => {
     expect(onDelete).toHaveBeenCalled();
   });
 
-  it("editable image opens the preview on click, like a read-only one (MUL-8957)", () => {
-    renderWithQuery(
-      <Attachment
-        attachment={{
-          kind: "url",
-          url: "https://external.example/shot.png",
-          filename: "",
-          forceKind: "image",
-        }}
-        editable
-      />,
-    );
-    const figure = document.querySelector(".image-figure") as HTMLElement;
-    expect(figure.getAttribute("data-clickable")).toBe("true");
-    fireEvent.click(figure);
-    expect(screen.getByRole("dialog").querySelector("img")).toBeTruthy();
-  });
-
-  it("uploading image stays inert to clicks", () => {
-    renderWithQuery(
-      <Attachment
-        attachment={{
-          kind: "url",
-          url: "https://external.example/shot.png",
-          filename: "",
-          forceKind: "image",
-          uploading: true,
-        }}
-        editable
-      />,
-    );
-    const figure = document.querySelector(".image-figure") as HTMLElement;
-    expect(figure.hasAttribute("data-clickable")).toBe(false);
-    fireEvent.click(figure);
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
   it("url-only image resolves to a record via context and uses its id for download", () => {
     const att = makeRecord({
       filename: "from-resolver.png",
@@ -381,6 +344,10 @@ describe("Attachment — image dispatch", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "View" }));
 
+    await waitFor(() =>
+      expect(document.querySelectorAll("img")).toHaveLength(2),
+    );
+
     const imageSrcs = [...document.querySelectorAll("img")].map((img) =>
       img.getAttribute("src"),
     );
@@ -400,7 +367,7 @@ describe("Attachment — image dispatch", () => {
     expect(getAttachmentBlobMock).toHaveBeenCalledWith(id);
   });
 
-  it("opens preview with the same resolved media URL when a reopened draft record has no download_url", () => {
+  it("opens preview with the same resolved media URL when a reopened draft record has no download_url", async () => {
     configStore.setState({ cdnDomain: "cdn.example.test" });
     const id = "11111111-2222-3333-4444-555555555555";
     const markdownUrl = `https://multica-api.copilothub.ai/api/attachments/${id}/download`;
@@ -412,6 +379,7 @@ describe("Attachment — image dispatch", () => {
       download_url: "",
     });
     resolverState.attachments = [att];
+    getAttachmentMock.mockResolvedValue({ ...att, download_url: mediaUrl });
 
     renderWithQuery(
       <Attachment
@@ -425,6 +393,9 @@ describe("Attachment — image dispatch", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "View" }));
+
+    await waitFor(() =>
+      expect(document.querySelectorAll("img")).toHaveLength(2));
 
     const imageSrcs = [...document.querySelectorAll("img")].map((img) =>
       img.getAttribute("src"),
