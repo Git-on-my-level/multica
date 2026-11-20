@@ -1002,7 +1002,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, fmt.Errorf("move orphaned worktree aside: %w", err)
 		}
 		c.logger.Warn("repo checkout: moved orphaned worktree aside",
-			"url", params.RepoURL,
+			"url", redact.URLUserinfo(params.RepoURL),
 			"path", worktreePath,
 			"reason", reason,
 			"moved_to", movedTo,
@@ -1014,7 +1014,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	// another repository's checkout must be refused before any of them runs.
 	if other := otherRepoCheckout(ctx, barePath, worktreePath); other != "" {
 		return nil, fmt.Errorf("%w: %s already holds %s, not %s; run the checkout from a different directory",
-			ErrCheckoutPathTaken, worktreePath, other, redact.Text(params.RepoURL))
+			ErrCheckoutPathTaken, worktreePath, other, redact.Text(redact.URLUserinfo(params.RepoURL)))
 	}
 
 	// Once a workdir has moved to isolated metadata, keep using that safer
@@ -1105,7 +1105,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	}
 
 	c.logger.Info("repo checkout: worktree created",
-		"url", params.RepoURL,
+		"url", redact.URLUserinfo(params.RepoURL),
 		"path", worktreePath,
 		"branch", actualBranch,
 		"base", baseRef,
@@ -1123,7 +1123,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 func (c *Cache) logCheckoutReady(msg, repoURL, baseRef string, result *WorktreeResult) {
 	if result.Kept != "" {
 		c.logger.Info("repo checkout: existing checkout kept",
-			"url", repoURL,
+			"url", redact.URLUserinfo(repoURL),
 			"path", result.Path,
 			"branch", result.BranchName,
 			"reason", result.Kept,
@@ -1133,7 +1133,7 @@ func (c *Cache) logCheckoutReady(msg, repoURL, baseRef string, result *WorktreeR
 		return
 	}
 	c.logger.Info(msg,
-		"url", repoURL,
+		"url", redact.URLUserinfo(repoURL),
 		"path", result.Path,
 		"branch", result.BranchName,
 		"base", baseRef,
@@ -1253,7 +1253,7 @@ func otherRepoCheckout(ctx context.Context, barePath, path string) string {
 	if isIsolatedCheckoutContext(ctx, path) {
 		origin, err := isolatedCheckoutOriginContext(ctx, path)
 		if err == nil && !isolatedOriginCachedAt(origin, barePath) {
-			return "a checkout of " + redact.Text(origin)
+			return "a checkout of " + redact.Text(redact.URLUserinfo(origin))
 		}
 	}
 	return ""

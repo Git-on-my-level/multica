@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ func TestRepoCheckoutEquivalentURLsUseRegisteredRepo(t *testing.T) {
 	const scpURL = "git@gitlab.example.com:group/project.git"
 	const httpURL = "http://gitlab.example.com/group/project.git"
 	const httpsURL = "https://gitlab.example.com/group/project.git"
+	const httpsUserinfoURL = "https://checkout-log-user:checkout-log-pass@gitlab.example.com/group/project.git"
 	const sshPortURL = "ssh://git@gitlab.example.com:22/group/project.git"
 	const httpsPortURL = "https://gitlab.example.com:443/group/project.git"
 	const wsID = "ws-checkout"
@@ -46,7 +48,7 @@ func TestRepoCheckoutEquivalentURLsUseRegisteredRepo(t *testing.T) {
 	releaseSHA := git("-C", source, "rev-parse", "HEAD")
 	git("-C", source, "checkout", "main")
 	mainSHA := git("-C", source, "rev-parse", "HEAD")
-	for _, raw := range []string{scpURL, httpURL, httpsURL, sshPortURL, httpsPortURL} {
+	for _, raw := range []string{scpURL, httpURL, httpsURL, sshPortURL, httpsPortURL, httpsUserinfoURL} {
 		git("config", "--file", config, "--add", "url."+source+".insteadOf", raw)
 	}
 
@@ -56,6 +58,7 @@ func TestRepoCheckoutEquivalentURLsUseRegisteredRepo(t *testing.T) {
 	}{
 		{name: "reported HTTP input", registered: scpURL, requested: httpURL},
 		{name: "HTTPS input", registered: scpURL, requested: httpsURL, cold: true},
+		{name: "registered HTTPS userinfo is omitted from logs", registered: httpsUserinfoURL, requested: httpsURL, cold: true},
 		{name: "project ref through HTTP alias", registered: scpURL, requested: httpURL, projectURL: scpURL},
 		{name: "explicit ref overrides project", registered: scpURL, requested: httpURL, projectURL: scpURL, explicitRef: "main"},
 		{name: "registered default port with cold cache", registered: sshPortURL, requested: httpsURL, cold: true},
@@ -65,7 +68,8 @@ func TestRepoCheckoutEquivalentURLsUseRegisteredRepo(t *testing.T) {
 		{name: "isolated checkout retains registered origin", registered: scpURL, requested: httpURL, projectURL: scpURL, isolated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cache := repocache.New(t.TempDir(), slog.Default())
+			var logs bytes.Buffer
+			cache := repocache.New(t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
 			workDir := t.TempDir()
 			d := newRepoCheckoutTestDaemon(t, wsID, tc.registered, workDir, cache)
 			t.Cleanup(d.waitBackgroundSyncs)
@@ -107,6 +111,13 @@ func TestRepoCheckoutEquivalentURLsUseRegisteredRepo(t *testing.T) {
 			}
 			if got := git("-C", result.Path, "config", "--get", "remote.origin.url"); got != tc.registered {
 				t.Errorf("checkout origin = %q, want registered URL %q", got, tc.registered)
+			}
+			if tc.registered == httpsUserinfoURL {
+				logText := logs.String()
+				if !strings.Contains(logText, "msg=\"repo checkout: worktree created\" url="+httpsURL) ||
+					strings.Contains(logText, "checkout-log-user") || strings.Contains(logText, "checkout-log-pass") {
+					t.Errorf("expected credential-free checkout logs, got %s", logText)
+				}
 			}
 			if !d.repoBarePathIsLive(cache.BarePath(wsID, tc.registered)) {
 				t.Error("registered cache must remain live for GC")
