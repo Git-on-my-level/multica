@@ -4489,6 +4489,7 @@ export const EMPTY_JOIN_SHARE_LINK_RESPONSE: {
 };
 
 export const WakeupConditionSchema = z.union([
+  z.object({ type: z.literal("merge_return"), value: z.object({ revision: z.number().int().positive(), runtime_id: z.string(), agent_id: z.string(), project_id: z.string(), pr: z.string(), head: z.string(), branch: z.string(), observed_at: z.string(), merger_id: z.string() }) }),
   z.object({ type: z.literal("issue_field"), field: z.literal("status"), value: z.string() }),
   z.object({ type: z.literal("issue_field"), field: z.literal("assignee"), assignee_type: z.enum(["member", "agent", "squad"]), assignee_id: z.string() }),
   z.object({ type: z.literal("issue_field"), field: z.literal("label"), label_id: z.string() }),

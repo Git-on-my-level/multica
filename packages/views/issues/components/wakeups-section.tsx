@@ -56,6 +56,7 @@ export function conditionIcon(condition?: WakeupCondition | null) {
     case "children_done":
       return ListChecks;
     case "pull_request":
+    case "merge_return":
       return GitPullRequest;
     case "other_issue":
       return Link2;

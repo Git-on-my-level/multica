@@ -215,6 +215,8 @@ export function useWakeupText() {
   // "waiting for it" for cards and the header.
   const conditionParts = (c: WakeupCondition) => {
     switch (c.type) {
+      case "merge_return":
+        return { key: "assignee" as const, values: { name: names.actor("agent", c.value.agent_id) } };
       case "issue_field":
         switch (c.field) {
           case "status":

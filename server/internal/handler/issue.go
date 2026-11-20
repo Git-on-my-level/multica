@@ -3812,8 +3812,9 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateIssueRequest struct {
-	ExpectedRevision *int64  `json:"expected_revision,omitempty"`
-	Title            *string `json:"title"`
+	MergeReturnCustody json.RawMessage `json:"merge_return_custody,omitempty"`
+	ExpectedRevision   *int64          `json:"expected_revision,omitempty"`
+	Title              *string         `json:"title"`
 	// TitleBase is the title adopted by the editor before producing Title. It
 	// protects title edits without coupling them to unrelated issue mutations.
 	TitleBase   *string `json:"title_base,omitempty"`
@@ -4080,6 +4081,24 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// Track which fields were explicitly present in JSON (even if null)
 	var rawFields map[string]json.RawMessage
 	json.Unmarshal(bodyBytes, &rawFields)
+	preparingReturn, _ := r.Context().Value(mergeReturnPreparationKey{}).(bool)
+	if preparingReturn != (len(req.MergeReturnCustody) > 0) {
+		writeError(w, http.StatusBadRequest, "merge-return custody requires the guarded preparation endpoint")
+		return
+	}
+	if preparingReturn {
+		allowed := map[string]bool{"merge_return_custody": true, "expected_revision": true, "status": true, "assignee_type": true, "assignee_id": true, "suppress_run": true}
+		for field := range rawFields {
+			if !allowed[field] {
+				writeError(w, http.StatusBadRequest, "merge return only changes status and original assignee")
+				return
+			}
+		}
+		if !req.SuppressRun || req.ExpectedRevision == nil {
+			writeError(w, http.StatusBadRequest, "merge return requires no-start and expected revision")
+			return
+		}
+	}
 
 	if prevIssue.TriageState.Valid {
 		if field := triageLockedField(rawFields); field != "" {
@@ -4341,7 +4360,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	writeCtx := withWakeupHandedTo(r.Context(), h.handedToAgent(r.Context(), prevIssue, params, handoff != nil))
 	var issue db.Issue
 	attachmentsChanged := false
-	if req.Description != nil || req.TitleBase != nil || req.DescriptionBase != nil || len(attachmentIDs) > 0 {
+	if preparingReturn {
+		issue, err = h.prepareMergeReturn(writeCtx, prevIssue.WorkspaceID, statusKeyForGuard, params, req.MergeReturnCustody)
+	} else if req.Description != nil || req.TitleBase != nil || req.DescriptionBase != nil || len(attachmentIDs) > 0 {
 		var lockedPrev db.Issue
 		issue, lockedPrev, attachmentsChanged, err = h.updateIssueAtomically(
 			writeCtx, prevIssue.WorkspaceID, params, rawFields, req.TitleBase, req.DescriptionBase, attachmentIDs, statusKeyForGuard, handoff != nil,
@@ -4353,6 +4374,10 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		issue, err = h.updateIssueWithStatusGuard(writeCtx, prevIssue.WorkspaceID, statusKeyForGuard, params)
 	}
 	if err != nil {
+		if preparingReturn {
+			writeError(w, http.StatusConflict, "merge-return custody unreadable or changed; no ownership write: "+err.Error())
+			return
+		}
 		if writeIssueStatusRaceError(w, err) {
 			return
 		}
