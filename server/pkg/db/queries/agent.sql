@@ -801,6 +801,16 @@ FROM agent_task_queue
 WHERE parent_task_id = $1
   AND status <> 'cancelled';
 
+-- name: HasRuntimeOfflineRetryForParent :one
+-- A cancelled or completed recovery still consumes the one offline recovery.
+-- Call while holding LockRuntimeOfflineRetryParent.
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1);
+
+-- name: LockRuntimeOfflineRetryParent :exec
+-- Serialize deferred recovery creation without taking a task-row lock ahead
+-- of CreateRetryTask's workspace/owner fence (the teardown lock order).
+SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg('task_id')::uuid::text || ':runtime_offline_retry', 0));
+
 -- name: GetAgentTaskInWorkspace :one
 -- Loads a task only when its owning agent lives in the given workspace.
 -- agent_id is NOT NULL on every task row (and ON DELETE CASCADE, so the agent
