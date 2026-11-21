@@ -15,6 +15,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
 	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/pkg/redact"
 )
 
 // HealthResponse is returned by the daemon's local health endpoint.
@@ -537,15 +538,15 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 		registeredURL, err := d.ensureRepoReady(r.Context(), req.WorkspaceID, req.URL)
 		if err != nil {
 			if r.Context().Err() != nil {
-				d.logger.Debug("repo checkout readiness cancelled", "url", req.URL, "error", err)
+				d.logger.Debug("repo checkout readiness cancelled", "url", redact.URLUserinfo(req.URL), "error", redact.URLUserinfo(err.Error()))
 				return
 			}
 			statusCode := http.StatusInternalServerError
 			if errors.Is(err, ErrRepoNotConfigured) {
 				statusCode = http.StatusBadRequest
 			}
-			d.logger.Error("repo checkout readiness failed", "workspace_id", req.WorkspaceID, "url", req.URL, "error", err)
-			http.Error(w, err.Error(), statusCode)
+			d.logger.Error("repo checkout readiness failed", "workspace_id", req.WorkspaceID, "url", redact.URLUserinfo(req.URL), "error", redact.URLUserinfo(err.Error()))
+			http.Error(w, redact.URLUserinfo(err.Error()), statusCode)
 			return
 		}
 		req.URL = registeredURL
@@ -594,16 +595,16 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 				return
 			}
 			if r.Context().Err() != nil {
-				d.logger.Debug("repo checkout cancelled", "url", req.URL, "error", err)
+				d.logger.Debug("repo checkout cancelled", "url", redact.URLUserinfo(req.URL), "error", redact.URLUserinfo(err.Error()))
 				return
 			}
 			if errors.Is(err, repocache.ErrCheckoutPathTaken) {
-				d.logger.Warn("repo checkout rejected", "reason", "path_taken", "url", req.URL, "error", err)
-				http.Error(w, err.Error(), http.StatusConflict)
+				d.logger.Warn("repo checkout rejected", "reason", "path_taken", "url", redact.URLUserinfo(req.URL), "error", redact.URLUserinfo(err.Error()))
+				http.Error(w, redact.URLUserinfo(err.Error()), http.StatusConflict)
 				return
 			}
-			d.logger.Error("repo checkout failed", "url", req.URL, "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			d.logger.Error("repo checkout failed", "url", redact.URLUserinfo(req.URL), "error", redact.URLUserinfo(err.Error()))
+			http.Error(w, redact.URLUserinfo(err.Error()), http.StatusInternalServerError)
 			return
 		}
 

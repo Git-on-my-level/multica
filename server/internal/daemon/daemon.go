@@ -3739,7 +3739,7 @@ func (d *Daemon) syncWorkspaceReposContext(ctx context.Context, workspaceID stri
 		err = d.repoCache.Sync(workspaceID, repoDataToInfo(repos))
 	}
 	if err != nil {
-		d.logger.Warn("repo cache sync failed", "workspace_id", workspaceID, "error", err)
+		d.logger.Warn("repo cache sync failed", "workspace_id", workspaceID, "error", redact.URLUserinfo(err.Error()))
 	}
 	return err
 }
@@ -4231,34 +4231,35 @@ func (d *Daemon) ensureRepoReady(ctx context.Context, workspaceID, repoURL strin
 		return registeredURL, nil
 	}
 
-	resp, err := d.refreshWorkspaceRepos(ctx, workspaceID)
-	if err != nil {
-		return "", fmt.Errorf("refresh workspace repos: %w", err)
+	target := redact.URLUserinfo(repoURL)
+	if _, err := d.refreshWorkspaceRepos(ctx, workspaceID); err != nil {
+		return "", fmt.Errorf("refresh workspace repos for %s: %s", target, redact.URLUserinfo(err.Error()))
 	}
 
 	registeredURL = d.resolveWorkspaceRepoURL(workspaceID, repoURL)
 	if registeredURL == "" {
-		return "", ErrRepoNotConfigured
+		return "", fmt.Errorf("%w: %s", ErrRepoNotConfigured, target)
 	}
 
 	if d.repoCache.Lookup(workspaceID, registeredURL) != "" {
 		return registeredURL, nil
 	}
 
-	syncErr := d.syncWorkspaceReposContext(ctx, workspaceID, resp.Repos)
-	if err := ctx.Err(); err != nil {
+	// Checkout admission must not clone or fetch unrelated configured repos.
+	syncErr := d.syncWorkspaceReposContext(ctx, workspaceID, []RepoData{{URL: registeredURL}})
+	if ctx.Err() != nil {
 		return "", context.Cause(ctx)
 	}
 
-	if d.repoCache.Lookup(workspaceID, registeredURL) != "" {
+	cached := d.repoCache.Lookup(workspaceID, registeredURL) != ""
+	if syncErr != nil {
+		return "", fmt.Errorf("repo is configured but not synced: %s (target: %s)", redact.URLUserinfo(syncErr.Error()), target)
+	}
+	if cached {
 		return registeredURL, nil
 	}
 
-	if syncErr != nil {
-		return "", fmt.Errorf("repo is configured but not synced: %w", syncErr)
-	}
-
-	return "", fmt.Errorf("repo is configured but not synced")
+	return "", fmt.Errorf("repo is configured but not synced: %s", target)
 }
 
 // DefaultTokenRenewalInterval is how often the daemon asks the server to
