@@ -1585,6 +1585,7 @@ WHERE id = (
                 OR r.visibility = 'private'
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => $5::double precision)
       )
@@ -2932,37 +2933,52 @@ INSERT INTO agent_task_queue (
     channel_context_revision, handoff_note, workflow_step, id
 )
 SELECT
-    p.agent_id, COALESCE(a.runtime_id, p.runtime_id), p.issue_id, p.chat_session_id, p.autopilot_run_id,
-    CASE WHEN $2::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
+    COALESCE($2::uuid, p.agent_id),
+    COALESCE($3::uuid,
+             CASE WHEN NOT COALESCE($4::boolean, false) THEN a.runtime_id END,
+             p.runtime_id),
+    p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    CASE WHEN $5::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
     CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity'
-              OR COALESCE(a.runtime_id, p.runtime_id) IS DISTINCT FROM p.runtime_id THEN NULL
+              OR COALESCE($3::uuid,
+                          CASE WHEN NOT COALESCE($4::boolean, false) THEN a.runtime_id END,
+                          p.runtime_id) IS DISTINCT FROM p.runtime_id THEN NULL
          ELSE p.session_id END,
     p.work_dir,
-    p.attempt + 1, COALESCE($3::int, p.max_attempts), p.id,
-    p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity',
+    p.attempt + CASE WHEN COALESCE($4::boolean, false) THEN 0 ELSE 1 END,
+    COALESCE($6::int, p.max_attempts), p.id,
+    CASE WHEN COALESCE($4::boolean, false)
+         THEN p.force_fresh_session OR $2::uuid IS NOT NULL
+         ELSE p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' END,
     p.is_leader_task,
     p.squad_id,
     p.originator_user_id,
     p.accountable_user_id,
-    $4,
-    $5,
+    $7,
+    $8,
     p.originator_source, p.delegated_from_task_id, p.rule_version_id,
     p.trigger_evidence_kind, p.trigger_evidence_ref_id, p.id,
-    p.chat_input_task_id, $2,
+    p.chat_input_task_id, $5,
     p.channel_context_revision,
     -- Carried for a wakeup's prompt and a workflow handoff's brief (MUL-7420);
     -- rows from before workflow_step existed may hold a retired assignment note.
-    CASE WHEN p.context->>'wakeup_id' IS NOT NULL OR p.workflow_step IS NOT NULL THEN p.handoff_note END,
+    CASE WHEN COALESCE($4::boolean, false) OR p.context->>'wakeup_id' IS NOT NULL OR p.workflow_step IS NOT NULL THEN p.handoff_note END,
     -- A retry continues its parent's work, so it keeps the parent's step (MUL-7420).
     p.workflow_step,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
-    COALESCE($6::uuid, gen_random_uuid())
+    COALESCE($9::uuid, gen_random_uuid())
 FROM agent_task_queue p
 LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = $1
-  AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
+  AND lock_task_owner_rows(
+      COALESCE($2::uuid, p.agent_id),
+      p.issue_id,
+      COALESCE($3::uuid,
+               CASE WHEN NOT COALESCE($4::boolean, false) THEN a.runtime_id END,
+               p.runtime_id)
+  )
 ON CONFLICT (issue_id, agent_id, (COALESCE(comment_thread_id, '00000000-0000-0000-0000-000000000000'::uuid))) WHERE status IN ('queued', 'dispatched')
        OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
 DO NOTHING
@@ -2971,6 +2987,9 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 
 type CreateRetryTaskParams struct {
 	ID                   pgtype.UUID        `json:"id"`
+	TargetAgentID        pgtype.UUID        `json:"target_agent_id"`
+	TargetRuntimeID      pgtype.UUID        `json:"target_runtime_id"`
+	UnstartedHandoff     pgtype.Bool        `json:"unstarted_handoff"`
 	FireAt               pgtype.Timestamptz `json:"fire_at"`
 	MaxAttempts          pgtype.Int4        `json:"max_attempts"`
 	RuntimeMcpOverlay    []byte             `json:"runtime_mcp_overlay"`
@@ -2983,7 +3002,7 @@ type CreateRetryTaskParams struct {
 // Preserve a NULL chat_input_task_id for legacy/channel parents rather than
 // promoting untagged history to the task-owned input path.
 //
-// The retry is stamped with the agent's current runtime, as an enqueue is.
+// An ordinary retry is stamped with the agent's current runtime, as an enqueue is.
 // Claims fence on agent.runtime_id = task.runtime_id, so a retry stamped with a
 // runtime the agent moved off while the parent ran would be claimable by neither
 // daemon (#10717); UpdateAgent re-stamps only rows queued at switch time. An
@@ -3003,9 +3022,16 @@ type CreateRetryTaskParams struct {
 // Chat retry priority keeps older input ahead of newer turns. A non-NULL fire_at
 // defers dispatch until promotion. max_attempts optionally persists the effective
 // ceiling; it does not re-enable tasks whose retry budget was disabled.
+// unstarted_handoff is reserved for the atomic launcher-claim fence: no work
+// attempt was consumed. It can move the preserved input to an eligible peer,
+// or keep it deferred on the original health-gated runtime without losing it
+// to a newer pending task. All ordinary retry callers leave it NULL.
 func (q *Queries) CreateRetryTask(ctx context.Context, arg CreateRetryTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, createRetryTask,
 		arg.ID,
+		arg.TargetAgentID,
+		arg.TargetRuntimeID,
+		arg.UnstartedHandoff,
 		arg.FireAt,
 		arg.MaxAttempts,
 		arg.RuntimeMcpOverlay,
@@ -3453,20 +3479,28 @@ SET status = 'failed',
     session_rollout_missing = $4,
     retired_session_id = COALESCE($9, retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE agent_task_queue.id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+  AND ($10::timestamptz IS NULL OR (
+      status = 'dispatched' AND started_at IS NULL AND dispatched_at = $10
+      AND COALESCE(session_id, '') = '' AND COALESCE(work_dir, '') = ''
+      AND COALESCE(branch_name, '') = '' AND COALESCE(durable_work_dir, '') = ''
+      AND (result IS NULL OR result = '{}'::jsonb)
+      AND NOT EXISTS (SELECT 1 FROM task_message m WHERE m.task_id = agent_task_queue.id)
+  ))
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step
 `
 
 type FailAgentTaskParams struct {
-	ID                    pgtype.UUID `json:"id"`
-	Error                 pgtype.Text `json:"error"`
-	FailureReason         pgtype.Text `json:"failure_reason"`
-	SessionRolloutMissing bool        `json:"session_rollout_missing"`
-	SessionID             pgtype.Text `json:"session_id"`
-	WorkDir               pgtype.Text `json:"work_dir"`
-	DurableWorkDir        pgtype.Text `json:"durable_work_dir"`
-	BranchName            pgtype.Text `json:"branch_name"`
-	RetiredSessionID      pgtype.Text `json:"retired_session_id"`
+	ID                    pgtype.UUID        `json:"id"`
+	Error                 pgtype.Text        `json:"error"`
+	FailureReason         pgtype.Text        `json:"failure_reason"`
+	SessionRolloutMissing bool               `json:"session_rollout_missing"`
+	SessionID             pgtype.Text        `json:"session_id"`
+	WorkDir               pgtype.Text        `json:"work_dir"`
+	DurableWorkDir        pgtype.Text        `json:"durable_work_dir"`
+	BranchName            pgtype.Text        `json:"branch_name"`
+	RetiredSessionID      pgtype.Text        `json:"retired_session_id"`
+	LauncherClaimAt       pgtype.Timestamptz `json:"launcher_claim_at"`
 }
 
 // Marks a task as failed. session_id and work_dir are merged via COALESCE so
@@ -3495,6 +3529,7 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 		arg.DurableWorkDir,
 		arg.BranchName,
 		arg.RetiredSessionID,
+		arg.LauncherClaimAt,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(
@@ -7676,6 +7711,7 @@ WHERE t.runtime_id = ANY($1::uuid[])
     SELECT 1 FROM agent_runtime r
     WHERE r.id = t.runtime_id
       AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
       AND COALESCE(r.last_seen_at, r.updated_at) >=
           now() - make_interval(secs => $2::double precision)
   )
@@ -7808,6 +7844,7 @@ WITH due AS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
           AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
           AND COALESCE(r.last_seen_at, r.updated_at) >=
               now() - make_interval(secs => $2::double precision)
       )
@@ -7946,6 +7983,7 @@ WITH due AS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
           AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
           AND COALESCE(r.last_seen_at, r.updated_at) >=
               now() - make_interval(secs => $2::double precision)
       )
@@ -8208,6 +8246,7 @@ WHERE id = (
                 )
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => $4::double precision)
       )
@@ -8332,6 +8371,7 @@ WITH candidates AS MATERIALIZED (
                 )
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => $4::double precision)
       )

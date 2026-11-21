@@ -112,11 +112,28 @@ const TriageContextType = "triage"
 // a manual rerun's session from the named source task, which no query-level
 // exclusion can reach.
 func IsTriageTask(t db.AgentTaskQueue) bool {
+	triage, _ := taskTriageState(t)
+	return triage
+}
+
+// taskTriageState distinguishes an absent marker from a context that cannot
+// establish task provenance. Ordinary issue enqueues can store SQL NULL.
+func taskTriageState(t db.AgentTaskQueue) (triage, known bool) {
 	if len(t.Context) == 0 {
-		return false
+		return false, true
 	}
-	var payload struct {
-		Type string `json:"type"`
+	var payload *struct {
+		Type json.RawMessage `json:"type"`
 	}
-	return json.Unmarshal(t.Context, &payload) == nil && payload.Type == TriageContextType
+	if json.Unmarshal(t.Context, &payload) != nil || payload == nil {
+		return false, false
+	}
+	if len(payload.Type) == 0 {
+		return false, true
+	}
+	var taskType *string
+	if json.Unmarshal(payload.Type, &taskType) != nil || taskType == nil {
+		return false, false
+	}
+	return *taskType == TriageContextType, true
 }

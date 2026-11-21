@@ -5332,6 +5332,10 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 // CompleteTaskWithTransition. The bool is false for an idempotent replay that
 // observed an already-terminal row.
 func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, error) {
+	return s.failTaskWithTransition(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, nil, pgtype.Timestamptz{})
+}
+
+func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, launcherClaim *protocol.LauncherClaim, launcherClaimAt pgtype.Timestamptz) (*db.AgentTaskQueue, bool, error) {
 	// Strip bytes PostgreSQL cannot store before anything else reads errMsg, so
 	// the classifier, the transaction and every downstream consumer see the one
 	// text we will actually persist (GH #7098). Kept at the service boundary
@@ -5367,6 +5371,8 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 	// here — before the transaction — and only for retryable failures, so the
 	// common agent_error path skips this work entirely.
 	var (
+		launcherPeer     *db.Agent
+		peerOverlay      runtimeMCPOverlayData
 		wantRetry        bool
 		retryOverlay     runtimeMCPOverlayData
 		retryFireAt      pgtype.Timestamptz
@@ -5385,8 +5391,13 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			if retiredSessionID != "" {
 				parent.RetiredSessionID = pgtype.Text{String: retiredSessionID, Valid: true}
 			}
-			if retryEligible(failureReason, parent) && (failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg)) {
-				wantRetry = true
+			ordinaryRetry := retryEligible(failureReason, parent) &&
+				(failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg))
+			wantRetry = ordinaryRetry
+			if launcherClaim != nil {
+				wantRetry = launcherRecoveryEligible(parent, ordinaryRetry)
+			}
+			if wantRetry {
 				// Persist the reason-aware effective budget into the child so the
 				// retry chain self-describes (e.g. provider_network → max_attempts=3),
 				// rather than leaking a contradictory attempt=N/max_attempts=2 row.
@@ -5405,6 +5416,12 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 						"agent_id", util.UUIDToString(parent.AgentID), "error", aerr)
 				} else {
 					retryOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
+				}
+			}
+			if launcherClaim != nil {
+				launcherPeer, _ = s.launcherPeer(ctx, s.Queries, parent, *launcherClaim, pgtype.UUID{})
+				if launcherPeer != nil {
+					peerOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, *launcherPeer)
 				}
 			}
 		}
@@ -5432,12 +5449,13 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			}
 		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
-			ID:             taskID,
-			Error:          pgtype.Text{String: errMsg, Valid: true},
-			FailureReason:  pgtype.Text{String: failureReason, Valid: failureReason != ""},
-			SessionID:      pgtype.Text{String: sessionID, Valid: sessionID != ""},
-			WorkDir:        pgtype.Text{String: workDir, Valid: workDir != ""},
-			DurableWorkDir: pgtype.Text{String: durableWorkDir, Valid: durableWorkDir != ""},
+			LauncherClaimAt: launcherClaimAt,
+			ID:              taskID,
+			Error:           pgtype.Text{String: errMsg, Valid: true},
+			FailureReason:   pgtype.Text{String: failureReason, Valid: failureReason != ""},
+			SessionID:       pgtype.Text{String: sessionID, Valid: sessionID != ""},
+			WorkDir:         pgtype.Text{String: workDir, Valid: workDir != ""},
+			DurableWorkDir:  pgtype.Text{String: durableWorkDir, Valid: durableWorkDir != ""},
 			// A failed run can still have produced a branch: worktree mode
 			// commits whatever the agent left before tearing the worktree down,
 			// precisely so partial work survives. Dropping the name here would
@@ -5465,6 +5483,12 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		task = t
 		if err := recordMemberRescopeRefusal(ctx, qtx, task); err != nil {
 			return fmt.Errorf("arm member re-scope receipt: %w", err)
+		}
+		if launcherClaim != nil {
+			health, _ := json.Marshal(map[string]any{"code": "not_executable", "launcher_unavailable": true, "detail": protocol.LauncherUnavailableDetail})
+			if err := qtx.SetAgentRuntimeLauncherUnready(ctx, db.SetAgentRuntimeLauncherUnreadyParams{ID: t.RuntimeID, OfflineReason: health}); err != nil {
+				return err
+			}
 		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
@@ -5542,10 +5566,12 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// can never abort this transaction — which also carries the parent's
 		// failed status.
 		createRetry := wantRetry
-		if failureReason == string(taskfailure.ReasonRuntimeOffline) {
+		if createRetry && launcherClaim != nil {
+			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
+		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 			createRetry = createRetry && retryEligible(failureReason, t)
 		}
-		if createRetry {
+		if createRetry && launcherClaim == nil {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
 			if herr != nil {
 				return fmt.Errorf("check runnable successor: %w", herr)
@@ -5575,17 +5601,55 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			}
 		}
 		if createRetry {
+			var targetAgent, targetRuntime pgtype.UUID
+			var unstarted pgtype.Bool
+			chosenOverlay := retryOverlay
+			if launcherClaim != nil {
+				unstarted = pgtype.Bool{Bool: true, Valid: true}
+				if launcherPeer != nil {
+					var peer *db.Agent
+					_, err := qtx.LockAgentForTaskEnqueue(ctx, launcherPeer.ID)
+					if err == nil {
+						peer, err = s.launcherPeer(ctx, qtx, t, *launcherClaim, launcherPeer.ID)
+					}
+					if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+						return err
+					}
+					if peer != nil {
+						targetAgent = peer.ID
+						targetRuntime = peer.RuntimeID
+						retryFireAt = pgtype.Timestamptz{}
+						chosenOverlay = peerOverlay
+					}
+				}
+			}
+			params := db.CreateRetryTaskParams{
+				TargetAgentID: targetAgent, TargetRuntimeID: targetRuntime, UnstartedHandoff: unstarted,
+				NewTaskID:            dbid.NewV7(),
+				ID:                   taskID,
+				FireAt:               retryFireAt,
+				MaxAttempts:          retryMaxAttempts,
+				RuntimeMcpOverlay:    chosenOverlay.Overlay,
+				RuntimeConnectedApps: chosenOverlay.ConnectedApps,
+			}
 			var child db.AgentTaskQueue
-			_, cerr := qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
+			var cerr error
+			if !targetAgent.Valid {
+				_, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
+			}
 			if cerr == nil {
-				child, cerr = qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-					NewTaskID:            dbid.NewV7(),
-					ID:                   taskID,
-					FireAt:               retryFireAt,
-					MaxAttempts:          retryMaxAttempts,
-					RuntimeMcpOverlay:    retryOverlay.Overlay,
-					RuntimeConnectedApps: retryOverlay.ConnectedApps,
-				})
+				child, cerr = qtx.CreateRetryTask(ctx, params)
+			}
+			// A peer can acquire its pending slot after selection. Preserve the
+			// untouched outcome on the original health-gated route in that case.
+			if errors.Is(cerr, pgx.ErrNoRows) && launcherClaim != nil && targetAgent.Valid {
+				params.TargetAgentID, params.TargetRuntimeID = pgtype.UUID{}, pgtype.UUID{}
+				params.FireAt = pgtype.Timestamptz{Time: time.Now().Add(runtimeOfflineRetryDeferral), Valid: true}
+				params.RuntimeMcpOverlay = retryOverlay.Overlay
+				params.RuntimeConnectedApps = retryOverlay.ConnectedApps
+				if _, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID); cerr == nil {
+					child, cerr = qtx.CreateRetryTask(ctx, params)
+				}
 			}
 			switch {
 			case cerr == nil:

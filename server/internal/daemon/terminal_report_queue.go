@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 const (
@@ -43,19 +45,20 @@ const (
 // untouched and reported on every replay pass; downgrading must never delete a
 // payload merely because the older binary cannot decode it.
 type persistedTerminalTaskReport struct {
-	Version               int       `json:"version"`
-	CreatedAt             time.Time `json:"created_at"`
-	Kind                  string    `json:"kind"`
-	TaskID                string    `json:"task_id"`
-	Output                string    `json:"output,omitempty"`
-	BranchName            string    `json:"branch_name,omitempty"`
-	ErrorMessage          string    `json:"error,omitempty"`
-	SessionID             string    `json:"session_id,omitempty"`
-	WorkDir               string    `json:"work_dir,omitempty"`
-	DurableWorkDir        string    `json:"durable_work_dir,omitempty"`
-	FailureReason         string    `json:"failure_reason,omitempty"`
-	SessionRolloutMissing bool      `json:"session_rollout_missing,omitempty"`
-	RetiredSessionID      string    `json:"retired_session_id,omitempty"`
+	LauncherClaim         *protocol.LauncherClaim `json:"launcher_claim,omitempty"`
+	Version               int                     `json:"version"`
+	CreatedAt             time.Time               `json:"created_at"`
+	Kind                  string                  `json:"kind"`
+	TaskID                string                  `json:"task_id"`
+	Output                string                  `json:"output,omitempty"`
+	BranchName            string                  `json:"branch_name,omitempty"`
+	ErrorMessage          string                  `json:"error,omitempty"`
+	SessionID             string                  `json:"session_id,omitempty"`
+	WorkDir               string                  `json:"work_dir,omitempty"`
+	DurableWorkDir        string                  `json:"durable_work_dir,omitempty"`
+	FailureReason         string                  `json:"failure_reason,omitempty"`
+	SessionRolloutMissing bool                    `json:"session_rollout_missing,omitempty"`
+	RetiredSessionID      string                  `json:"retired_session_id,omitempty"`
 
 	PermanentRejectionCount   int        `json:"permanent_rejection_count,omitempty"`
 	FirstPermanentRejectionAt *time.Time `json:"first_permanent_rejection_at,omitempty"`
@@ -133,6 +136,7 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		return persistedTerminalTaskReport{}, err
 	}
 	return persistedTerminalTaskReport{
+		LauncherClaim:         report.launcherClaim,
 		Version:               terminalReportRecordVersion,
 		CreatedAt:             createdAt.UTC(),
 		Kind:                  kind,
@@ -166,6 +170,7 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		return terminalTaskReport{}, fmt.Errorf("unsupported terminal report kind %q", record.Kind)
 	}
 	return terminalTaskReport{
+		launcherClaim:         record.LauncherClaim,
 		kind:                  kind,
 		taskID:                record.TaskID,
 		output:                record.Output,

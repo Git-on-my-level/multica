@@ -266,6 +266,7 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
+	launcherClaim  *protocol.LauncherClaim
 	kind           terminalTaskReportKind
 	taskID         string
 	output         string
@@ -601,7 +602,9 @@ type Daemon struct {
 	// healGroup coalesces concurrent self-heal re-resolutions per provider so a
 	// just-upgraded agent seen by many queued tasks at once pays for a single
 	// login-shell probe + version detection instead of one per task (MUL-4486).
-	healGroup singleflight.Group
+	healGroup          singleflight.Group
+	launcherProbeGroup singleflight.Group
+	launcherActive     map[string]int // guarded by mu; tasks past the pre-input fence
 
 	wsHBMu        sync.RWMutex         // guards wsHBLastAck and wsLastReceive
 	wsHBLastAck   map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
@@ -785,9 +788,10 @@ type Daemon struct {
 }
 
 type profileLaunchSpec struct {
-	path      string
-	version   string
-	fixedArgs []string
+	workspaceID string
+	path        string
+	version     string
+	fixedArgs   []string
 }
 
 // New creates a new Daemon instance.
@@ -1768,9 +1772,10 @@ func (r *revivedRuntimes) add(d *Daemon, runtimeID, provider string) {
 // re-attach it. Without that the server ends up "offline, no reason", which
 // downgrades the refusal back to "wait for the machine" (MUL-6164).
 type demotionRecord struct {
-	evidence string
-	offline  *RuntimeOfflineReason
-	seq      uint64
+	launcherUnavailable bool
+	evidence            string
+	offline             *RuntimeOfflineReason
+	seq                 uint64
 }
 
 // setLifecycleCtx records the context Run was handed.
@@ -1806,9 +1811,10 @@ func (d *Daemon) markProvidersDemotedLocked(providers map[string]runtimeVerdict)
 	d.demotionSeq++
 	for provider, verdict := range providers {
 		d.demotedProviders[provider] = demotionRecord{
-			evidence: verdict.reason,
-			offline:  verdict.offline,
-			seq:      d.demotionSeq,
+			launcherUnavailable: verdict.launcherUnavailable,
+			evidence:            verdict.reason,
+			offline:             verdict.offline,
+			seq:                 d.demotionSeq,
 		}
 	}
 }
@@ -1912,6 +1918,9 @@ func (d *Daemon) clearProviderDemotions(providers []string, sampledAfter uint64)
 			continue
 		}
 		delete(d.demotedProviders, provider)
+		if record.launcherUnavailable && !strings.HasPrefix(provider, "profile:") {
+			d.kickAgentDiscovery()
+		}
 		d.logger.Info("agent CLI is usable again",
 			"provider", provider, "previous_verdict", record.evidence)
 	}
@@ -2311,6 +2320,24 @@ func (d *Daemon) allRuntimeIDs() []string {
 	return ids
 }
 
+// Heartbeats and wakeups must continue covering held runtimes until their
+// active tasks settle. Only claims exclude a held provider.
+func (d *Daemon) claimableRuntimeIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var ids []string
+	for _, ws := range d.workspaces {
+		for _, id := range ws.runtimeIDs {
+			rt := d.runtimeIndex[id]
+			if d.runtimeDemotedLocked(rt) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // findRuntime looks up a Runtime by its ID.
 func (d *Daemon) findRuntime(id string) *Runtime {
 	d.mu.Lock()
@@ -2325,7 +2352,7 @@ func (d *Daemon) findRuntime(id string) *Runtime {
 // args resolved for a custom runtime profile. Called from
 // registerRuntimesForWorkspace. Lazily initializes the map so test fixtures
 // that build a Daemon literal without seeding every map don't panic.
-func (d *Daemon) recordProfileLaunch(profileID, path, version string, fixedArgs []string) {
+func (d *Daemon) recordProfileLaunch(workspaceID, profileID, path, version string, fixedArgs []string) {
 	if profileID == "" || path == "" {
 		return
 	}
@@ -2335,9 +2362,10 @@ func (d *Daemon) recordProfileLaunch(profileID, path, version string, fixedArgs 
 		d.profileLaunchSpecs = make(map[string]profileLaunchSpec)
 	}
 	d.profileLaunchSpecs[profileID] = profileLaunchSpec{
-		path:      path,
-		version:   version,
-		fixedArgs: append([]string(nil), fixedArgs...),
+		workspaceID: workspaceID,
+		path:        path,
+		version:     version,
+		fixedArgs:   append([]string(nil), fixedArgs...),
 	}
 }
 
@@ -2429,6 +2457,8 @@ type builtinProbeVerdict int
 const (
 	builtinProbeOK builtinProbeVerdict = iota
 	builtinProbeUnavailable
+	// A task-free --version invocation could not start its launcher chain.
+	builtinProbeLauncherUnavailable
 	builtinProbeBelowMinimum
 	// builtinProbeProtocolSkew: the backend and its remote counterpart
 	// (e.g. the museapp receptionist) speak different protocol versions.
@@ -2489,15 +2519,8 @@ func demotableBuiltinProbeVerdict(verdict builtinProbeVerdict) bool {
 // builtinProbeNeedsConfirmation reports whether a demotable verdict must
 // reproduce across two probe rounds (confirmCondemned) before it is acted on.
 //
-// Only builtinProbeBelowMinimum does not: it is a pure function of a version
-// string this round already parsed, so a second look reaches the same
-// conclusion. The other demotable verdicts describe deterministic states but
-// rest on an observation that is not — an installer overwriting the bin entry in
-// place (the very repair we tell users to run), a DSH upgrade moving the
-// profile under a probe, or a museapp receptionist mid-upgrade answering one
-// /v1/health with another protocol version. Requiring a second sighting a
-// window later makes those windows impossible to mistake for a verdict, and
-// costs a genuinely broken provider one extra round.
+// Below-minimum is a pure function of a parsed version. Other scheduled
+// verdicts require confirmation because they can be observed during an install.
 func builtinProbeNeedsConfirmation(verdict builtinProbeVerdict) bool {
 	return verdict != builtinProbeBelowMinimum
 }
@@ -2542,8 +2565,9 @@ const dshProbeFailedReason = "the DSH runtime profile probe returned no usable a
 // that a reason code is decided at its source and never reverse-engineered from
 // a human-readable string, and this is that source.
 type runtimeVerdict struct {
-	reason  string
-	offline *RuntimeOfflineReason
+	launcherUnavailable bool
+	reason              string
+	offline             *RuntimeOfflineReason
 }
 
 // newRuntimeVerdict pairs a probe verdict with what the server needs to know
@@ -2559,6 +2583,10 @@ type runtimeVerdict struct {
 func newRuntimeVerdict(probe builtinProbeResult, execPath string, installing bool) runtimeVerdict {
 	verdict, reason := probe.verdict, probe.reason
 	switch verdict {
+	case builtinProbeLauncherUnavailable:
+		return runtimeVerdict{launcherUnavailable: true, reason: reason, offline: &RuntimeOfflineReason{
+			Code: RuntimeOfflineCodeNotExecutable, Detail: reason, LauncherUnavailable: true,
+		}}
 	case builtinProbeNotExecutable:
 		offline := &RuntimeOfflineReason{Code: RuntimeOfflineCodeNotExecutable, Detail: reason}
 		if repair, ok := agent.ExecFormatRepairFor(execPath); ok {
@@ -3191,7 +3219,11 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// later transition (zero → first profile added).
 		return profileSetSignature(nil)
 	}
-	for _, profile := range resp.RuntimeProfiles {
+	return d.appendProfileRuntimeEntries(ctx, workspaceID, resp.RuntimeProfiles, runtimes, failedProfiles)
+}
+
+func (d *Daemon) appendProfileRuntimeEntries(ctx context.Context, workspaceID string, profiles []RuntimeProfile, runtimes *[]map[string]string, failedProfiles *[]map[string]string) string {
+	for _, profile := range profiles {
 		runtimeType := agent.ProfileRuntimeType(profile.RuntimeType, profile.ProtocolFamily)
 		if profile.CommandName == "" || profile.ProtocolFamily == "" {
 			d.logger.Warn("skip custom runtime profile: missing command_name or protocol_family",
@@ -3271,8 +3303,53 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// --version` is Claude Code's version, `ccms --version` is the
 		// wrapper's, and only the former means anything to the min-version
 		// gate (GH #7046).
-		version, verErr := detectAgentVersion(ctx, agent.NewCommand(resolved,
-			agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger)).ForVersionProbe(runtimeType))
+		d.mu.Lock()
+		previousVersion := d.profileLaunchSpecs[profile.ID].version
+		d.mu.Unlock()
+		d.recordProfileLaunch(workspaceID, profile.ID, resolved, previousVersion, profile.FixedArgs)
+		appendHeldProfile := func() {
+			d.mu.Lock()
+			busy := d.launcherActive["profile:"+profile.ID] != 0
+			d.mu.Unlock()
+			if busy {
+				// Preserve running siblings; the local hold prevents new launches.
+				name := profile.DisplayName
+				if d.cfg.DeviceName != "" {
+					name = fmt.Sprintf("%s (%s)", name, d.cfg.DeviceName)
+				}
+				*runtimes = append(*runtimes, map[string]string{"name": name, "type": runtimeType, "profile_id": profile.ID, "version": previousVersion, "status": "online", "failure_code": protocol.LauncherUnavailableCode})
+				return
+			}
+			*failedProfiles = append(*failedProfiles, map[string]string{
+				"profile_id": profile.ID, "failure_code": protocol.LauncherUnavailableCode,
+				"reason": launcherUnavailableDetail,
+			})
+		}
+		sampledAfter := d.demotionSeqSnapshot()
+		command := agent.NewCommand(resolved, agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger)).ForVersionProbe(runtimeType)
+		var version string
+		var verErr error
+		if runtimeType == "opencode" {
+			version, verErr = d.probeOpenCodeLauncherCommand(ctx, command)
+		} else {
+			version, verErr = detectAgentVersion(ctx, command)
+		}
+		key := "profile:" + profile.ID
+		if runtimeType == "opencode" && errors.Is(verErr, errLauncherUnavailable) {
+			d.holdLauncher(key)
+			appendHeldProfile()
+			continue
+		}
+		if verErr == nil && runtimeType == "opencode" {
+			d.clearProviderDemotions([]string{key}, sampledAfter)
+		}
+		d.mu.Lock()
+		held := d.providerDemotedLocked(key)
+		d.mu.Unlock()
+		if held {
+			appendHeldProfile()
+			continue
+		}
 		if verErr != nil {
 			d.logger.Debug("custom runtime profile: version probe failed (registering with empty version)",
 				"workspace_id", workspaceID, "profile_id", profile.ID, "path", resolved, "error", verErr)
@@ -3282,7 +3359,7 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		if d.cfg.DeviceName != "" {
 			displayName = fmt.Sprintf("%s (%s)", displayName, d.cfg.DeviceName)
 		}
-		d.recordProfileLaunch(profile.ID, resolved, version, profile.FixedArgs)
+		d.recordProfileLaunch(workspaceID, profile.ID, resolved, version, profile.FixedArgs)
 		d.logger.Info("registering custom runtime profile",
 			"workspace_id", workspaceID, "profile_id", profile.ID,
 			"protocol_family", profile.ProtocolFamily, "command_path", resolved)
@@ -3294,7 +3371,7 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 			"profile_id": profile.ID,
 		})
 	}
-	return profileSetSignature(resp.RuntimeProfiles)
+	return profileSetSignature(profiles)
 }
 
 // profileSetSignature is a stable content hash of the workspace's custom
@@ -5582,7 +5659,7 @@ func (d *Daemon) pollLoop(ctx context.Context, taskWakeups <-chan taskWakeup) er
 			d.waitForTaskCleanup(&taskWG, 30*time.Second)
 			return ctx.Err()
 		case <-runtimeSetCh:
-			// The batch poller re-derives allRuntimeIDs() each cycle; nudge it to
+			// The batch poller re-derives claimableRuntimeIDs() each cycle; nudge it to
 			// pick up a registered/removed runtime promptly.
 			nudge()
 		case wk := <-taskWakeups:
@@ -5618,8 +5695,9 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		if pollerCtx.Err() != nil {
 			return
 		}
+		d.demoteHeldLaunchers(pollerCtx)
 
-		runtimeIDs := d.allRuntimeIDs()
+		runtimeIDs := d.claimableRuntimeIDs()
 		if len(runtimeIDs) == 0 {
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return
@@ -6062,6 +6140,33 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
 	d.mu.Unlock()
+	if tracked {
+		// Probe before preparation, StartTask or passing task input to a backend.
+		d.checkLauncherHealth(ctx, rt)
+	}
+	d.mu.Lock()
+	rt, tracked = d.runtimeIndex[task.RuntimeID]
+	launcherFailed := tracked && d.demotedProviders[launcherKey(rt)].launcherUnavailable
+	if tracked && d.runtimeDemotedLocked(rt) {
+		tracked = false
+	}
+	if tracked {
+		if d.launcherActive == nil {
+			d.launcherActive = make(map[string]int)
+		}
+		d.launcherActive[launcherKey(rt)]++
+	}
+	d.mu.Unlock()
+	if tracked {
+		defer func() {
+			d.mu.Lock()
+			d.launcherActive[launcherKey(rt)]--
+			if d.launcherActive[launcherKey(rt)] == 0 {
+				delete(d.launcherActive, launcherKey(rt))
+			}
+			d.mu.Unlock()
+		}()
+	}
 	// The runtime can go offline between the batch claim leaving with its ID and
 	// the claimed task arriving here — a below-minimum demotion or a drift
 	// convergence to zero both drop rows while a claim is in flight. Reporting it
@@ -6070,9 +6175,19 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 	// hundred lines later as `no agent configured for provider ""`, which reads
 	// like a misconfigured host and is not retried.
 	if !tracked {
+		var launcherClaim *protocol.LauncherClaim
+		if launcherFailed && task.DispatchedAt != "" {
+			launcherClaim = &protocol.LauncherClaim{DispatchedAt: task.DispatchedAt}
+			if task.Agent != nil {
+				launcherClaim.Model = task.Agent.Model
+				launcherClaim.ThinkingLevel = task.Agent.ThinkingLevel
+				launcherClaim.ServiceTier = task.Agent.ServiceTier
+			}
+		}
 		d.logger.Warn("claimed task targets a runtime this daemon no longer hosts; failing it back for retry",
 			"task", task.ID, "runtime_id", task.RuntimeID)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
+			launcherClaim: launcherClaim,
 			kind:          terminalTaskReportFail,
 			taskID:        task.ID,
 			errorMessage:  "runtime went offline before the run started",
@@ -6236,6 +6351,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
+		d.checkFailedLauncher(finalCtx, rt, taskRunFailureReason(err))
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
 		// result, especially the actual/preserved workdir and delivered branch.
@@ -6293,6 +6409,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 		result.Comment = "daemon shut down while task was in flight"
 	}
 
+	d.checkFailedLauncher(finalCtx, rt, result.FailureReason)
 	d.reportTaskResult(ctx, task.ID, result, taskLog)
 
 	// Write GC metadata after the task finishes so the periodic GC loop
@@ -6875,6 +6992,11 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	case terminalTaskReportComplete:
 		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	case terminalTaskReportFail:
+		if report.launcherClaim != nil {
+			return d.client.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", report.taskID), map[string]any{
+				"error": protocol.LauncherUnavailableDetail, "failure_reason": "runtime_offline", "launcher_claim": report.launcherClaim,
+			}, nil, schedule)
+		}
 		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
