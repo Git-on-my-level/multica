@@ -276,7 +276,8 @@ func (b *BatchedHeartbeatScheduler) flushOnce(ctx context.Context) {
 			preservedOffline++
 			continue
 		}
-		if _, err := b.queries.MarkAgentRuntimeOnline(ctx, state.ID); err != nil {
+		restored, err := b.queries.MarkAgentRuntimeOnline(ctx, state.ID)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				missing++
 				b.notifyRuntimeGone(state.ID)
@@ -285,6 +286,10 @@ func (b *BatchedHeartbeatScheduler) flushOnce(ctx context.Context) {
 			b.requeue([]pgtype.UUID{state.ID})
 			slog.Warn("heartbeat batch offline recovery failed",
 				"runtime_id", uuidToString(state.ID), "error", err)
+			continue
+		}
+		if restored.Status != "online" {
+			preservedOffline++
 			continue
 		}
 		recovered++

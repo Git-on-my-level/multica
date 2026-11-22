@@ -35,10 +35,11 @@ func (e *osExecNotFound) Error() string { return "exec: " + e.cmd + ": not found
 // TestClient_GetRuntimeProfiles_RequestShape asserts the daemon GETs the
 // documented path and parses the server's runtime_profiles payload.
 func TestClient_GetRuntimeProfiles_RequestShape(t *testing.T) {
-	var gotMethod, gotPath string
+	var gotMethod, gotPath, gotDaemon string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
+		gotDaemon = r.URL.Query().Get("daemon_id")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"workspace_id":"ws-1",
@@ -62,9 +63,12 @@ func TestClient_GetRuntimeProfiles_RequestShape(t *testing.T) {
 
 	c := NewClient(srv.URL)
 	c.SetToken("tok")
-	resp, err := c.GetRuntimeProfiles(context.Background(), "ws-1")
+	resp, err := c.GetRuntimeProfiles(context.Background(), "ws-1", "daemon-1")
 	if err != nil {
 		t.Fatalf("GetRuntimeProfiles: %v", err)
+	}
+	if gotDaemon != "daemon-1" {
+		t.Fatalf("daemon_id = %q", gotDaemon)
 	}
 	if gotMethod != http.MethodGet {
 		t.Errorf("method = %q, want GET", gotMethod)
@@ -91,10 +95,11 @@ func TestClient_GetRuntimeProfiles_RequestShape(t *testing.T) {
 // configurable set of runtime profiles and captures the runtimes array sent
 // to /api/daemon/register.
 type profileRegisterFixture struct {
-	daemon       *Daemon
-	server       *httptest.Server
-	sentRuntimes []map[string]any
-	sentFailures []map[string]any
+	registerStatus int
+	daemon         *Daemon
+	server         *httptest.Server
+	sentRuntimes   []map[string]any
+	sentFailures   []map[string]any
 }
 
 func newProfileRegisterFixture(t *testing.T, profiles []RuntimeProfile, profilesStatus int) *profileRegisterFixture {
@@ -103,6 +108,10 @@ func newProfileRegisterFixture(t *testing.T, profiles []RuntimeProfile, profiles
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/daemon/register":
+			if fx.registerStatus != 0 {
+				w.WriteHeader(fx.registerStatus)
+				return
+			}
 			var body struct {
 				Runtimes       []map[string]any `json:"runtimes"`
 				FailedProfiles []map[string]any `json:"failed_profiles"`

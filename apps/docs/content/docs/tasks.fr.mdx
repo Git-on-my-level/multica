@@ -42,7 +42,7 @@ Une exécution passe généralement par ces états :
 | `deferred` | Programmée pour plus tard ; entre dans la file d'attente à l'heure prévue |
 | `queued` | En attente de prise en charge par un runtime |
 | `dispatched` | Un runtime l'a prise en charge et démarre l'outil de codage IA |
-| `waiting_local_directory` | Le répertoire local cible est occupé par une autre exécution ; attente de la libération du verrou du répertoire |
+| `waiting_local_directory` | En attente du répertoire local cible ou d'un slot d'exécution du daemon avant le démarrage |
 | `running` | L'outil de codage IA est en cours d'exécution |
 | `completed` | L'exécution s'est terminée normalement |
 | `failed` | L'exécution a rencontré une erreur ou a été interrompue |
@@ -139,6 +139,8 @@ Le préfixe `agent_error.` est omis dans ce tableau.
 
 ## Relance manuelle
 
+La relance manuelle est indisponible après un refus de sécurité définitif de Codex sur une tâche. Pour demander un travail réellement différent, connectez-vous à Multica et publiez un nouveau commentaire sur la même tâche. Commencez la première ligne par `RESCOPE:` et décrivez le nouveau travail sur cette ligne. Utilisez la mention ou le routage habituel des commentaires pour joindre l’agent. La directive autorise une tentative dans une nouvelle session. Une modification de commentaire ou une publication avec un jeton d’accès ne peut pas fournir cette directive.
+
 Cliquer sur le bouton Relancer l'exécution d'une ligne du journal d'exécution invoque **l'agent qui a traité cette exécution à ce moment-là**. Même si la tâche a été réassignée depuis, la relance ne bascule pas vers le nouvel assigné.
 
 Une relance conserve autant que possible les fichiers que l'exécution précédente a déjà écrits dans le répertoire local. Si la session d'origine est toujours sûre et que le même runtime prend en charge la relance, celle-ci poursuit aussi la session précédente. Les erreurs qui corrompent la session, comme un dépassement de contexte ou des requêtes invalides, démarrent plutôt une nouvelle session dans le répertoire de travail d'origine. Lorsque le répertoire d'origine n'existe plus, un nouveau répertoire de travail est utilisé.
@@ -167,7 +169,7 @@ Les valeurs ci-dessous sont celles de la configuration par défaut du serveur.
 | `deferred` | Programmée pour plus tard | Passe à `queued` à l'heure prévue, puis les règles ci-dessous s'appliquent |
 | `queued` | En attente de prise en charge par un runtime | Attend tant que son runtime continue d'envoyer des signaux de vie, et dans tous les cas au moins un délai de grâce de reconnexion après la mise en file d'attente ; n'échoue que lorsque les deux fenêtres sont écoulées, et n'est pas relancée automatiquement |
 | `dispatched` | Prise en charge ; l'outil démarre | Considérée comme en échec après plus de **5 minutes** dans cet état |
-| `waiting_local_directory` | En attente de la libération du verrou du répertoire local | Pas de délai propre ; reprend le processus de démarrage une fois le répertoire libéré |
+| `waiting_local_directory` | En attente du répertoire local et de la capacité d'exécution | Pas de délai propre ; reprend le démarrage lorsque le répertoire et un slot d'exécution du daemon sont disponibles |
 | `running` | L'outil de codage IA est en cours d'exécution | Pas de durée maximale fixe ; la vivacité suit le signal de vie du runtime — un toutes les 15 secondes ; un runtime qui perd son signal de vie est marqué hors ligne au plus tard en 3 minutes environ. Ses exécutions n'échouent qu'une fois le signal de vie absent au-delà du délai de grâce de reconnexion (`MULTICA_RUNTIME_RECONNECT_GRACE`, 3 heures par défaut) ; un redémarrage du daemon les récupère directement |
 
 La relance automatique ne couvre que les défaillances transitoires ci-dessous, et ne s'applique qu'aux exécutions rattachées à une tâche ou à une discussion (hors mode **Exécution seule** des automatisations) :
@@ -181,7 +183,7 @@ La relance automatique ne couvre que les défaillances transitoires ci-dessous, 
 | Échec du téléchargement du bundle de skills | 2 par défaut (le processus de l'agent n'a pas encore démarré à ce stade ; les bundles déjà téléchargés proviennent du cache local) |
 | Interruption réseau de l'outil | Jusqu'à 3 ; la dernière tentative démarre après un délai d'environ 5 secondes |
 
-Tous les autres motifs d'échec (authentification, quota, configuration, modèle, etc.) ne sont jamais relancés automatiquement ; corrigez d'abord la cause, puis relancez manuellement.
+Pour les autres échecs, par exemple d’authentification, de quota, de configuration ou de modèle, corrigez la cause avant de relancer manuellement. Un refus de sécurité définitif de Codex sur une tâche exige le nouveau commentaire décrit ci-dessus.
 
 ## Étapes suivantes
 

@@ -36,7 +36,8 @@ const (
 // it: the wire reason code, and — when the daemon reported one — the command
 // that repairs the runtime.
 type AgentVerdict struct {
-	Availability AgentAvailability
+	LauncherUnavailable bool
+	Availability        AgentAvailability
 	// Reason is the dispatch code for a non-available verdict, empty otherwise.
 	Reason dispatch.ReasonCode
 	// Repair is the fix the daemon reported for an unusable runtime: the npm
@@ -70,9 +71,10 @@ type RuntimeRepair struct {
 // runtimeOfflineReason is the daemon's structured explanation, stored on the
 // runtime row's metadata by the deregister handler.
 type runtimeOfflineReason struct {
-	Code   string         `json:"code"`
-	Detail string         `json:"detail"`
-	Repair *RuntimeRepair `json:"repair"`
+	LauncherUnavailable bool           `json:"launcher_unavailable"`
+	Code                string         `json:"code"`
+	Detail              string         `json:"detail"`
+	Repair              *RuntimeRepair `json:"repair"`
 	// Installing: the daemon has an automatic install in flight, so this offline
 	// runtime is expected to come back on its own and work may queue.
 	Installing bool `json:"installing"`
@@ -161,6 +163,9 @@ func runtimeVerdict(rt db.AgentRuntime, agent db.Agent) AgentVerdict {
 			Detail:       "agent owner does not have access to the private runtime",
 		}
 	}
+	if reason, ok := parseRuntimeOfflineReason(rt.Metadata); ok && reason.Code == runtimeOfflineCodeNotExecutable && reason.LauncherUnavailable {
+		return AgentVerdict{Availability: AgentBlocked, Reason: dispatch.ReasonRuntimeUnusable, Detail: reason.Detail, LauncherUnavailable: true}
+	}
 	if rt.Status == "online" {
 		return AgentVerdict{Availability: AgentAvailable}
 	}
@@ -170,10 +175,11 @@ func runtimeVerdict(rt db.AgentRuntime, agent db.Agent) AgentVerdict {
 		switch {
 		case reason.Code == runtimeOfflineCodeNotExecutable:
 			return AgentVerdict{
-				Availability: AgentBlocked,
-				Reason:       dispatch.ReasonRuntimeUnusable,
-				Repair:       reason.Repair,
-				Detail:       reason.Detail,
+				LauncherUnavailable: reason.LauncherUnavailable,
+				Availability:        AgentBlocked,
+				Reason:              dispatch.ReasonRuntimeUnusable,
+				Repair:              reason.Repair,
+				Detail:              reason.Detail,
 			}
 		// A missing runtime profile is the same shape of finding — the machine
 		// is reachable and its CLI cannot serve work — but its own reason code,
@@ -276,6 +282,9 @@ func RuntimeUnusableNotice(agentName string, verdict AgentVerdict) string {
 	if verdict.Reason == dispatch.ReasonRuntimeProfileMissing {
 		return runtimeProfileMissingNotice(name)
 	}
+	if verdict.LauncherUnavailable {
+		return fmt.Sprintf("%s could not start: an OpenCode launcher health check exited 127, so this trigger was not queued. Repair the configured launcher on that machine and verify its version check succeeds using the profile's command and arguments. The daemon must observe a successful check before triggering the agent again.", name)
+	}
 	if verdict.Repair != nil && verdict.Repair.Command != "" {
 		return fmt.Sprintf(
 			"%s could not start: its CLI is installed but cannot be executed on that machine, so this trigger was not queued.\n\n"+
@@ -307,6 +316,7 @@ func runtimeProfileMissingNotice(name string) string {
 		"%s could not start: the DeepSeek Harness CLI is installed on that machine, but its `multica` runtime profile is missing or needs migration, so this trigger was not queued.\n\n"+
 			"Build a compatible `@multica-ai/dsh-runtime` bundle from [multica-ai/dsh-multica-runtime](https://github.com/multica-ai/dsh-multica-runtime#local-development), following its README's DSH version requirements. For a missing profile, install the built directory or tarball with `dsh plugin --profile multica add`, or set `MULTICA_DSH_PROFILE_BUNDLE` for the daemon to install it.\n\n"+
 			"For an existing bridge configuration, back up the profile and install the compatible bundle manually. In `dsh.profile.bundles`, replace `dsh-profile-multica` with `@multica-ai/dsh-runtime`; if both are listed, remove `dsh-profile-multica`. If the first-party runtime is only in `dependencies`, add it to `dsh.profile.bundles`. `MULTICA_DSH_PROFILE_BUNDLE` will not migrate an existing bridge configuration.\n\n"+
+			"If the profile probe names incompatible DSH core packages after an application upgrade, back up the profile manifest and review its profile-local core dependency overrides. Use core packages compatible with the installed application while retaining required independent plugins. Check the daemon's profile diagnostic for the package versions and manifest location, then rerun `dsh --profile multica --probe`.\n\n"+
 			"The runtime registers on its own within a couple of minutes after that; trigger the agent again then.",
 		name,
 	)

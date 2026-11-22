@@ -40,6 +40,15 @@ WHERE id = ANY(@ids::uuid[])
   AND workspace_id = @workspace_id
 ORDER BY created_at ASC, id ASC;
 
+-- name: ListCommentOriginsForIssue :many
+-- Author and time of the live comments in @ids, without their bodies: the
+-- issue attachment list labels each file with the comment that delivered it.
+SELECT id, author_type, author_id, created_at FROM comment
+WHERE id = ANY(@ids::uuid[])
+  AND issue_id = @issue_id
+  AND workspace_id = @workspace_id
+  AND deleted_at IS NULL;
+
 -- name: ListChildCommentsForParents :many
 -- Fetch one descendant level for a bounded set of parent comments. Each parent
 -- maps back to its thread root in the Go breadth-first walk, avoiding one query
@@ -519,6 +528,12 @@ WITH touched_issue AS (
     SELECT ti.id, ti.workspace_id, sqlc.arg(author_type), sqlc.arg(author_id), sqlc.arg(content), sqlc.arg(type), sqlc.narg(parent_id), sqlc.narg(source_task_id), sqlc.narg(quick_action_id), sqlc.narg(via_plugin_id), sqlc.narg(suppressed_agent_ids)::uuid[], COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING *
+), stamped_directive AS (
+    INSERT INTO member_rescope_directive (comment_id)
+    SELECT id FROM inserted_comment
+    WHERE COALESCE(sqlc.narg(member_rescope_directive)::boolean, false)
+      AND author_type = 'member' AND type = 'comment' AND source_task_id IS NULL
+      AND via_plugin_id IS NULL
 )
 SELECT inserted_comment.*, touched_issue.revision AS issue_revision
 FROM inserted_comment
@@ -605,6 +620,12 @@ WITH locked_issue AS MATERIALIZED (
               comment.resolved_by_type, comment.resolved_by_id, comment.source_task_id,
               comment.quick_action_id, comment.via_plugin_id, comment.revision,
               comment.deleted_at, target.did_change
+), revoked_directive AS (
+    -- An edited directive loses its original authorization, even if a later
+    -- edit restores the text. Resolution changes never reach this path.
+    DELETE FROM member_rescope_directive
+    USING updated_comment
+    WHERE comment_id = updated_comment.id AND updated_comment.did_change
 ), touched_issue AS (
     UPDATE issue
     SET revision = issue.revision + 1,
@@ -627,12 +648,20 @@ SELECT updated_comment.id, updated_comment.issue_id, updated_comment.author_type
 FROM updated_comment;
 
 -- name: BumpCommentRevision :one
-UPDATE comment
-SET revision = revision + 1,
-    updated_at = now()
-WHERE id = @id
-  AND workspace_id = @workspace_id
-RETURNING *;
+-- Used for attachment-only edits. Attachments can change the scope of a run.
+WITH updated_comment AS (
+    UPDATE comment
+    SET revision = revision + 1,
+        updated_at = now()
+    WHERE id = @id
+      AND workspace_id = @workspace_id
+    RETURNING *
+), revoked_directive AS (
+    DELETE FROM member_rescope_directive
+    USING updated_comment
+    WHERE comment_id = updated_comment.id
+)
+SELECT * FROM updated_comment;
 
 -- name: HasAgentCommentedSince :one
 SELECT EXISTS (
@@ -738,20 +767,30 @@ RETURNING *;
 -- Removes a comment that has no replies. The NOT EXISTS guard keeps this
 -- statement from ever reaching the legacy parent_id cascade: a comment with a
 -- reply is tombstoned instead, never deleted with its replies.
-DELETE FROM comment
-WHERE comment.id = @id AND comment.workspace_id = @workspace_id
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id;
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = @id AND comment.workspace_id = @workspace_id
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed;
 
 -- name: DeleteReplylessCommentTombstone :one
 -- Removes a tombstone whose last reply is gone. The delete transaction calls
 -- this for each ancestor in turn, so a chain of placeholders never outlives
 -- the replies it kept attached.
-DELETE FROM comment
-WHERE comment.id = @id AND comment.workspace_id = @workspace_id
-  AND comment.deleted_at IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id;
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = @id AND comment.workspace_id = @workspace_id
+      AND comment.deleted_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed;
 
 -- name: TouchIssueForCommentDelete :one
 -- A delete counts as activity on its issue, like CreateComment and
@@ -918,3 +957,33 @@ FROM comment c
 JOIN ancestor_ids path ON path.id = c.id
 ORDER BY c.id
 FOR UPDATE OF c;
+
+-- name: ListThreadMemberAuthors :many
+-- The members who wrote any other comment in the thread @comment_id belongs
+-- to: its root and every reply under that root, at any depth. Used by the
+-- bystander delivery tier, so a reply in a thread you took part in still
+-- reaches you on an issue you are only watching (MUL-9343).
+WITH RECURSIVE root_of AS (
+    SELECT c.id, c.parent_id
+    FROM comment c
+    WHERE c.id = @comment_id AND c.workspace_id = @workspace_id
+    UNION ALL
+    SELECT p.id, p.parent_id
+    FROM comment p
+    JOIN root_of r ON p.id = r.parent_id
+),
+thread AS (
+    SELECT c.id
+    FROM comment c
+    WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1)
+    UNION ALL
+    SELECT c.id
+    FROM comment c
+    JOIN thread t ON c.parent_id = t.id
+)
+SELECT DISTINCT c.author_id
+FROM comment c
+JOIN thread t ON t.id = c.id
+WHERE c.id <> @comment_id
+  AND c.author_type = 'member'
+  AND c.deleted_at IS NULL;
