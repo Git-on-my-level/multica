@@ -14,12 +14,6 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// Files to symlink from the shared ~/.codex/ into the per-task CODEX_HOME.
-// Symlinks share state (e.g. auth tokens) so changes propagate automatically.
-var codexSymlinkedFiles = []string{
-	"auth.json",
-}
-
 // Files to copy from the shared ~/.codex/ into the per-task CODEX_HOME.
 // Copies are isolated — task-local config and cache refreshes don't mutate
 // the shared home.
@@ -46,6 +40,7 @@ var codexModelsCacheConfigFiles = []string{
 // CodexHomeOptions carries optional inputs for prepareCodexHomeWithOpts that
 // affect the generated per-task config.toml.
 type CodexHomeOptions struct {
+	authPreparation *CodexAuthPreparation
 	// CodexVersion is the detected Codex CLI version (e.g. "0.121.0"). Empty
 	// means unknown; on macOS, unknown is treated as "probably broken" so the
 	// daemon falls back to danger-full-access for network access. See
@@ -213,20 +208,16 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		logger.Warn("execenv: codex-home sessions dir prepare failed", "error", err)
 	}
 
-	// Symlink shared files (auth).
-	for _, name := range codexSymlinkedFiles {
-		src := filepath.Join(sharedHome, name)
-		dst := filepath.Join(codexHome, name)
-		if err := ensureSymlink(src, dst); err != nil {
-			logger.Warn("execenv: codex-home symlink failed", "file", name, "error", err)
-		}
+	// The symlink lets changes to shared auth propagate into the task home.
+	sharedAuth := filepath.Join(sharedHome, "auth.json")
+	taskAuth := filepath.Join(codexHome, "auth.json")
+	linkErr := ensureSymlink(sharedAuth, taskAuth)
+	if linkErr != nil {
+		logger.Warn("execenv: codex auth link preparation failed")
 	}
-
-	// Surface the resulting auth.json state (file kind only, never contents)
-	// so operators diagnosing token-refresh failures can tell whether the
-	// per-task home is tracking the shared ~/.codex/auth.json or has drifted
-	// into a stale local copy.
-	logCodexAuthState(filepath.Join(codexHome, "auth.json"), logger)
+	if opts.authPreparation != nil {
+		*opts.authPreparation = observeCodexAuthPreparation(sharedAuth, taskAuth, linkErr != nil)
+	}
 
 	// Sync isolated files from the shared source. Track the config.toml sync
 	// outcome specifically: on Windows a failed sync makes the per-task config
@@ -1305,29 +1296,53 @@ func ensureSymlink(src, dst string) error {
 	return createFileLink(src, dst)
 }
 
-// logCodexAuthState records the kind of auth.json the per-task CODEX_HOME
-// ended up with — symlink (with target), regular file (with size + mtime),
-// or missing — so an operator chasing refresh_token_reused / token_expired
-// reports can immediately tell whether the per-task home is tracking the
-// shared ~/.codex/auth.json or has drifted into a stale local copy.
-//
-// Never logs the file contents.
-func logCodexAuthState(authPath string, logger *slog.Logger) {
-	fi, err := os.Lstat(authPath)
+// CodexAuthPreparation crosses the prep helper boundary without including
+// auth paths, link targets, file contents, or filesystem error text.
+type CodexAuthPreparation struct {
+	ObservedAt    time.Time
+	SharedFile    string
+	TaskFile      string
+	LinksToShared bool
+	LinkFailed    bool
+}
+
+func observeCodexAuthPreparation(sharedAuth, taskAuth string, linkFailed bool) CodexAuthPreparation {
+	observedAt := time.Now().UTC()
+	target, err := os.Readlink(taskAuth)
+	return CodexAuthPreparation{
+		ObservedAt:    observedAt,
+		SharedFile:    codexAuthFileState(sharedAuth),
+		TaskFile:      codexAuthFileState(taskAuth),
+		LinksToShared: err == nil && target == sharedAuth,
+		LinkFailed:    linkFailed,
+	}
+}
+
+func codexAuthFileState(path string) string {
+	fi, err := os.Lstat(path)
 	if err != nil {
-		logger.Info("execenv: codex auth.json absent", "path", authPath, "error", err)
-		return
+		if os.IsNotExist(err) {
+			return "absent"
+		}
+		return "unknown"
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		target, _ := os.Readlink(authPath)
-		logger.Info("execenv: codex auth.json is symlink", "path", authPath, "target", target)
-		return
+		target, err := os.Stat(path)
+		switch {
+		case os.IsNotExist(err):
+			return "dangling_symlink"
+		case err != nil:
+			return "symlink_unknown"
+		case target.Mode().IsRegular():
+			return "symlink_to_file"
+		default:
+			return "symlink_to_other"
+		}
 	}
-	logger.Info("execenv: codex auth.json is regular file",
-		"path", authPath,
-		"size", fi.Size(),
-		"mtime", fi.ModTime().UTC(),
-	)
+	if fi.Mode().IsRegular() {
+		return "regular_file"
+	}
+	return "other"
 }
 
 // (The daemon used to write a minimal inline config here; the authoritative
