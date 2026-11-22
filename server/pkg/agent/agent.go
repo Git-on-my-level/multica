@@ -353,15 +353,10 @@ type Result struct {
 	// requested session from future lookups. Backends must not set this together
 	// with ResumeRejected; the latter means the session is permanently unusable.
 	ResumeRejectedTransient bool
-	// codexInitializeRetrySafe is provider-internal evidence that an
-	// initialize timeout happened before semantic activity and after the
-	// process tree was reaped. It is intentionally not part of the public
-	// result contract.
-	codexInitializeRetrySafe bool
 	// codexStartupRefreshRetrySafe is provider-internal evidence that the
 	// first turn produced no semantic progress because Codex could not load
 	// its model catalog, and that the process tree was reaped afterwards.
-	// Like codexInitializeRetrySafe it is not part of the public contract.
+	// It is not part of the public contract.
 	codexStartupRefreshRetrySafe bool
 }
 

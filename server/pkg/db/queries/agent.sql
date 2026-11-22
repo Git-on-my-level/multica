@@ -535,7 +535,7 @@ WHERE id = $1 AND issue_id IS NULL
 -- Preserve a NULL chat_input_task_id for legacy/channel parents rather than
 -- promoting untagged history to the task-owned input path.
 --
--- The retry is stamped with the agent's current runtime, as an enqueue is.
+-- An ordinary retry is stamped with the agent's current runtime, as an enqueue is.
 -- Claims fence on agent.runtime_id = task.runtime_id, so a retry stamped with a
 -- runtime the agent moved off while the parent ran would be claimable by neither
 -- daemon (#10717); UpdateAgent re-stamps only rows queued at switch time. An
@@ -555,6 +555,10 @@ WHERE id = $1 AND issue_id IS NULL
 -- Chat retry priority keeps older input ahead of newer turns. A non-NULL fire_at
 -- defers dispatch until promotion. max_attempts optionally persists the effective
 -- ceiling; it does not re-enable tasks whose retry budget was disabled.
+-- unstarted_handoff is reserved for the atomic launcher-claim fence: no work
+-- attempt was consumed. It can move the preserved input to an eligible peer,
+-- or keep it deferred on the original health-gated runtime without losing it
+-- to a newer pending task. All ordinary retry callers leave it NULL.
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, chat_session_id, autopilot_run_id,
     status, priority, trigger_comment_id, coalesced_comment_ids, trigger_summary, context,
@@ -567,7 +571,11 @@ INSERT INTO agent_task_queue (
     channel_context_revision, handoff_note, workflow_step, id
 )
 SELECT
-    p.agent_id, COALESCE(a.runtime_id, p.runtime_id), p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    COALESCE(sqlc.narg(target_agent_id)::uuid, p.agent_id),
+    COALESCE(sqlc.narg(target_runtime_id)::uuid,
+             CASE WHEN NOT COALESCE(sqlc.narg(unstarted_handoff)::boolean, false) THEN a.runtime_id END,
+             p.runtime_id),
+    p.issue_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN sqlc.narg(fire_at)::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
@@ -576,11 +584,16 @@ SELECT
              'runtime_id', p.runtime_id, 'session_id', p.session_id))
     END,
     CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity'
-              OR COALESCE(a.runtime_id, p.runtime_id) IS DISTINCT FROM p.runtime_id THEN NULL
+              OR COALESCE(sqlc.narg(target_runtime_id)::uuid,
+                          CASE WHEN NOT COALESCE(sqlc.narg(unstarted_handoff)::boolean, false) THEN a.runtime_id END,
+                          p.runtime_id) IS DISTINCT FROM p.runtime_id THEN NULL
          ELSE p.session_id END,
     p.work_dir,
-    p.attempt + 1, COALESCE(sqlc.narg(max_attempts)::int, p.max_attempts), p.id,
-    p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity',
+    p.attempt + CASE WHEN COALESCE(sqlc.narg(unstarted_handoff)::boolean, false) THEN 0 ELSE 1 END,
+    COALESCE(sqlc.narg(max_attempts)::int, p.max_attempts), p.id,
+    CASE WHEN COALESCE(sqlc.narg(unstarted_handoff)::boolean, false)
+         THEN p.force_fresh_session OR sqlc.narg(target_agent_id)::uuid IS NOT NULL
+         ELSE p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' END,
     p.is_leader_task,
     p.squad_id,
     p.originator_user_id,
@@ -593,7 +606,7 @@ SELECT
     p.channel_context_revision,
     -- Carried for a wakeup's prompt and a workflow handoff's brief (MUL-7420);
     -- rows from before workflow_step existed may hold a retired assignment note.
-    CASE WHEN p.context->>'wakeup_id' IS NOT NULL OR p.workflow_step IS NOT NULL THEN p.handoff_note END,
+    CASE WHEN COALESCE(sqlc.narg(unstarted_handoff)::boolean, false) OR p.context->>'wakeup_id' IS NOT NULL OR p.workflow_step IS NOT NULL THEN p.handoff_note END,
     -- A retry continues its parent's work, so it keeps the parent's step (MUL-7420).
     p.workflow_step,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
@@ -612,7 +625,13 @@ WHERE p.id = $1
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
   ))
-  AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
+  AND lock_task_owner_rows(
+      COALESCE(sqlc.narg(target_agent_id)::uuid, p.agent_id),
+      p.issue_id,
+      COALESCE(sqlc.narg(target_runtime_id)::uuid,
+               CASE WHEN NOT COALESCE(sqlc.narg(unstarted_handoff)::boolean, false) THEN a.runtime_id END,
+               p.runtime_id)
+  )
 ON CONFLICT (issue_id, agent_id, (COALESCE(comment_thread_id, '00000000-0000-0000-0000-000000000000'::uuid))) WHERE status IN ('queued', 'dispatched')
        OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
 DO NOTHING
@@ -816,6 +835,16 @@ FROM agent_task_queue
 WHERE parent_task_id = $1
   AND status <> 'cancelled';
 
+-- name: HasRuntimeOfflineRetryForParent :one
+-- A cancelled or completed recovery still consumes the one offline recovery.
+-- Call while holding LockRuntimeOfflineRetryParent.
+SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1);
+
+-- name: LockRuntimeOfflineRetryParent :exec
+-- Serialize deferred recovery creation without taking a task-row lock ahead
+-- of CreateRetryTask's workspace/owner fence (the teardown lock order).
+SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg('task_id')::uuid::text || ':runtime_offline_retry', 0));
+
 -- name: GetAgentTaskInWorkspace :one
 -- Loads a task only when its owning agent lives in the given workspace.
 -- agent_id is NOT NULL on every task row (and ON DELETE CASCADE, so the agent
@@ -839,15 +868,30 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 -- otherwise a user mashing the create button could fire concurrent quick-creates
 -- whose completion lookup would race over "most recent issue by this agent".
+WITH codex_config AS MATERIALIZED (
+    SELECT c.configuration,
+           a.codex_model_admission_rejection = jsonb_build_array(c.runtime_id, c.configuration) AS rejected
+    FROM codex_model_admission_config c
+    JOIN agent a ON a.id = c.agent_id
+    WHERE c.agent_id = @agent_id AND c.runtime_id = @runtime_id
+)
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
+    context = COALESCE(
+        (SELECT COALESCE(context, '{}'::jsonb) || jsonb_build_object('codex_model_admission', configuration)
+         FROM codex_config),
+        context - 'codex_model_admission'
+    ),
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.agent_id = @agent_id
       AND atq.runtime_id = @runtime_id
       AND atq.status = 'queued'
+      AND (@ignore_codex_model_rejection::boolean OR NOT EXISTS (
+          SELECT 1 FROM codex_config WHERE rejected
+      ))
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
       AND EXISTS (
           SELECT 1
@@ -865,6 +909,7 @@ WHERE id = (
                 OR r.visibility = 'private'
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => @runtime_stale_secs::double precision)
       )
@@ -999,6 +1044,7 @@ WHERE id = (
                 )
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => @runtime_stale_secs::double precision)
       )
@@ -1046,6 +1092,7 @@ WITH candidates AS MATERIALIZED (
                 )
             )
             AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => @runtime_stale_secs::double precision)
       )
@@ -1184,7 +1231,7 @@ WHERE session_id NOT IN (SELECT session_id FROM retired_sessions)
     status IN ('completed', 'cancelled')
     OR (
       status = 'failed'
-      AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow', 'codex_resume_oversized', 'opencode_clock_skew')
+      AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity', 'agent_error.context_overflow', 'codex_resume_oversized', 'opencode_clock_skew', 'agent_error.codex_safety_refusal')
       AND NOT (COALESCE(error, '') ILIKE '%400%' AND COALESCE(error, '') ILIKE '%invalid_request_error%')
       AND NOT (COALESCE(error, '') ILIKE '%image dimensions exceed max allowed size%' AND COALESCE(error, '') ILIKE '%image.source.base64.data%')
       -- A provider credential-resolution failure ("Could not resolve
@@ -1286,7 +1333,14 @@ SET status = 'failed',
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE agent_task_queue.id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+  AND (sqlc.narg(launcher_claim_at)::timestamptz IS NULL OR (
+      status = 'dispatched' AND started_at IS NULL AND dispatched_at = sqlc.narg(launcher_claim_at)
+      AND COALESCE(session_id, '') = '' AND COALESCE(work_dir, '') = ''
+      AND COALESCE(branch_name, '') = '' AND COALESCE(durable_work_dir, '') = ''
+      AND (result IS NULL OR result = '{}'::jsonb)
+      AND NOT EXISTS (SELECT 1 FROM task_message m WHERE m.task_id = agent_task_queue.id)
+  ))
 RETURNING *;
 
 -- name: UpdateAgentTaskSession :exec
@@ -1931,6 +1985,36 @@ WHERE id = (
           OR (NOT t.is_leader_task AND t.squad_id IS NULL)
       )
       AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(@new_trigger_comment_id::uuid)
+      -- A claim returned to the queue after delivery failure must keep its
+      -- original member directive until that same admitted attempt settles.
+      AND NOT EXISTS (
+          SELECT 1 FROM member_rescope_receipt r
+          WHERE r.issue_id = t.issue_id AND r.agent_id = t.agent_id
+            AND r.admitted_task_id = t.id
+      )
+      -- A queued member-authored re-scope owns its one permitted attempt.
+      -- Ordinary comments must not replace it while the receipt is armed.
+      AND NOT (
+          EXISTS (
+              SELECT 1 FROM member_rescope_directive d
+              JOIN comment c ON c.id = d.comment_id
+              WHERE d.comment_id = t.trigger_comment_id
+                AND c.deleted_at IS NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM member_rescope_directive d
+              JOIN comment c ON c.id = d.comment_id
+              WHERE d.comment_id = @new_trigger_comment_id::uuid
+                AND c.deleted_at IS NULL
+          )
+          AND COALESCE((
+              SELECT r.admitted_task_id IS NULL
+              FROM member_rescope_receipt r
+              WHERE r.issue_id = t.issue_id AND r.agent_id = t.agent_id
+              ORDER BY r.armed_at DESC, r.refusal_task_id DESC
+              LIMIT 1
+          ), false)
+      )
       AND (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
@@ -2366,6 +2450,7 @@ WITH due AS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
           AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
           AND COALESCE(r.last_seen_at, r.updated_at) >=
               now() - make_interval(secs => @runtime_stale_secs::double precision)
       )
@@ -2432,6 +2517,7 @@ WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
     SELECT 1 FROM agent_runtime r
     WHERE r.id = t.runtime_id
       AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
       AND COALESCE(r.last_seen_at, r.updated_at) >=
           now() - make_interval(secs => @runtime_stale_secs::double precision)
   )
@@ -2469,6 +2555,7 @@ WITH due AS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
           AND r.status = 'online'
+          AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
           AND COALESCE(r.last_seen_at, r.updated_at) >=
               now() - make_interval(secs => @runtime_stale_secs::double precision)
       )

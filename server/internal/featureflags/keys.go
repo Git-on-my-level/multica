@@ -7,6 +7,8 @@ import (
 )
 
 const (
+	// CodexModelAdmission gates the per-agent dispatch circuit breaker.
+	CodexModelAdmission = "codex_model_admission"
 	// BillingWorkspaceSubscriptions gates the workspace-scoped entitlement,
 	// Stripe Checkout, seat reconcile, and Billing Portal proxy surface. It is
 	// deliberately off by default so the main repository can ship before the

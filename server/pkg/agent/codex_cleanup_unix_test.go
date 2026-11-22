@@ -6,9 +6,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestCodexInitializeParentDeadlineDoesNotPersistOpaqueEnv is the other half of
@@ -66,7 +69,7 @@ func TestCodexInitializeParentDeadlineDoesNotPersistOpaqueEnv(t *testing.T) {
 	if strings.Contains(persisted, secret) {
 		t.Fatalf("opaque env persisted after the parent deadline: %s", persisted)
 	}
-	if result.Status != "failed" || result.codexInitializeRetrySafe {
+	if result.Status != "failed" {
 		t.Fatalf("parent deadline must fail without initialize retry: %+v", result)
 	}
 }
@@ -108,7 +111,90 @@ func TestCodexInitializeParentCancellationDoesNotPersistOpaqueEnv(t *testing.T) 
 	if strings.Contains(persisted, secret) {
 		t.Fatalf("opaque env persisted after parent context ended: %s", persisted)
 	}
-	if result.Status != "failed" || result.codexInitializeRetrySafe {
+	if result.Status != "failed" {
 		t.Fatalf("parent context must fail without initialize retry: %+v", result)
+	}
+}
+
+func TestCodexInitializeTimeoutDoesNotReplayAmbiguousStartup(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		startup string
+		effects int
+	}{
+		{name: "silent"},
+		{
+			name:    "silent after a local side effect",
+			startup: `printf 'effect\n' >> "$STARTUP_EFFECTS"`,
+			effects: 1,
+		},
+		{
+			name:    "activity without an initialize response",
+			startup: `echo '{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt"}}'`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			launchesPath := filepath.Join(root, "launches")
+			effectsPath := filepath.Join(root, "effects")
+			pidsPath := filepath.Join(root, "pids")
+			fakePath := writeFakeCodexAppServer(t, `
+printf 'launch\n' >> "$LAUNCHES"
+read -r request || exit 1
+case "$request" in *'"method":"initialize"'*) ;; *) exit 2 ;; esac
+`+tc.startup+`
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s %s\n' "$$" "$!" > "$PIDS"
+wait
+`)
+			var logs strings.Builder
+			result, messages := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+				Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+				TaskID: "initialize-timeout-task",
+				Env: map[string]string{
+					"LAUNCHES": launchesPath, "STARTUP_EFFECTS": effectsPath, "PIDS": pidsPath,
+				},
+			}, ExecOptions{HandshakeTimeout: 2 * time.Second}, 15*time.Second)
+
+			if result.Status != "failed" || !strings.Contains(result.Error, "codex initialize failed: "+CodexHandshakeTimeoutMarker) {
+				t.Fatalf("expected terminal initialize timeout, got %+v", result)
+			}
+			if len(messages) != 0 {
+				t.Fatalf("unexpected task messages: %+v", messages)
+			}
+			launches, err := os.ReadFile(launchesPath)
+			if err != nil || string(launches) != "launch\n" {
+				t.Fatalf("expected a single launch, got %q (%v)", launches, err)
+			}
+			effects, err := os.ReadFile(effectsPath)
+			if tc.effects == 0 && !os.IsNotExist(err) {
+				t.Fatalf("expected no fixture effects, got %q (%v)", effects, err)
+			}
+			if tc.effects == 1 && (err != nil || string(effects) != "effect\n") {
+				t.Fatalf("expected one fixture effect, got %q (%v)", effects, err)
+			}
+			pidBytes, err := os.ReadFile(pidsPath)
+			pids := strings.Fields(string(pidBytes))
+			if err != nil || len(pids) != 2 {
+				t.Fatalf("expected leader and descendant PIDs, got %q (%v)", pidBytes, err)
+			}
+			for _, value := range pids {
+				pid, err := strconv.Atoi(value)
+				if err != nil || pid <= 0 {
+					t.Fatalf("invalid PID %q", value)
+				}
+				waitProcessGone(t, pid)
+			}
+			logged := logs.String()
+			for _, want := range []string{`"phase":"cleanup"`, `"phase":"initialize_failure"`, `"task_id":"initialize-timeout-task"`, `"attempt":1`} {
+				if !strings.Contains(logged, want) {
+					t.Errorf("missing %q in lifecycle log: %s", want, logged)
+				}
+			}
+		})
 	}
 }

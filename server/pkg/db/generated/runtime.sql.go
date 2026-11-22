@@ -1681,7 +1681,10 @@ func (q *Queries) LockWorkspaceForRuntimeMerge(ctx context.Context, runtimeIds [
 
 const markAgentRuntimeOnline = `-- name: MarkAgentRuntimeOnline :one
 UPDATE agent_runtime
-SET status = 'online', last_seen_at = now(), updated_at = now()
+SET status = CASE WHEN metadata->'offline_reason'->>'code' = 'not_executable'
+                       AND metadata->'offline_reason'->>'launcher_unavailable' = 'true'
+                  THEN status ELSE 'online' END,
+    last_seen_at = now(), updated_at = now()
 WHERE id = $1
 RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, shared_with, max_concurrent_tasks
 `
@@ -1689,6 +1692,8 @@ RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, dev
 // Used on the offline→online transition (and on first heartbeat after
 // registration). Writes status, last_seen_at, and updated_at because the
 // status flip is a real state change and we want updated_at to reflect it.
+// A heartbeat establishes liveness, not launcher health. Only a successful
+// registration probe may clear the not-executable reason and restore claims.
 func (q *Queries) MarkAgentRuntimeOnline(ctx context.Context, id pgtype.UUID) (AgentRuntime, error) {
 	row := q.db.QueryRow(ctx, markAgentRuntimeOnline, id)
 	var i AgentRuntime
@@ -1720,6 +1725,8 @@ const markAgentRuntimeOnlineIfOffline = `-- name: MarkAgentRuntimeOnlineIfOfflin
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1 AND status <> 'online'
+  AND NOT COALESCE(metadata->'offline_reason'->>'code' = 'not_executable'
+                  AND metadata->'offline_reason'->>'launcher_unavailable' = 'true', false)
 `
 
 // Reports whether this heartbeat performed an offline -> online transition.
@@ -1926,6 +1933,23 @@ func (q *Queries) SelectStaleOnlineRuntimes(ctx context.Context, staleSeconds fl
 	return items, nil
 }
 
+const setAgentRuntimeLauncherUnready = `-- name: SetAgentRuntimeLauncherUnready :exec
+UPDATE agent_runtime
+SET metadata = metadata || jsonb_build_object('offline_reason', $1::jsonb), updated_at = now()
+WHERE id = $2
+`
+
+type SetAgentRuntimeLauncherUnreadyParams struct {
+	OfflineReason []byte      `json:"offline_reason"`
+	ID            pgtype.UUID `json:"id"`
+}
+
+// Fence new dispatch without interrupting tasks already running on this host.
+func (q *Queries) SetAgentRuntimeLauncherUnready(ctx context.Context, arg SetAgentRuntimeLauncherUnreadyParams) error {
+	_, err := q.db.Exec(ctx, setAgentRuntimeLauncherUnready, arg.OfflineReason, arg.ID)
+	return err
+}
+
 const setAgentRuntimeOffline = `-- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
@@ -2032,7 +2056,7 @@ SET runtime_id = NULL, updated_at = now()
 WHERE runtime_id = $1
   AND owner_id IS DISTINCT FROM $2
   AND NOT COALESCE(owner_id = ANY($3::uuid[]), false)
-RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters
+RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters, codex_model_admission_rejection
 `
 
 type UnbindNonOwnerAgentsFromRuntimeParams struct {
@@ -2082,6 +2106,7 @@ func (q *Queries) UnbindNonOwnerAgentsFromRuntime(ctx context.Context, arg Unbin
 			&i.DisabledRuntimeSkills,
 			&i.ServiceTier,
 			&i.ConversationStarters,
+			&i.CodexModelAdmissionRejection,
 		); err != nil {
 			return nil, err
 		}
@@ -2119,7 +2144,7 @@ const unbindUserAgentsFromRuntime = `-- name: UnbindUserAgentsFromRuntime :many
 UPDATE agent
 SET runtime_id = NULL, updated_at = now()
 WHERE runtime_id = $1 AND kind = 'user'
-RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters
+RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters, codex_model_admission_rejection
 `
 
 // MUL-5559: the runtime-delete replacement for archive-then-hard-delete. Every
@@ -2171,6 +2196,7 @@ func (q *Queries) UnbindUserAgentsFromRuntime(ctx context.Context, runtimeID pgt
 			&i.DisabledRuntimeSkills,
 			&i.ServiceTier,
 			&i.ConversationStarters,
+			&i.CodexModelAdmissionRejection,
 		); err != nil {
 			return nil, err
 		}

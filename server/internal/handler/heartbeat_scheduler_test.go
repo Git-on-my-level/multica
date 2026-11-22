@@ -395,6 +395,33 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 	}
 }
 
+func TestBatchedHeartbeatScheduler_LauncherHealthDoesNotPublishRecovery(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+	rt := loadRuntime(t, runtimeID)
+	if err := testHandler.Queries.SetAgentRuntimeOfflineWithReason(context.Background(), db.SetAgentRuntimeOfflineWithReasonParams{
+		ID: rt.ID, OfflineReason: []byte(`{"code":"not_executable","launcher_unavailable":true}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setRuntimeLastSeenAt(t, runtimeID, time.Now().Add(-2*time.Hour))
+	recoveries := &recordingRecoveryNotifier{}
+	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, 0, nil)
+	sched.RecoveryNotifier = recoveries
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	sched.FlushNow(context.Background())
+	if got := loadRuntime(t, runtimeID).Status; got != "offline" {
+		t.Fatalf("launcher status = %s", got)
+	}
+	if len(recoveries.workspaceIDs) != 0 {
+		t.Fatalf("blocked launcher published recovery: %v", recoveries.workspaceIDs)
+	}
+}
+
 type recoveryContextKey struct{}
 
 // silenceUnusedPgUUID ensures the package compiles even if no other test

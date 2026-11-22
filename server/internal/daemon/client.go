@@ -1210,9 +1210,10 @@ const RuntimeOfflineCodeDshProfile = "dsh_profile"
 // repairs the install. Prose stays in Detail for logs — never as the thing a
 // client parses.
 type RuntimeOfflineReason struct {
-	Code   string                  `json:"code"`
-	Detail string                  `json:"detail,omitempty"`
-	Repair *agent.ExecFormatRepair `json:"repair,omitempty"`
+	LauncherUnavailable bool                    `json:"launcher_unavailable,omitempty"`
+	Code                string                  `json:"code"`
+	Detail              string                  `json:"detail,omitempty"`
+	Repair              *agent.ExecFormatRepair `json:"repair,omitempty"`
 	// Installing reports that the daemon has an automatic install in flight for
 	// this runtime. It is the difference between "a human has to act" and "this
 	// comes back by itself", which the server cannot infer from the code alone:

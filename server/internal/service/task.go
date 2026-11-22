@@ -1319,6 +1319,12 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
@@ -1495,6 +1501,12 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	}
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	if rerunOfTaskID.Valid {
+		// A replay may retain the old comment for context, but its direct
+		// trigger is the rerun. A later comment merge can replace this evidence.
+		attr.EvidenceKind = attribution.EvidenceRerun
+		attr.EvidenceRefID = rerunOfTaskID
+	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	params := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
@@ -3742,7 +3754,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
-	var claimed *db.AgentTaskQueue
+	var claimed, blocked *db.AgentTaskQueue
 	var reclaimCheckAfter time.Time
 	var decisionDetail claimDecisionDetail
 	defer func() {
@@ -3750,7 +3762,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		s.recordClaimDecision(agentID, runtimeID, outcome, scope, decisionDetail)
 	}()
 
-	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+	err := s.runInTaskTx(ctx, func(qtx *db.Queries, tx pgx.Tx) error {
 		t0 := time.Now()
 		agent, err := qtx.GetAgentForClaimUpdate(ctx, agentID)
 		getAgentMs = time.Since(t0).Milliseconds()
@@ -3828,20 +3840,49 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 
 		t0 = time.Now()
 		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
+		guardEnabled := s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          agentID,
-			RuntimeID:        claimRuntimeID,
-			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+			AgentID:                   agentID,
+			RuntimeID:                 claimRuntimeID,
+			PrepareLeaseSecs:          prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:          RuntimeClaimFreshnessSeconds,
+			IgnoreCodexModelRejection: !guardEnabled,
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				outcome = "no_tasks"
+				outcome = claimOutcomeNoTasks
+				if guardEnabled && len(agent.CodexModelAdmissionRejection) != 0 {
+					held, err := qtx.IsCodexModelAdmissionRejected(ctx, db.IsCodexModelAdmissionRejectedParams{
+						AgentID: agentID, RuntimeID: claimRuntimeID,
+					})
+					if err != nil {
+						outcome = claimOutcomeErrorClaim
+						return fmt.Errorf("read Codex model admission hold: %w", err)
+					}
+					if held {
+						outcome = claimOutcomeCodexModelAdmissionHeld
+					}
+				}
 				return nil
 			}
 			outcome = "error_claim"
 			return fmt.Errorf("claim task: %w", err)
+		}
+
+		task, err = s.guardMemberRescopeClaim(ctx, tx, task)
+		if err != nil {
+			outcome = claimOutcomeErrorClaim
+			return fmt.Errorf("check member re-scope: %w", err)
+		}
+		if task.Status == "cancelled" {
+			if err := SettleTerminalTaskState(ctx, qtx, task); err != nil {
+				outcome = claimOutcomeErrorClaim
+				return err
+			}
+			blocked = &task
+			outcome = claimOutcomeMemberRescopeRequired
+			return nil
 		}
 
 		// An idle task-owned direct-chat row may already be visible as the
@@ -3874,6 +3915,12 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			outcome = "error_transaction"
 		}
 		return nil, err
+	}
+	if blocked != nil {
+		s.captureTaskCancelled(ctx, *blocked)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, *blocked, map[string]any{
+			"error": blocked.Error.String, "failure_reason": memberRescopeRequired,
+		})
 	}
 	if claimed == nil {
 		return nil, nil
@@ -5285,6 +5332,10 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 // CompleteTaskWithTransition. The bool is false for an idempotent replay that
 // observed an already-terminal row.
 func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, error) {
+	return s.failTaskWithTransition(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, nil, pgtype.Timestamptz{})
+}
+
+func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, launcherClaim *protocol.LauncherClaim, launcherClaimAt pgtype.Timestamptz) (*db.AgentTaskQueue, bool, error) {
 	// Strip bytes PostgreSQL cannot store before anything else reads errMsg, so
 	// the classifier, the transaction and every downstream consumer see the one
 	// text we will actually persist (GH #7098). Kept at the service boundary
@@ -5320,6 +5371,8 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 	// here — before the transaction — and only for retryable failures, so the
 	// common agent_error path skips this work entirely.
 	var (
+		launcherPeer     *db.Agent
+		peerOverlay      runtimeMCPOverlayData
 		wantRetry        bool
 		retryOverlay     runtimeMCPOverlayData
 		retryFireAt      pgtype.Timestamptz
@@ -5330,12 +5383,26 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
 		} else {
-			// Eligibility needs the current failure and resume pointer before
-			// FailAgentTask persists them later in this transaction.
-			parent.Error = pgtype.Text{String: errMsg, Valid: true}
-			parent.SessionID = pgtype.Text{String: sessionID, Valid: sessionID != ""}
-			if retryEligible(failureReason, parent) {
-				wantRetry = true
+			// Cursor retry policy uses the current failure diagnostics.
+			if failureReason == taskfailure.ReasonAgentProviderNetwork.String() {
+				parent.Error = pgtype.Text{String: errMsg, Valid: true}
+			}
+			// The report can carry the first resume pointer. Cursor recovery
+			// requires that pointer in this report even if one is stored.
+			if sessionID != "" || taskfailure.CursorTransientNetworkError(errMsg) {
+				parent.SessionID = pgtype.Text{String: sessionID, Valid: sessionID != ""}
+			}
+			parent.SessionRolloutMissing = parent.SessionRolloutMissing || sessionRolloutMissing
+			if retiredSessionID != "" {
+				parent.RetiredSessionID = pgtype.Text{String: retiredSessionID, Valid: true}
+			}
+			ordinaryRetry := retryEligible(failureReason, parent) &&
+				(failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg))
+			wantRetry = ordinaryRetry
+			if launcherClaim != nil {
+				wantRetry = launcherRecoveryEligible(parent, ordinaryRetry)
+			}
+			if wantRetry {
 				// Persist the reason-aware effective budget into the child so the
 				// retry chain self-describes (e.g. provider_network → max_attempts=3),
 				// rather than leaking a contradictory attempt=N/max_attempts=2 row.
@@ -5356,8 +5423,23 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 					retryOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
 				}
 			}
+			if launcherClaim != nil {
+				launcherPeer, _ = s.launcherPeer(ctx, s.Queries, parent, *launcherClaim, pgtype.UUID{})
+				if launcherPeer != nil {
+					peerOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, *launcherPeer)
+				}
+			}
 		}
 	}
+
+	var rejectedCodexModel string
+	var unparsedCodexRejection bool
+	if s.FeatureFlags.IsEnabled(ctx, featureflags.CodexModelAdmission, true) &&
+		(strings.Contains(errMsg, "model_not_found") || strings.Contains(errMsg, codexChatGPTRejection)) {
+		rejectedCodexModel = codexRejectedModel(errMsg)
+		unparsedCodexRejection = rejectedCodexModel == "" && strings.Contains(errMsg, codexChatGPTRejection)
+	}
+	var newCodexModelHold bool
 
 	var task db.AgentTaskQueue
 	var retried *db.AgentTaskQueue
@@ -5366,13 +5448,19 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
+		if rejectedCodexModel != "" {
+			if err := qtx.LockCodexModelAdmissionAgentForTask(ctx, taskID); err != nil {
+				return fmt.Errorf("lock Codex model admission: %w", err)
+			}
+		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
-			ID:             taskID,
-			Error:          pgtype.Text{String: errMsg, Valid: true},
-			FailureReason:  pgtype.Text{String: failureReason, Valid: failureReason != ""},
-			SessionID:      pgtype.Text{String: sessionID, Valid: sessionID != ""},
-			WorkDir:        pgtype.Text{String: workDir, Valid: workDir != ""},
-			DurableWorkDir: pgtype.Text{String: durableWorkDir, Valid: durableWorkDir != ""},
+			LauncherClaimAt: launcherClaimAt,
+			ID:              taskID,
+			Error:           pgtype.Text{String: errMsg, Valid: true},
+			FailureReason:   pgtype.Text{String: failureReason, Valid: failureReason != ""},
+			SessionID:       pgtype.Text{String: sessionID, Valid: sessionID != ""},
+			WorkDir:         pgtype.Text{String: workDir, Valid: workDir != ""},
+			DurableWorkDir:  pgtype.Text{String: durableWorkDir, Valid: durableWorkDir != ""},
 			// A failed run can still have produced a branch: worktree mode
 			// commits whatever the agent left before tearing the worktree down,
 			// precisely so partial work survives. Dropping the name here would
@@ -5387,7 +5475,26 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		if err != nil {
 			return err
 		}
+		if rejectedCodexModel != "" {
+			changed, err := qtx.RecordCodexModelAdmissionRejection(ctx, db.RecordCodexModelAdmissionRejectionParams{
+				TaskID:        taskID,
+				RejectedModel: rejectedCodexModel,
+			})
+			if err != nil {
+				return fmt.Errorf("record Codex model rejection: %w", err)
+			}
+			newCodexModelHold = changed > 0
+		}
 		task = t
+		if err := recordMemberRescopeRefusal(ctx, qtx, task); err != nil {
+			return fmt.Errorf("arm member re-scope receipt: %w", err)
+		}
+		if launcherClaim != nil {
+			health, _ := json.Marshal(map[string]any{"code": "not_executable", "launcher_unavailable": true, "detail": protocol.LauncherUnavailableDetail})
+			if err := qtx.SetAgentRuntimeLauncherUnready(ctx, db.SetAgentRuntimeLauncherUnreadyParams{ID: t.RuntimeID, OfflineReason: health}); err != nil {
+				return err
+			}
+		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.
@@ -5464,7 +5571,12 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// can never abort this transaction — which also carries the parent's
 		// failed status.
 		createRetry := wantRetry
-		if createRetry {
+		if createRetry && launcherClaim != nil {
+			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
+		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
+			createRetry = createRetry && retryEligible(failureReason, t)
+		}
+		if createRetry && launcherClaim == nil {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
 			if herr != nil {
 				return fmt.Errorf("check runnable successor: %w", herr)
@@ -5494,19 +5606,57 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			}
 		}
 		if createRetry {
+			var targetAgent, targetRuntime pgtype.UUID
+			var unstarted pgtype.Bool
+			chosenOverlay := retryOverlay
+			if launcherClaim != nil {
+				unstarted = pgtype.Bool{Bool: true, Valid: true}
+				if launcherPeer != nil {
+					var peer *db.Agent
+					_, err := qtx.LockAgentForTaskEnqueue(ctx, launcherPeer.ID)
+					if err == nil {
+						peer, err = s.launcherPeer(ctx, qtx, t, *launcherClaim, launcherPeer.ID)
+					}
+					if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+						return err
+					}
+					if peer != nil {
+						targetAgent = peer.ID
+						targetRuntime = peer.RuntimeID
+						retryFireAt = pgtype.Timestamptz{}
+						chosenOverlay = peerOverlay
+					}
+				}
+			}
+			params := db.CreateRetryTaskParams{
+				TargetAgentID: targetAgent, TargetRuntimeID: targetRuntime, UnstartedHandoff: unstarted,
+				NewTaskID:               dbid.NewV7(),
+				ID:                      taskID,
+				FireAt:                  retryFireAt,
+				MaxAttempts:             retryMaxAttempts,
+				RequiredResumeSessionID: cursorRetrySession(t.Error.String, sessionID),
+				RequiredResumeRuntimeID: t.RuntimeID,
+				RuntimeMcpOverlay:       chosenOverlay.Overlay,
+				RuntimeConnectedApps:    chosenOverlay.ConnectedApps,
+			}
 			var child db.AgentTaskQueue
-			_, cerr := qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
+			var cerr error
+			if !targetAgent.Valid {
+				_, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
+			}
 			if cerr == nil {
-				child, cerr = qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-					NewTaskID:               dbid.NewV7(),
-					ID:                      taskID,
-					FireAt:                  retryFireAt,
-					MaxAttempts:             retryMaxAttempts,
-					RequiredResumeSessionID: cursorRetrySession(t.Error.String, sessionID),
-					RequiredResumeRuntimeID: t.RuntimeID,
-					RuntimeMcpOverlay:       retryOverlay.Overlay,
-					RuntimeConnectedApps:    retryOverlay.ConnectedApps,
-				})
+				child, cerr = qtx.CreateRetryTask(ctx, params)
+			}
+			// A peer can acquire its pending slot after selection. Preserve the
+			// untouched outcome on the original health-gated route in that case.
+			if errors.Is(cerr, pgx.ErrNoRows) && launcherClaim != nil && targetAgent.Valid {
+				params.TargetAgentID, params.TargetRuntimeID = pgtype.UUID{}, pgtype.UUID{}
+				params.FireAt = pgtype.Timestamptz{Time: time.Now().Add(runtimeOfflineRetryDeferral), Valid: true}
+				params.RuntimeMcpOverlay = retryOverlay.Overlay
+				params.RuntimeConnectedApps = retryOverlay.ConnectedApps
+				if _, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID); cerr == nil {
+					child, cerr = qtx.CreateRetryTask(ctx, params)
+				}
 			}
 			switch {
 			case cerr == nil:
@@ -5625,6 +5775,14 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		return nil, false, fmt.Errorf("fail task: %w", err)
 	}
 
+	if newCodexModelHold {
+		slog.Warn("queued Codex dispatch held after model rejection",
+			"task_id", util.UUIDToString(task.ID), "agent_id", util.UUIDToString(task.AgentID),
+			"runtime_id", util.UUIDToString(task.RuntimeID), "model", rejectedCodexModel)
+	} else if unparsedCodexRejection {
+		slog.Warn("unrecognized Codex model rejection format",
+			"task_id", util.UUIDToString(task.ID), "agent_id", util.UUIDToString(task.AgentID))
+	}
 	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
 	s.captureTaskFailed(ctx, task)
 	s.publishRequeuedChatTasks(ctx, queuedChat)
@@ -5821,7 +5979,7 @@ func resumeUnsafeFailureReason(reason string) bool {
 	// codex_resume_oversized is the strongest member of this set: a codex
 	// rollout only ever grows, so a thread whose resume response already
 	// overflowed the reader will overflow on every future attempt too.
-	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew":
+	case "iteration_limit", "agent_fallback_message", "api_invalid_request", "codex_semantic_inactivity", "agent_error.context_overflow", "codex_resume_oversized", "opencode_clock_skew", taskfailure.ReasonCodexSafetyRefusal.String():
 		return true
 	default:
 		return false
@@ -5893,6 +6051,20 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 			!taskfailure.CursorPreActionNetworkError(t.Error.String) ||
 			!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) {
+			return false
+		}
+	}
+	// Offline recovery gets at most one additional attempt, even when another
+	// policy granted a larger budget. A missing session pointer alone does not
+	// prove the session unsafe: a daemon may not have reported it yet. Preserve
+	// any reported pointer and reject explicit evidence that it cannot resume.
+	// Keep max_attempts unchanged so other failure policies retain their budget.
+	if failureReason == string(taskfailure.ReasonRuntimeOffline) {
+		if t.Attempt >= 2 || !(t.IssueID.Valid || t.ChatSessionID.Valid) ||
+			(t.SessionID.Valid && t.SessionID.String != "" && strings.TrimSpace(t.SessionID.String) == "") ||
+			t.ForceFreshSession || t.SessionRolloutMissing ||
+			(t.RetiredSessionID.Valid && t.RetiredSessionID.String != "" && (t.SessionID.String == "" || t.RetiredSessionID.String == t.SessionID.String)) ||
+			ResumeUnsafeFailure(t.FailureReason.String, t.Error.String) {
 			return false
 		}
 	}
@@ -6034,6 +6206,27 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 			return nil, nil
 		}
 		return nil, err
+	}
+	if reason == string(taskfailure.ReasonRuntimeOffline) {
+		// Deferred retries do not occupy the queued-task unique slot. Serialize
+		// by parent without reversing the workspace-to-task teardown lock order.
+		if err := qtx.LockRuntimeOfflineRetryParent(ctx, parent.ID); err != nil {
+			return nil, err
+		}
+		current, err := qtx.GetAgentTask(ctx, parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		if current.Status != "failed" || current.FailureReason.String != reason || !retryEligible(reason, current) {
+			return nil, nil
+		}
+		hasRetry, err := qtx.HasRuntimeOfflineRetryForParent(ctx, parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		if hasRetry {
+			return nil, nil
+		}
 	}
 	var child db.AgentTaskQueue
 	_, err = qtx.LockAgentForTaskEnqueue(ctx, parent.AgentID)
@@ -7368,15 +7561,21 @@ func (s *TaskService) dispatchDelegatedFailureRecoveryComment(ctx context.Contex
 // (e.g. some tests construct TaskService directly), fn runs against the
 // regular Queries handle without transactional guarantees.
 func (s *TaskService) runInTx(ctx context.Context, fn func(*db.Queries) error) error {
+	return s.runInTaskTx(ctx, func(q *db.Queries, _ pgx.Tx) error {
+		return fn(q)
+	})
+}
+
+func (s *TaskService) runInTaskTx(ctx context.Context, fn func(*db.Queries, pgx.Tx) error) error {
 	if s.TxStarter == nil {
-		return fn(s.Queries)
+		return fn(s.Queries, nil)
 	}
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	if err := fn(s.Queries.WithTx(tx)); err != nil {
+	if err := fn(s.Queries.WithTx(tx), tx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

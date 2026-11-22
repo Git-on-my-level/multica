@@ -173,6 +173,9 @@ func TestAuth_WrongSigningMethod(t *testing.T) {
 func TestAuth_ValidToken(t *testing.T) {
 	var gotUserID, gotEmail string
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !IsMemberSession(r.Context()) {
+			t.Error("verified member JWT did not establish member session provenance")
+		}
 		gotUserID = r.Header.Get("X-User-ID")
 		gotEmail = r.Header.Get("X-User-Email")
 		w.WriteHeader(http.StatusOK)

@@ -12,12 +12,19 @@ import (
 )
 
 const bumpCommentRevision = `-- name: BumpCommentRevision :one
-UPDATE comment
-SET revision = revision + 1,
-    updated_at = now()
-WHERE id = $1
-  AND workspace_id = $2
-RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids
+WITH updated_comment AS (
+    UPDATE comment
+    SET revision = revision + 1,
+        updated_at = now()
+    WHERE id = $1
+      AND workspace_id = $2
+    RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids
+), revoked_directive AS (
+    DELETE FROM member_rescope_directive
+    USING updated_comment
+    WHERE comment_id = updated_comment.id
+)
+SELECT id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids FROM updated_comment
 `
 
 type BumpCommentRevisionParams struct {
@@ -25,9 +32,33 @@ type BumpCommentRevisionParams struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
-func (q *Queries) BumpCommentRevision(ctx context.Context, arg BumpCommentRevisionParams) (Comment, error) {
+type BumpCommentRevisionRow struct {
+	ID                 pgtype.UUID        `json:"id"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	AuthorType         string             `json:"author_type"`
+	AuthorID           pgtype.UUID        `json:"author_id"`
+	Content            string             `json:"content"`
+	Type               string             `json:"type"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	ParentID           pgtype.UUID        `json:"parent_id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	ResolvedAt         pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedByType     pgtype.Text        `json:"resolved_by_type"`
+	ResolvedByID       pgtype.UUID        `json:"resolved_by_id"`
+	SourceTaskID       pgtype.UUID        `json:"source_task_id"`
+	QuickActionID      pgtype.UUID        `json:"quick_action_id"`
+	ViaPluginID        pgtype.UUID        `json:"via_plugin_id"`
+	Revision           int64              `json:"revision"`
+	RecoverySettledAt  pgtype.Timestamptz `json:"recovery_settled_at"`
+	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	SuppressedAgentIds []pgtype.UUID      `json:"suppressed_agent_ids"`
+}
+
+// Used for attachment-only edits. Attachments can change the scope of a run.
+func (q *Queries) BumpCommentRevision(ctx context.Context, arg BumpCommentRevisionParams) (BumpCommentRevisionRow, error) {
 	row := q.db.QueryRow(ctx, bumpCommentRevision, arg.ID, arg.WorkspaceID)
-	var i Comment
+	var i BumpCommentRevisionRow
 	err := row.Scan(
 		&i.ID,
 		&i.IssueID,
@@ -236,6 +267,12 @@ WITH touched_issue AS (
     SELECT ti.id, ti.workspace_id, $3, $4, $5, $6, $7, $8, $9, $10, $11::uuid[], COALESCE($12::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids
+), stamped_directive AS (
+    INSERT INTO member_rescope_directive (comment_id)
+    SELECT id FROM inserted_comment
+    WHERE COALESCE($13::boolean, false)
+      AND author_type = 'member' AND type = 'comment' AND source_task_id IS NULL
+      AND via_plugin_id IS NULL
 )
 SELECT inserted_comment.id, inserted_comment.issue_id, inserted_comment.author_type, inserted_comment.author_id, inserted_comment.content, inserted_comment.type, inserted_comment.created_at, inserted_comment.updated_at, inserted_comment.parent_id, inserted_comment.workspace_id, inserted_comment.resolved_at, inserted_comment.resolved_by_type, inserted_comment.resolved_by_id, inserted_comment.source_task_id, inserted_comment.quick_action_id, inserted_comment.via_plugin_id, inserted_comment.revision, inserted_comment.recovery_settled_at, inserted_comment.deleted_at, inserted_comment.suppressed_agent_ids, touched_issue.revision AS issue_revision
 FROM inserted_comment
@@ -243,18 +280,19 @@ JOIN touched_issue ON touched_issue.id = inserted_comment.issue_id
 `
 
 type CreateCommentParams struct {
-	IssueID            pgtype.UUID   `json:"issue_id"`
-	WorkspaceID        pgtype.UUID   `json:"workspace_id"`
-	AuthorType         string        `json:"author_type"`
-	AuthorID           pgtype.UUID   `json:"author_id"`
-	Content            string        `json:"content"`
-	Type               string        `json:"type"`
-	ParentID           pgtype.UUID   `json:"parent_id"`
-	SourceTaskID       pgtype.UUID   `json:"source_task_id"`
-	QuickActionID      pgtype.UUID   `json:"quick_action_id"`
-	ViaPluginID        pgtype.UUID   `json:"via_plugin_id"`
-	SuppressedAgentIds []pgtype.UUID `json:"suppressed_agent_ids"`
-	ID                 pgtype.UUID   `json:"id"`
+	IssueID                pgtype.UUID   `json:"issue_id"`
+	WorkspaceID            pgtype.UUID   `json:"workspace_id"`
+	AuthorType             string        `json:"author_type"`
+	AuthorID               pgtype.UUID   `json:"author_id"`
+	Content                string        `json:"content"`
+	Type                   string        `json:"type"`
+	ParentID               pgtype.UUID   `json:"parent_id"`
+	SourceTaskID           pgtype.UUID   `json:"source_task_id"`
+	QuickActionID          pgtype.UUID   `json:"quick_action_id"`
+	ViaPluginID            pgtype.UUID   `json:"via_plugin_id"`
+	SuppressedAgentIds     []pgtype.UUID `json:"suppressed_agent_ids"`
+	ID                     pgtype.UUID   `json:"id"`
+	MemberRescopeDirective pgtype.Bool   `json:"member_rescope_directive"`
 }
 
 type CreateCommentRow struct {
@@ -311,6 +349,7 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 		arg.ViaPluginID,
 		arg.SuppressedAgentIds,
 		arg.ID,
+		arg.MemberRescopeDirective,
 	)
 	var i CreateCommentRow
 	err := row.Scan(
@@ -340,10 +379,15 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 }
 
 const deleteLeafComment = `-- name: DeleteLeafComment :one
-DELETE FROM comment
-WHERE comment.id = $1 AND comment.workspace_id = $2
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed
 `
 
 type DeleteLeafCommentParams struct {
@@ -367,11 +411,16 @@ func (q *Queries) DeleteLeafComment(ctx context.Context, arg DeleteLeafCommentPa
 }
 
 const deleteReplylessCommentTombstone = `-- name: DeleteReplylessCommentTombstone :one
-DELETE FROM comment
-WHERE comment.id = $1 AND comment.workspace_id = $2
-  AND comment.deleted_at IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
-RETURNING comment.id, comment.parent_id
+WITH removed AS (
+    DELETE FROM comment
+    WHERE comment.id = $1 AND comment.workspace_id = $2
+      AND comment.deleted_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM comment child WHERE child.parent_id = comment.id)
+    RETURNING comment.id, comment.parent_id
+), deleted_directive AS (
+    DELETE FROM member_rescope_directive WHERE comment_id IN (SELECT id FROM removed)
+)
+SELECT id, parent_id FROM removed
 `
 
 type DeleteReplylessCommentTombstoneParams struct {
@@ -2427,6 +2476,12 @@ WITH locked_issue AS MATERIALIZED (
               comment.resolved_by_type, comment.resolved_by_id, comment.source_task_id,
               comment.quick_action_id, comment.via_plugin_id, comment.revision,
               comment.deleted_at, target.did_change
+), revoked_directive AS (
+    -- An edited directive loses its original authorization, even if a later
+    -- edit restores the text. Resolution changes never reach this path.
+    DELETE FROM member_rescope_directive
+    USING updated_comment
+    WHERE comment_id = updated_comment.id AND updated_comment.did_change
 ), touched_issue AS (
     UPDATE issue
     SET revision = issue.revision + 1,
