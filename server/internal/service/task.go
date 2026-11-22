@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -5378,7 +5379,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		retryFireAt      pgtype.Timestamptz
 		retryMaxAttempts pgtype.Int4
 	)
-	if retryableReasons[failureReason] {
+	hermesStartupFailure := taskfailure.HermesGatewayStartingDeadline(errMsg)
+	if retryableReasons[failureReason] || hermesStartupFailure {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
@@ -5398,7 +5400,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			}
 			ordinaryRetry := retryEligible(failureReason, parent) &&
 				(failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg))
-			wantRetry = ordinaryRetry
+			startupRecovery := launcherClaim == nil && hermesGatewayResumeRetryEligible(failureReason, errMsg, parent)
+			wantRetry = ordinaryRetry || startupRecovery
 			if launcherClaim != nil {
 				wantRetry = launcherRecoveryEligible(parent, ordinaryRetry)
 			}
@@ -5573,6 +5576,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		createRetry := wantRetry
 		if createRetry && launcherClaim != nil {
 			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
+		} else if hermesStartupFailure {
+			createRetry = createRetry && hermesGatewayResumeRetryEligible(failureReason, errMsg, t)
 		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 			createRetry = createRetry && retryEligible(failureReason, t)
 		}
@@ -5645,6 +5650,11 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 				_, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
 			}
 			if cerr == nil {
+				if launcherClaim == nil && hermesStartupFailure {
+					// Start the jitter after overlay preparation and queue locking
+					// so the new child waits even when those operations run slowly.
+					params.FireAt = pgtype.Timestamptz{Time: time.Now().Add(hermesGatewayRetryDelay()), Valid: true}
+				}
 				child, cerr = qtx.CreateRetryTask(ctx, params)
 			}
 			// A peer can acquire its pending slot after selection. Preserve the
@@ -5868,6 +5878,24 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 	s.broadcastTaskFailedEvent(ctx, task, errMsg, failureReason, retried != nil)
 
 	return &task, true, nil
+}
+
+// hermesGatewayResumeRetryEligible is deliberately only used by the live
+// failure transaction. Orphan sweeping must not revive historical failures.
+func hermesGatewayResumeRetryEligible(reason, raw string, t db.AgentTaskQueue) bool {
+	return reason == taskfailure.ReasonAgentProviderServerError.String() &&
+		taskfailure.HermesGatewayStartingDeadline(raw) &&
+		(t.Status == "running" || t.Status == "dispatched" || t.Status == "failed") &&
+		t.Attempt == 1 && t.Attempt < t.MaxAttempts &&
+		!t.AutopilotRunID.Valid && !IsTriageTask(t) &&
+		(t.IssueID.Valid || t.ChatSessionID.Valid) &&
+		t.SessionID.Valid && t.SessionID.String != "" &&
+		!t.ForceFreshSession && !t.SessionRolloutMissing && !t.RetiredSessionID.Valid &&
+		!ResumeUnsafeFailure(reason, raw)
+}
+
+func hermesGatewayRetryDelay() time.Duration {
+	return 5*time.Second + time.Duration(rand.Int64N(int64(5*time.Second)))
 }
 
 // retryableReasons enumerates failure reasons that the auto-retry path is
