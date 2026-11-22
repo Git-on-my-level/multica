@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // cursorBackend implements Backend by spawning the Cursor Agent CLI
@@ -23,6 +25,9 @@ type cursorBackend struct {
 }
 
 func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	if opts.RequireCursorResume && strings.TrimSpace(opts.ResumeSessionID) == "" {
+		return nil, fmt.Errorf("Cursor recovery requires the original session")
+	}
 	execName := b.cfg.ExecutablePath
 	if execName == "" {
 		execName = "cursor-agent"
@@ -36,7 +41,13 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	runCtx, cancel := runContext(ctx, timeout)
 
 	args := buildCursorArgs(opts, b.cfg.Logger)
-	cmd, _, _ := b.cfg.commandAt(execName).execVia(runCtx, chooseCursorInvocation, lookedUp, args, b.cfg.Logger)
+	command := b.cfg.commandAt(execName)
+	if opts.RequireCursorResume {
+		command = command.withFilteredPrefix(func(prefix []string) []string {
+			return filterCustomArgs(prefix, cursorRecoveryBlockedArgs, b.cfg.Logger)
+		})
+	}
+	cmd, _, _ := command.execVia(runCtx, chooseCursorInvocation, lookedUp, args, b.cfg.Logger)
 	hideAgentWindow(cmd)
 	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 500 * time.Millisecond
@@ -123,6 +134,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		finalStatus := "completed"
 		var finalError string
 		var protocolError string
+		recoverySessionMismatch := false
 		resultSeen := false
 		resultIsError := false
 		resultBytes := 0
@@ -175,6 +187,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			lastEventType = observedCursorEventType(evt.Type)
 
 			if sid := evt.readSessionID(); sid != "" {
+				if opts.RequireCursorResume && sid != opts.ResumeSessionID {
+					recoverySessionMismatch = true
+					background.ObserveTerminal()
+					cancel()
+					break scanLoop
+				}
 				sessionID = sid
 				supplements.activate(sid)
 			}
@@ -382,6 +400,9 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			}
 		} else {
 			switch {
+			case recoverySessionMismatch:
+				finalStatus = "failed"
+				finalError = "Cursor recovery reported a different session; earlier actions may have taken effect"
 			case runCtx.Err() == context.DeadlineExceeded:
 				finalStatus = "timeout"
 				finalError = fmt.Sprintf("cursor-agent timed out after %s", timeout)
@@ -411,6 +432,10 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			}
 		}
 
+		if opts.RequireCursorResume && finalStatus == "completed" && sessionID == "" {
+			finalStatus = "failed"
+			finalError = "Cursor recovery did not confirm the original session; earlier actions may have taken effect"
+		}
 		if finalError != "" {
 			finalError = sanitizeAgentDiagnostic(finalError)
 		}
@@ -471,6 +496,13 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// A partial transcript is not a final answer. Keep it in Messages for
 			// observability, but never expose it as Result.Output on failure.
 			finalOutput = ""
+		}
+
+		// Keep custody on the requested session, including when recovery fails.
+		// The initial pre-action failure also needs the requested session to
+		// schedule a same-session recovery because it emitted no session event.
+		if opts.RequireCursorResume || (finalStatus == "failed" && sessionID == "" && taskfailure.CursorPreActionNetworkError(finalError)) {
+			sessionID = opts.ResumeSessionID
 		}
 
 		resCh <- Result{
@@ -1058,6 +1090,16 @@ var cursorBlockedArgs = map[string]blockedArgMode{
 	"--yolo":          blockedStandalone, // auto-approval for autonomous operation
 }
 
+// Recovery owns the session and working directory even when a runtime profile
+// or task supplied flags for a different conversation.
+var cursorRecoveryBlockedArgs = map[string]blockedArgMode{
+	"--resume":    blockedOptionalValue,
+	"-r":          blockedOptionalValue,
+	"--continue":  blockedStandalone,
+	"-c":          blockedStandalone,
+	"--workspace": blockedWithValue,
+}
+
 // buildCursorArgs assembles the argv for a one-shot cursor-agent invocation.
 //
 // Usage: cursor-agent -p --output-format stream-json
@@ -1095,6 +1137,10 @@ func buildCursorArgs(opts ExecOptions, logger *slog.Logger) []string {
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, cursorBlockedArgs, logger)...)
+	customArgs := opts.CustomArgs
+	if opts.RequireCursorResume {
+		customArgs = filterCustomArgs(customArgs, cursorRecoveryBlockedArgs, logger)
+	}
+	args = append(args, filterCustomArgs(customArgs, cursorBlockedArgs, logger)...)
 	return args
 }

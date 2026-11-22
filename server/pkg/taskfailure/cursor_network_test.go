@@ -115,3 +115,50 @@ func TestCursorConnectionStalledScope(t *testing.T) {
 		}
 	}
 }
+
+func TestCursorTransientLaunchClassificationAndBoundary(t *testing.T) {
+	t.Parallel()
+	const header = "cursor-agent exited with error: exit status 1 (result_seen=false, exit_code=1, scanner_error=false, event_count=0, invalid_event_count=0, last_event_type=none); actions completed before finalization may already have taken effect; cursor stderr: "
+	for _, witness := range []string{"RetriableError: [unavailable] Error", "getaddrinfo ENOTFOUND api2.cursor.sh", "Error: getaddrinfo ENOTFOUND api2.cursor.sh"} {
+		t.Run(witness, func(t *testing.T) {
+			raw := header + witness
+			for _, input := range []string{witness, raw, strings.ToUpper(raw), raw + "\n    at transport (/cursor/index.js:500:403)"} {
+				if got := Classify(input); got != ReasonAgentProviderNetwork {
+					t.Fatalf("Classify(%q) = %s", input, got)
+				}
+				if got := NormalizeDaemonReason(ReasonAgentProcessFailure.String(), input); got != ReasonAgentProviderNetwork {
+					t.Fatalf("NormalizeDaemonReason(%q) = %s", input, got)
+				}
+			}
+			if !CursorPreActionNetworkError(raw) {
+				t.Fatal("complete pre-action diagnostics should permit recovery")
+			}
+			for _, ambiguous := range []string{
+				witness,
+				strings.Replace(raw, "event_count=0", "event_count=14", 1),
+				strings.Replace(raw, "last_event_type=none", "last_event_type=connection", 1),
+				strings.Replace(raw, "invalid_event_count=0", "invalid_event_count=1", 1),
+				strings.Replace(raw, "scanner_error=false", "scanner_error=true", 1),
+				strings.Replace(raw, "result_seen=false", "result_seen=true", 1),
+				strings.Replace(raw, "exit_code=1", "exit_code=-1", 1),
+				raw + "\nAPI Error: 401 Unauthorized",
+				raw + "\nAPI Error: 429 quota exceeded",
+			} {
+				if CursorPreActionNetworkError(ambiguous) {
+					t.Errorf("unsafe recovery: %q", ambiguous)
+				}
+			}
+		})
+	}
+	for _, raw := range []string{
+		"RetriableError: [unavailable] Error_OTHER",
+		"getaddrinfo ENOTFOUND api2.cursor.sh.evil",
+		"MCP server error: RetriableError: [unavailable] Error",
+		header + "local tool failed: getaddrinfo ENOTFOUND api2.cursor.sh",
+		"some tool exited with error: exit status 1; cursor stderr: RetriableError: [unavailable] Error",
+	} {
+		if CursorTransientNetworkError(raw) || Classify(raw) == ReasonAgentProviderNetwork {
+			t.Errorf("unrelated failure matched: %q", raw)
+		}
+	}
+}

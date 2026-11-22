@@ -8384,6 +8384,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return TaskResult{}, err
 	}
 
+	if task.RequireCursorResume && (provider != "cursor" || task.PriorSessionID == "") {
+		return TaskResult{}, errors.New("Cursor recovery cannot resume the original session")
+	}
+
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
 	// CLI would otherwise silently fall back to the user-global config — a
@@ -9222,6 +9226,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
 
+	if task.RequireCursorResume && task.PriorSessionID == "" {
+		return TaskResult{}, errors.New("Cursor recovery cannot reach the original session")
+	}
+
 	// Build the runtime brief and inject it into the provider-specific
 	// instruction file when supported.
 	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
@@ -9525,6 +9533,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		TurnInterruptTimeout:       d.cfg.CodexTurnInterruptTimeout,
 		ThreadHandshakeTimeout:     d.cfg.CodexThreadHandshakeTimeout,
 		ResumeSessionID:            task.PriorSessionID,
+		RequireCursorResume:        task.RequireCursorResume,
 		// Post-gate intent: PriorSessionID here already reflects the pre-flight
 		// resume gates (a dropped resume is surfaced via the prompt instead). If it
 		// survived to here, the backend must disclose the loss when the live
@@ -9742,7 +9751,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	lastAttempt := result
-	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
+	if !task.RequireCursorResume && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
@@ -9797,7 +9806,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Fork: a run that failed on a spent plan window re-runs on the next pool
 	// account with headroom (account_pool_fork.go). Its session belonged to
 	// the spent account, so the re-run starts cold.
-	for taskAccount.failover(lastAttempt, taskLog) {
+	for !task.RequireCursorResume && taskAccount.failover(lastAttempt, taskLog) {
 		hadSession := task.PriorSessionID != "" || result.SessionID != ""
 		firstUsage := result.Usage
 		if err := taskAccount.applyEnv(agentEnv, env.CodexHome); err != nil {
@@ -10259,7 +10268,9 @@ func (d *Daemon) repairWorktreeDelivery(ctx context.Context, backend agent.Backe
 	opts := withPriorTaskUsage(execOpts, result.Usage)
 	// Continue the conversation when there is one, so the agent knows what it
 	// just did; the prompt is self-contained for the backends that cannot.
-	opts.ResumeSessionID = result.SessionID
+	if !opts.RequireCursorResume {
+		opts.ResumeSessionID = result.SessionID
+	}
 	opts.ResumeContinuityNotice = ""
 	// No additional messages during housekeeping. The repair turn's reply is
 	// discarded (mergeWorktreeRepairResult keeps the task's own), so a

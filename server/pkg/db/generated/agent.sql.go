@@ -2940,7 +2940,11 @@ SELECT
     p.issue_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN $5::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
-    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
+    p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
+    CASE WHEN $6::text IS NULL THEN p.context
+         ELSE COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('cursor_recovery', jsonb_build_object(
+             'runtime_id', p.runtime_id, 'session_id', p.session_id))
+    END,
     CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity'
               OR COALESCE($3::uuid,
                           CASE WHEN NOT COALESCE($4::boolean, false) THEN a.runtime_id END,
@@ -2948,7 +2952,7 @@ SELECT
          ELSE p.session_id END,
     p.work_dir,
     p.attempt + CASE WHEN COALESCE($4::boolean, false) THEN 0 ELSE 1 END,
-    COALESCE($6::int, p.max_attempts), p.id,
+    COALESCE($7::int, p.max_attempts), p.id,
     CASE WHEN COALESCE($4::boolean, false)
          THEN p.force_fresh_session OR $2::uuid IS NOT NULL
          ELSE p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' END,
@@ -2956,8 +2960,8 @@ SELECT
     p.squad_id,
     p.originator_user_id,
     p.accountable_user_id,
-    $7,
     $8,
+    $9,
     p.originator_source, p.delegated_from_task_id, p.rule_version_id,
     p.trigger_evidence_kind, p.trigger_evidence_ref_id, p.id,
     p.chat_input_task_id, $5,
@@ -2968,10 +2972,21 @@ SELECT
     -- A retry continues its parent's work, so it keeps the parent's step (MUL-7420).
     p.workflow_step,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
-    COALESCE($9::uuid, gen_random_uuid())
+    COALESCE($10::uuid, gen_random_uuid())
 FROM agent_task_queue p
 LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = $1
+  -- A Cursor recovery is safe only on the parent session and runtime.
+  -- The agent enqueue lock serializes this insert with runtime rebinding.
+  AND ($6::text IS NULL OR (
+      p.status = 'failed'
+      AND p.failure_reason = 'agent_error.provider_network'
+      AND p.session_id = $6::text
+      AND p.runtime_id = $11::uuid
+      AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
+      AND p.retired_session_id IS DISTINCT FROM p.session_id
+      AND a.runtime_id = p.runtime_id
+  ))
   AND lock_task_owner_rows(
       COALESCE($2::uuid, p.agent_id),
       p.issue_id,
@@ -2986,15 +3001,17 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type CreateRetryTaskParams struct {
-	ID                   pgtype.UUID        `json:"id"`
-	TargetAgentID        pgtype.UUID        `json:"target_agent_id"`
-	TargetRuntimeID      pgtype.UUID        `json:"target_runtime_id"`
-	UnstartedHandoff     pgtype.Bool        `json:"unstarted_handoff"`
-	FireAt               pgtype.Timestamptz `json:"fire_at"`
-	MaxAttempts          pgtype.Int4        `json:"max_attempts"`
-	RuntimeMcpOverlay    []byte             `json:"runtime_mcp_overlay"`
-	RuntimeConnectedApps []byte             `json:"runtime_connected_apps"`
-	NewTaskID            pgtype.UUID        `json:"new_task_id"`
+	ID                      pgtype.UUID        `json:"id"`
+	TargetAgentID           pgtype.UUID        `json:"target_agent_id"`
+	TargetRuntimeID         pgtype.UUID        `json:"target_runtime_id"`
+	UnstartedHandoff        pgtype.Bool        `json:"unstarted_handoff"`
+	FireAt                  pgtype.Timestamptz `json:"fire_at"`
+	RequiredResumeSessionID pgtype.Text        `json:"required_resume_session_id"`
+	MaxAttempts             pgtype.Int4        `json:"max_attempts"`
+	RuntimeMcpOverlay       []byte             `json:"runtime_mcp_overlay"`
+	RuntimeConnectedApps    []byte             `json:"runtime_connected_apps"`
+	NewTaskID               pgtype.UUID        `json:"new_task_id"`
+	RequiredResumeRuntimeID pgtype.UUID        `json:"required_resume_runtime_id"`
 }
 
 // Clone an attempt with inherited attribution, planned comments, and input-batch
@@ -3033,10 +3050,12 @@ func (q *Queries) CreateRetryTask(ctx context.Context, arg CreateRetryTaskParams
 		arg.TargetRuntimeID,
 		arg.UnstartedHandoff,
 		arg.FireAt,
+		arg.RequiredResumeSessionID,
 		arg.MaxAttempts,
 		arg.RuntimeMcpOverlay,
 		arg.RuntimeConnectedApps,
 		arg.NewTaskID,
+		arg.RequiredResumeRuntimeID,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(

@@ -9,6 +9,8 @@ import (
 func TestCursorConnectionStalledDoesNotStartFreshSession(t *testing.T) {
 	t.Parallel()
 	for _, raw := range []string{
+		"cursor-agent exited with error: exit status 1; cursor stderr: RetriableError: [unavailable] Error",
+		"cursor-agent exited with error: exit status 1; cursor stderr: Error: getaddrinfo ENOTFOUND api2.cursor.sh",
 		"cursor-agent exited with error: exit status 1; cursor stderr: RetriableError: Connection stalled",
 		"cursor-agent prompt write failed: write |1: broken pipe; cursor stderr: RetriableError: Connection stalled repeatedly",
 	} {
