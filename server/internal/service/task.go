@@ -5379,7 +5379,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		retryFireAt      pgtype.Timestamptz
 		retryMaxAttempts pgtype.Int4
 	)
-	if retryableReasons[failureReason] || taskfailure.HermesGatewayStartingDeadline(errMsg) {
+	hermesStartupFailure := taskfailure.HermesGatewayStartingDeadline(errMsg)
+	if retryableReasons[failureReason] || hermesStartupFailure {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
@@ -5409,10 +5410,6 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 				// fire_at NULL so the child is created immediately-claimable.
 				if delay := retryDelayForAttempt(failureReason, parent.Attempt); delay > 0 {
 					retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
-				}
-				if startupRecovery {
-					// Jitter avoids synchronizing tasks waiting on the same starting gateway.
-					retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(hermesGatewayRetryDelay()), Valid: true}
 				}
 				if agent, aerr := s.Queries.GetAgent(ctx, parent.AgentID); aerr != nil {
 					// Best-effort: a missing overlay is not retry-fatal — the child
@@ -5574,7 +5571,7 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		createRetry := wantRetry
 		if createRetry && launcherClaim != nil {
 			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
-		} else if taskfailure.HermesGatewayStartingDeadline(errMsg) {
+		} else if hermesStartupFailure {
 			createRetry = createRetry && hermesGatewayResumeRetryEligible(failureReason, errMsg, t)
 		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 			createRetry = createRetry && retryEligible(failureReason, t)
@@ -5646,6 +5643,11 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 				_, cerr = qtx.LockAgentForTaskEnqueue(ctx, t.AgentID)
 			}
 			if cerr == nil {
+				if launcherClaim == nil && hermesStartupFailure {
+					// Start the jitter after overlay preparation and queue locking
+					// so the new child waits even when those operations run slowly.
+					params.FireAt = pgtype.Timestamptz{Time: time.Now().Add(hermesGatewayRetryDelay()), Valid: true}
+				}
 				child, cerr = qtx.CreateRetryTask(ctx, params)
 			}
 			// A peer can acquire its pending slot after selection. Preserve the
