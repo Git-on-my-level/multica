@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,8 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -94,7 +97,8 @@ func TestAdmissionClaimBoundary(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			d := New(Config{ServerBaseURL: srv.URL, MaxConcurrentTasks: 1}, slog.New(slog.NewTextHandler(noopWriter{}, nil)))
+			var logs bytes.Buffer
+			d := New(Config{ServerBaseURL: srv.URL, MaxConcurrentTasks: 1}, slog.New(slog.NewTextHandler(&logs, nil)))
 			d.runtimeIndex["rt"] = Runtime{ID: "rt", Provider: "opencode"}
 			fake := &fakeAdmission{granted: tc.granted, err: tc.acquireErr}
 			d.admission = newAdmissionController(fake, d.logger)
@@ -108,6 +112,16 @@ func TestAdmissionClaimBoundary(t *testing.T) {
 			}
 			if fake.matches != 1 || fake.acquires != 1 {
 				t.Fatalf("matches = %d, acquires = %d", fake.matches, fake.acquires)
+			}
+			wantDenied := !tc.granted && tc.acquireErr == nil
+			if result.AdmissionDenied != wantDenied {
+				t.Fatalf("AdmissionDenied = %t, want %t", result.AdmissionDenied, wantDenied)
+			}
+			if wantDenied {
+				if log := logs.String(); !strings.Contains(log, "level=INFO") ||
+					!strings.Contains(log, "bucket=morph") || !strings.Contains(log, "holder="+fake.holder) {
+					t.Fatalf("denial log missing bucket or holder: %s", log)
+				}
 			}
 			wantTasks := tc.hasTask || tc.wantRegular > 0
 			if (len(result.Tasks) > 0) != wantTasks {
@@ -220,5 +234,19 @@ func TestAdmissionLeaseReleasedWhenTaskExits(t *testing.T) {
 				t.Fatalf("releases=%d, observations=%v", fake.releases, fake.observations)
 			}
 		})
+	}
+}
+
+func TestAdmissionDenialShortensClaimPoll(t *testing.T) {
+	d := New(Config{PollInterval: 30 * time.Second, WSClaimPollInterval: 3 * time.Minute}, slog.New(slog.NewTextHandler(noopWriter{}, nil)))
+	generation := d.wsRPC.attach(func([]byte) (*wsOutbound, error) { return nil, nil })
+	d.wsRPC.markRPCV1Supported(generation)
+	result := claimTasksResult{ClaimedOverWS: true, ClaimPollHintSupported: true}
+	if interval := d.taskClaimPollInterval(result); interval <= d.cfg.PollInterval {
+		t.Fatalf("empty preview shortened normal WS wait to %s", interval)
+	}
+	result.AdmissionDenied = true
+	if interval := d.taskClaimPollInterval(result); interval != d.cfg.PollInterval {
+		t.Fatalf("denied candidate wait = %s, want %s", interval, d.cfg.PollInterval)
 	}
 }

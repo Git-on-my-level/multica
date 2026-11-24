@@ -5995,17 +5995,20 @@ func (q *Queries) ListNonOwnerAgentsByRuntimeForUpdate(ctx context.Context, arg 
 }
 
 const listOpenCodeAdmissionCandidates = `-- name: ListOpenCodeAdmissionCandidates :many
-SELECT candidate.agent_id, candidate.model FROM (
-    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at
+SELECT candidate.agent_id, candidate.model, candidate.reclaim_due, candidate.promote_due FROM (
+    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at,
+        bool_or(t.status = 'dispatched') OVER (PARTITION BY t.agent_id)::boolean AS reclaim_due,
+        bool_or(t.status = 'deferred') OVER (PARTITION BY t.agent_id)::boolean AS promote_due
     FROM agent_task_queue t
     JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
     JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
     WHERE t.runtime_id = $1
+      AND ($2::uuid IS NULL OR t.agent_id = $2::uuid)
       AND (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.fire_at <= now())
           OR (t.status = 'dispatched' AND t.started_at IS NULL
-              AND t.dispatched_at < now() - make_interval(secs => $2::double precision)
+              AND t.dispatched_at < now() - make_interval(secs => $3::double precision)
               AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
       )
     ORDER BY t.agent_id, t.priority DESC, t.created_at ASC
@@ -6015,18 +6018,21 @@ ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.agent_id
 
 type ListOpenCodeAdmissionCandidatesParams struct {
 	RuntimeID         pgtype.UUID `json:"runtime_id"`
+	AgentID           pgtype.UUID `json:"agent_id"`
 	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
 }
 
 type ListOpenCodeAdmissionCandidatesRow struct {
-	AgentID pgtype.UUID `json:"agent_id"`
-	Model   pgtype.Text `json:"model"`
+	AgentID    pgtype.UUID `json:"agent_id"`
+	Model      pgtype.Text `json:"model"`
+	ReclaimDue bool        `json:"reclaim_due"`
+	PromoteDue bool        `json:"promote_due"`
 }
 
 // Read only. Include due deferred work and lost-response dispatches so a
 // denied agent can leave both paths untouched until a later poll.
 func (q *Queries) ListOpenCodeAdmissionCandidates(ctx context.Context, arg ListOpenCodeAdmissionCandidatesParams) ([]ListOpenCodeAdmissionCandidatesRow, error) {
-	rows, err := q.db.Query(ctx, listOpenCodeAdmissionCandidates, arg.RuntimeID, arg.ClaimRecoverySecs)
+	rows, err := q.db.Query(ctx, listOpenCodeAdmissionCandidates, arg.RuntimeID, arg.AgentID, arg.ClaimRecoverySecs)
 	if err != nil {
 		return nil, err
 	}
@@ -6034,7 +6040,12 @@ func (q *Queries) ListOpenCodeAdmissionCandidates(ctx context.Context, arg ListO
 	items := []ListOpenCodeAdmissionCandidatesRow{}
 	for rows.Next() {
 		var i ListOpenCodeAdmissionCandidatesRow
-		if err := rows.Scan(&i.AgentID, &i.Model); err != nil {
+		if err := rows.Scan(
+			&i.AgentID,
+			&i.Model,
+			&i.ReclaimDue,
+			&i.PromoteDue,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

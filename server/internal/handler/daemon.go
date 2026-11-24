@@ -4606,7 +4606,9 @@ func (h *Handler) claimTaskByRuntime(w http.ResponseWriter, r *http.Request, adm
 	if admittedModel != nil && (resp.Agent == nil || resp.Agent.Model != *admittedModel) {
 		// An edit can land after the queue transaction but before payload
 		// assembly. The daemon must see the same model it admitted.
-		requeueFailedClaim("admission model changed")
+		if err := h.TaskService.RequeueOpenCodeAdmissionModelChanged(r.Context(), *task); err != nil {
+			slog.Error("task claim: failed to requeue after admission model changed", "task_id", uuidToString(task.ID), "error", err)
+		}
 		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
 		outcome = "admission_model_changed"
 		return

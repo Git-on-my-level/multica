@@ -856,13 +856,6 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.agentsAvailable.Store(&initialAgents)
 	d.executionEnvironmentCommand = defaultExecutionEnvironmentCommand
-	if cfg.Admission.Enabled {
-		path := strings.TrimSpace(cfg.Admission.AgentctlPath)
-		if path == "" {
-			path = "agentctl"
-		}
-		d.admission = newAdmissionController(agentctlAdmission{path: path}, logger)
-	}
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
 	return d
@@ -2179,6 +2172,7 @@ func (d *Daemon) run(ctx context.Context, healthLn net.Listener) error {
 		logFields = append(logFields, "profile", d.cfg.Profile)
 	}
 	d.logger.Info("starting daemon", logFields...)
+	d.startAdmission()
 	d.logger.Debug("daemon config resolved",
 		"daemon_id", d.cfg.DaemonID,
 		"device_name", d.cfg.DeviceName,
@@ -5821,9 +5815,6 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			continue
 		}
 		interval := d.taskClaimPollInterval(claimResult)
-		if claimResult.AdmissionPolled {
-			interval = min(interval, d.normalTaskClaimPollInterval())
-		}
 		if err := sleepWithContextOrWakeup(pollerCtx, interval, wakeup); err != nil {
 			return
 		}
@@ -5950,8 +5941,9 @@ func (d *Daemon) taskClaimPollInterval(result claimTasksResult) time.Duration {
 	// locked row) stays forced but goes back to the normal cadence, and the
 	// terminal transition that clears a capacity or serialization barrier sends
 	// its own targeted wakeup. Capping instead of returning keeps a sooner
-	// deferred-task deadline.
-	if len(result.Tasks) > 0 && d.hasPendingForceRecheck() {
+	// deferred-task deadline. A limiter denial also needs a short poll because
+	// a host-local release may have no server wakeup.
+	if result.AdmissionDenied || len(result.Tasks) > 0 && d.hasPendingForceRecheck() {
 		if poll := d.normalTaskClaimPollInterval(); interval > poll {
 			interval = poll
 		}
@@ -10601,9 +10593,8 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// terminal boundary is one whose result cannot outrank a force stop, so it
 	// must not be given a hand-off window it can never use. Every such backend
 	// keeps the previous behaviour, including a wedged one, which is force
-	// stopped and classified without waiting for anything. Sessions that use
-	// Result to acknowledge process cleanup still need the bounded hand-off.
-	handsOverTerminal := session.TerminalObserved != nil || session.CleanupRequired
+	// stopped and classified without waiting for anything.
+	handsOverTerminal := session.TerminalObserved != nil
 	terminalObserved := session.TerminalObserved
 	if terminalObserved == nil {
 		terminalObserved = func() bool { return false }

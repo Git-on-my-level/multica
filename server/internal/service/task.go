@@ -3772,7 +3772,7 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			return fmt.Errorf("agent not found: %w", err)
 		}
 		if scope.expectedModel != nil && agent.Model.String != *scope.expectedModel {
-			outcome = claimOutcomeNoTasks
+			outcome = claimOutcomeAdmissionModelChanged
 			return nil
 		}
 		claimRuntimeID := runtimeID
@@ -4138,24 +4138,60 @@ func (s *TaskService) OpenCodeAdmissionCandidates(ctx context.Context, runtimeID
 // agent/model the daemon has checked. A scoped probe cannot certify that
 // other agents on the runtime are idle or that their reclaims were checked.
 func (s *TaskService) ClaimOpenCodeAdmission(ctx context.Context, runtimeID, agentID pgtype.UUID, model string) (*db.AgentTaskQueue, error) {
-	task, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
-		RuntimeID: runtimeID, AdmissionAgentID: agentID, AdmissionModel: pgtype.Text{String: model, Valid: true},
-		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+	scope := claimScope{claimPath: claimPathRuntime, expectedModel: &model}
+	candidates, err := s.Queries.ListOpenCodeAdmissionCandidates(ctx, db.ListOpenCodeAdmissionCandidatesParams{
+		RuntimeID: runtimeID, AgentID: agentID, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 	})
-	if err == nil {
-		s.trackTaskForReclaim(task, time.Now().Add(claimResponseRecoveryWindow+ReclaimCheckHintSafetyMargin))
-		s.recordClaimDecision(task.AgentID, task.RuntimeID, "reclaimed_dispatched", claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
-		return &task, nil
+	if err != nil {
+		s.recordClaimDecision(agentID, runtimeID, claimOutcomeErrorList, scope, claimDecisionDetail{})
+		return nil, fmt.Errorf("read admitted claim candidate: %w", err)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("reclaim admitted task: %w", err)
+	if len(candidates) == 0 {
+		s.recordClaimDecision(agentID, runtimeID, claimOutcomeEmptyDB, scope, claimDecisionDetail{})
+		return nil, nil
 	}
-	if err := s.PromoteDueDeferredTasksForRuntime(ctx, runtimeID); err != nil {
-		return nil, err
+	scope.candidates = 1
+	candidate := candidates[0]
+	if candidate.Model.String != model {
+		s.recordClaimDecision(agentID, runtimeID, claimOutcomeAdmissionModelChanged, scope, claimDecisionDetail{})
+		return nil, nil
 	}
-	return s.claimTask(ctx, agentID, runtimeID, claimScope{claimPath: claimPathRuntime, expectedModel: &model})
+	if candidate.PromoteDue {
+		if err := s.PromoteDueDeferredTasksForRuntime(ctx, runtimeID); err != nil {
+			s.recordClaimDecision(agentID, runtimeID, claimOutcomeErrorPromoteDeferred, scope, claimDecisionDetail{})
+			return nil, err
+		}
+	}
+
+	checkStarted := time.Now()
+	if candidate.ReclaimDue && len(s.ReclaimCheck.DueRuntimeIDs(ctx, []string{util.UUIDToString(runtimeID)}, checkStarted)) > 0 {
+		task, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
+			RuntimeID: runtimeID, AdmissionAgentID: agentID, AdmissionModel: pgtype.Text{String: model, Valid: true},
+			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+		})
+		// The check covers only one agent. Leave the runtime-wide marker and
+		// other agents' recovery hints alone.
+		if err == nil {
+			s.trackTaskForReclaim(task, checkStarted.Add(claimResponseRecoveryWindow+ReclaimCheckHintSafetyMargin))
+			s.recordClaimDecision(task.AgentID, task.RuntimeID, claimOutcomeReclaimedDispatched, scope, claimDecisionDetail{})
+			return &task, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.recordClaimDecision(agentID, runtimeID, claimOutcomeErrorReclaimDispatched, scope, claimDecisionDetail{})
+			return nil, fmt.Errorf("reclaim admitted task: %w", err)
+		}
+	}
+	return s.claimTask(ctx, agentID, runtimeID, scope)
+}
+
+// RequeueOpenCodeAdmissionModelChanged records a delivery rejection and
+// releases the exact claim generation before any credentials are returned.
+func (s *TaskService) RequeueOpenCodeAdmissionModelChanged(ctx context.Context, task db.AgentTaskQueue) error {
+	s.recordClaimDecision(task.AgentID, task.RuntimeID, claimOutcomeAdmissionModelChanged, claimScope{claimPath: claimPathRuntime, candidates: 1}, claimDecisionDetail{})
+	_, err := s.RequeueTaskAfterClaimFailure(ctx, task)
+	return err
 }
 
 // ErrClaimDeliveryAuthz signals that the final delivery gate rejected the

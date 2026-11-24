@@ -33,6 +33,22 @@ type admissionClient interface {
 
 type agentctlAdmission struct{ path string }
 
+func (d *Daemon) startAdmission() {
+	if !d.cfg.Admission.Enabled {
+		return
+	}
+	path := strings.TrimSpace(d.cfg.Admission.AgentctlPath)
+	if path == "" {
+		path = "agentctl"
+	}
+	resolved, err := exec.LookPath(path)
+	if err == nil {
+		path = resolved
+	}
+	d.admission = newAdmissionController(agentctlAdmission{path: path}, d.logger)
+	d.logger.Info("OpenCode admission enabled", "agentctl_path", path, "agentctl_resolved", err == nil)
+}
+
 func (a agentctlAdmission) call(ctx context.Context, result any, args ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, admissionCommandTimeout)
 	defer cancel()
@@ -159,6 +175,7 @@ func (a *admissionController) reserve(ctx context.Context, runtimeID, model stri
 		return nil, true, err
 	}
 	if !granted {
+		a.logger.Info("OpenCode admission denied", "bucket", lease.bucket, "holder", lease.holder)
 		return nil, false, nil
 	}
 	return lease, true, nil
@@ -272,14 +289,14 @@ func openCodeAdmissionPath(runtimeID string) string {
 // has already passed admission. Failure to preview is safe to fall back from;
 // failure of the claim itself may have committed and must never be replayed
 // through the legacy path.
-func (d *Daemon) claimOpenCodeRuntime(ctx context.Context, runtimeID string) (task *Task, previewOK bool, err error) {
+func (d *Daemon) claimOpenCodeRuntime(ctx context.Context, runtimeID string) (task *Task, previewOK, denied bool, err error) {
 	candidates, err := d.client.openCodeAdmissionCandidates(ctx, runtimeID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, denied, err
 	}
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
-			return nil, true, err
+			return nil, true, denied, err
 		}
 		model := candidate.Model
 		if model == "" {
@@ -287,23 +304,24 @@ func (d *Daemon) claimOpenCodeRuntime(ctx context.Context, runtimeID string) (ta
 		}
 		lease, allowed, err := d.admission.reserve(ctx, runtimeID, model)
 		if err != nil {
-			return nil, false, err
+			return nil, false, denied, err
 		}
 		if !allowed {
+			denied = true
 			continue
 		}
 		task, err := d.client.claimOpenCodeAdmission(ctx, runtimeID, candidate)
 		if task == nil || err != nil {
 			lease.release()
 			if err != nil {
-				return nil, true, err
+				return nil, true, denied, err
 			}
 			continue
 		}
 		task.admission = lease
-		return task, true, nil
+		return task, true, denied, nil
 	}
-	return nil, true, nil
+	return nil, true, denied, nil
 }
 
 // claimTasksWithAdmission keeps opt-out and non-OpenCode runtimes on the
@@ -315,7 +333,7 @@ func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []strin
 	}
 	regular := make([]string, 0, len(runtimeIDs))
 	var admitted []*Task
-	var polled bool
+	var denied bool
 	var openCodeErr error
 	previewed := make(map[string]struct{})
 	// Bound the extra work in one cycle, even when the host serves many
@@ -329,11 +347,11 @@ func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []strin
 			regular = append(regular, runtimeID)
 			continue
 		}
-		polled = true
 		if len(admitted) >= slots || admissionCtx.Err() != nil {
 			continue
 		}
-		task, previewOK, err := d.claimOpenCodeRuntime(admissionCtx, runtimeID)
+		task, previewOK, runtimeDenied, err := d.claimOpenCodeRuntime(admissionCtx, runtimeID)
+		denied = denied || runtimeDenied
 		if !previewOK {
 			if ctx.Err() == nil {
 				d.admission.warnOnce(err)
@@ -374,9 +392,9 @@ func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []strin
 	}
 	// Return every successful claim even when another transport failed.
 	result.Tasks = append(admitted, result.Tasks...)
-	result.AdmissionPolled = polled
+	result.AdmissionDenied = denied
 	result.AdmissionClaimed = len(admitted) > 0
-	if polled && result.ForceRecheckedRuntimeIDs != nil {
+	if result.ForceRecheckedRuntimeIDs != nil {
 		// The OpenCode preview reads the database directly. Drop its wake hints
 		// instead of repeatedly asking the ordinary batch cache to clear them.
 		for _, id := range forceRecheck {

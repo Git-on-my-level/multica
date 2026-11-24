@@ -42,6 +42,7 @@ const (
 	claimOutcomeClaimed                 = "claimed"
 	claimOutcomeNoTasks                 = "no_tasks"
 	claimOutcomeCodexModelAdmissionHeld = "codex_model_admission_held"
+	claimOutcomeAdmissionModelChanged   = "admission_model_changed"
 	claimOutcomeNoCapacity              = "no_capacity"
 	claimOutcomeRuntimeNoCapacity       = "runtime_no_capacity"
 	claimOutcomeNoRuntime               = "no_runtime"
@@ -129,8 +130,8 @@ func claimReasonFor(outcome string, scope claimScope) string {
 			return claimReasonUnknownCandidates
 		}
 		return claimReasonNoVisibleCandidates
-	case claimOutcomeCodexModelAdmissionHeld:
-		return claimOutcomeCodexModelAdmissionHeld
+	case claimOutcomeCodexModelAdmissionHeld, claimOutcomeAdmissionModelChanged:
+		return outcome
 	case claimOutcomeNoCapacity:
 		return claimReasonAgentConcurrencyCap
 	case claimOutcomeRuntimeNoCapacity:

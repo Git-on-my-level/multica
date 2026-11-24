@@ -508,9 +508,6 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 
 		startTime := time.Now()
 		result := func(status, errText, sessionID string, rejected bool) {
-			if opts.OpenCodeProcessStarted != nil {
-				stop(runCtx.Err() != nil)
-			}
 			resCh <- Result{Status: status, Error: errText, SessionID: sessionID, ResumeRejected: rejected, DurationMs: time.Since(startTime).Milliseconds()}
 		}
 
@@ -715,7 +712,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, CleanupRequired: opts.OpenCodeProcessStarted != nil}, nil
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 // opencodeACPNotify writes a JSON-RPC notification (no id, no response).

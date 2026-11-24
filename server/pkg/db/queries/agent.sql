@@ -2950,12 +2950,15 @@ SELECT comment_thread_root_id(@comment_id::uuid)::uuid AS id;
 -- name: ListOpenCodeAdmissionCandidates :many
 -- Read only. Include due deferred work and lost-response dispatches so a
 -- denied agent can leave both paths untouched until a later poll.
-SELECT candidate.agent_id, candidate.model FROM (
-    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at
+SELECT candidate.agent_id, candidate.model, candidate.reclaim_due, candidate.promote_due FROM (
+    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at,
+        bool_or(t.status = 'dispatched') OVER (PARTITION BY t.agent_id)::boolean AS reclaim_due,
+        bool_or(t.status = 'deferred') OVER (PARTITION BY t.agent_id)::boolean AS promote_due
     FROM agent_task_queue t
     JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
     JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
     WHERE t.runtime_id = @runtime_id
+      AND (sqlc.narg(agent_id)::uuid IS NULL OR t.agent_id = sqlc.narg(agent_id)::uuid)
       AND (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.fire_at <= now())

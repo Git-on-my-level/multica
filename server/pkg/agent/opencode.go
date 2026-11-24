@@ -422,7 +422,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, CleanupRequired: opts.OpenCodeProcessStarted != nil}, nil
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 func openCodeRecordProcessStart(opts ExecOptions) func() {
