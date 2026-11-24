@@ -112,6 +112,25 @@ multica daemon autostart disable
 
 Claude Code 和 Codex 執行時的頁面上還有**額度**：CLI 帳號在方案的 5 小時工作階段和每週視窗裡已經用了多少、什麼時候重置，以及用量是否跑在時間前面。這些資料由 CLI 在執行任務時回報，反映的是這個執行時最近一次執行時的狀態。API Key 帳號沒有方案額度。
 
+### OpenCode 供應商准入 [#opencode-admission]
+
+自架 OpenCode 常駐程式可與原生執行共用 agentctl 的主機供應商配額桶。請使用支援 `admission` 指令的 agentctl 版本並設定對應的配額桶。常駐程式和原生 agentctl 指令須使用相同的系統使用者和 agentctl 狀態目錄。
+
+將以下設定加入常駐程式的設定檔（`~/.multica/config.json` 或 `~/.multica/profiles/<name>/config.json`），然後重新啟動常駐程式。伺服器和常駐程式都須支援准入。
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+在代理程式的模型欄位填寫完整的 `provider/model`。准入檢查針對此欄位，OpenCode 預設設定、啟動包裝程式和自訂引數也可選擇模型。未獲准入的執行會繼續排隊。如果第一次檢查前無法使用 agentctl 或伺服器預覽，常駐程式會採用原有的並行限制。如果本輪輪詢逾時或中途停止，尚未檢查的 OpenCode 執行會繼續排隊。OpenCode JSON run 傳輸會回報步驟開始和結構化的 HTTP 429 事件。ACP 執行同樣需要准入，其請求嘗試次數不納入統計。
+
+若要還原，請將 `admission.enabled` 設為 `false` 並重新啟動常駐程式。
+
 ## 本機 MCP 配置 [#local-mcp]
 
 AI 代理沒有儲存 MCP 配置時，Multica 不向工具傳任何 MCP 設定，工具照常讀取這臺電腦上它自己的配置。

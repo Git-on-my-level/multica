@@ -2145,6 +2145,16 @@ const claimBatchMaxTasksCap = 32
 // runtime_ids are skipped silently (a daemon may send a just-deleted runtime;
 // it self-heals via the heartbeat path).
 func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
+	h.claimTasksByRuntime(w, r, false)
+}
+
+// ClaimTasksWithOpenCodeAdmission uses the same scheduler as the regular batch
+// endpoint. A zero-slot request previews OpenCode candidates without claiming.
+func (h *Handler) ClaimTasksWithOpenCodeAdmission(w http.ResponseWriter, r *http.Request) {
+	h.claimTasksByRuntime(w, r, true)
+}
+
+func (h *Handler) claimTasksByRuntime(w http.ResponseWriter, r *http.Request, admitOpenCode bool) {
 	start := time.Now()
 	buildDeadline, responseDeadline := batchClaimDeadlines(r.Context(), start)
 	buildCtx, cancelBuild := context.WithDeadline(r.Context(), buildDeadline)
@@ -2161,7 +2171,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		// EmptyClaim.Bump. Absent/unknown on an older daemon → behaves exactly as
 		// before (TTL fallback). Parsed defensively; ids not in the authorized set
 		// are dropped.
-		ForceRecheckRuntimeIDs []string `json:"force_recheck_runtime_ids"`
+		ForceRecheckRuntimeIDs []string                           `json:"force_recheck_runtime_ids"`
+		AdmissionCandidates    []protocol.BatchAdmissionCandidate `json:"admission_candidates"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -2186,7 +2197,12 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	// An explicit force list also opts in for clients that predate the header.
 	wantAck := len(req.ForceRecheckRuntimeIDs) > 0 || requestHasClientCapability(r, protocol.DaemonCapabilityForceRecheckV1)
+	preview := admitOpenCode && req.MaxTasks == 0
 	respondEmpty := func() {
+		if preview {
+			writeMeasuredJSON(w, http.StatusOK, map[string]any{"admission_candidates": []protocol.BatchAdmissionCandidate{}})
+			return
+		}
 		response := map[string]any{"tasks": []AgentTaskResponse{}}
 		if wantAck {
 			response["force_rechecked_runtime_ids"] = []string{}
@@ -2203,7 +2219,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "max_tasks must not be negative")
 		return
 	}
-	if req.MaxTasks == 0 {
+	if req.MaxTasks == 0 && !preview {
 		respondEmpty()
 		return
 	}
@@ -2290,6 +2306,52 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var admission service.OpenCodeBatchAdmission
+	if admitOpenCode {
+		admission = make(service.OpenCodeBatchAdmission)
+		var openCodeIDs []pgtype.UUID
+		for _, id := range authorized {
+			if runtimeByID[uuidToString(id)].Provider == "opencode" {
+				admission[id] = make(map[pgtype.UUID]protocol.BatchAdmissionCandidate)
+				openCodeIDs = append(openCodeIDs, id)
+			}
+		}
+		if preview {
+			candidates, err := h.TaskService.OpenCodeBatchAdmissionCandidates(r.Context(), openCodeIDs)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to preview OpenCode candidates")
+				return
+			}
+			writeMeasuredJSON(w, http.StatusOK, map[string]any{"admission_candidates": candidates})
+			return
+		}
+		for _, candidate := range req.AdmissionCandidates {
+			runtimeID, err := util.ParseUUID(candidate.RuntimeID)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid admission runtime_id")
+				return
+			}
+			permits, restricted := admission[runtimeID]
+			if !restricted {
+				continue
+			}
+			agentID, ok := parseUUIDOrBadRequest(w, candidate.AgentID, "agent_id")
+			if !ok {
+				return
+			}
+			if candidate.ReclaimTaskID != "" {
+				reclaimID, ok := parseUUIDOrBadRequest(w, candidate.ReclaimTaskID, "reclaim_task_id")
+				if !ok {
+					return
+				}
+				candidate.ReclaimTaskID = uuidToString(reclaimID)
+			}
+			candidate.RuntimeID = uuidToString(runtimeID)
+			candidate.AgentID = uuidToString(agentID)
+			permits[agentID] = candidate
+		}
+	}
+
 	// Restrict the force-recheck set (#7452) to runtimes this daemon is
 	// authorized for: an unknown or malformed id is skipped (matching this
 	// endpoint's "unknown id skipped" semantics), and an id for another daemon's
@@ -2306,7 +2368,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		forceRecheck = append(forceRecheck, ruid)
 	}
 
-	claimed, forceRechecked, err := h.TaskService.ClaimTasksForRuntimes(r.Context(), authorized, maxTasks, forceRecheck...)
+	claimed, forceRechecked, err := h.TaskService.ClaimTasksForRuntimesWithAdmission(r.Context(), authorized, maxTasks, admission, forceRecheck...)
 	if err != nil {
 		slog.Warn("claim tasks failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to claim tasks")
@@ -2341,6 +2403,14 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			// it has already settled the task where the failure requires it.
 			// Undelivered claims are recovered below with a separate budget.
 			continue
+		}
+		if permits, restricted := admission[task.RuntimeID]; restricted {
+			permit, allowed := permits[task.AgentID]
+			if !allowed || resp.Agent == nil || resp.Agent.Model != permit.Model {
+				h.TaskService.RecordOpenCodeAdmissionDeliveryRejection(task, true)
+				// The batch recovery below requeues undelivered generations.
+				continue
+			}
 		}
 		if !rt.OwnerID.Valid {
 			slog.Error("batch claim: runtime owner missing; cancelling task to avoid unscoped agent credentials",
@@ -2420,9 +2490,20 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	// omit the support bit so the daemon conservatively retains its ordinary
 	// PollInterval. Omitted claims also retain that short poll in case recovery
 	// failed or the task_available wakeup raced with this response.
-	if len(out) == len(claimed) && len(out) < maxTasks && requestHasClientCapability(r, protocol.DaemonCapabilityClaimPollHintsV1) {
+	hintRuntimes := authorized
+	if len(admission) > 0 {
+		// The local admission poll schedules protected work. A denied, overdue
+		// deferred task must not turn the long WS hint into a one-second loop.
+		hintRuntimes = make([]pgtype.UUID, 0, len(authorized)-len(admission))
+		for _, id := range authorized {
+			if _, restricted := admission[id]; !restricted {
+				hintRuntimes = append(hintRuntimes, id)
+			}
+		}
+	}
+	if len(hintRuntimes) > 0 && len(out) == len(claimed) && len(out) < maxTasks && requestHasClientCapability(r, protocol.DaemonCapabilityClaimPollHintsV1) {
 		nextDeferred, nextErr := h.Queries.NextDeferredTaskFireAtForRuntimes(r.Context(), db.NextDeferredTaskFireAtForRuntimesParams{
-			RuntimeIds:       authorized,
+			RuntimeIds:       hintRuntimes,
 			RuntimeStaleSecs: service.RuntimeClaimFreshnessSeconds,
 		})
 		if nextErr != nil {
@@ -4471,7 +4552,41 @@ func worktreeClaimBlockReason(resources []ProjectResourceData, runtime db.AgentR
 
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
 // The response includes the agent's name and skills, fetched fresh from the DB.
+func (h *Handler) ListOpenCodeAdmissionCandidates(w http.ResponseWriter, r *http.Request) {
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, chi.URLParam(r, "runtimeId"))
+	if !ok {
+		return
+	}
+	if runtime.Provider != "opencode" {
+		writeError(w, http.StatusBadRequest, "admission requires an OpenCode runtime")
+		return
+	}
+	candidates, err := h.TaskService.OpenCodeAdmissionCandidates(r.Context(), runtime.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to preview OpenCode candidates")
+		return
+	}
+	writeJSON(w, http.StatusOK, candidates)
+}
+
+func (h *Handler) ClaimOpenCodeAdmission(w http.ResponseWriter, r *http.Request) {
+	var candidate protocol.AdmissionCandidate
+	if err := json.NewDecoder(r.Body).Decode(&candidate); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid admission candidate")
+		return
+	}
+	agentID, ok := parseUUIDOrBadRequest(w, candidate.AgentID, "agent_id")
+	if !ok {
+		return
+	}
+	h.claimTaskByRuntime(w, r, agentID, &candidate.Model)
+}
+
 func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
+	h.claimTaskByRuntime(w, r, pgtype.UUID{}, nil)
+}
+
+func (h *Handler) claimTaskByRuntime(w http.ResponseWriter, r *http.Request, admittedAgentID pgtype.UUID, admittedModel *string) {
 	runtimeID := chi.URLParam(r, "runtimeId")
 	start := time.Now()
 
@@ -4507,7 +4622,17 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	authMs = time.Since(start).Milliseconds()
 
 	claimStart := time.Now()
-	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
+	var task *db.AgentTaskQueue
+	var err error
+	if admittedModel == nil {
+		task, err = h.TaskService.ClaimTaskForRuntime(r.Context(), runtime.ID)
+	} else {
+		if runtime.Provider != "opencode" {
+			writeError(w, http.StatusBadRequest, "admission requires an OpenCode runtime")
+			return
+		}
+		task, err = h.TaskService.ClaimOpenCodeAdmission(r.Context(), runtime.ID, admittedAgentID, *admittedModel)
+	}
 	claimMs = time.Since(claimStart).Milliseconds()
 	if err != nil {
 		outcome = "error_claim"
@@ -4558,6 +4683,15 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 				"error", err,
 			)
 		}
+	}
+	if admittedModel != nil && (resp.Agent == nil || resp.Agent.Model != *admittedModel) {
+		// An edit can land after the queue transaction but before payload
+		// assembly. The daemon must see the same model it admitted.
+		h.TaskService.RecordOpenCodeAdmissionDeliveryRejection(*task, false)
+		requeueFailedClaim("admission model changed")
+		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
+		outcome = "admission_model_changed"
+		return
 	}
 	// Mint a task-scoped `mat_` token bound to (agent, task, workspace,
 	// owner). The daemon will inject this as MULTICA_TOKEN into the agent

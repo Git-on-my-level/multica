@@ -1019,6 +1019,7 @@ SET dispatched_at = now(),
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
+      AND (sqlc.narg(admission_agent_id)::uuid IS NULL OR atq.agent_id = sqlc.narg(admission_agent_id)::uuid)
       AND atq.status = 'dispatched'
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
@@ -1031,6 +1032,7 @@ WHERE id = (
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
+            AND (sqlc.narg(admission_model)::text IS NULL OR COALESCE(a.model, '') = sqlc.narg(admission_model)::text)
             AND (
                 r.visibility = 'public'
                 OR (
@@ -1079,6 +1081,15 @@ WITH candidates AS MATERIALIZED (
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
+            AND (
+                NOT @admission_restricted::boolean
+                OR atq.runtime_id = ANY(@unrestricted_runtime_ids::uuid[])
+                OR (
+                    atq.runtime_id::text = (@admission_reclaims::jsonb -> atq.id::text ->> 'runtime_id')
+                    AND atq.agent_id::text = (@admission_reclaims::jsonb -> atq.id::text ->> 'agent_id')
+                    AND COALESCE(a.model, '') = (@admission_reclaims::jsonb -> atq.id::text ->> 'model')
+                )
+            )
             AND (
                 r.visibility = 'public'
                 OR (
@@ -2943,3 +2954,31 @@ RETURNING *;
 
 -- name: GetCommentThreadRootID :one
 SELECT comment_thread_root_id(@comment_id::uuid)::uuid AS id;
+
+
+-- name: ListOpenCodeAdmissionCandidates :many
+-- One candidate per agent, in the batch claim's recovery-first, priority/FIFO
+-- order. An exact stale dispatch ID lets a permit cover at most one delivery.
+SELECT candidate.runtime_id, candidate.agent_id, candidate.model, candidate.reclaim_due,
+       candidate.reclaim_task_id, candidate.promote_due
+FROM (
+    SELECT DISTINCT ON (t.agent_id) t.runtime_id, t.agent_id, a.model, t.priority,
+        CASE WHEN t.status = 'dispatched' THEN t.dispatched_at ELSE t.created_at END AS order_at,
+        (t.status = 'dispatched')::boolean AS reclaim_due,
+        CASE WHEN t.status = 'dispatched' THEN t.id ELSE NULL END::uuid AS reclaim_task_id,
+        bool_or(t.status = 'deferred') OVER (PARTITION BY t.agent_id)::boolean AS promote_due
+    FROM agent_task_queue t
+    JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
+    JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
+    WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
+      AND (sqlc.narg(agent_id)::uuid IS NULL OR t.agent_id = sqlc.narg(agent_id)::uuid)
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.fire_at <= now())
+          OR (t.status = 'dispatched' AND t.started_at IS NULL
+              AND t.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
+              AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
+      )
+    ORDER BY t.agent_id, reclaim_due DESC, t.priority DESC, order_at ASC, t.id
+) candidate
+ORDER BY candidate.reclaim_due DESC, candidate.priority DESC, candidate.order_at ASC, candidate.agent_id;

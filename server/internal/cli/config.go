@@ -19,8 +19,16 @@ const (
 	TaskConfigRootEnv = "MULTICA_TASK_CONFIG_ROOT"
 )
 
+// AdmissionConfig configures the daemon's optional host-local agentctl admission.
+type AdmissionConfig struct {
+	Enabled      bool   `json:"enabled"`
+	AgentctlPath string `json:"agentctl_path,omitempty"`
+}
+
 // CLIConfig holds persistent CLI settings.
 type CLIConfig struct {
+	Admission *AdmissionConfig `json:"admission,omitempty"`
+
 	ServerURL   string `json:"server_url,omitempty"`
 	AppURL      string `json:"app_url,omitempty"`
 	WorkspaceID string `json:"workspace_id,omitempty"`

@@ -343,18 +343,20 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		_ = stdout.Close()
 	}()
 
+	processDone := openCodeRecordProcessStart(opts)
 	go func() {
 		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
 
 		startTime := time.Now()
-		scanResult := run.processEvents(stdout, msgCh)
+		scanResult := run.processEventsWithAttempts(stdout, msgCh, opts.OpenCodeAttempt)
 
 		// Wait for process exit, then release the cancellation handler.
 		exitErr := cmd.Wait()
 		close(procDone)
 		releaseProcessGroup(cmd)
+		processDone()
 		duration := time.Since(startTime)
 
 		// Wait closes the process pipes, so a prompt write still blocked when
@@ -423,6 +425,13 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
+func openCodeRecordProcessStart(opts ExecOptions) func() {
+	if opts.OpenCodeProcessStarted != nil {
+		return opts.OpenCodeProcessStarted()
+	}
+	return func() {}
+}
+
 // ── Event handlers ──
 
 // eventResult holds the accumulated state from processing the event stream.
@@ -446,6 +455,10 @@ type eventResult struct {
 // processEvents reads JSON lines from r, dispatches events to ch, and returns
 // the accumulated result. This is the core scanner loop, extracted for testability.
 func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventResult {
+	return b.processEventsWithAttempts(r, ch, nil)
+}
+
+func (b *opencodeBackend) processEventsWithAttempts(r io.Reader, ch chan<- Message, observeAttempt func(bool)) eventResult {
 	var output strings.Builder
 	var sessionID string
 	var usage TokenUsage
@@ -506,6 +519,18 @@ func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventRes
 		var event opencodeEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			continue
+		}
+
+		if observeAttempt != nil {
+			switch event.Type {
+			case "step_start":
+				observeAttempt(false)
+			case "retry", "error":
+				if event.Error != nil && (string(event.Error.Status) == "429" ||
+					event.Error.Data != nil && string(event.Error.Data.StatusCode) == "429") {
+					observeAttempt(true)
+				}
+			}
 		}
 
 		if event.SessionID != "" {
@@ -896,8 +921,9 @@ type opencodeToolState struct {
 // `{"type": "provider.invalid-output", "message": …}`. Both are decoded so a
 // 2.x failure surfaces its real cause instead of "unknown opencode error".
 type opencodeError struct {
-	Name string           `json:"name,omitempty"`
-	Data *opencodeErrData `json:"data,omitempty"`
+	Status json.RawMessage  `json:"status,omitempty"`
+	Name   string           `json:"name,omitempty"`
+	Data   *opencodeErrData `json:"data,omitempty"`
 	// 2.x shape.
 	Type string `json:"type,omitempty"`
 	Msg  string `json:"message,omitempty"`
@@ -921,5 +947,6 @@ func (e *opencodeError) Message() string {
 }
 
 type opencodeErrData struct {
-	Message string `json:"message,omitempty"`
+	StatusCode json.RawMessage `json:"statusCode,omitempty"`
+	Message    string          `json:"message,omitempty"`
 }

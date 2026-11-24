@@ -5994,6 +5994,76 @@ func (q *Queries) ListNonOwnerAgentsByRuntimeForUpdate(ctx context.Context, arg 
 	return items, nil
 }
 
+const listOpenCodeAdmissionCandidates = `-- name: ListOpenCodeAdmissionCandidates :many
+SELECT candidate.runtime_id, candidate.agent_id, candidate.model, candidate.reclaim_due,
+       candidate.reclaim_task_id, candidate.promote_due
+FROM (
+    SELECT DISTINCT ON (t.agent_id) t.runtime_id, t.agent_id, a.model, t.priority,
+        CASE WHEN t.status = 'dispatched' THEN t.dispatched_at ELSE t.created_at END AS order_at,
+        (t.status = 'dispatched')::boolean AS reclaim_due,
+        CASE WHEN t.status = 'dispatched' THEN t.id ELSE NULL END::uuid AS reclaim_task_id,
+        bool_or(t.status = 'deferred') OVER (PARTITION BY t.agent_id)::boolean AS promote_due
+    FROM agent_task_queue t
+    JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
+    JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
+    WHERE t.runtime_id = ANY($1::uuid[])
+      AND ($2::uuid IS NULL OR t.agent_id = $2::uuid)
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.fire_at <= now())
+          OR (t.status = 'dispatched' AND t.started_at IS NULL
+              AND t.dispatched_at < now() - make_interval(secs => $3::double precision)
+              AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
+      )
+    ORDER BY t.agent_id, reclaim_due DESC, t.priority DESC, order_at ASC, t.id
+) candidate
+ORDER BY candidate.reclaim_due DESC, candidate.priority DESC, candidate.order_at ASC, candidate.agent_id
+`
+
+type ListOpenCodeAdmissionCandidatesParams struct {
+	RuntimeIds        []pgtype.UUID `json:"runtime_ids"`
+	AgentID           pgtype.UUID   `json:"agent_id"`
+	ClaimRecoverySecs float64       `json:"claim_recovery_secs"`
+}
+
+type ListOpenCodeAdmissionCandidatesRow struct {
+	RuntimeID     pgtype.UUID `json:"runtime_id"`
+	AgentID       pgtype.UUID `json:"agent_id"`
+	Model         pgtype.Text `json:"model"`
+	ReclaimDue    bool        `json:"reclaim_due"`
+	ReclaimTaskID pgtype.UUID `json:"reclaim_task_id"`
+	PromoteDue    bool        `json:"promote_due"`
+}
+
+// One candidate per agent, in the batch claim's recovery-first, priority/FIFO
+// order. An exact stale dispatch ID lets a permit cover at most one delivery.
+func (q *Queries) ListOpenCodeAdmissionCandidates(ctx context.Context, arg ListOpenCodeAdmissionCandidatesParams) ([]ListOpenCodeAdmissionCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCodeAdmissionCandidates, arg.RuntimeIds, arg.AgentID, arg.ClaimRecoverySecs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCodeAdmissionCandidatesRow{}
+	for rows.Next() {
+		var i ListOpenCodeAdmissionCandidatesRow
+		if err := rows.Scan(
+			&i.RuntimeID,
+			&i.AgentID,
+			&i.Model,
+			&i.ReclaimDue,
+			&i.ReclaimTaskID,
+			&i.PromoteDue,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingDelegatedFailureRecoveries = `-- name: ListPendingDelegatedFailureRecoveries :many
 SELECT recovery.id, recovery.issue_id, recovery.author_type, recovery.author_id, recovery.content, recovery.type, recovery.created_at, recovery.updated_at, recovery.parent_id, recovery.workspace_id, recovery.resolved_at, recovery.resolved_by_type, recovery.resolved_by_id, recovery.source_task_id, recovery.quick_action_id, recovery.via_plugin_id, recovery.revision, recovery.recovery_settled_at, recovery.deleted_at, recovery.suppressed_agent_ids
 FROM comment recovery
@@ -8240,9 +8310,10 @@ SET dispatched_at = now(),
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
+      AND ($3::uuid IS NULL OR atq.agent_id = $3::uuid)
       AND atq.status = 'dispatched'
       AND atq.started_at IS NULL
-      AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
+      AND atq.dispatched_at < now() - make_interval(secs => $4::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
@@ -8252,6 +8323,7 @@ WHERE id = (
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
+            AND ($5::text IS NULL OR COALESCE(a.model, '') = $5::text)
             AND (
                 r.visibility = 'public'
                 OR (
@@ -8267,7 +8339,7 @@ WHERE id = (
             AND r.status = 'online'
           AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $6::double precision)
       )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
     LIMIT 1
@@ -8279,7 +8351,9 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 type ReclaimStaleDispatchedTaskForRuntimeParams struct {
 	RuntimeID         pgtype.UUID `json:"runtime_id"`
 	PrepareLeaseSecs  float64     `json:"prepare_lease_secs"`
+	AdmissionAgentID  pgtype.UUID `json:"admission_agent_id"`
 	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
+	AdmissionModel    pgtype.Text `json:"admission_model"`
 	RuntimeStaleSecs  float64     `json:"runtime_stale_secs"`
 }
 
@@ -8292,7 +8366,9 @@ func (q *Queries) ReclaimStaleDispatchedTaskForRuntime(ctx context.Context, arg 
 	row := q.db.QueryRow(ctx, reclaimStaleDispatchedTaskForRuntime,
 		arg.RuntimeID,
 		arg.PrepareLeaseSecs,
+		arg.AdmissionAgentID,
 		arg.ClaimRecoverySecs,
+		arg.AdmissionModel,
 		arg.RuntimeStaleSecs,
 	)
 	var i AgentTaskQueue
@@ -8378,6 +8454,15 @@ WITH candidates AS MATERIALIZED (
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
             AND (
+                NOT $4::boolean
+                OR atq.runtime_id = ANY($5::uuid[])
+                OR (
+                    atq.runtime_id::text = ($6::jsonb -> atq.id::text ->> 'runtime_id')
+                    AND atq.agent_id::text = ($6::jsonb -> atq.id::text ->> 'agent_id')
+                    AND COALESCE(a.model, '') = ($6::jsonb -> atq.id::text ->> 'model')
+                )
+            )
+            AND (
                 r.visibility = 'public'
                 OR (
                     r.visibility = 'private'
@@ -8392,10 +8477,10 @@ WITH candidates AS MATERIALIZED (
             AND r.status = 'online'
           AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $7::double precision)
       )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
-    LIMIT $5::int
+    LIMIT $8::int
     FOR UPDATE SKIP LOCKED
 )
 UPDATE agent_task_queue
@@ -8406,11 +8491,14 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type ReclaimStaleDispatchedTasksForRuntimesParams struct {
-	PrepareLeaseSecs  float64       `json:"prepare_lease_secs"`
-	RuntimeIds        []pgtype.UUID `json:"runtime_ids"`
-	ClaimRecoverySecs float64       `json:"claim_recovery_secs"`
-	RuntimeStaleSecs  float64       `json:"runtime_stale_secs"`
-	MaxTasks          int32         `json:"max_tasks"`
+	PrepareLeaseSecs       float64       `json:"prepare_lease_secs"`
+	RuntimeIds             []pgtype.UUID `json:"runtime_ids"`
+	ClaimRecoverySecs      float64       `json:"claim_recovery_secs"`
+	AdmissionRestricted    bool          `json:"admission_restricted"`
+	UnrestrictedRuntimeIds []pgtype.UUID `json:"unrestricted_runtime_ids"`
+	AdmissionReclaims      []byte        `json:"admission_reclaims"`
+	RuntimeStaleSecs       float64       `json:"runtime_stale_secs"`
+	MaxTasks               int32         `json:"max_tasks"`
 }
 
 // Batch variant of ReclaimStaleDispatchedTaskForRuntime (MUL-4257): re-delivers
@@ -8427,6 +8515,9 @@ func (q *Queries) ReclaimStaleDispatchedTasksForRuntimes(ctx context.Context, ar
 		arg.PrepareLeaseSecs,
 		arg.RuntimeIds,
 		arg.ClaimRecoverySecs,
+		arg.AdmissionRestricted,
+		arg.UnrestrictedRuntimeIds,
+		arg.AdmissionReclaims,
 		arg.RuntimeStaleSecs,
 		arg.MaxTasks,
 	)

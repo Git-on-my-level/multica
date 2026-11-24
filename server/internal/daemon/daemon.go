@@ -443,6 +443,7 @@ type repoCacheBackend interface {
 
 // Daemon is the local agent runtime that polls for and executes tasks.
 type Daemon struct {
+	admission *admissionController
 	// accountPool is the fork's subscription account pool (account_pool_fork.go);
 	// nil when no provider has extra accounts.
 	accountPool *accountPool
@@ -2171,6 +2172,7 @@ func (d *Daemon) run(ctx context.Context, healthLn net.Listener) error {
 		logFields = append(logFields, "profile", d.cfg.Profile)
 	}
 	d.logger.Info("starting daemon", logFields...)
+	d.startAdmission()
 	d.logger.Debug("daemon config resolved",
 		"daemon_id", d.cfg.DaemonID,
 		"device_name", d.cfg.DeviceName,
@@ -5741,7 +5743,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// queued task until the TTL (#7452). Intersect with the live runtime set
 		// so a runtime deleted since it was woken (#7969) is never force-rechecked.
 		forceRecheck := d.filterLiveRuntimes(d.drainWokenRuntimes())
-		claimResult, err := d.claimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots), forceRecheck...)
+		claimResult, err := d.claimTasksWithAdmission(pollerCtx, runtimeIDs, len(slots), forceRecheck)
 		if err != nil {
 			d.exitClaim()
 			releaseSlots(slots)
@@ -5812,7 +5814,8 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		if dispatched > 0 && dispatched == len(slots) {
 			continue
 		}
-		if err := sleepWithContextOrWakeup(pollerCtx, d.taskClaimPollInterval(claimResult), wakeup); err != nil {
+		interval := d.taskClaimPollInterval(claimResult)
+		if err := sleepWithContextOrWakeup(pollerCtx, interval, wakeup); err != nil {
 			return
 		}
 	}
@@ -5938,8 +5941,9 @@ func (d *Daemon) taskClaimPollInterval(result claimTasksResult) time.Duration {
 	// locked row) stays forced but goes back to the normal cadence, and the
 	// terminal transition that clears a capacity or serialization barrier sends
 	// its own targeted wakeup. Capping instead of returning keeps a sooner
-	// deferred-task deadline.
-	if len(result.Tasks) > 0 && d.hasPendingForceRecheck() {
+	// deferred-task deadline. A limiter denial also needs a short poll because
+	// a host-local release may have no server wakeup.
+	if result.AdmissionDenied || len(result.Tasks) > 0 && d.hasPendingForceRecheck() {
 		if poll := d.normalTaskClaimPollInterval(); interval > poll {
 			interval = poll
 		}
@@ -5955,7 +5959,7 @@ func (d *Daemon) normalTaskClaimPollInterval() time.Duration {
 }
 
 func (d *Daemon) baseTaskClaimPollInterval(result claimTasksResult) time.Duration {
-	if !d.wsRPC.supportsRPCV1() || !result.ClaimedOverWS || !result.ClaimPollHintSupported {
+	if !d.wsRPC.supportsRPCV1() || !(result.ClaimedOverWS || result.ClaimedWithAdmission) || !result.ClaimPollHintSupported {
 		return d.normalTaskClaimPollInterval()
 	}
 	upperBound := d.cfg.WSClaimPollInterval
@@ -6137,6 +6141,7 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 }
 
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease) {
+	defer task.admission.release()
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
 	d.mu.Unlock()
@@ -6296,6 +6301,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot.index, taskLog)
+	task.admission.release()
 	if errors.Is(err, errStartClaimRejected) {
 		// The row belongs to another claim (or is terminal). A task-id-only
 		// failure callback from this stale delivery could kill its new owner.
@@ -9559,6 +9565,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		OpenclawModelOverride:  openclawModelOverride,
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
+	}
+	if task.admission != nil {
+		execOpts.OpenCodeAttempt = task.admission.countAttempt
+		execOpts.OpenCodeProcessStarted = task.admission.processStarted
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:

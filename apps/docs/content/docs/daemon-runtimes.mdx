@@ -111,6 +111,25 @@ Token usage, cost, and failures across runs are summarized per workspace on the 
 
 For Claude Code and Codex runtimes, the runtime's page also shows **Limits**: how much of the plan's 5-hour session and weekly windows the CLI account has used, when each resets, and whether usage is running ahead of the time elapsed. The CLI reports these while it runs tasks, so the numbers are as of the runtime's latest run. API-key accounts have no plan limits to show.
 
+### OpenCode provider admission [#opencode-admission]
+
+Self-hosted OpenCode daemons can share agentctl's host-local provider buckets with native runs. Use an agentctl build with the `admission` commands and configure the relevant bucket. Run the daemon and native agentctl commands under the same OS user and agentctl state directory.
+
+Add this object to the daemon profile's JSON config (`~/.multica/config.json` or `~/.multica/profiles/<name>/config.json`), then restart the daemon. Both the server and daemon need to support admission.
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+Set the full `provider/model` in the agent's model field. Model selection from OpenCode defaults, launch wrappers, or custom flags is outside the pre-claim model check. A denied run stays queued. The daemon uses its usual concurrency limits if agentctl or the server preview is unavailable before the first check. If the poll runs out of time or stops partway through, unchecked OpenCode work stays queued. The OpenCode JSON run transport reports step starts and structured HTTP 429 events. ACP runs use the same admission gate and provide no request-attempt samples.
+
+To roll back, set `admission.enabled` to `false` and restart the daemon.
+
 ## Local MCP configuration [#local-mcp]
 
 When an agent has no MCP configuration saved, Multica passes no MCP settings and the tool reads its own configuration on that computer as usual.
