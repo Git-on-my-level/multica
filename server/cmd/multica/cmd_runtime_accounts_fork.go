@@ -70,7 +70,7 @@ func init() {
 	runtimeAccountsCmd.AddCommand(runtimeAccountsListCmd, runtimeAccountsAddCmd, runtimeAccountsRemoveCmd, runtimeAccountsThresholdCmd)
 	runtimeAccountsListCmd.Flags().String("output", "table", "Output format: table or json")
 	runtimeAccountsAddCmd.Flags().String("id", "", "Account id, for example claude-2 (required)")
-	runtimeAccountsAddCmd.Flags().String("facts-id", "", "Capacity facts account id (defaults to --id)")
+	runtimeAccountsAddCmd.Flags().String("facts-id", "", "Capacity facts account id (defaults to --id for new accounts)")
 	runtimeAccountsAddCmd.Flags().String("executable", "", "Claude: launcher that runs Claude Code as this account")
 	runtimeAccountsAddCmd.Flags().String("config-dir", "", "Claude: the account's CLAUDE_CONFIG_DIR")
 	runtimeAccountsAddCmd.Flags().String("home", "", "Codex: the account's CODEX_HOME")
@@ -142,6 +142,9 @@ func runRuntimeAccountsAdd(cmd *cobra.Command, args []string) error {
 	replaced := false
 	for i, existing := range pools.Accounts[provider] {
 		if existing.ID == spec.ID {
+			if !cmd.Flags().Changed("facts-id") {
+				spec.FactsID = existing.FactsID
+			}
 			pools.Accounts[provider][i] = spec
 			replaced = true
 		}

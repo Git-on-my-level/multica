@@ -387,6 +387,8 @@ Set `facts_file` to the absolute path of the published agentctl capacity facts f
 {
   "facts_file": "/home/you/.local/state/capacity/facts.json",
   "facts_max_age_seconds": 3600,
+  "epsilon": 0.03,
+  "expected_run_cost": 0.01,
   "default_facts_ids": {
     "claude": "claude-2",
     "codex": "codex"
@@ -394,7 +396,7 @@ Set `facts_file` to the absolute path of the published agentctl capacity facts f
 }
 ```
 
-Use the facts ID that corresponds to each default login on this machine. Extra accounts use their configured ID by default. Set `facts_id` on an extra account or pass `--facts-id` to `runtime accounts add` when its ID differs from the published ID. Restart the daemon after editing the profile.
+Use the facts ID that corresponds to each default login on this machine. Extra accounts use their configured ID by default. Set `facts_id` on an extra account or pass `--facts-id` to `runtime accounts add` when its ID differs from the published ID. Pass `--facts-id ""` to reset an existing mapping to the account's configured ID. Restart the daemon after editing the profile.
 
 - **At launch.** The default `drain_before_reset` policy prefers the account whose latest window reset comes first. Every window's projected usage must fit within `1 - epsilon` (`epsilon` defaults to `0.03`). Projection adds `expected_run_cost` (default `0.01`) for the proposed run, local in-flight leases, and local runs completed since that window was observed. On equal reset times, lower projected usage on the latest window wins, then pool order. If every account is over threshold, the least-used account comes first. Accounts missing their login are skipped. `runtime accounts list` previews the ranking without the running daemon's in-memory debits.
 - **Fallback and rollback.** When facts are unconfigured, unreadable, invalid, stale, or missing for a usable candidate, the daemon logs a warning and uses `soonest_reset` with its local run snapshots. It prefers the account whose limiting window resets soonest among accounts at least five percentage points below `switch_threshold`. Unknown usage follows, then over-threshold accounts (least used first), then exhausted accounts. Set `"policy": "soonest_reset"` under `account_pools` and restart to always use this policy.

@@ -357,10 +357,11 @@ func (p *accountPool) rankLocked(provider string, skip map[string]bool, facts ma
 
 // taskAccount is the account one task runs under.
 type taskAccount struct {
-	pool      *accountPool
-	provider  string
-	spec      cli.AccountSpec
-	tried     map[string]bool
+	pool     *accountPool
+	provider string
+	spec     cli.AccountSpec
+	tried    map[string]bool
+	// Only the runTask goroutine starts and releases this lease.
 	attempted bool
 	// setConfigDir records that this lease put CLAUDE_CONFIG_DIR into the
 	// task env, so switching back to the default account removes it.

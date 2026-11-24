@@ -188,3 +188,32 @@ func TestAccountPoolDrainFailoverTransfersTheReservation(t *testing.T) {
 		t.Fatalf("failover which never started left a debit: %v, %v", p.active, p.completed)
 	}
 }
+
+func TestAccountPoolStatusShowsFactsWithConfiguredLimits(t *testing.T) {
+	p, root := newTestPool(t, "codex", "codex-2")
+	t.Setenv(cli.TaskConfigRootEnv, root)
+	p.factsFile = filepath.Join(root, "facts.json")
+	now := time.Now().UTC().Truncate(time.Second)
+	firstReset := now.Add(24 * time.Hour)
+	writeAccountFacts(t, p, now.Add(-2*time.Hour), fmt.Sprintf(`[
+		{"id":"codex","windows":[{"name":"weekly","used_ratio":0.9,"resets_at":%q}]},
+		{"id":"codex-2","windows":[{"name":"weekly","used_ratio":0.16,"resets_at":%q}]}
+	]`, firstReset.Format(time.RFC3339), firstReset.Add(24*time.Hour).Format(time.RFC3339)))
+	cfg := &cli.AccountPoolsConfig{
+		Accounts:        map[string][]cli.AccountSpec{"codex": p.providers["codex"][1:]},
+		FactsFile:       p.factsFile,
+		DefaultFactsIDs: map[string]string{"codex": "codex"},
+	}
+	rows := AccountPoolStatus(cfg, "")
+	if len(rows) != 2 || !rows[0].Next || rows[0].UsedPercent != nil {
+		t.Fatalf("stale facts should use local state: %+v", rows)
+	}
+	cfg.FactsMaxAgeSeconds = 3 * 3600
+	cfg.ExpectedRunCost = pct(0.10)
+	cfg.Epsilon = pct(0.04)
+	rows = AccountPoolStatus(cfg, "")
+	if len(rows) != 2 || !rows[1].Next || rows[0].UsedPercent == nil || *rows[0].UsedPercent != 90 ||
+		rows[0].ResetsAt == nil || !rows[0].ResetsAt.Equal(firstReset) {
+		t.Fatalf("configured limits should select codex-2 and display facts: %+v", rows)
+	}
+}
