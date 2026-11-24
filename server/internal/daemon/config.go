@@ -73,6 +73,7 @@ const (
 	DefaultGCInterval                     = 2 * time.Hour
 	DefaultGCTTL                          = 24 * time.Hour      // 1 day — AI-coding issues rarely stay open long
 	DefaultGCCompletedTaskTTL             = 14 * 24 * time.Hour // 14 days — bound completed issue-task env retention on every server; see the MULTICA_GC_COMPLETED_TASK_TTL comment in LoadConfig
+	DefaultGCWorkspaceMaxAge              = 28 * 24 * time.Hour // maximum lifetime for an inactive managed issue workspace
 	DefaultGCOrphanTTL                    = 72 * time.Hour      // 3 days — orphans with no meta (crashes, pre-GC leftovers)
 	DefaultGCArtifactTTL                  = 12 * time.Hour      // 12h — drop regenerable artifacts once a task has been completed this long
 	DefaultGCCodexSessionTTL              = 14 * 24 * time.Hour // 14 days — reclaim per-issue Codex session stores untouched this long
@@ -118,6 +119,7 @@ type Config struct {
 	GCInterval                     time.Duration         // how often the GC loop runs (default: 2h)
 	GCTTL                          time.Duration         // clean dirs whose issue is done/cancelled and updated_at < now()-TTL (default: 24h)
 	GCCompletedTaskTTL             time.Duration         // fully clean inactive issue-task envs; local_directory envs expire only codex-home, preserving daemon logs/output and externally stored sessions (default: 14d; 0 disables)
+	GCWorkspaceMaxAge              time.Duration         // maximum lifetime for inactive managed issue workspaces (default: 28d; 0 disables)
 	GCOrphanTTL                    time.Duration         // clean orphan dirs with no meta, or dirs whose issue gc-check returns 404, once they exceed this age (default: 72h). The 404 path uses the same TTL — a scoped-down token can't instantly wipe live workspaces.
 	GCArtifactTTL                  time.Duration         // once a task has been completed for at least this long, drop regenerable artifacts: pattern-matched build outputs when the parent record keeps the directory (an open issue), and the exact daemon-managed Codex cache for every task kind (default: 12h, set 0 to disable both)
 	GCArtifactPatterns             []string              // basename patterns whose subtrees are removed during artifact cleanup (default: node_modules, .next, .turbo)
@@ -582,13 +584,21 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// and logs/ with it. The default is bounded on every server, self-host
 	// included, because unbounded retention fills the disk of any long-lived
 	// daemon whose issues sit open (in review, awaiting response, backlog) and
-	// nobody is watching it. 14d is deliberately generous: past that much idle
-	// time main has usually moved far enough that a fresh checkout beats a
-	// stale worktree. Operators who want the old keep-until-terminal behavior
-	// set MULTICA_GC_COMPLETED_TASK_TTL=0.
+	// nobody is watching it. Managed issue workspace age is measured from
+	// initial ownership.
+	// An explicit zero disables this policy and defaults the independent
+	// workspace ceiling to off, preserving existing retention opt-outs.
 	// Local-directory tasks keep their daemon logs and output; this TTL removes
 	// only their Codex home, and only when session history is stored elsewhere.
 	gcCompletedTaskTTL, err := durationFromEnv("MULTICA_GC_COMPLETED_TASK_TTL", DefaultGCCompletedTaskTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	workspaceMaxAgeDefault := max(DefaultGCWorkspaceMaxAge, gcCompletedTaskTTL)
+	if gcCompletedTaskTTL <= 0 {
+		workspaceMaxAgeDefault = 0
+	}
+	gcWorkspaceMaxAge, err := durationFromEnv("MULTICA_GC_WORKSPACE_MAX_AGE", workspaceMaxAgeDefault)
 	if err != nil {
 		return Config{}, err
 	}
@@ -668,6 +678,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		GCInterval:                      gcInterval,
 		GCTTL:                           gcTTL,
 		GCCompletedTaskTTL:              gcCompletedTaskTTL,
+		GCWorkspaceMaxAge:               gcWorkspaceMaxAge,
 		GCOrphanTTL:                     gcOrphanTTL,
 		GCArtifactTTL:                   gcArtifactTTL,
 		GCArtifactPatterns:              gcArtifactPatterns,

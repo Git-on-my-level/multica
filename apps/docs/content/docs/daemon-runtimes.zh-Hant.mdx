@@ -174,7 +174,9 @@ cd ~/.multica/cursor-mcp-auth/<agent-id>/user-login/workdir && CURSOR_DATA_DIR=~
 | 自動化（僅執行）、快速建立 | 執行結束後的下一輪清理 |
 | 找不到歸屬（目錄缺少後設資料，或伺服器上已沒有對應記錄） | 目錄 72 小時沒有改動 |
 
-任務仍未關閉時，執行完成 12 小時後只刪可以重新生成的內容：目錄中的 `node_modules`、`.next`、`.turbo`，以及 `codex-home` 下的四個精確路徑：`.sandbox-bin`、`.tmp/plugins`、`.tmp/marketplaces`、`cache/remote_plugin_catalog`。其他檔案（包括 SQLite 資料庫和 WAL 檔案）保留。受管的任務執行目錄預設還會在執行完成 14 天後整體刪除，不論任務是否關閉。
+任務仍未關閉時，執行完成 12 小時後只刪可以重新生成的內容：目錄中的 `node_modules`、`.next`、`.turbo`，以及 `codex-home` 下的四個精確路徑：`.sandbox-bin`、`.tmp/plugins`、`.tmp/marketplaces`、`cache/remote_plugin_catalog`。其他檔案（包括 SQLite 資料庫和 WAL 檔案）保留。
+
+受管任務執行完成後，其目錄預設在達到 14 天的目錄年齡時可以刪除。年齡從守護程序首次取得目錄所有權時算起，重新執行不會重設。即使無法取得任務狀態，也適用獨立的 28 天上限。設為 `MULTICA_GC_WORKSPACE_MAX_AGE=0` 可關閉上限。
 
 未歸檔的聊天如果使用 Multica 管理的工作目錄，守護程序預設會在最後一次執行結束 12 小時後，按同樣的規則清理可重新生成的內容。清理成功後，守護程序會略過該次執行的重複掃描。後續執行結束並經過相同的等待時間後，就會再次符合清理條件。聊天直接在專案本地目錄執行時，只清理上述精確路徑中的 Codex 快取。
 

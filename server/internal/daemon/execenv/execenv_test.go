@@ -6863,13 +6863,22 @@ func TestWriteEnvRootOwnerAtomicallyReplacesMarker(t *testing.T) {
 	if err := os.WriteFile(ownerPath, []byte(taskID), 0o644); err != nil {
 		t.Fatalf("seed legacy owner: %v", err)
 	}
+	past := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(ownerPath, past, past); err != nil {
+		t.Fatal(err)
+	}
 	before, err := os.Stat(ownerPath)
 	if err != nil {
 		t.Fatalf("stat legacy owner: %v", err)
 	}
 
-	if err := writeEnvRootOwner(envRoot, "ws-authoritative", taskID); err != nil {
+	lock, reset, err := claimEnvRoot(envRoot, "ws-authoritative", taskID)
+	if err != nil {
 		t.Fatalf("upgrade owner: %v", err)
+	}
+	defer releaseLockFile(lock)
+	if !reset {
+		t.Fatal("legacy owner must still permit a reset")
 	}
 	after, err := os.Stat(ownerPath)
 	if err != nil {
@@ -6877,6 +6886,10 @@ func TestWriteEnvRootOwnerAtomicallyReplacesMarker(t *testing.T) {
 	}
 	if os.SameFile(before, after) {
 		t.Fatal("owner marker was rewritten in place instead of atomically replaced")
+	}
+
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("owner timestamp changed from %v to %v", before.ModTime(), after.ModTime())
 	}
 
 	owner, err := ReadEnvRootOwner(envRoot)
@@ -6890,8 +6903,8 @@ func TestWriteEnvRootOwnerAtomicallyReplacesMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read env root: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != envRootOwnerFile {
-		t.Fatalf("env root entries = %v, want only %s", entries, envRootOwnerFile)
+	if len(entries) != 2 {
+		t.Fatalf("env root entries = %v, want only owner marker and run lock", entries)
 	}
 }
 

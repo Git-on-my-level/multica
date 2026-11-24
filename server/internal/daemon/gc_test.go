@@ -60,10 +60,17 @@ func createTaskDir(t *testing.T, root, wsID, dirName string, meta *execenv.GCMet
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(taskDir, ".task_owner"), owner, 0o644); err != nil {
+	ownerPath := filepath.Join(taskDir, ".task_owner")
+	if err := os.WriteFile(ownerPath, owner, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if meta != nil {
+		if !meta.CompletedAt.IsZero() {
+			// A real workspace is already owned when its first run completes.
+			if err := os.Chtimes(ownerPath, meta.CompletedAt, meta.CompletedAt); err != nil {
+				t.Fatal(err)
+			}
+		}
 		data, _ := json.Marshal(meta)
 		if err := os.WriteFile(filepath.Join(taskDir, ".gc_meta.json"), data, 0o644); err != nil {
 			t.Fatal(err)

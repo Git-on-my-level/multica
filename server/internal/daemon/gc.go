@@ -35,6 +35,8 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 		"interval", d.cfg.GCInterval,
 		"ttl", d.cfg.GCTTL,
 		"completed_task_ttl", d.cfg.GCCompletedTaskTTL,
+		"completed_issue_task_age_basis", "initial task ownership (.task_owner mtime)",
+		"workspace_max_age", d.cfg.GCWorkspaceMaxAge,
 		"orphan_ttl", d.cfg.GCOrphanTTL,
 		"artifact_ttl", d.cfg.GCArtifactTTL,
 		"repo_ttl", d.cfg.GCRepoTTL,
@@ -225,6 +227,10 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			stats.localDirectoriesRetained++
 		}
 		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
+			if removal, expired := d.issueWorkspaceLifetime(taskDir, meta); expired {
+				cleanedHere += d.applyGCActionWithChatMeta(ctx, taskDir, gcActionClean, stats, meta, removal)
+				continue
+			}
 			if workspaceID := strings.TrimSpace(meta.WorkspaceID); workspaceID != "" {
 				issueCandidatesByWorkspace[workspaceID] = append(
 					issueCandidatesByWorkspace[workspaceID],
@@ -357,11 +363,21 @@ func (d *Daemon) applyGCActionWithChatMeta(ctx context.Context, taskDir string, 
 			return 0
 		}
 	}
+	var claim *execenv.EnvRootGCClaim
+	if removal.workspaceAge {
+		claim = d.lockExpiredIssueWorkspace(taskDir, checkedMeta, removal)
+		if claim == nil {
+			stats.skipped++
+			return 0
+		}
+		defer claim.Release()
+	}
+
 	bytesBefore := stats.bytesReclaimed
 	removedBefore := stats.artifactRemoved
 	switch action {
 	case gcActionClean, gcActionOrphan:
-		bytes, removed := d.cleanTaskDir(taskDir)
+		bytes, removed := d.cleanTaskDirWithClaim(taskDir, claim)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -375,6 +391,9 @@ func (d *Daemon) applyGCActionWithChatMeta(ctx context.Context, taskDir string, 
 		attrs := []any{"dir", taskDir, "bytes_reclaimed", bytes, "reason", removal.reason}
 		if removal.retention > 0 {
 			attrs = append(attrs, "retention", removal.retention)
+		}
+		if removal.age > 0 {
+			attrs = append(attrs, "age", removal.age)
 		}
 		if removal.status != "" {
 			attrs = append(attrs, "status", removal.status)
@@ -444,9 +463,11 @@ func recordArtifactCleanup(stats *gcStats, removed int, bytes int64, perPattern 
 }
 
 type gcRemovalDetails struct {
-	reason    string
-	status    string
-	retention time.Duration
+	reason       string
+	status       string
+	retention    time.Duration
+	age          time.Duration
+	workspaceAge bool
 }
 
 type gcAction int
@@ -581,6 +602,9 @@ func (d *Daemon) applyLocalDirectoryGCOverride(taskDir string, meta *execenv.GCM
 func (d *Daemon) shouldCleanTaskDirForKind(ctx context.Context, taskDir string, meta *execenv.GCMeta) (gcAction, gcRemovalDetails) {
 	switch meta.Kind {
 	case execenv.GCKindIssue:
+		if removal, expired := d.issueWorkspaceLifetime(taskDir, meta); expired {
+			return gcActionClean, removal
+		}
 		return d.gcDecisionIssue(ctx, taskDir, meta)
 	case execenv.GCKindChat:
 		return d.gcDecisionChat(ctx, taskDir, meta)
@@ -603,8 +627,8 @@ func (d *Daemon) orphanByMTime(taskDir, reason string) (gcAction, gcRemovalDetai
 	if err != nil {
 		return gcActionSkip, gcRemovalDetails{}
 	}
-	if time.Since(info.ModTime()) > d.cfg.GCOrphanTTL {
-		return gcActionOrphan, gcRemovalDetails{reason: reason, retention: d.cfg.GCOrphanTTL}
+	if age := time.Since(info.ModTime()); age > d.cfg.GCOrphanTTL {
+		return gcActionOrphan, gcRemovalDetails{reason: reason, retention: d.cfg.GCOrphanTTL, age: age}
 	}
 	return gcActionSkip, gcRemovalDetails{}
 }
@@ -651,24 +675,20 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 
 	terminal, recognized := issueGCLifecycle(result)
 
-	if terminal && time.Since(result.UpdatedAt) > d.cfg.GCTTL {
-		return gcActionClean, gcRemovalDetails{reason: "terminal issue retention expired", status: result.Status, retention: d.cfg.GCTTL}
+	if age := time.Since(result.UpdatedAt); terminal && age > d.cfg.GCTTL {
+		return gcActionClean, gcRemovalDetails{reason: "terminal issue retention expired", status: result.Status, retention: d.cfg.GCTTL, age: age}
 	}
 
-	// Operators may opt into a hard retention bound for completed issue-task
-	// environments even while the parent issue stays open. A successful parent
-	// lookup with a recognized status is intentionally required: transient
-	// network/auth failures and response drift keep data rather than turning an
-	// unavailable or malformed status into a deletion signal.
-	// The active-root guard and reservation protect concurrent reuse. User-owned
-	// local_directory envs stay on the existing artifact-only policy so a shorter
-	// completed-task TTL cannot make artifact cleanup happen early.
-	if d.cfg.GCCompletedTaskTTL > 0 &&
-		!meta.LocalDirectory &&
-		!meta.CompletedAt.IsZero() &&
-		recognized &&
-		time.Since(meta.CompletedAt) > d.cfg.GCCompletedTaskTTL {
-		return gcActionClean, gcRemovalDetails{reason: "completed task retention expired", status: result.Status, retention: d.cfg.GCCompletedTaskTTL}
+	// A recognized parent status and a completed run are required for the
+	// normal TTL. Reuse refreshes completed_at, so the clock is the age of
+	// the physical workspace the run used.
+	if d.cfg.GCCompletedTaskTTL > 0 && recognized && !meta.LocalDirectory && !meta.CompletedAt.IsZero() {
+		if age := issueWorkspaceAge(taskDir); age > d.cfg.GCCompletedTaskTTL {
+			return gcActionClean, gcRemovalDetails{
+				reason: "completed task retention expired", status: result.Status,
+				retention: d.cfg.GCCompletedTaskTTL, age: age, workspaceAge: true,
+			}
+		}
 	}
 
 	if d.cfg.GCArtifactTTL > 0 && !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > d.cfg.GCArtifactTTL {
@@ -687,6 +707,58 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 	}
 
 	return gcActionSkip, gcRemovalDetails{}
+}
+
+const gcWorkspaceMaxAgeReason = "workspace maximum lifetime exceeded"
+
+func (d *Daemon) issueWorkspaceLifetime(taskDir string, meta *execenv.GCMeta) (gcRemovalDetails, bool) {
+	if d.cfg.GCWorkspaceMaxAge <= 0 || meta.LocalDirectory || strings.TrimSpace(meta.IssueID) == "" {
+		return gcRemovalDetails{}, false
+	}
+	age := issueWorkspaceAge(taskDir)
+	if age <= d.cfg.GCWorkspaceMaxAge {
+		return gcRemovalDetails{}, false
+	}
+	return gcRemovalDetails{
+		reason: gcWorkspaceMaxAgeReason, retention: d.cfg.GCWorkspaceMaxAge, age: age, workspaceAge: true,
+	}, true
+}
+
+func issueWorkspaceAge(taskDir string) time.Duration {
+	ownedAt, err := execenv.EnvRootOwnedAt(taskDir)
+	if err != nil {
+		return 0
+	}
+	return time.Since(ownedAt)
+}
+
+// lockExpiredIssueWorkspace also checks the on-disk run lock, which protects a
+// workspace in use by a different daemon sharing this workspaces root.
+func (d *Daemon) lockExpiredIssueWorkspace(taskDir string, checked *execenv.GCMeta, removal gcRemovalDetails) *execenv.EnvRootGCClaim {
+	rel, err := filepath.Rel(d.cfg.WorkspacesRoot, taskDir)
+	if err != nil {
+		return nil
+	}
+	root, err := os.OpenRoot(d.cfg.WorkspacesRoot)
+	if err != nil {
+		return nil
+	}
+	defer root.Close()
+	claim, err := execenv.LockEnvRootForGC(root, rel, taskDir)
+	if err != nil || claim == nil {
+		return nil
+	}
+	info, statErr := os.Lstat(taskDir)
+	meta, metaErr := execenv.ReadGCMeta(taskDir)
+	if statErr != nil || !claim.Matches(info) || metaErr != nil ||
+		meta.Kind != execenv.GCKindIssue || meta.LocalDirectory ||
+		meta.IssueID != checked.IssueID || meta.WorkspaceID != checked.WorkspaceID ||
+		(removal.reason != gcWorkspaceMaxAgeReason && meta.CompletedAt.IsZero()) ||
+		issueWorkspaceAge(taskDir) <= removal.retention || d.environments.servesFrom(taskDir) {
+		claim.Release()
+		return nil
+	}
+	return claim
 }
 
 // issueGCLifecycle answers the only two questions GC asks about a parent issue:
@@ -909,6 +981,10 @@ func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
 // reclaimed bytes for the removal log and cycle summary. A failed or
 // refused removal reports removed=false.
 func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
+	return d.cleanTaskDirWithClaim(taskDir, nil)
+}
+
+func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootGCClaim) (bytes int64, removed bool) {
 	// Measure first, prove ownership second. dirSize walks the entire tree,
 	// which on a large task directory takes long enough for the validated
 	// directory to be replaced underneath us — checking before that walk would
@@ -920,10 +996,22 @@ func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
 		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
 		return 0, false
 	}
-	if err := execenv.RemoveCursorMcpAuthLink(taskDir, d.cfg.Profile); err != nil {
-		d.logger.Warn("gc: remove cursor mcp auth link failed", "dir", taskDir, "error", err)
+	var removeLinkErr, err error
+	if claim == nil {
+		removeLinkErr = execenv.RemoveCursorMcpAuthLink(taskDir, d.cfg.Profile)
+		err = os.RemoveAll(taskDir)
+	} else {
+		info, statErr := os.Lstat(taskDir)
+		if statErr != nil || !claim.Matches(info) {
+			return 0, false
+		}
+		removeLinkErr = claim.RemoveCursorMcpAuthLink(d.cfg.Profile)
+		err = claim.RemoveExpiredRoot()
 	}
-	if err := os.RemoveAll(taskDir); err != nil {
+	if removeLinkErr != nil {
+		d.logger.Warn("gc: remove cursor mcp auth link failed", "dir", taskDir, "error", removeLinkErr)
+	}
+	if err != nil {
 		d.logger.Warn("gc: remove task dir failed", "dir", taskDir, "error", err)
 		return 0, false
 	}

@@ -278,7 +278,8 @@ API key 与 base URL 都为空时，这一层关闭，不会发出任何上游�
 | `MULTICA_GC_ENABLED` | `true` | 设为 `false` 或 `0` 关闭整个清理循环 |
 | `MULTICA_GC_INTERVAL` | `2h` | 两轮清理之间的间隔；守护进程启动约 30 秒后先清理一次 |
 | `MULTICA_GC_TTL` | `24h` | 任务进入 `done` 或 `closed` 分类、或聊天会话归档后，再过多久删除对应运行目录 |
-| `MULTICA_GC_COMPLETED_TASK_TTL` | `14d` | 运行完成后多久删除托管任务目录；本地目录运行只删除 `codex-home`，保留 daemon 日志、输出和外部会话存储，仍有本地会话记录的 home 不删除。`0` 表示关闭此到期清理 |
+| `MULTICA_GC_COMPLETED_TASK_TTL` | `14d` | 至少完成过一次运行的闲置托管任务目录的保留时间，从首次取得所有权时算起。本地目录运行仅在会话记录存于运行目录之外时，按最近一次运行完成时间清理 `codex-home`。`0` 关闭此到期清理 |
+| `MULTICA_GC_WORKSPACE_MAX_AGE` | `28d` | 闲置托管任务运行目录的最长保留时间，从首次取得所有权时算起。默认值不低于已完成任务的保留时间，后者关闭时上限默认也关闭。`0` 只关闭上限 |
 | `MULTICA_GC_ORPHAN_TTL` | `72h` | 找不到归属的目录多久没有改动后删除 |
 | `MULTICA_GC_ARTIFACT_TTL` | `12h` | 从运行结束到守护进程清理可重新生成内容的时间。下一行的目录名规则适用于未关闭的任务，以及使用托管工作目录的未归档聊天。守护进程管理的 Codex 缓存也适用相同时长。设为 `0` 可保留这些缓存 |
 | `MULTICA_GC_ARTIFACT_PATTERNS` | `node_modules,.next,.turbo` | 按目录名匹配的可再生成内容，逗号分隔。设置后**替换**默认列表，要保留默认项就一并写上；含 `/` 或 `\` 的项会被忽略 |

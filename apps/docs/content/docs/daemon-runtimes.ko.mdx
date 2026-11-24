@@ -173,7 +173,9 @@ cd ~/.multica/cursor-mcp-auth/<agent-id>/user-login/workdir && CURSOR_DATA_DIR=~
 | 오토파일럿(실행만), 빠른 생성 | 실행이 끝난 뒤 다음 정리 때 |
 | 소속을 찾을 수 없음(메타데이터가 없거나 서버에 해당 기록이 없음) | 디렉터리가 72시간 동안 변경되지 않았을 때 |
 
-태스크가 열려 있으면 실행 완료 12시간 후 다시 만들 수 있는 내용만 삭제합니다. 대상은 `node_modules`, `.next`, `.turbo`와 `codex-home` 안의 정확한 경로 `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, `cache/remote_plugin_catalog`입니다. SQLite 데이터베이스와 WAL을 포함한 나머지 파일은 유지합니다. 관리되는 태스크 실행 디렉터리는 태스크 종료 여부와 관계없이 기본적으로 완료 14일 후 전체도 삭제됩니다.
+태스크가 열려 있으면 실행 완료 12시간 후 다시 만들 수 있는 내용만 삭제합니다. 대상은 `node_modules`, `.next`, `.turbo`와 `codex-home` 안의 정확한 경로 `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, `cache/remote_plugin_catalog`입니다. SQLite 데이터베이스와 WAL을 포함한 나머지 파일은 유지합니다.
+
+실행이 완료된 관리형 태스크 디렉터리는 기본적으로 생성 후 14일이 지나면 삭제 대상이 됩니다. 경과 시간은 데몬이 디렉터리를 처음 소유한 시점부터 계산하며 이후 실행으로 초기화되지 않습니다. 태스크 상태를 가져올 수 없을 때도 별도의 28일 상한이 적용됩니다. `MULTICA_GC_WORKSPACE_MAX_AGE=0`으로 상한을 끌 수 있습니다.
 
 보관하지 않은 채팅이 Multica에서 관리하는 작업 디렉터리를 사용하면 기본적으로 마지막 실행이 끝나고 12시간 뒤 같은 규칙으로 다시 만들 수 있는 내용을 정리합니다. 정리에 성공하면 해당 실행의 반복 스캔을 건너뜁니다. 이후 실행이 끝나면 같은 시간이 지난 뒤 다시 정리 대상이 됩니다. 프로젝트 로컬 디렉터리에서 직접 실행하는 채팅은 위의 정확한 Codex 캐시 경로만 정리합니다.
 

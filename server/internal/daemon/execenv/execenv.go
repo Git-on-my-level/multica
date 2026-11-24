@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1380,6 +1381,117 @@ func (c *EnvRootClaim) Release() {
 	c.lock = nil
 }
 
+// EnvRootGCClaim pins the workspace and its parent from lock acquisition
+// through reclamation. The basename is used only to unlink the empty root.
+type EnvRootGCClaim struct {
+	claim  *EnvRootClaim
+	root   *os.Root
+	parent *os.Root
+	name   string
+	info   os.FileInfo
+}
+
+// LockEnvRootForGC takes the run lock through the directory handle that will
+// also be used to remove the contents.
+func LockEnvRootForGC(wsRoot *os.Root, rel, envRoot string) (*EnvRootGCClaim, error) {
+	if wsRoot == nil || !filepath.IsLocal(rel) || rel == "." {
+		return nil, fmt.Errorf("execenv: env root %s is not inside the workspaces root", envRoot)
+	}
+	parent, err := wsRoot.OpenRoot(filepath.Dir(rel))
+	if err != nil {
+		return nil, err
+	}
+	name := filepath.Base(rel)
+	info, err := parent.Lstat(name)
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeIrregular != 0 {
+		parent.Close()
+		return nil, fmt.Errorf("execenv: gc root %s is not a regular directory", envRoot)
+	}
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	gc := &EnvRootGCClaim{root: root, parent: parent, name: name, info: info}
+	lockedInfo, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, lockedInfo) {
+		gc.Release()
+		return nil, fmt.Errorf("execenv: gc root %s changed before lock acquisition", envRoot)
+	}
+	gc.claim, err = lockOpenEnvRoot(root, envRoot)
+	if err != nil {
+		gc.Release()
+		return nil, err
+	}
+	return gc, nil
+}
+
+func (c *EnvRootGCClaim) Release() {
+	c.claim.Release()
+	if c.root != nil {
+		c.root.Close()
+		c.root = nil
+	}
+	c.parent.Close()
+}
+
+func (c *EnvRootGCClaim) checkEntry() error {
+	info, err := c.parent.Lstat(c.name)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || !os.SameFile(info, c.info) {
+		return fmt.Errorf("execenv: gc root entry %s changed", c.name)
+	}
+	return nil
+}
+
+// Matches reports whether info identifies the directory held by the claim.
+func (c *EnvRootGCClaim) Matches(info os.FileInfo) bool {
+	return info.IsDir() && os.SameFile(info, c.info)
+}
+
+func (c *EnvRootGCClaim) RemoveCursorMcpAuthLink(daemonProfile string) error {
+	return removeCursorMcpAuthLinkRecord(c.root.ReadFile, CursorUserDataDir(), cursorMcpAuthStoreRootDir(daemonProfile))
+}
+
+// RemoveExpiredRoot holds the run lock until all recursive removal is over.
+// The final removal is nonrecursive and relative to the pinned parent.
+func (c *EnvRootGCClaim) RemoveExpiredRoot() error {
+	if err := c.checkEntry(); err != nil {
+		return err
+	}
+	entries, err := fs.ReadDir(c.root.FS(), ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == envRootLockFile || entry.Name() == envRootOwnerFile || entry.Name() == gcMetaFile {
+			continue
+		}
+		if err := c.root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{gcMetaFile, envRootOwnerFile, envRootLockFile} {
+		if err := c.root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	// Windows can defer unlinking an open lock file until its handle closes.
+	c.claim.Release()
+	c.root.Close()
+	c.root = nil
+	if err := c.checkEntry(); err != nil {
+		return err
+	}
+	return c.parent.Remove(c.name)
+}
+
 // ClaimEnvRoot takes the full claim for a fresh preparation of taskID: it
 // proves ownership, refuses a root a live execution or another task holds, and
 // resets a stale root this task owns so the caller receives a clean directory.
@@ -1465,20 +1577,28 @@ func LockEnvRootForReuse(wsRoot *os.Root, rel, envRoot string) (*EnvRootClaim, o
 		return nil, nil, nil
 	}
 
-	lock, err := envRootHandle.OpenFile(envRootLockFile, os.O_CREATE|os.O_RDWR, 0o644)
+	claim, err := lockOpenEnvRoot(envRootHandle, envRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("execenv: open env root lock for %s: %w", envRoot, err)
+		return nil, nil, err
+	}
+	return claim, info, nil
+}
+
+func lockOpenEnvRoot(root *os.Root, envRoot string) (*EnvRootClaim, error) {
+	lock, err := root.OpenFile(envRootLockFile, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("execenv: open env root lock for %s: %w", envRoot, err)
 	}
 	locked, err := lockFileExclusiveNonBlocking(lock)
 	if err != nil {
 		lock.Close()
-		return nil, nil, fmt.Errorf("execenv: lock env root %s: %w", envRoot, err)
+		return nil, fmt.Errorf("execenv: lock env root %s: %w", envRoot, err)
 	}
 	if !locked {
 		lock.Close()
-		return nil, nil, fmt.Errorf("execenv: reuse %s: %w", envRoot, ErrEnvRootBusy)
+		return nil, fmt.Errorf("execenv: lock %s: %w", envRoot, ErrEnvRootBusy)
 	}
-	return &EnvRootClaim{rootDir: envRoot, lock: lock}, info, nil
+	return &EnvRootClaim{rootDir: envRoot, lock: lock}, nil
 }
 
 // envRootOwnerFile records which workspace and task an env root belongs to:
@@ -1558,7 +1678,12 @@ func claimEnvRoot(envRoot, workspaceID, taskID string) (lockFile *os.File, reset
 		// Upgrade legacy task-only markers while the lock makes the rewrite
 		// exclusive. Disk usage can then attribute active roots by workspace.
 		if owner.WorkspaceID == "" {
-			if err := writeEnvRootOwner(envRoot, workspaceID, taskID); err != nil {
+			// Preserve the marker's original age when upgrading its format.
+			createdAt, err := EnvRootOwnedAt(envRoot)
+			if err != nil {
+				return nil, false, err
+			}
+			if err := writeEnvRootOwnerAt(envRoot, workspaceID, taskID, createdAt); err != nil {
 				return nil, false, err
 			}
 		}
@@ -1613,6 +1738,10 @@ func releaseLockFile(f *os.File) {
 // safe from another execution racing mid-claim. The same-directory temp file
 // and rename keep lock-free readers from observing a truncated JSON marker.
 func writeEnvRootOwner(envRoot, workspaceID, taskID string) error {
+	return writeEnvRootOwnerAt(envRoot, workspaceID, taskID, time.Time{})
+}
+
+func writeEnvRootOwnerAt(envRoot, workspaceID, taskID string, ownedAt time.Time) error {
 	path := filepath.Join(envRoot, envRootOwnerFile)
 	data, err := json.Marshal(EnvRootOwner{WorkspaceID: workspaceID, TaskID: taskID})
 	if err != nil {
@@ -1640,6 +1769,11 @@ func writeEnvRootOwner(envRoot, workspaceID, taskID string) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp env root owner for %s: %w", envRoot, err)
+	}
+	if !ownedAt.IsZero() {
+		if err := os.Chtimes(tmpPath, ownedAt, ownedAt); err != nil {
+			return fmt.Errorf("preserve env root owner time for %s: %w", envRoot, err)
+		}
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace env root owner for %s: %w", envRoot, err)
@@ -1684,6 +1818,18 @@ func readEnvRootOwner(envRoot string) (string, error) {
 type EnvRootOwner struct {
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	TaskID      string `json:"task_id"`
+}
+
+// EnvRootOwnedAt reports when the daemon first claimed this physical workspace.
+func EnvRootOwnedAt(envRoot string) (time.Time, error) {
+	info, err := os.Lstat(filepath.Join(envRoot, envRootOwnerFile))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return time.Time{}, fmt.Errorf("env root owner in %s is not a regular file", envRoot)
+	}
+	return info.ModTime(), nil
 }
 
 // ReadEnvRootOwner reads both current JSON markers and legacy plain task IDs.
