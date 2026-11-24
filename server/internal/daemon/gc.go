@@ -363,7 +363,7 @@ func (d *Daemon) applyGCActionWithChatMeta(ctx context.Context, taskDir string, 
 			return 0
 		}
 	}
-	var claim *execenv.EnvRootClaim
+	var claim *execenv.EnvRootGCClaim
 	if removal.workspaceAge {
 		claim = d.lockExpiredIssueWorkspace(taskDir, checkedMeta, removal)
 		if claim == nil {
@@ -734,7 +734,7 @@ func issueWorkspaceAge(taskDir string) time.Duration {
 
 // lockExpiredIssueWorkspace also checks the on-disk run lock, which protects a
 // workspace in use by a different daemon sharing this workspaces root.
-func (d *Daemon) lockExpiredIssueWorkspace(taskDir string, checked *execenv.GCMeta, removal gcRemovalDetails) *execenv.EnvRootClaim {
+func (d *Daemon) lockExpiredIssueWorkspace(taskDir string, checked *execenv.GCMeta, removal gcRemovalDetails) *execenv.EnvRootGCClaim {
 	rel, err := filepath.Rel(d.cfg.WorkspacesRoot, taskDir)
 	if err != nil {
 		return nil
@@ -744,13 +744,13 @@ func (d *Daemon) lockExpiredIssueWorkspace(taskDir string, checked *execenv.GCMe
 		return nil
 	}
 	defer root.Close()
-	claim, lockedInfo, err := execenv.LockEnvRootForReuse(root, rel, taskDir)
+	claim, err := execenv.LockEnvRootForGC(root, rel, taskDir)
 	if err != nil || claim == nil {
 		return nil
 	}
 	info, statErr := os.Lstat(taskDir)
 	meta, metaErr := execenv.ReadGCMeta(taskDir)
-	if statErr != nil || !os.SameFile(info, lockedInfo) || metaErr != nil ||
+	if statErr != nil || !claim.Matches(info) || metaErr != nil ||
 		meta.Kind != execenv.GCKindIssue || meta.LocalDirectory ||
 		meta.IssueID != checked.IssueID || meta.WorkspaceID != checked.WorkspaceID ||
 		(removal.reason != gcWorkspaceMaxAgeReason && meta.CompletedAt.IsZero()) ||
@@ -984,7 +984,7 @@ func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
 	return d.cleanTaskDirWithClaim(taskDir, nil)
 }
 
-func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootClaim) (bytes int64, removed bool) {
+func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootGCClaim) (bytes int64, removed bool) {
 	// Measure first, prove ownership second. dirSize walks the entire tree,
 	// which on a large task directory takes long enough for the validated
 	// directory to be replaced underneath us — checking before that walk would
@@ -996,14 +996,20 @@ func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootCla
 		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
 		return 0, false
 	}
-	if err := execenv.RemoveCursorMcpAuthLink(taskDir, d.cfg.Profile); err != nil {
-		d.logger.Warn("gc: remove cursor mcp auth link failed", "dir", taskDir, "error", err)
-	}
-	var err error
+	var removeLinkErr, err error
 	if claim == nil {
+		removeLinkErr = execenv.RemoveCursorMcpAuthLink(taskDir, d.cfg.Profile)
 		err = os.RemoveAll(taskDir)
 	} else {
+		info, statErr := os.Lstat(taskDir)
+		if statErr != nil || !claim.Matches(info) {
+			return 0, false
+		}
+		removeLinkErr = claim.RemoveCursorMcpAuthLink(d.cfg.Profile)
 		err = claim.RemoveExpiredRoot()
+	}
+	if removeLinkErr != nil {
+		d.logger.Warn("gc: remove cursor mcp auth link failed", "dir", taskDir, "error", removeLinkErr)
 	}
 	if err != nil {
 		d.logger.Warn("gc: remove task dir failed", "dir", taskDir, "error", err)

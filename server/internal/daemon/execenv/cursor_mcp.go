@@ -450,7 +450,13 @@ func RemoveCursorMcpAuthLink(envRoot, daemonProfile string) error {
 // a project of userDataDir that is a symlink to the recorded target, or a hard
 // link to a file in the agent stores. A file Cursor wrote itself is left alone.
 func removeCursorMcpAuthLink(envRoot, userDataDir, storeRoot string) error {
-	data, err := os.ReadFile(filepath.Join(envRoot, cursorMcpAuthLinkRecordFile))
+	return removeCursorMcpAuthLinkRecord(func(name string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(envRoot, name))
+	}, userDataDir, storeRoot)
+}
+
+func removeCursorMcpAuthLinkRecord(readFile func(string) ([]byte, error), userDataDir, storeRoot string) error {
+	data, err := readFile(cursorMcpAuthLinkRecordFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
