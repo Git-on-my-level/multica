@@ -6,3 +6,12 @@ type AdmissionCandidate struct {
 	AgentID string `json:"agent_id"`
 	Model   string `json:"model"`
 }
+
+// BatchAdmissionCandidate is a single agent permit in the mixed-runtime
+// batch. The reclaim ID limits the permit to one lost delivery or new claim.
+type BatchAdmissionCandidate struct {
+	AdmissionCandidate
+	RuntimeID     string `json:"runtime_id"`
+	ReclaimTaskID string `json:"reclaim_task_id,omitempty"`
+	PromoteDue    bool   `json:"promote_due,omitempty"`
+}

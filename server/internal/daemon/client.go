@@ -297,8 +297,8 @@ type claimTasksResult struct {
 	NextDeferredTaskAfterMillis int64     `json:"next_deferred_task_after_ms,omitempty"`
 	ForceRecheckedRuntimeIDs    *[]string `json:"force_rechecked_runtime_ids,omitempty"`
 	ClaimedOverWS               bool      `json:"-"`
+	ClaimedWithAdmission        bool      `json:"-"`
 	AdmissionDenied             bool      `json:"-"`
-	AdmissionClaimed            bool      `json:"-"`
 }
 
 // ClaimTasks is the machine-level (MUL-4257) batch counterpart of ClaimTask:

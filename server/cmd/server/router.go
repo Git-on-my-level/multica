@@ -1700,6 +1700,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		// transitional alias; the daemon coordinator targets the canonical
 		// path.
 		r.Post("/tasks/claim", h.ClaimTasksByRuntime)
+		r.Post("/tasks/admission", h.ClaimTasksWithOpenCodeAdmission)
 		r.Post("/claim", h.ClaimTasksByRuntime)
 		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/prepare-lease", h.ExtendTaskPrepareLease)
 		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/skill-bundles/resolve", h.ResolveTaskSkillBundles)

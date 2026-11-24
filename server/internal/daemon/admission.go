@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -21,6 +19,8 @@ import (
 
 const (
 	admissionCommandTimeout = 5 * time.Second
+	admissionScanTimeout    = 2 * admissionCommandTimeout
+	admissionBatchPath      = "/api/daemon/tasks/admission"
 	admissionMatchTTL       = 3 * time.Minute
 )
 
@@ -117,7 +117,7 @@ type admissionController struct {
 
 	// The batch poller is the sole reader and writer of the match cache.
 	matches         map[string]admissionMatch
-	retryAt         time.Time
+	scanTimeout     time.Duration
 	pendingReleases sync.Map // holder -> bucket, for commands that could not release immediately
 }
 
@@ -127,12 +127,12 @@ type admissionMatch struct {
 }
 
 func newAdmissionController(client admissionClient, logger *slog.Logger) *admissionController {
-	return &admissionController{client: client, logger: logger, matches: make(map[string]admissionMatch)}
+	return &admissionController{client: client, logger: logger, scanTimeout: admissionScanTimeout, matches: make(map[string]admissionMatch)}
 }
 
 func (a *admissionController) warnOnce(err error) {
 	a.warn.Do(func() {
-		a.logger.Warn("OpenCode admission unavailable, using daemon concurrency limits", "error", err)
+		a.logger.Warn("OpenCode admission unavailable", "error", err)
 	})
 }
 
@@ -149,7 +149,6 @@ func (a *admissionController) reserve(ctx context.Context, runtimeID, model stri
 		bucket, err := a.client.match(ctx, model)
 		if err != nil {
 			a.warnOnce(err)
-			a.retryAt = now.Add(DefaultPollInterval)
 			return nil, true, err
 		}
 		for key, entry := range a.matches {
@@ -168,10 +167,9 @@ func (a *admissionController) reserve(ctx context.Context, runtimeID, model stri
 	granted, err := a.client.acquire(ctx, lease.bucket, lease.holder, os.Getpid())
 	if err != nil {
 		a.warnOnce(err)
-		a.retryAt = now.Add(DefaultPollInterval)
 		// A lost reply can hide a committed grant. Release this exact holder
 		// even though the claim may proceed under the normal concurrency caps.
-		lease.release()
+		lease.releaseWithContext(ctx)
 		return nil, true, err
 	}
 	if !granted {
@@ -225,12 +223,16 @@ func (l *admissionLease) processStarted() func() {
 		ready := l.taskEnded && l.processes == 0
 		l.processMu.Unlock()
 		if ready {
-			l.settle()
+			l.settle(context.Background())
 		}
 	}
 }
 
 func (l *admissionLease) release() {
+	l.releaseWithContext(context.Background())
+}
+
+func (l *admissionLease) releaseWithContext(ctx context.Context) {
 	if l == nil {
 		return
 	}
@@ -239,14 +241,12 @@ func (l *admissionLease) release() {
 	ready := l.processes == 0
 	l.processMu.Unlock()
 	if ready {
-		l.settle()
+		l.settle(ctx)
 	}
 }
 
-func (l *admissionLease) settle() {
+func (l *admissionLease) settle(ctx context.Context) {
 	l.releaseOnce.Do(func() {
-		// A cancelled run still owns a live release operation.
-		ctx := context.Background()
 		a := l.controller
 		if err := a.client.release(ctx, l.bucket, l.holder); err != nil {
 			a.warnOnce(err)
@@ -261,150 +261,122 @@ func (l *admissionLease) settle() {
 	})
 }
 
-func (c *Client) openCodeAdmissionCandidates(ctx context.Context, runtimeID string) ([]protocol.AdmissionCandidate, error) {
+func (c *Client) previewOpenCodeAdmission(ctx context.Context, daemonID string, runtimeIDs []string) ([]protocol.BatchAdmissionCandidate, error) {
 	ctx, cancel := context.WithTimeout(ctx, admissionCommandTimeout)
 	defer cancel()
-	var candidates []protocol.AdmissionCandidate
-	err := c.getJSON(ctx, openCodeAdmissionPath(runtimeID), &candidates)
-	return candidates, err
-}
-
-func (c *Client) claimOpenCodeAdmission(ctx context.Context, runtimeID string, candidate protocol.AdmissionCandidate) (*Task, error) {
-	ctx, cancel := context.WithTimeout(ctx, batchClaimRequestTimeout)
-	defer cancel()
 	var resp struct {
-		Task *Task `json:"task"`
+		Candidates *[]protocol.BatchAdmissionCandidate `json:"admission_candidates"`
 	}
-	if err := c.postJSON(ctx, openCodeAdmissionPath(runtimeID), candidate, &resp); err != nil {
+	if err := c.postJSON(ctx, admissionBatchPath, claimTasksBody(daemonID, runtimeIDs, 0), &resp); err != nil {
 		return nil, err
 	}
-	return resp.Task, nil
-}
-
-func openCodeAdmissionPath(runtimeID string) string {
-	return fmt.Sprintf("/api/daemon/runtimes/%s/tasks/admission", url.PathEscape(runtimeID))
-}
-
-// claimOpenCodeRuntime sends a mutating request only for an agent whose model
-// has already passed admission. Failure to preview is safe to fall back from;
-// failure of the claim itself may have committed and must never be replayed
-// through the legacy path.
-func (d *Daemon) claimOpenCodeRuntime(ctx context.Context, runtimeID string) (task *Task, previewOK, denied bool, err error) {
-	candidates, err := d.client.openCodeAdmissionCandidates(ctx, runtimeID)
-	if err != nil {
-		return nil, false, denied, err
+	if resp.Candidates == nil {
+		return nil, errors.New("server did not return an admission preview")
 	}
+	return *resp.Candidates, nil
+}
+
+func (c *Client) claimAdmittedBatch(ctx context.Context, daemonID string, runtimeIDs []string, slots int, forceRecheck []string, permits []protocol.BatchAdmissionCandidate) (claimTasksResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, batchClaimRequestTimeout)
+	defer cancel()
+	body := claimTasksBody(daemonID, runtimeIDs, slots, forceRecheck...)
+	body["admission_candidates"] = permits
+	var result claimTasksResult
+	if err := c.postJSON(ctx, admissionBatchPath, body, &result); err != nil {
+		return claimTasksResult{}, err
+	}
+	return result, nil
+}
+
+// claimTasksWithAdmission stages permits before one machine-wide batch claim.
+// The server schedules ordinary work and permitted OpenCode work together,
+// including stale-dispatch recovery, in its normal priority/FIFO order.
+func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []string, slots int, forceRecheck []string) (claimTasksResult, error) {
+	ordinaryClaim := func() (claimTasksResult, error) {
+		return d.claimTasksWSFirst(ctx, d.cfg.DaemonID, runtimeIDs, slots, forceRecheck...)
+	}
+	if d.admission == nil {
+		return ordinaryClaim()
+	}
+	hasOpenCode := false
+	for _, id := range runtimeIDs {
+		if runtime := d.findRuntime(id); runtime != nil && runtime.Provider == "opencode" {
+			hasOpenCode = true
+			break
+		}
+	}
+	if !hasOpenCode || slots <= 0 {
+		return ordinaryClaim()
+	}
+	if retryAfter := d.wsClaimHTTPFallbackAfter.Load(); retryAfter > time.Now().UnixNano() {
+		// A previous fail-open batch over WS may already have committed.
+		return claimTasksResult{ForceRecheckedRuntimeIDs: ackNone()}, nil
+	}
+
+	scanCtx, cancelScan := context.WithTimeout(ctx, d.admission.scanTimeout)
+	defer cancelScan()
+	d.admission.retryRelease(scanCtx)
+	candidates, err := d.client.previewOpenCodeAdmission(scanCtx, d.cfg.DaemonID, runtimeIDs)
+	if err != nil && scanCtx.Err() == nil {
+		d.admission.warnOnce(err)
+		return ordinaryClaim()
+	}
+
+	type candidateKey struct{ runtimeID, agentID string }
+	leases := make(map[candidateKey]*admissionLease)
+	defer func() {
+		// Release losing permits without giving each command a fresh budget.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admissionCommandTimeout)
+		defer cancel()
+		for _, lease := range leases {
+			lease.releaseWithContext(releaseCtx)
+		}
+	}()
+
+	var permits []protocol.BatchAdmissionCandidate
+	checked, denied := false, false
 	for _, candidate := range candidates {
-		if err := ctx.Err(); err != nil {
-			return nil, true, denied, err
+		if scanCtx.Err() != nil {
+			break
 		}
 		model := candidate.Model
 		if model == "" {
 			model = d.cfg.Agents["opencode"].Model
 		}
-		lease, allowed, err := d.admission.reserve(ctx, runtimeID, model)
+		lease, allowed, err := d.admission.reserve(scanCtx, candidate.RuntimeID, model)
 		if err != nil {
-			return nil, false, denied, err
+			if !checked && scanCtx.Err() == nil {
+				return ordinaryClaim()
+			}
+			break
 		}
+		checked = true
 		if !allowed {
 			denied = true
 			continue
 		}
-		task, err := d.client.claimOpenCodeAdmission(ctx, runtimeID, candidate)
-		if task == nil || err != nil {
-			lease.release()
-			if err != nil {
-				return nil, true, denied, err
-			}
-			continue
-		}
-		task.admission = lease
-		return task, true, denied, nil
+		permits = append(permits, candidate)
+		key := candidateKey{candidate.RuntimeID, candidate.AgentID}
+		leases[key] = lease
 	}
-	return nil, true, denied, nil
-}
+	cancelScan()
 
-// claimTasksWithAdmission keeps opt-out and non-OpenCode runtimes on the
-// normal machine-wide path. An opted-in OpenCode runtime can fill one local
-// slot per pass; each successful claim nudges the poller to fill more slots.
-func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []string, slots int, forceRecheck []string) (claimTasksResult, error) {
-	if d.admission == nil {
-		return d.claimTasksWSFirst(ctx, d.cfg.DaemonID, runtimeIDs, slots, forceRecheck...)
+	// The server gates every OpenCode runtime in this batch, including those
+	// with no permits. An interrupted scan can still dispatch ordinary work
+	// and earlier grants, while absent candidates stay queued.
+	result, err := d.client.claimAdmittedBatch(ctx, d.cfg.DaemonID, runtimeIDs, slots, forceRecheck, permits)
+	if err != nil {
+		return claimTasksResult{}, err
 	}
-	regular := make([]string, 0, len(runtimeIDs))
-	var admitted []*Task
-	var denied bool
-	var openCodeErr error
-	previewed := make(map[string]struct{})
-	// Bound the extra work in one cycle, even when the host serves many
-	// workspaces or several candidates have raced another claimant.
-	admissionCtx, cancel := context.WithTimeout(ctx, 2*admissionCommandTimeout)
-	defer cancel()
-	d.admission.retryRelease(admissionCtx)
-	for _, runtimeID := range runtimeIDs {
-		runtime := d.findRuntime(runtimeID)
-		if runtime == nil || runtime.Provider != "opencode" || time.Now().Before(d.admission.retryAt) {
-			regular = append(regular, runtimeID)
+	for _, task := range result.Tasks {
+		if task == nil {
 			continue
 		}
-		if len(admitted) >= slots || admissionCtx.Err() != nil {
-			continue
-		}
-		task, previewOK, runtimeDenied, err := d.claimOpenCodeRuntime(admissionCtx, runtimeID)
-		denied = denied || runtimeDenied
-		if !previewOK {
-			if ctx.Err() == nil {
-				d.admission.warnOnce(err)
-				regular = append(regular, runtimeID)
-			}
-			continue
-		}
-		if err != nil {
-			openCodeErr = err
-			continue
-		}
-		previewed[runtimeID] = struct{}{}
-		if task != nil {
-			admitted = append(admitted, task)
-		}
+		key := candidateKey{task.RuntimeID, task.AgentID}
+		task.admission = leases[key]
+		delete(leases, key)
 	}
-
-	result := claimTasksResult{ForceRecheckedRuntimeIDs: ackNone()}
-	if len(regular) > 0 && len(admitted) < slots && ctx.Err() == nil {
-		var regularForce []string
-		for _, id := range forceRecheck {
-			for _, runtimeID := range regular {
-				if id == runtimeID {
-					regularForce = append(regularForce, id)
-					break
-				}
-			}
-		}
-		var err error
-		result, err = d.claimTasksWSFirst(ctx, d.cfg.DaemonID, regular, slots-len(admitted), regularForce...)
-		if err != nil {
-			if len(admitted) == 0 {
-				return claimTasksResult{}, err
-			}
-			d.logger.Warn("ordinary batch claim failed after an OpenCode claim", "error", err)
-			result = claimTasksResult{ForceRecheckedRuntimeIDs: ackNone()}
-		}
-	}
-	// Return every successful claim even when another transport failed.
-	result.Tasks = append(admitted, result.Tasks...)
 	result.AdmissionDenied = denied
-	result.AdmissionClaimed = len(admitted) > 0
-	if result.ForceRecheckedRuntimeIDs != nil {
-		// The OpenCode preview reads the database directly. Drop its wake hints
-		// instead of repeatedly asking the ordinary batch cache to clear them.
-		for _, id := range forceRecheck {
-			if _, ok := previewed[id]; ok {
-				*result.ForceRecheckedRuntimeIDs = append(*result.ForceRecheckedRuntimeIDs, id)
-			}
-		}
-	}
-	if openCodeErr != nil && ctx.Err() == nil {
-		d.logger.Warn("OpenCode scoped claim failed", "error", openCodeErr)
-	}
+	result.ClaimedWithAdmission = true
 	return result, nil
 }

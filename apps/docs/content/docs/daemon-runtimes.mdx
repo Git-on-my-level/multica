@@ -126,7 +126,7 @@ Add this object to the daemon profile's JSON config (`~/.multica/config.json` or
 }
 ```
 
-Set the full `provider/model` in the agent's model field. Model selection from OpenCode defaults, launch wrappers, or custom flags is outside the pre-claim model check. A denied run stays queued. When agentctl or the server's admission preview is unavailable, the daemon falls back to its usual concurrency limits. The OpenCode JSON run transport reports step starts and structured HTTP 429 events. ACP runs use the same admission gate and provide no request-attempt samples.
+Set the full `provider/model` in the agent's model field. Model selection from OpenCode defaults, launch wrappers, or custom flags is outside the pre-claim model check. A denied run stays queued. The daemon uses its usual concurrency limits if agentctl or the server preview is unavailable before the first check. If the poll runs out of time or stops partway through, unchecked OpenCode work stays queued. The OpenCode JSON run transport reports step starts and structured HTTP 429 events. ACP runs use the same admission gate and provide no request-attempt samples.
 
 To roll back, set `admission.enabled` to `false` and restart the daemon.
 

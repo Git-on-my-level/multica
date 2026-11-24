@@ -125,3 +125,107 @@ EXECUTE FUNCTION %s();`, triggerName, taskID, functionName))
 		t.Fatalf("task after payload change = %s, model %s, tokens %d", status, model, tokenCount)
 	}
 }
+
+func claimAdmissionBatch(t *testing.T, runtimeIDs []string, slots int, permits ...protocol.BatchAdmissionCandidate) (*batchClaimResponse, []protocol.BatchAdmissionCandidate) {
+	t.Helper()
+	req := newOwnerDaemonRequest(http.MethodPost, "/api/daemon/tasks/admission", map[string]any{
+		"daemon_id": batchClaimTestDaemonID, "runtime_ids": runtimeIDs, "max_tasks": slots,
+		"admission_candidates": permits,
+	})
+	var resp struct {
+		batchClaimResponse
+		Preview []protocol.BatchAdmissionCandidate `json:"admission_candidates"`
+	}
+	testutil.Call(t, testHandler.ClaimTasksWithOpenCodeAdmission, req).Want(http.StatusOK).JSON(&resp)
+	return &resp.batchClaimResponse, resp.Preview
+}
+
+func TestOpenCodeAdmissionBatchPreservesPriorityAndFIFO(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ordinaryPrio int
+		openCodePrio int
+		ordinaryWins bool
+	}{
+		{name: "ordinary higher priority", ordinaryPrio: 5, openCodePrio: 1, ordinaryWins: true},
+		{name: "ordinary older at equal priority", ordinaryPrio: 1, openCodePrio: 1, ordinaryWins: true},
+		{name: "OpenCode higher priority", ordinaryPrio: 1, openCodePrio: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ocRuntime := dbfx.Runtime(t, "OpenCode ordered batch", testutil.Cols{"provider": "opencode"})
+			regularRuntime := dbfx.Runtime(t, "Ordinary ordered batch")
+			oc := dbfx.Agent(t, "Admitted", ocRuntime, testutil.Cols{"model": "morph/admitted"})
+			regular := dbfx.Agent(t, "Ordinary", regularRuntime)
+			now := time.Now()
+			ocTask := dbfx.Task(t, oc, testutil.Cols{
+				"runtime_id": ocRuntime, "issue_id": dbfx.Issue(t, "OpenCode candidate"), "priority": tc.openCodePrio,
+				"created_at": now.Add(-time.Minute),
+			})
+			ordinaryTask := dbfx.Task(t, regular, testutil.Cols{
+				"runtime_id": regularRuntime, "issue_id": dbfx.Issue(t, "Ordinary candidate"), "priority": tc.ordinaryPrio,
+				"created_at": now.Add(-2 * time.Minute),
+			})
+
+			runtimes := []string{ocRuntime, regularRuntime}
+			preview, permits := claimAdmissionBatch(t, runtimes, 0)
+			if len(preview.Tasks) != 0 || len(permits) != 1 || permits[0].RuntimeID != ocRuntime || permits[0].AgentID != oc {
+				t.Fatalf("unexpected read-only preview: %+v, permits %+v", preview, permits)
+			}
+			first, second := ocTask, ordinaryTask
+			if tc.ordinaryWins {
+				first, second = ordinaryTask, ocTask
+			}
+			for _, want := range []string{first, second} {
+				resp, _ := claimAdmissionBatch(t, runtimes, 1, permits...)
+				if len(resp.Tasks) != 1 || resp.Tasks[0].ID != want {
+					t.Fatalf("one-slot batch chose %+v, want %s", resp.Tasks, want)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenCodeAdmissionBatchFencesRecoveryAndNewClaims(t *testing.T) {
+	runtime := dbfx.Runtime(t, "OpenCode recovery batch", testutil.Cols{"provider": "opencode"})
+	regularRuntime := dbfx.Runtime(t, "Ordinary recovery batch")
+	permitted := dbfx.Agent(t, "Permitted", runtime, testutil.Cols{"model": "morph/admitted", "max_concurrent_tasks": 8})
+	denied := dbfx.Agent(t, "Denied", runtime, testutil.Cols{"model": "morph/denied"})
+	regular := dbfx.Agent(t, "Ordinary", regularRuntime)
+	old := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Microsecond)
+	stale := func(agentID, subject string, priority int) string {
+		return dbfx.Task(t, agentID, testutil.Cols{
+			"runtime_id": runtime, "issue_id": dbfx.Issue(t, subject), "priority": priority,
+			"status": "dispatched", "dispatched_at": old,
+		})
+	}
+	wantRecovery := stale(permitted, "Recover permitted dispatch", 2)
+	unpermittedStale := stale(denied, "Hold denied dispatch", 3)
+	secondStale := stale(permitted, "Second dispatch from same agent", 1)
+	queued := dbfx.Task(t, permitted, testutil.Cols{
+		"runtime_id": runtime, "issue_id": dbfx.Issue(t, "Same agent queued"), "priority": 5,
+	})
+	ordinary := dbfx.Task(t, regular, testutil.Cols{
+		"runtime_id": regularRuntime, "issue_id": dbfx.Issue(t, "Ordinary queued"), "priority": 4,
+	})
+	runtimes := []string{runtime, regularRuntime}
+	_, candidates := claimAdmissionBatch(t, runtimes, 0)
+	if len(candidates) != 2 || candidates[0].AgentID != denied || candidates[1].ReclaimTaskID != wantRecovery {
+		t.Fatalf("unexpected recovery preview: %+v", candidates)
+	}
+	reply, _ := claimAdmissionBatch(t, runtimes, 4, candidates[1])
+	if len(reply.Tasks) != 2 || reply.Tasks[0].ID != wantRecovery || reply.Tasks[1].ID != ordinary {
+		t.Fatalf("batch delivered %+v, want one admitted recovery followed by ordinary work", reply.Tasks)
+	}
+	for _, id := range []string{unpermittedStale, secondStale} {
+		var at time.Time
+		dbfx.QueryRow(t, "SELECT dispatched_at FROM agent_task_queue WHERE id=$1", id).Scan(&at)
+		if !at.Equal(old) {
+			t.Fatalf("dispatch %s was refreshed without a permit: %v", id, at)
+		}
+	}
+	var status string
+	dbfx.QueryRow(t, "SELECT status FROM agent_task_queue WHERE id=$1", queued).Scan(&status)
+	if status != "queued" {
+		t.Fatalf("one recovery permit also claimed an agent's queued task: status=%s", status)
+	}
+}

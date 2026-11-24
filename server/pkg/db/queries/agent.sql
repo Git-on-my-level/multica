@@ -1082,6 +1082,15 @@ WITH candidates AS MATERIALIZED (
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
             AND (
+                NOT @admission_restricted::boolean
+                OR atq.runtime_id = ANY(@unrestricted_runtime_ids::uuid[])
+                OR (
+                    atq.runtime_id::text = (@admission_reclaims::jsonb -> atq.id::text ->> 'runtime_id')
+                    AND atq.agent_id::text = (@admission_reclaims::jsonb -> atq.id::text ->> 'agent_id')
+                    AND COALESCE(a.model, '') = (@admission_reclaims::jsonb -> atq.id::text ->> 'model')
+                )
+            )
+            AND (
                 r.visibility = 'public'
                 OR (
                     r.visibility = 'private'
@@ -2948,16 +2957,20 @@ SELECT comment_thread_root_id(@comment_id::uuid)::uuid AS id;
 
 
 -- name: ListOpenCodeAdmissionCandidates :many
--- Read only. Include due deferred work and lost-response dispatches so a
--- denied agent can leave both paths untouched until a later poll.
-SELECT candidate.agent_id, candidate.model, candidate.reclaim_due, candidate.promote_due FROM (
-    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at,
-        bool_or(t.status = 'dispatched') OVER (PARTITION BY t.agent_id)::boolean AS reclaim_due,
+-- One candidate per agent, in the batch claim's recovery-first, priority/FIFO
+-- order. An exact stale dispatch ID lets a permit cover at most one delivery.
+SELECT candidate.runtime_id, candidate.agent_id, candidate.model, candidate.reclaim_due,
+       candidate.reclaim_task_id, candidate.promote_due
+FROM (
+    SELECT DISTINCT ON (t.agent_id) t.runtime_id, t.agent_id, a.model, t.priority,
+        CASE WHEN t.status = 'dispatched' THEN t.dispatched_at ELSE t.created_at END AS order_at,
+        (t.status = 'dispatched')::boolean AS reclaim_due,
+        CASE WHEN t.status = 'dispatched' THEN t.id ELSE NULL END::uuid AS reclaim_task_id,
         bool_or(t.status = 'deferred') OVER (PARTITION BY t.agent_id)::boolean AS promote_due
     FROM agent_task_queue t
     JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
     JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
-    WHERE t.runtime_id = @runtime_id
+    WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
       AND (sqlc.narg(agent_id)::uuid IS NULL OR t.agent_id = sqlc.narg(agent_id)::uuid)
       AND (
           t.status = 'queued'
@@ -2966,6 +2979,6 @@ SELECT candidate.agent_id, candidate.model, candidate.reclaim_due, candidate.pro
               AND t.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
               AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
       )
-    ORDER BY t.agent_id, t.priority DESC, t.created_at ASC
+    ORDER BY t.agent_id, reclaim_due DESC, t.priority DESC, order_at ASC, t.id
 ) candidate
-ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.agent_id;
+ORDER BY candidate.reclaim_due DESC, candidate.priority DESC, candidate.order_at ASC, candidate.agent_id;

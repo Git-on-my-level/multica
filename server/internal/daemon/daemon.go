@@ -5811,7 +5811,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// negotiated WS RPC receives task-available pushes, so this poll is only
 		// a missed-event safety net and can run less often. Claim errors retain
 		// the configured fallback cadence above.
-		if claimResult.AdmissionClaimed || dispatched > 0 && dispatched == len(slots) {
+		if dispatched > 0 && dispatched == len(slots) {
 			continue
 		}
 		interval := d.taskClaimPollInterval(claimResult)
@@ -5959,7 +5959,7 @@ func (d *Daemon) normalTaskClaimPollInterval() time.Duration {
 }
 
 func (d *Daemon) baseTaskClaimPollInterval(result claimTasksResult) time.Duration {
-	if !d.wsRPC.supportsRPCV1() || !result.ClaimedOverWS || !result.ClaimPollHintSupported {
+	if !d.wsRPC.supportsRPCV1() || !(result.ClaimedOverWS || result.ClaimedWithAdmission) || !result.ClaimPollHintSupported {
 		return d.normalTaskClaimPollInterval()
 	}
 	upperBound := d.cfg.WSClaimPollInterval

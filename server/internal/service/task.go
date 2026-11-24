@@ -4119,16 +4119,32 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 // OpenCodeAdmissionCandidates returns the current agent/model keys with
 // runnable queue states. The preview never updates task or scheduling state.
 func (s *TaskService) OpenCodeAdmissionCandidates(ctx context.Context, runtimeID pgtype.UUID) ([]protocol.AdmissionCandidate, error) {
+	batch, err := s.OpenCodeBatchAdmissionCandidates(ctx, []pgtype.UUID{runtimeID})
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]protocol.AdmissionCandidate, 0, len(batch))
+	for _, candidate := range batch {
+		candidates = append(candidates, candidate.AdmissionCandidate)
+	}
+	return candidates, nil
+}
+
+func (s *TaskService) OpenCodeBatchAdmissionCandidates(ctx context.Context, runtimeIDs []pgtype.UUID) ([]protocol.BatchAdmissionCandidate, error) {
+	candidates := make([]protocol.BatchAdmissionCandidate, 0)
+	if len(runtimeIDs) == 0 {
+		return candidates, nil
+	}
 	rows, err := s.Queries.ListOpenCodeAdmissionCandidates(ctx, db.ListOpenCodeAdmissionCandidatesParams{
-		RuntimeID: runtimeID, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+		RuntimeIds: runtimeIDs, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	candidates := make([]protocol.AdmissionCandidate, 0, len(rows))
 	for _, row := range rows {
-		candidates = append(candidates, protocol.AdmissionCandidate{
-			AgentID: util.UUIDToString(row.AgentID), Model: row.Model.String,
+		candidates = append(candidates, protocol.BatchAdmissionCandidate{
+			AdmissionCandidate: protocol.AdmissionCandidate{AgentID: util.UUIDToString(row.AgentID), Model: row.Model.String},
+			RuntimeID:          util.UUIDToString(row.RuntimeID), ReclaimTaskID: util.UUIDToString(row.ReclaimTaskID), PromoteDue: row.PromoteDue,
 		})
 	}
 	return candidates, nil
@@ -4140,7 +4156,7 @@ func (s *TaskService) OpenCodeAdmissionCandidates(ctx context.Context, runtimeID
 func (s *TaskService) ClaimOpenCodeAdmission(ctx context.Context, runtimeID, agentID pgtype.UUID, model string) (*db.AgentTaskQueue, error) {
 	scope := claimScope{claimPath: claimPathRuntime, expectedModel: &model}
 	candidates, err := s.Queries.ListOpenCodeAdmissionCandidates(ctx, db.ListOpenCodeAdmissionCandidatesParams{
-		RuntimeID: runtimeID, AgentID: agentID, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+		RuntimeIds: []pgtype.UUID{runtimeID}, AgentID: agentID, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
 	})
 	if err != nil {
 		s.recordClaimDecision(agentID, runtimeID, claimOutcomeErrorList, scope, claimDecisionDetail{})
@@ -4186,12 +4202,14 @@ func (s *TaskService) ClaimOpenCodeAdmission(ctx context.Context, runtimeID, age
 	return s.claimTask(ctx, agentID, runtimeID, scope)
 }
 
-// RequeueOpenCodeAdmissionModelChanged records a delivery rejection and
-// releases the exact claim generation before any credentials are returned.
-func (s *TaskService) RequeueOpenCodeAdmissionModelChanged(ctx context.Context, task db.AgentTaskQueue) error {
-	s.recordClaimDecision(task.AgentID, task.RuntimeID, claimOutcomeAdmissionModelChanged, claimScope{claimPath: claimPathRuntime, candidates: 1}, claimDecisionDetail{})
-	_, err := s.RequeueTaskAfterClaimFailure(ctx, task)
-	return err
+// RecordOpenCodeAdmissionDeliveryRejection reports a model change detected
+// while the claim payload was being built.
+func (s *TaskService) RecordOpenCodeAdmissionDeliveryRejection(task db.AgentTaskQueue, batch bool) {
+	path := claimPathRuntime
+	if batch {
+		path = claimPathBatch
+	}
+	s.recordClaimDecision(task.AgentID, task.RuntimeID, claimOutcomeAdmissionModelChanged, claimScope{claimPath: path, candidates: 1}, claimDecisionDetail{})
 }
 
 // ErrClaimDeliveryAuthz signals that the final delivery gate rejected the
@@ -4391,6 +4409,14 @@ func (s *TaskService) RequeueTaskAfterClaimFailure(ctx context.Context, task db.
 // so a daemon can tell "this server acknowledged nothing" from "this server does
 // not know the field at all".
 func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int, forceRecheckRuntimeIDs ...pgtype.UUID) ([]db.AgentTaskQueue, []string, error) {
+	return s.ClaimTasksForRuntimesWithAdmission(ctx, runtimeIDs, maxTasks, nil, forceRecheckRuntimeIDs...)
+}
+
+// OpenCodeBatchAdmission lists permits by runtime and agent. A present
+// runtime with no permits cannot dispatch or reclaim any tasks.
+type OpenCodeBatchAdmission map[pgtype.UUID]map[pgtype.UUID]protocol.BatchAdmissionCandidate
+
+func (s *TaskService) ClaimTasksForRuntimesWithAdmission(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int, admission OpenCodeBatchAdmission, forceRecheckRuntimeIDs ...pgtype.UUID) ([]db.AgentTaskQueue, []string, error) {
 	if len(runtimeIDs) == 0 || maxTasks <= 0 {
 		return nil, nil, nil
 	}
@@ -4408,6 +4434,9 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	uniqueIDs := make([]pgtype.UUID, 0, len(runtimeIDs))
 	runtimeInSet := make(map[string]struct{}, len(runtimeIDs))
 	for _, rid := range runtimeIDs {
+		if permits, restricted := admission[rid]; restricted && len(permits) == 0 {
+			continue
+		}
 		key := util.UUIDToString(rid)
 		runtimeInSet[key] = struct{}{}
 		if _, dup := seen[key]; dup {
@@ -4417,10 +4446,48 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		uniqueIDs = append(uniqueIDs, rid)
 	}
 
+	if len(uniqueIDs) == 0 {
+		return nil, nil, nil
+	}
 	claimed := make([]db.AgentTaskQueue, 0, maxTasks)
+	promotionIDs, reclaimIDs := uniqueIDs, uniqueIDs
+	var ordinaryIDs []pgtype.UUID
+	var reclaimPermits []byte
+	if len(admission) > 0 {
+		promotionIDs, reclaimIDs = nil, nil
+		byTask := make(map[string]protocol.BatchAdmissionCandidate)
+		for _, rid := range uniqueIDs {
+			permits, restricted := admission[rid]
+			if !restricted {
+				ordinaryIDs = append(ordinaryIDs, rid)
+				promotionIDs = append(promotionIDs, rid)
+				reclaimIDs = append(reclaimIDs, rid)
+				continue
+			}
+			var promoteDue, reclaimDue bool
+			for _, permit := range permits {
+				promoteDue = promoteDue || permit.PromoteDue
+				if permit.ReclaimTaskID != "" {
+					reclaimDue = true
+					byTask[permit.ReclaimTaskID] = permit
+				}
+			}
+			if promoteDue {
+				promotionIDs = append(promotionIDs, rid)
+			}
+			if reclaimDue {
+				reclaimIDs = append(reclaimIDs, rid)
+			}
+		}
+		var err error
+		reclaimPermits, err = json.Marshal(byTask)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode reclaim permits: %w", err)
+		}
+	}
 
-	// 1. Promote due deferred tasks across the whole set (promote-first, like
-	// the singular path). Replay the per-row side effects the singular service
+	// 1. Promote due deferred tasks across the eligible set (promote-first,
+	// like the singular path). Replay the per-row side effects the singular service
 	// method PromoteDueDeferredTasksForRuntime performs — crucially
 	// EmptyClaim.Bump (via NotifyTaskEnqueued → notifyTaskAvailable) so a
 	// just-promoted deferred task invalidates its runtime's cached empty
@@ -4428,38 +4495,40 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// MarkEmpty from a prior idle poll would short-circuit the runtime and the
 	// promoted task would sit unclaimed until the empty key's TTL. Also emits
 	// the deferred→queued UI event and the enqueue analytics sample.
-	s.cancelSupersededDeferredRetries(ctx, uniqueIDs)
-	promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, db.PromoteDueDeferredTasksForRuntimesParams{
-		RuntimeIds:       uniqueIDs,
-		RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
-	})
-	if isDuplicatePendingTaskErr(err) {
-		// Same tolerance as the single-runtime path, and it matters more here:
-		// one contended row would otherwise fail the claim for EVERY runtime in
-		// the batch. Promote nothing this tick and let the claim continue.
-		slog.Info("promote deferred tasks (batch): slot taken by a concurrent enqueue, skipping this tick")
-		promoted = nil
-	} else if err != nil {
-		s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_promote_deferred", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
-		return nil, nil, fmt.Errorf("promote deferred tasks: %w", err)
-	}
-	for _, task := range promoted {
-		slog.Info("deferred task promoted (batch)",
-			"task_id", util.UUIDToString(task.ID),
-			"runtime_id", util.UUIDToString(task.RuntimeID),
-			"agent_id", util.UUIDToString(task.AgentID),
-		)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-		s.NotifyTaskEnqueued(ctx, task)
+	var err error
+	if len(promotionIDs) > 0 {
+		s.cancelSupersededDeferredRetries(ctx, promotionIDs)
+		promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, db.PromoteDueDeferredTasksForRuntimesParams{
+			RuntimeIds:       promotionIDs,
+			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+		})
+		if isDuplicatePendingTaskErr(err) {
+			// Same tolerance as the single-runtime path, and it matters more here:
+			// one contended row would otherwise fail the claim for EVERY runtime in
+			// the batch. Promote nothing this tick and let the claim continue.
+			slog.Info("promote deferred tasks (batch): slot taken by a concurrent enqueue, skipping this tick")
+			promoted = nil
+		} else if err != nil {
+			s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_promote_deferred", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
+			return nil, nil, fmt.Errorf("promote deferred tasks: %w", err)
+		}
+		for _, task := range promoted {
+			slog.Info("deferred task promoted (batch)",
+				"task_id", util.UUIDToString(task.ID),
+				"runtime_id", util.UUIDToString(task.RuntimeID),
+				"agent_id", util.UUIDToString(task.AgentID),
+			)
+			s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
+			s.NotifyTaskEnqueued(ctx, task)
+		}
 	}
 
-	// 2. Reclaim lost-response dispatched tasks when any runtime's task schedule
-	// or bounded DB backstop is due. The query always receives the complete
-	// machine-level set so per-runtime backstops stay aligned and fixed UPDATE
-	// setup/locking cost is paid at a predictable cadence. A nil/missing/failed
-	// cache preserves the historical query path.
-	runtimeKeys := make([]string, 0, len(uniqueIDs))
-	for _, rid := range uniqueIDs {
+	// 2. Reclaim lost-response dispatched tasks when any eligible runtime's
+	// schedule or bounded DB backstop is due. Ordinary runtimes are checked as
+	// a group to keep their backstops aligned. An admitted agent contributes
+	// at most one exact stale dispatch to the same priority-ordered UPDATE.
+	runtimeKeys := make([]string, 0, len(reclaimIDs))
+	for _, rid := range reclaimIDs {
 		runtimeKeys = append(runtimeKeys, util.UUIDToString(rid))
 	}
 	checkStarted := time.Now()
@@ -4469,11 +4538,14 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	if len(dueKeys) > 0 {
 		reclaimCheckAfter = time.Now().Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		reclaimed, err = s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
-			RuntimeIds:        uniqueIDs,
-			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
-			MaxTasks:          int32(maxTasks),
+			RuntimeIds:             reclaimIDs,
+			AdmissionRestricted:    len(admission) > 0,
+			UnrestrictedRuntimeIds: ordinaryIDs,
+			AdmissionReclaims:      reclaimPermits,
+			ClaimRecoverySecs:      claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:       prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:       RuntimeClaimFreshnessSeconds,
+			MaxTasks:               int32(maxTasks),
 		})
 		if err != nil {
 			s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_reclaim_dispatched", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
@@ -4482,12 +4554,15 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		// The UPDATE's fixed setup/locking cost dominates array width. Query and
 		// advance the complete machine-level set together so per-runtime backstops
 		// cannot drift into one UPDATE on almost every daemon poll.
-		s.ReclaimCheck.MarkChecked(
-			ctx,
-			runtimeKeys,
-			checkStarted,
-			time.Now().Add(ReclaimCheckRetryInterval),
-		)
+		checkedKeys := runtimeKeys
+		if len(admission) > 0 {
+			// An exact recovery permit cannot settle a runtime-wide hint.
+			checkedKeys = make([]string, 0, len(ordinaryIDs))
+			for _, rid := range ordinaryIDs {
+				checkedKeys = append(checkedKeys, util.UUIDToString(rid))
+			}
+		}
+		s.ReclaimCheck.MarkChecked(ctx, checkedKeys, checkStarted, time.Now().Add(ReclaimCheckRetryInterval))
 	}
 	for i := range reclaimed {
 		s.trackTaskForReclaim(reclaimed[i], reclaimCheckAfter)
@@ -4524,7 +4599,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	for _, rid := range uniqueIDs {
 		key := util.UUIDToString(rid)
 		_, forced := forceRecheck[key]
-		if !forced && s.EmptyClaim.IsEmpty(ctx, key) {
+		if _, restricted := admission[rid]; !restricted && !forced && s.EmptyClaim.IsEmpty(ctx, key) {
 			continue
 		}
 		versions[key] = s.EmptyClaim.CurrentVersion(ctx, key)
@@ -4593,6 +4668,11 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// 6. Claim per distinct agent through the runtime-scoped helper, preserving
 	// per-(issue, agent) serialization, capacity caps, and dispatch side effects.
 	triedAgents := make(map[string]struct{}, len(candidates))
+	for _, task := range reclaimed {
+		if _, restricted := admission[task.RuntimeID]; restricted {
+			triedAgents[util.UUIDToString(task.AgentID)] = struct{}{}
+		}
+	}
 	// Candidate rows per agent for the claim-decision scope; see the singular
 	// path above for why it is counted before the loop.
 	candidatesByAgent := make(map[string]int, len(candidates))
@@ -4613,10 +4693,15 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 		triedAgents[agentKey] = struct{}{}
 
-		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID, claimScope{
-			claimPath:  claimPathBatch,
-			candidates: candidatesByAgent[agentKey],
-		})
+		scope := claimScope{claimPath: claimPathBatch, candidates: candidatesByAgent[agentKey]}
+		if permits, restricted := admission[candidates[i].RuntimeID]; restricted {
+			permit, allowed := permits[candidates[i].AgentID]
+			if !allowed {
+				continue
+			}
+			scope.expectedModel = &permit.Model
+		}
+		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID, scope)
 		if err != nil {
 			// Each scoped claim commits in its own transaction, so earlier
 			// iterations (and step-2 reclaims) are already dispatched
