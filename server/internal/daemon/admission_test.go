@@ -269,7 +269,8 @@ func TestAdmissionPartialScanNeverFallsBack(t *testing.T) {
 			}}
 			d.admission = newAdmissionController(fake, d.logger)
 			d.admission.scanTimeout = 500 * time.Millisecond
-			result, err := d.claimTasksWithAdmission(t.Context(), []string{"oc", "oc-other", "regular"}, 1, nil)
+			// Three free slots, so a grant does not end the scan before the later check fails.
+			result, err := d.claimTasksWithAdmission(t.Context(), []string{"oc", "oc-other", "regular"}, 3, nil)
 			if err != nil || result.AdmissionDenied == tc.firstGranted || len(result.Tasks) != 1 || result.Tasks[0].ID != "ordinary" {
 				t.Fatalf("unexpected partial result: %+v, %v", result, err)
 			}
@@ -408,5 +409,31 @@ func TestAdmissionDenialShortensClaimPoll(t *testing.T) {
 	result.AdmissionDenied = true
 	if interval := d.taskClaimPollInterval(result); interval != d.cfg.PollInterval {
 		t.Fatalf("denied candidate wait = %s, want %s", interval, d.cfg.PollInterval)
+	}
+}
+
+func TestAdmissionStopsReservingAtFreeSlots(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := readAdmissionBatchRequest(t, r)
+		if req.MaxTasks == 0 {
+			_, _ = fmt.Fprint(w, `{"admission_candidates":[{"runtime_id":"rt","agent_id":"a","model":"morph/deepseek"},{"runtime_id":"rt","agent_id":"b","model":"morph/deepseek"},{"runtime_id":"rt","agent_id":"c","model":"morph/deepseek"}]}`)
+			return
+		}
+		if len(req.Permits) != 1 || req.Permits[0].AgentID != "a" {
+			t.Errorf("permits beyond free slots: %+v", req.Permits)
+		}
+		_, _ = fmt.Fprint(w, `{"tasks":[{"id":"task","runtime_id":"rt","agent_id":"a"}]}`)
+	}))
+	defer srv.Close()
+	d := New(Config{ServerBaseURL: srv.URL, MaxConcurrentTasks: 1}, slog.New(slog.NewTextHandler(noopWriter{}, nil)))
+	d.runtimeIndex["rt"] = Runtime{ID: "rt", Provider: "opencode"}
+	fake := &fakeAdmission{granted: true}
+	d.admission = newAdmissionController(fake, d.logger)
+	result, err := d.claimTasksWithAdmission(t.Context(), []string{"rt"}, 1, nil)
+	if err != nil || len(result.Tasks) != 1 || result.Tasks[0].admission == nil {
+		t.Fatalf("unexpected claim: %+v, %v", result, err)
+	}
+	if fake.acquires != 1 || fake.releases != 0 {
+		t.Fatalf("acquires = %d, releases = %d; want 1 and 0", fake.acquires, fake.releases)
 	}
 }

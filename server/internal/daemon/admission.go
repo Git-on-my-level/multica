@@ -339,6 +339,11 @@ func (d *Daemon) claimTasksWithAdmission(ctx context.Context, runtimeIDs []strin
 		if scanCtx.Err() != nil {
 			break
 		}
+		// The batch can return at most `slots` tasks; a permit beyond that would
+		// hold shared provider capacity that this claim can never use.
+		if len(permits) >= slots {
+			break
+		}
 		model := candidate.Model
 		if model == "" {
 			model = d.cfg.Agents["opencode"].Model
