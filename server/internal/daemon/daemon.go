@@ -9825,6 +9825,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		backend = switched
 		freshPrompt := prepareColdRetry(hadSession)
+		execOpts.OnRateLimits = taskAccount.observeRateLimits(observeRateLimits)
 		taskAccount.attempted = true
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, withPriorTaskUsage(execOpts, firstUsage), taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {

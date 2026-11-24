@@ -170,12 +170,18 @@ func TestAccountPoolDrainFailoverTransfersTheReservation(t *testing.T) {
 	writeAccountFacts(t, p, drainTestNow, codexDrainFacts(0.96, 0.16))
 	log := slog.New(slog.DiscardHandler)
 	lease := d.selectTaskAccount("codex", &Task{}, false, log)
+	observeFirst := lease.observeRateLimits(nil)
 	lease.attempted = true
 	if !lease.failover(agent.Result{Status: "failed", Error: "You've hit your weekly limit"}, log) {
 		t.Fatal("expected quota failover")
 	}
 	if p.active["codex/default"] != 0 || p.active["codex/codex-2"] != 1 {
 		t.Fatalf("failover did not transfer the reservation: %v", p.active)
+	}
+	snapshot := snapshotWith(agent.RateLimitWindow{UsedPercent: pct(100)})
+	observeFirst(*snapshot)
+	if p.state.Accounts["codex/codex-2"] != nil {
+		t.Fatal("a late snapshot from the first account was attributed to the replacement account")
 	}
 	lease.release()
 	if p.active["codex/codex-2"] != 0 || len(p.completed["codex/codex-2"]) != 0 {

@@ -495,19 +495,20 @@ func (t *taskAccount) observeRateLimits(next func(agent.RateLimitSnapshot)) func
 	if t == nil {
 		return next
 	}
+	id := t.spec.ID
 	return func(s agent.RateLimitSnapshot) {
 		p := t.pool
 		p.mu.Lock()
 		stored := s
-		stored.Account, stored.Accounts = t.spec.ID, nil
-		st := p.accountStateLocked(t.provider, t.spec.ID)
+		stored.Account, stored.Accounts = id, nil
+		st := p.accountStateLocked(t.provider, id)
 		st.Snapshot = &stored
 		if ratio, reset, known := accountPressure(&stored, p.now()); known && ratio >= 1 && reset.After(st.ExhaustedUntil) {
 			st.ExhaustedUntil = reset
 		}
 		var siblings []agent.RateLimitSnapshot
 		for _, spec := range p.providers[t.provider] {
-			if spec.ID == t.spec.ID {
+			if spec.ID == id {
 				continue
 			}
 			if other := p.state.Accounts[accountKey(t.provider, spec.ID)]; other != nil && other.Snapshot != nil && len(siblings) < cli.MaxExtraAccounts {
@@ -583,7 +584,6 @@ func (t *taskAccount) failover(result agent.Result, taskLog *slog.Logger) bool {
 	}
 	if next != nil {
 		t.releaseLocked()
-		// A late rate-limit callback reads t.spec under the same mutex.
 		t.spec = next.spec
 		t.tried[next.spec.ID] = true
 		p.reserveLocked(t.provider, next.spec.ID)
