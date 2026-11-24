@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1847,4 +1848,28 @@ func equalStringSlice(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestOpenCodeCountsAdmissionAttempts(t *testing.T) {
+	backend := &opencodeBackend{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	stream := strings.NewReader(`
+{"type":"step_start","part":{"type":"step-start"}}
+{"type":"retry","error":{"status":429}}
+{"type":"retry","error":{"status":"429"}}
+{"type":"retry","error":{"code":429}}
+{"type":"error","error":{"data":{"statusCode":429,"message":"provider rate limited"}}}
+{"type":"error","error":{"data":{"statusCode":{"invalid":429},"message":"keep this error parseable"}}}
+{"type":"retry","error":{"status":503}}
+{"type":"step_start","part":{"type":"step-start"}}
+`)
+	var attempts, throttle int
+	backend.processEventsWithAttempts(stream, make(chan Message, 16), func(throttled bool) {
+		attempts++
+		if throttled {
+			throttle++
+		}
+	})
+	if attempts != 4 || throttle != 2 {
+		t.Fatalf("attempts=%d, throttled=%d, want 4 and 2", attempts, throttle)
+	}
 }

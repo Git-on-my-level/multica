@@ -450,6 +450,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 	var promptSent atomic.Bool
 
 	var stopOnce sync.Once
+	processDone := openCodeRecordProcessStart(opts)
 	stop := func(force bool) {
 		stopOnce.Do(func() {
 			_ = stdin.Close()
@@ -472,6 +473,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 			<-readerDone
 			<-stderrDone
 			releaseProcessGroup(cmd)
+			processDone()
 		})
 	}
 

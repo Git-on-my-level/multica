@@ -28,6 +28,7 @@ func TestClaimDecisionReasonFor(t *testing.T) {
 		{name: "claimed stays claimed", outcome: claimOutcomeClaimed, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonClaimed},
 		{name: "claimed via runtime poll", outcome: claimOutcomeClaimed, scope: claimScope{claimPath: claimPathRuntime, candidates: 3}, want: claimReasonClaimed},
 		{name: "model admission hold is distinct from an empty queue", outcome: claimOutcomeCodexModelAdmissionHeld, scope: claimScope{claimPath: claimPathBatch, candidates: 1}, want: "codex_model_admission_held"},
+		{name: "OpenCode admission scope changed", outcome: claimOutcomeAdmissionModelChanged, scope: claimScope{claimPath: claimPathRuntime, candidates: 1}, want: "admission_model_changed"},
 		{name: "no capacity maps to concurrency cap", outcome: claimOutcomeNoCapacity, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonAgentConcurrencyCap},
 		{name: "runtime no capacity maps to runtime cap", outcome: claimOutcomeRuntimeNoCapacity, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonRuntimeConcurrencyCap},
 		{name: "no runtime maps to unbound agent", outcome: claimOutcomeNoRuntime, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonAgentUnbound},

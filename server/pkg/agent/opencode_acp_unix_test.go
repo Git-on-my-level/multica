@@ -165,7 +165,8 @@ func TestOpencodeACPCancelSendsSessionCancel(t *testing.T) {
 	backend, logPath := newFakeOpencodeACP(t, "opencode v2.2.0", "cancel")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	session, err := backend.Execute(ctx, "do it", ExecOptions{Cwd: t.TempDir(), Timeout: 20 * time.Second})
+	exited := make(chan struct{})
+	session, err := backend.Execute(ctx, "do it", ExecOptions{Cwd: t.TempDir(), Timeout: 20 * time.Second, OpenCodeProcessStarted: func() func() { return func() { close(exited) } }})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -178,6 +179,11 @@ func TestOpencodeACPCancelSendsSessionCancel(t *testing.T) {
 	}()
 	select {
 	case res := <-session.Result:
+		select {
+		case <-exited:
+		default:
+			t.Fatal("cancellation result arrived before process cleanup")
+		}
 		if res.Status != "aborted" {
 			t.Fatalf("result = %+v", res)
 		}
