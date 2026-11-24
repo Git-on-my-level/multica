@@ -2,9 +2,11 @@ package cli
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Fork overlay: subscription account pools. A daemon can run one provider
@@ -27,6 +29,14 @@ const DefaultAccountID = "default"
 // account stops being preferred. Matches agentctl's capacity pools.
 const DefaultAccountSwitchThreshold = 0.95
 
+const (
+	AccountPolicyDrainBeforeReset = "drain_before_reset"
+	AccountPolicySoonestReset     = "soonest_reset"
+	DefaultAccountFactsMaxAge     = time.Hour
+	DefaultAccountEpsilon         = 0.03
+	DefaultAccountExpectedRunCost = 0.01
+)
+
 // MaxExtraAccounts caps a provider's extra accounts: a rate-limit report
 // carries every other account's snapshot and the server accepts at most this
 // many siblings.
@@ -35,7 +45,13 @@ const MaxExtraAccounts = 8
 // AccountPoolsConfig is the per-profile account pool configuration.
 type AccountPoolsConfig struct {
 	// SwitchThreshold overrides DefaultAccountSwitchThreshold when in (0, 1].
-	SwitchThreshold float64 `json:"switch_threshold,omitempty"`
+	SwitchThreshold    float64           `json:"switch_threshold,omitempty"`
+	Policy             string            `json:"policy,omitempty"`
+	FactsFile          string            `json:"facts_file,omitempty"`
+	FactsMaxAgeSeconds int               `json:"facts_max_age_seconds,omitempty"`
+	DefaultFactsIDs    map[string]string `json:"default_facts_ids,omitempty"`
+	Epsilon            *float64          `json:"epsilon,omitempty"`
+	ExpectedRunCost    *float64          `json:"expected_run_cost,omitempty"`
 	// Accounts maps a provider ("claude", "codex") to its extra accounts.
 	Accounts map[string][]AccountSpec `json:"accounts,omitempty"`
 }
@@ -53,6 +69,7 @@ type AccountPoolsConfig struct {
 // skills and session store, so switching accounts never forks that state.
 type AccountSpec struct {
 	ID         string `json:"id"`
+	FactsID    string `json:"facts_id,omitempty"`
 	Executable string `json:"executable,omitempty"`
 	ConfigDir  string `json:"config_dir,omitempty"`
 	Home       string `json:"home,omitempty"`
@@ -69,6 +86,9 @@ func ValidateAccountSpec(provider string, spec AccountSpec) (AccountSpec, error)
 	}
 	if spec.ID == DefaultAccountID {
 		return spec, fmt.Errorf("account id %q is reserved for the provider's default login", DefaultAccountID)
+	}
+	if spec.FactsID != "" && !accountIDPattern.MatchString(spec.FactsID) {
+		return spec, fmt.Errorf("account %s: invalid facts_id %q", spec.ID, spec.FactsID)
 	}
 	clean := func(field, value string) (string, error) {
 		value = strings.TrimSpace(value)
@@ -120,7 +140,47 @@ func NormalizeAccountPools(cfg *AccountPoolsConfig) (*AccountPoolsConfig, error)
 	if cfg.SwitchThreshold < 0 || cfg.SwitchThreshold > 1 {
 		return nil, fmt.Errorf("switch_threshold must be between 0 and 1, got %v", cfg.SwitchThreshold)
 	}
-	out := &AccountPoolsConfig{SwitchThreshold: cfg.SwitchThreshold}
+	out := *cfg
+	out.Accounts = nil
+	out.DefaultFactsIDs = nil
+	switch cfg.Policy {
+	case "", AccountPolicyDrainBeforeReset, AccountPolicySoonestReset:
+	default:
+		return nil, fmt.Errorf("unknown account pool policy %q", cfg.Policy)
+	}
+	if out.FactsFile = strings.TrimSpace(cfg.FactsFile); out.FactsFile != "" {
+		if !filepath.IsAbs(out.FactsFile) {
+			return nil, fmt.Errorf("facts_file must be an absolute path")
+		}
+		out.FactsFile = filepath.Clean(out.FactsFile)
+	}
+	if cfg.FactsMaxAgeSeconds < 0 || int64(cfg.FactsMaxAgeSeconds) > math.MaxInt64/int64(time.Second) {
+		return nil, fmt.Errorf("facts_max_age_seconds is out of range")
+	}
+	epsilon, cost := DefaultAccountEpsilon, DefaultAccountExpectedRunCost
+	if cfg.Epsilon != nil {
+		epsilon = *cfg.Epsilon
+		out.Epsilon = &epsilon
+	}
+	if cfg.ExpectedRunCost != nil {
+		cost = *cfg.ExpectedRunCost
+		out.ExpectedRunCost = &cost
+	}
+	if !(epsilon >= 0 && epsilon < 1) {
+		return nil, fmt.Errorf("epsilon must be in [0, 1)")
+	}
+	if !(cost >= 0 && cost <= 1-epsilon) {
+		return nil, fmt.Errorf("expected_run_cost must be in [0, 1 - epsilon]")
+	}
+	for provider, id := range cfg.DefaultFactsIDs {
+		if (provider != "claude" && provider != "codex") || !accountIDPattern.MatchString(id) {
+			return nil, fmt.Errorf("invalid default_facts_ids entry %q: %q", provider, id)
+		}
+		if out.DefaultFactsIDs == nil {
+			out.DefaultFactsIDs = map[string]string{}
+		}
+		out.DefaultFactsIDs[provider] = id
+	}
 	for provider, specs := range cfg.Accounts {
 		if len(specs) == 0 {
 			continue
@@ -129,6 +189,7 @@ func NormalizeAccountPools(cfg *AccountPoolsConfig) (*AccountPoolsConfig, error)
 			return nil, fmt.Errorf("%s: at most %d extra accounts, got %d", provider, MaxExtraAccounts, len(specs))
 		}
 		seen := map[string]bool{}
+		factsSeen := map[string]bool{out.DefaultFactsIDs[provider]: true}
 		for _, spec := range specs {
 			valid, err := ValidateAccountSpec(provider, spec)
 			if err != nil {
@@ -138,14 +199,24 @@ func NormalizeAccountPools(cfg *AccountPoolsConfig) (*AccountPoolsConfig, error)
 				return nil, fmt.Errorf("%s: duplicate account id %q", provider, valid.ID)
 			}
 			seen[valid.ID] = true
+			factsID := valid.FactsID
+			if factsID == "" {
+				factsID = valid.ID
+			}
+			if factsSeen[factsID] {
+				return nil, fmt.Errorf("%s: duplicate facts id %q", provider, factsID)
+			}
+			factsSeen[factsID] = true
 			if out.Accounts == nil {
 				out.Accounts = map[string][]AccountSpec{}
 			}
 			out.Accounts[provider] = append(out.Accounts[provider], valid)
 		}
 	}
-	if len(out.Accounts) == 0 && out.SwitchThreshold == 0 {
+	if len(out.Accounts) == 0 && out.SwitchThreshold == 0 && out.Policy == "" &&
+		out.FactsFile == "" && out.FactsMaxAgeSeconds == 0 && len(out.DefaultFactsIDs) == 0 &&
+		out.Epsilon == nil && out.ExpectedRunCost == nil {
 		return nil, nil
 	}
-	return out, nil
+	return &out, nil
 }

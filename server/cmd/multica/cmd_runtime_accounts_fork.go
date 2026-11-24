@@ -22,10 +22,14 @@ var runtimeAccountsCmd = &cobra.Command{
 	Short: "Manage this machine's subscription account pools (local only)",
 	Long: `Run Claude Code or Codex under several subscription accounts on this machine.
 
-The daemon runs each task under the account with the most plan headroom and,
-when an account's session or weekly window runs out mid-task, re-runs the task
-on the next account. The provider's default login is always in the pool as
-"default"; add the extra logins you created on this machine.
+With fresh capacity facts, the daemon favors the account whose last window
+resets first and reserves headroom in every window. It uses local snapshots
+and the soonest_reset policy when facts are unavailable. Configure facts_file,
+default_facts_ids and optional policy in the profile config.json under
+account_pools. The provider's login is always in the pool as "default".
+
+When an account runs out mid-task, the daemon re-runs the task on the next
+account.
 
   multica runtime accounts add claude --id claude-2 --executable ~/.local/bin/claude-2 --config-dir ~/.claude-2
   multica runtime accounts add codex --id codex-2 --home ~/.codex-2
@@ -56,7 +60,7 @@ var runtimeAccountsRemoveCmd = &cobra.Command{
 
 var runtimeAccountsThresholdCmd = &cobra.Command{
 	Use:   "threshold <0-1>",
-	Short: "Set the usage share above which an account stops being preferred (default 0.95)",
+	Short: "Set the soonest_reset switch threshold (default 0.95)",
 	Args:  exactArgs(1),
 	RunE:  runRuntimeAccountsThreshold,
 }
@@ -66,6 +70,7 @@ func init() {
 	runtimeAccountsCmd.AddCommand(runtimeAccountsListCmd, runtimeAccountsAddCmd, runtimeAccountsRemoveCmd, runtimeAccountsThresholdCmd)
 	runtimeAccountsListCmd.Flags().String("output", "table", "Output format: table or json")
 	runtimeAccountsAddCmd.Flags().String("id", "", "Account id, for example claude-2 (required)")
+	runtimeAccountsAddCmd.Flags().String("facts-id", "", "Capacity facts account id (defaults to --id)")
 	runtimeAccountsAddCmd.Flags().String("executable", "", "Claude: launcher that runs Claude Code as this account")
 	runtimeAccountsAddCmd.Flags().String("config-dir", "", "Claude: the account's CLAUDE_CONFIG_DIR")
 	runtimeAccountsAddCmd.Flags().String("home", "", "Codex: the account's CODEX_HOME")
@@ -113,11 +118,13 @@ func runRuntimeAccountsAdd(cmd *cobra.Command, args []string) error {
 	}
 	provider := args[0]
 	id, _ := cmd.Flags().GetString("id")
+	factsID, _ := cmd.Flags().GetString("facts-id")
 	executable, _ := cmd.Flags().GetString("executable")
 	configDir, _ := cmd.Flags().GetString("config-dir")
 	home, _ := cmd.Flags().GetString("home")
 	spec, err := cli.ValidateAccountSpec(provider, cli.AccountSpec{
 		ID:         id,
+		FactsID:    factsID,
 		Executable: expandAccountPath(executable),
 		ConfigDir:  expandAccountPath(configDir),
 		Home:       expandAccountPath(home),
@@ -191,6 +198,10 @@ func runRuntimeAccountsThreshold(cmd *cobra.Command, args []string) error {
 
 func runRuntimeAccountsList(cmd *cobra.Command, _ []string) error {
 	_, profile, pools, err := loadAccountPools(cmd)
+	if err != nil {
+		return err
+	}
+	pools, err = cli.NormalizeAccountPools(pools)
 	if err != nil {
 		return err
 	}
