@@ -376,19 +376,35 @@ multica runtime accounts add claude --id claude-3 --config-dir ~/.claude-3
 # Codex: the account's CODEX_HOME (only its auth.json is used)
 multica runtime accounts add codex --id codex-2 --home ~/.codex-2
 
-multica runtime accounts list          # usage, reset time and state per account
-multica runtime accounts threshold 0.9 # optional, default 0.95
+multica runtime accounts list          # usage, reset time and estimated next account
+multica runtime accounts threshold 0.9 # optional, for soonest_reset (default 0.95)
 multica daemon restart
 ```
 
-How the daemon chooses:
+Set `facts_file` to the absolute path of the published agentctl capacity facts file in the profile's `config.json`. Add the following fields to the existing `account_pools` object alongside `accounts`:
 
-- **At launch.** It reads the plan windows each account's CLI last reported (the same data as the runtime page's Limits section). Among the accounts whose most-used window stays at least 5% below the switch threshold, it takes the one whose limiting window **resets soonest**, so capacity that is about to reset gets used first. After those come accounts with no usage seen yet, then accounts over the threshold (least used first), then exhausted accounts. An account whose login is missing on disk is skipped.
-- **Sessions stay on their account.** A follow-up that would resume a session stays on that session's account while it has headroom. If the daemon has to move the task to another account, it starts a fresh session with the usual continuity notice: Claude refuses to resume another account's session.
-- **Failover.** If a run fails because the account's session or weekly limit is spent, the daemon marks that account exhausted until its window resets (an hour if the reset time is unknown). It then re-runs the task right away on the next account that has headroom, trying each account at most once per task.
+```json
+{
+  "facts_file": "/home/you/.local/state/capacity/facts.json",
+  "facts_max_age_seconds": 3600,
+  "epsilon": 0.03,
+  "expected_run_cost": 0.01,
+  "default_facts_ids": {
+    "claude": "claude-2",
+    "codex": "codex"
+  }
+}
+```
+
+Use the facts ID that corresponds to each default login on this machine. Extra accounts use their configured ID by default. Set `facts_id` on an extra account or pass `--facts-id` to `runtime accounts add` when its ID differs from the published ID. Pass `--facts-id ""` to reset an existing mapping to the account's configured ID. Restart the daemon after editing the profile.
+
+- **At launch.** The default `drain_before_reset` policy prefers the account whose latest window reset comes first. Every window's projected usage must fit within `1 - epsilon` (`epsilon` defaults to `0.03`). Projection adds `expected_run_cost` (default `0.01`) for the proposed run, local in-flight leases, and local runs completed since that window was observed. On equal reset times, lower projected usage on the latest window wins, then pool order. If every account is over threshold, the least-used account comes first. Accounts missing their login are skipped. `runtime accounts list` previews the ranking without the running daemon's in-memory debits.
+- **Fallback and rollback.** When facts are unconfigured, unreadable, invalid, stale, or missing for a usable candidate, the daemon logs a warning and uses `soonest_reset` with its local run snapshots. It prefers the account whose limiting window resets soonest among accounts at least five percentage points below `switch_threshold`. Unknown usage follows, then over-threshold accounts (least used first), then exhausted accounts. Set `"policy": "soonest_reset"` under `account_pools` and restart to always use this policy.
+- **Sessions stay on their account.** A follow-up that would resume a session stays on that session's account while it has headroom. If the daemon has to move the task to another account, it starts a fresh session with the usual continuity notice.
+- **Failover.** A quota failure marks that account exhausted until its window resets (an hour if the reset time is unknown). The daemon re-runs the task on the next available account, trying each account at most once per task.
 - **Pinned agents bypass the pool.** That covers custom runtime profiles and agents whose `custom_env` sets their own login or API key (`CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and similar).
 
-The runtime page's Limits section shows the account the runtime last ran under, followed by every other account in the pool. Pool configuration and state stay on the machine: the config lives in the profile's `config.json` under `account_pools`, and the state in `account-pools-state.json` next to it. Credentials are never copied or sent to the server.
+The runtime page's Limits section shows the account the runtime last ran under, followed by every other account in the pool. The daemon reads capacity facts locally. It persists run snapshots, exhaustion and session bindings in `account-pools-state.json` next to the profile config. Keep profile edits on the upgraded daemon host because older CLI binaries can discard new fields when saving the profile.
 
 ### Local Environments
 

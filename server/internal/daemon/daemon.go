@@ -8476,6 +8476,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Fork: pick the subscription account before anything reads the resume
 	// pointer, so a task moving accounts builds a cold prompt (account_pool_fork.go).
 	taskAccount := d.selectTaskAccount(provider, &task, usesCustomProfileCommand, taskLog)
+	defer taskAccount.release()
 	defer d.registerTaskAccount(task.ID, taskAccount)()
 	baseExecutable := entry.Path
 	entry.Path = taskAccount.executable(baseExecutable)
@@ -9708,6 +9709,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	observeRateLimits, stopRateLimitFlush := d.startRateLimitFlush(ctx, task.ID, taskLog)
 	execOpts.OnRateLimits = taskAccount.observeRateLimits(observeRateLimits)
 	defer stopRateLimitFlush()
+	if taskAccount != nil {
+		taskAccount.attempted = true
+	}
 	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
 		return TaskResult{}, err
@@ -9831,6 +9835,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		backend = switched
 		freshPrompt := prepareColdRetry(hadSession)
+		execOpts.OnRateLimits = taskAccount.observeRateLimits(observeRateLimits)
+		taskAccount.attempted = true
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, withPriorTaskUsage(execOpts, firstUsage), taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
 			taskLog.Warn("account pool: re-run on the next account failed to start; keeping the quota failure", "error", retryErr)

@@ -6,8 +6,9 @@ This is a fork-only operational contract. Preserve it when merging upstream.
 
 - Native OMP runtime/provider support.
 - Subscription account pools: one daemon runs Claude Code / Codex under
-  several local subscription logins, picks the account with headroom per
-  task and fails over on a spent plan window (CLI_AND_DAEMON.md).
+  several local subscription logins. It uses fresh capacity facts to drain
+  the account that resets first, falls back to local run snapshots, and
+  fails over on a spent plan window (CLI_AND_DAEMON.md).
 - Fork install, update, and repository URLs (`install-fork`), without an
   upstream Homebrew tap.
 - Desktop updater feed defaults to `Git-on-my-level/multica` (baked into
@@ -43,7 +44,7 @@ Current isolated overlays:
 | Host-scoped runtime profiles | `server/internal/handler/daemon_profile_fork.go` + one guard in the `DaemonRegister` failed-profile loop; `packages/views/runtimes/components/pending-runtime-fork.ts` + one filter in `runtime-detail-page.tsx` |
 | Host-local Devin ACP | `server/pkg/agent/devin.go` + BuiltinRuntimes `devin` (`devin acp`; no cloud Devin; no root `--permission-mode`) |
 | ZCode (Z.ai) ACP family | `server/pkg/agent/zcode.go` + probe for `zcode-acp-server`; migration `9018` (port of upstream #6987, which numbers it 469) |
-| Subscription account pools | `server/internal/daemon/account_pool_fork.go` (+ hooks in `runTask`), `server/internal/cli/account_pools_fork.go`, `multica runtime accounts` (`cmd_runtime_accounts_fork.go`), `account`/`accounts` on rate-limit snapshots and the runtime Limits section |
+| Subscription account pools | `server/internal/daemon/account_pool_fork.go` (+ hooks in `runTask`), `server/internal/daemon/account_pool_facts_fork.go` (`drain_before_reset` and `soonest_reset` fallback), `server/internal/cli/account_pools_fork.go`, `multica runtime accounts` (`cmd_runtime_accounts_fork.go`), `account`/`accounts` on rate-limit snapshots and the runtime Limits section |
 
 The durable workspace event stream is **retired** (ruling R24, 2026-11-16), not
 paused: `multica event list|watch` returns nothing after the 2026-09-13 capture

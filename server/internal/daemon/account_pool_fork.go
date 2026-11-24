@@ -23,10 +23,9 @@ import (
 // task under the account with the most usable plan headroom, and when a run
 // fails because its account's plan window is spent, the daemon marks that
 // account exhausted until the window resets and re-runs the task once on each
-// remaining account. Selection follows agentctl's capacity pools: among the
-// accounts whose most-used window stays at least accountHeadroom below the
-// switch threshold, prefer the one whose limiting window resets soonest, so
-// capacity that is about to reset is used first.
+// remaining account. With fresh capacity facts, selection favors accounts
+// whose last window resets earliest and whose projected usage fits every
+// window. The legacy policy uses the limiting window from local snapshots.
 //
 // State (latest snapshot per account, exhaustion, which account owns which
 // session) is daemon-local and persisted next to the profile so a restart does
@@ -49,13 +48,20 @@ const (
 )
 
 type accountPool struct {
-	mu        sync.Mutex
-	threshold float64
-	providers map[string][]cli.AccountSpec // default account first
-	state     accountPoolState
-	statePath string
-	now       func() time.Time
-	log       *slog.Logger
+	mu              sync.Mutex
+	threshold       float64
+	policy          string
+	factsFile       string
+	factsMaxAge     time.Duration
+	epsilon         float64
+	expectedRunCost float64
+	active          map[string]int
+	completed       map[string][]time.Time
+	providers       map[string][]cli.AccountSpec // default account first
+	state           accountPoolState
+	statePath       string
+	now             func() time.Time
+	log             *slog.Logger
 	// codexSharedHome resolves the daemon's own CODEX_HOME, the default
 	// account's credential home.
 	codexSharedHome func() string
@@ -87,6 +93,11 @@ func newAccountPool(cfg *cli.AccountPoolsConfig, statePath string, log *slog.Log
 	}
 	p := &accountPool{
 		threshold:       cli.DefaultAccountSwitchThreshold,
+		policy:          cfg.Policy,
+		factsFile:       cfg.FactsFile,
+		factsMaxAge:     cli.DefaultAccountFactsMaxAge,
+		epsilon:         cli.DefaultAccountEpsilon,
+		expectedRunCost: cli.DefaultAccountExpectedRunCost,
 		providers:       map[string][]cli.AccountSpec{},
 		statePath:       statePath,
 		now:             time.Now,
@@ -97,11 +108,30 @@ func newAccountPool(cfg *cli.AccountPoolsConfig, statePath string, log *slog.Log
 	if cfg.SwitchThreshold > 0 {
 		p.threshold = cfg.SwitchThreshold
 	}
+	if cfg.FactsMaxAgeSeconds > 0 {
+		p.factsMaxAge = time.Duration(cfg.FactsMaxAgeSeconds) * time.Second
+	}
+	if cfg.Epsilon != nil {
+		p.epsilon = *cfg.Epsilon
+	}
+	if cfg.ExpectedRunCost != nil {
+		p.expectedRunCost = *cfg.ExpectedRunCost
+	}
+	if p.policy != cli.AccountPolicySoonestReset && p.factsFile != "" {
+		p.active = map[string]int{}
+		p.completed = map[string][]time.Time{}
+	}
 	for provider, specs := range cfg.Accounts {
 		if len(specs) == 0 {
 			continue
 		}
-		p.providers[provider] = append([]cli.AccountSpec{{ID: cli.DefaultAccountID}}, specs...)
+		pool := append([]cli.AccountSpec{{ID: cli.DefaultAccountID, FactsID: cfg.DefaultFactsIDs[provider]}}, specs...)
+		for i := 1; i < len(pool); i++ {
+			if pool[i].FactsID == "" {
+				pool[i].FactsID = pool[i].ID
+			}
+		}
+		p.providers[provider] = pool
 	}
 	if len(p.providers) == 0 {
 		return nil
@@ -258,17 +288,19 @@ func (p *accountPool) usable(provider string, spec cli.AccountSpec) bool {
 }
 
 type accountCandidate struct {
-	spec      cli.AccountSpec
-	tier      int // 0 preferred, 1 unknown usage, 2 over threshold, 3 exhausted
-	ratio     float64
-	resetsAt  time.Time
-	exhausted time.Time
-	order     int
+	spec          cli.AccountSpec
+	tier          int // 0 preferred, 1 unknown usage, 2 over threshold, 3 exhausted
+	ratio         float64
+	resetsAt      time.Time
+	exhausted     time.Time
+	order         int
+	orderReset    time.Time
+	orderPressure float64
 }
 
 // rankLocked orders the provider's usable accounts, best first, leaving out
 // those in skip.
-func (p *accountPool) rankLocked(provider string, skip map[string]bool) []accountCandidate {
+func (p *accountPool) rankLocked(provider string, skip map[string]bool, facts map[string][]accountFactWindow) []accountCandidate {
 	now := p.now()
 	var out []accountCandidate
 	for i, spec := range p.providers[provider] {
@@ -282,7 +314,7 @@ func (p *accountPool) rankLocked(provider string, skip map[string]bool) []accoun
 			snap = st.Snapshot
 		}
 		ratio, reset, known := accountPressure(snap, now)
-		c.ratio, c.resetsAt = ratio, reset
+		c.ratio, c.resetsAt, c.orderReset = ratio, reset, reset
 		switch {
 		case st != nil && st.ExhaustedUntil.After(now):
 			c.tier, c.exhausted = 3, st.ExhaustedUntil
@@ -295,6 +327,7 @@ func (p *accountPool) rankLocked(provider string, skip map[string]bool) []accoun
 		}
 		out = append(out, c)
 	}
+	p.applyCapacityFacts(provider, out, facts, now)
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		if a.tier != b.tier {
@@ -302,13 +335,11 @@ func (p *accountPool) rankLocked(provider string, skip map[string]bool) []accoun
 		}
 		switch a.tier {
 		case 0:
-			// Use the capacity that resets soonest first; an unknown reset
-			// sorts last.
-			if !a.resetsAt.Equal(b.resetsAt) {
-				if a.resetsAt.IsZero() || b.resetsAt.IsZero() {
-					return b.resetsAt.IsZero()
-				}
-				return a.resetsAt.Before(b.resetsAt)
+			if !a.orderReset.Equal(b.orderReset) {
+				return b.orderReset.IsZero() || (!a.orderReset.IsZero() && a.orderReset.Before(b.orderReset))
+			}
+			if a.orderPressure != b.orderPressure {
+				return a.orderPressure < b.orderPressure
 			}
 		case 2:
 			if a.ratio != b.ratio {
@@ -330,6 +361,8 @@ type taskAccount struct {
 	provider string
 	spec     cli.AccountSpec
 	tried    map[string]bool
+	// Only the runTask goroutine starts and releases this lease.
+	attempted bool
 	// setConfigDir records that this lease put CLAUDE_CONFIG_DIR into the
 	// task env, so switching back to the default account removes it.
 	setConfigDir bool
@@ -359,8 +392,9 @@ func (d *Daemon) selectTaskAccount(provider string, task *Task, customCommand bo
 			}
 		}
 	}
+	facts := p.loadFacts(provider)
 	p.mu.Lock()
-	ranked := p.rankLocked(provider, nil)
+	ranked := p.rankLocked(provider, nil, facts)
 	if len(ranked) == 0 {
 		p.mu.Unlock()
 		return nil
@@ -381,6 +415,7 @@ func (d *Daemon) selectTaskAccount(provider string, task *Task, customCommand bo
 			}
 		}
 	}
+	p.reserveLocked(provider, chosen.spec.ID)
 	p.mu.Unlock()
 
 	if sessionAccount != "" && chosen.spec.ID != sessionAccount {
@@ -461,19 +496,20 @@ func (t *taskAccount) observeRateLimits(next func(agent.RateLimitSnapshot)) func
 	if t == nil {
 		return next
 	}
+	id := t.spec.ID
 	return func(s agent.RateLimitSnapshot) {
 		p := t.pool
 		p.mu.Lock()
 		stored := s
-		stored.Account, stored.Accounts = t.spec.ID, nil
-		st := p.accountStateLocked(t.provider, t.spec.ID)
+		stored.Account, stored.Accounts = id, nil
+		st := p.accountStateLocked(t.provider, id)
 		st.Snapshot = &stored
 		if ratio, reset, known := accountPressure(&stored, p.now()); known && ratio >= 1 && reset.After(st.ExhaustedUntil) {
 			st.ExhaustedUntil = reset
 		}
 		var siblings []agent.RateLimitSnapshot
 		for _, spec := range p.providers[t.provider] {
-			if spec.ID == t.spec.ID {
+			if spec.ID == id {
 				continue
 			}
 			if other := p.state.Accounts[accountKey(t.provider, spec.ID)]; other != nil && other.Snapshot != nil && len(siblings) < cli.MaxExtraAccounts {
@@ -527,9 +563,11 @@ func (t *taskAccount) failover(result agent.Result, taskLog *slog.Logger) bool {
 		return false
 	}
 	p := t.pool
+	facts := p.loadFacts(t.provider)
 	p.mu.Lock()
 	now := p.now()
-	st := p.accountStateLocked(t.provider, t.spec.ID)
+	priorID := t.spec.ID
+	st := p.accountStateLocked(t.provider, priorID)
 	until := now.Add(accountQuotaFallbackCooldown)
 	if ratio, reset, known := accountPressure(st.Snapshot, now); known && ratio >= p.threshold && reset.After(now) {
 		until = reset
@@ -538,26 +576,26 @@ func (t *taskAccount) failover(result agent.Result, taskLog *slog.Logger) bool {
 		st.ExhaustedUntil = until
 	}
 	var next *accountCandidate
-	for _, c := range p.rankLocked(t.provider, t.tried) {
+	for _, c := range p.rankLocked(t.provider, t.tried, facts) {
 		if c.tier < 3 {
 			c := c
 			next = &c
 			break
 		}
 	}
+	if next != nil {
+		t.releaseLocked()
+		t.spec = next.spec
+		t.tried[next.spec.ID] = true
+		p.reserveLocked(t.provider, next.spec.ID)
+	}
 	p.saveLocked()
 	p.mu.Unlock()
-	taskLog.Warn("account pool: account hit its plan limit", "provider", t.provider, "account", t.spec.ID, "exhausted_until", until.UTC().Format(time.RFC3339))
+	taskLog.Warn("account pool: account hit its plan limit", "provider", t.provider, "account", priorID, "exhausted_until", until.UTC().Format(time.RFC3339))
 	if next == nil {
 		return false
 	}
-	taskLog.Info("account pool: failing over", "provider", t.provider, "from", t.spec.ID, "to", next.spec.ID)
-	// A late rate-limit callback from the finished run reads t.spec under
-	// the pool mutex.
-	p.mu.Lock()
-	t.spec = next.spec
-	p.mu.Unlock()
-	t.tried[next.spec.ID] = true
+	taskLog.Info("account pool: failing over", "provider", t.provider, "from", priorID, "to", next.spec.ID)
 	return true
 }
 
@@ -623,8 +661,6 @@ func AccountPoolStatus(cfg *cli.AccountPoolsConfig, profile string) []AccountPoo
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	providers := make([]string, 0, len(p.providers))
 	for provider := range p.providers {
 		providers = append(providers, provider)
@@ -632,7 +668,7 @@ func AccountPoolStatus(cfg *cli.AccountPoolsConfig, profile string) []AccountPoo
 	sort.Strings(providers)
 	var rows []AccountPoolStatusRow
 	for _, provider := range providers {
-		ranked := p.rankLocked(provider, nil)
+		ranked := p.rankLocked(provider, nil, p.loadFacts(provider))
 		byID := map[string]accountCandidate{}
 		for _, c := range ranked {
 			byID[c.spec.ID] = c

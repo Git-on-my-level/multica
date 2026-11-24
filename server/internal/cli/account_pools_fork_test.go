@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,86 @@ func TestValidateAccountSpec(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestAccountPoolConfigVersionSkew(t *testing.T) {
+	// Existing profiles omit the policy and all facts fields.
+	const legacy = `{"account_pools":{"switch_threshold":0.92,"accounts":{
+		"claude":[{"id":"personal","config_dir":"/u/.claude-1"}]}}}`
+	var current CLIConfig
+	if err := json.Unmarshal([]byte(legacy), &current); err != nil {
+		t.Fatal(err)
+	}
+	pools, err := NormalizeAccountPools(current.AccountPools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pools.Policy != "" || pools.FactsFile != "" || pools.SwitchThreshold != 0.92 {
+		t.Fatalf("legacy config changed: %+v", pools)
+	}
+	pools.Policy = AccountPolicyDrainBeforeReset
+	pools.FactsFile = "/u/capacity/facts.json"
+	pools.DefaultFactsIDs = map[string]string{"claude": "claude-2"}
+	pools.Accounts["claude"][0].FactsID = "claude-1"
+	pools, err = NormalizeAccountPools(pools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.AccountPools = pools
+	body, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip CLIConfig
+	if err := json.Unmarshal(body, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	got := roundTrip.AccountPools
+	if got.Policy != pools.Policy || got.FactsFile != pools.FactsFile || got.DefaultFactsIDs["claude"] != "claude-2" ||
+		got.Accounts["claude"][0].FactsID != "claude-1" {
+		t.Fatalf("current config lost facts fields: %+v", got)
+	}
+	// Older CLI readers ignore new keys and retain the prior selection inputs.
+	var old struct {
+		AccountPools struct {
+			SwitchThreshold float64 `json:"switch_threshold"`
+			Accounts        map[string][]struct {
+				ID        string `json:"id"`
+				ConfigDir string `json:"config_dir"`
+			} `json:"accounts"`
+		} `json:"account_pools"`
+	}
+	if err := json.Unmarshal(body, &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.AccountPools.SwitchThreshold != 0.92 || old.AccountPools.Accounts["claude"][0].ConfigDir != "/u/.claude-1" {
+		t.Fatalf("old reader lost account config: %+v", old.AccountPools)
+	}
+}
+
+func TestNormalizeAccountPoolPolicyOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*AccountPoolsConfig)
+	}{
+		{"unknown policy", func(c *AccountPoolsConfig) { c.Policy = "typo" }},
+		{"relative path", func(c *AccountPoolsConfig) { c.FactsFile = "relative.json" }},
+		{"negative age", func(c *AccountPoolsConfig) { c.FactsMaxAgeSeconds = -1 }},
+		{"invalid epsilon", func(c *AccountPoolsConfig) { v := 1.0; c.Epsilon = &v }},
+		{"cost exceeds headroom", func(c *AccountPoolsConfig) { v := 1.0; c.ExpectedRunCost = &v }},
+		{"invalid facts id", func(c *AccountPoolsConfig) { c.Accounts["claude"][0].FactsID = "bad/id" }},
+		{"duplicated facts id", func(c *AccountPoolsConfig) { c.DefaultFactsIDs = map[string]string{"claude": "claude-1"} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &AccountPoolsConfig{
+				Accounts: map[string][]AccountSpec{"claude": {{ID: "claude-1", ConfigDir: "/u/.claude-1"}}},
+			}
+			tc.edit(cfg)
+			if _, err := NormalizeAccountPools(cfg); err == nil {
+				t.Fatal("invalid account pool config was accepted")
 			}
 		})
 	}

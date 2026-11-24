@@ -66,7 +66,7 @@ func setSnapshot(p *accountPool, provider, id string, s *agent.RateLimitSnapshot
 
 func rankedIDs(p *accountPool, provider string) []string {
 	var ids []string
-	for _, c := range p.rankLocked(provider, nil) {
+	for _, c := range p.rankLocked(provider, nil, p.loadFacts(provider)) {
 		ids = append(ids, c.spec.ID)
 	}
 	return ids
