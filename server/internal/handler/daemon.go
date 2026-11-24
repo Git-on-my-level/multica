@@ -4471,7 +4471,41 @@ func worktreeClaimBlockReason(resources []ProjectResourceData, runtime db.AgentR
 
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
 // The response includes the agent's name and skills, fetched fresh from the DB.
+func (h *Handler) ListOpenCodeAdmissionCandidates(w http.ResponseWriter, r *http.Request) {
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, chi.URLParam(r, "runtimeId"))
+	if !ok {
+		return
+	}
+	if runtime.Provider != "opencode" {
+		writeError(w, http.StatusBadRequest, "admission requires an OpenCode runtime")
+		return
+	}
+	candidates, err := h.TaskService.OpenCodeAdmissionCandidates(r.Context(), runtime.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to preview OpenCode candidates")
+		return
+	}
+	writeJSON(w, http.StatusOK, candidates)
+}
+
+func (h *Handler) ClaimOpenCodeAdmission(w http.ResponseWriter, r *http.Request) {
+	var candidate protocol.AdmissionCandidate
+	if err := json.NewDecoder(r.Body).Decode(&candidate); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid admission candidate")
+		return
+	}
+	agentID, ok := parseUUIDOrBadRequest(w, candidate.AgentID, "agent_id")
+	if !ok {
+		return
+	}
+	h.claimTaskByRuntime(w, r, agentID, &candidate.Model)
+}
+
 func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
+	h.claimTaskByRuntime(w, r, pgtype.UUID{}, nil)
+}
+
+func (h *Handler) claimTaskByRuntime(w http.ResponseWriter, r *http.Request, admittedAgentID pgtype.UUID, admittedModel *string) {
 	runtimeID := chi.URLParam(r, "runtimeId")
 	start := time.Now()
 
@@ -4507,7 +4541,17 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	authMs = time.Since(start).Milliseconds()
 
 	claimStart := time.Now()
-	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
+	var task *db.AgentTaskQueue
+	var err error
+	if admittedModel == nil {
+		task, err = h.TaskService.ClaimTaskForRuntime(r.Context(), runtime.ID)
+	} else {
+		if runtime.Provider != "opencode" {
+			writeError(w, http.StatusBadRequest, "admission requires an OpenCode runtime")
+			return
+		}
+		task, err = h.TaskService.ClaimOpenCodeAdmission(r.Context(), runtime.ID, admittedAgentID, *admittedModel)
+	}
 	claimMs = time.Since(claimStart).Milliseconds()
 	if err != nil {
 		outcome = "error_claim"
@@ -4558,6 +4602,14 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 				"error", err,
 			)
 		}
+	}
+	if admittedModel != nil && (resp.Agent == nil || resp.Agent.Model != *admittedModel) {
+		// An edit can land after the queue transaction but before payload
+		// assembly. The daemon must see the same model it admitted.
+		requeueFailedClaim("admission model changed")
+		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
+		outcome = "admission_model_changed"
+		return
 	}
 	// Mint a task-scoped `mat_` token bound to (agent, task, workspace,
 	// owner). The daemon will inject this as MULTICA_TOKEN into the agent

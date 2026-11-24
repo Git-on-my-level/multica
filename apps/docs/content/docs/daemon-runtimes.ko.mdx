@@ -111,6 +111,25 @@ multica daemon autostart disable
 
 Claude Code와 Codex 런타임 페이지에는 **한도**도 표시됩니다. CLI 계정이 요금제의 5시간 세션과 주간 한도를 얼마나 썼는지, 언제 초기화되는지, 사용량이 경과 시간보다 빠르게 늘고 있는지 보여 줍니다. 이 값은 CLI가 작업을 실행하는 동안 보고하므로 런타임의 최근 실행 시점 기준입니다. API 키 계정에는 요금제 한도가 없습니다.
 
+### OpenCode 제공업체 실행 승인 [#opencode-admission]
+
+셀프 호스팅 OpenCode 데몬은 네이티브 실행과 agentctl의 호스트별 제공업체 버킷을 공유할 수 있습니다. `admission` 명령을 지원하는 agentctl을 사용하고 해당 버킷을 구성하세요. 데몬과 네이티브 agentctl 명령은 같은 OS 사용자와 agentctl 상태 디렉터리를 사용해야 합니다.
+
+데몬 프로필 설정(`~/.multica/config.json` 또는 `~/.multica/profiles/<name>/config.json`)에 아래 항목을 추가한 뒤 데몬을 재시작하세요. 서버와 데몬 모두 이 기능을 지원해야 합니다.
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+에이전트의 모델 필드에 전체 `provider/model`을 지정하세요. 실행 승인은 이 필드를 기준으로 판단합니다. OpenCode 기본 설정, 실행 래퍼, 사용자 지정 플래그도 모델을 선택할 수 있습니다. 승인이 거부된 실행은 대기열에 남습니다. agentctl이나 서버 미리 보기를 사용할 수 없으면 기본 동시 실행 한도를 적용합니다. OpenCode JSON run 전송 방식은 단계 시작과 구조화된 HTTP 429 이벤트를 보고합니다. ACP 실행에도 승인이 적용되지만 요청 시도 횟수는 보고되지 않습니다.
+
+되돌리려면 `admission.enabled`를 `false`로 설정하고 데몬을 재시작하세요.
+
 ## 로컬 MCP 설정 [#local-mcp]
 
 에이전트에 MCP 설정이 저장되어 있지 않으면 Multica는 MCP 설정을 전혀 전달하지 않고, 도구는 평소처럼 그 컴퓨터에 있는 자체 설정을 읽습니다.

@@ -104,8 +104,9 @@ const (
 // outcome maps to unknown_candidates rather than a definitive
 // no_visible_candidates.
 type claimScope struct {
-	claimPath  string
-	candidates int
+	claimPath     string
+	candidates    int
+	expectedModel *string
 }
 
 // claimDecisionDetail carries the capacity numbers behind a no_capacity or

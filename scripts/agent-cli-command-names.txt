@@ -1,3 +1,4 @@
+agentctl
 agy
 amp
 claude

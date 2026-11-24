@@ -3771,6 +3771,10 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			outcome = "error_get_agent"
 			return fmt.Errorf("agent not found: %w", err)
 		}
+		if scope.expectedModel != nil && agent.Model.String != *scope.expectedModel {
+			outcome = claimOutcomeNoTasks
+			return nil
+		}
 		claimRuntimeID := runtimeID
 		if !claimRuntimeID.Valid {
 			claimRuntimeID = agent.RuntimeID
@@ -4110,6 +4114,48 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	}
 
 	return claimed, nil
+}
+
+// OpenCodeAdmissionCandidates returns the current agent/model keys with
+// runnable queue states. The preview never updates task or scheduling state.
+func (s *TaskService) OpenCodeAdmissionCandidates(ctx context.Context, runtimeID pgtype.UUID) ([]protocol.AdmissionCandidate, error) {
+	rows, err := s.Queries.ListOpenCodeAdmissionCandidates(ctx, db.ListOpenCodeAdmissionCandidatesParams{
+		RuntimeID: runtimeID, ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]protocol.AdmissionCandidate, 0, len(rows))
+	for _, row := range rows {
+		candidates = append(candidates, protocol.AdmissionCandidate{
+			AgentID: util.UUIDToString(row.AgentID), Model: row.Model.String,
+		})
+	}
+	return candidates, nil
+}
+
+// ClaimOpenCodeAdmission limits both claim and lost-response recovery to the
+// agent/model the daemon has checked. A scoped probe cannot certify that
+// other agents on the runtime are idle or that their reclaims were checked.
+func (s *TaskService) ClaimOpenCodeAdmission(ctx context.Context, runtimeID, agentID pgtype.UUID, model string) (*db.AgentTaskQueue, error) {
+	task, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
+		RuntimeID: runtimeID, AdmissionAgentID: agentID, AdmissionModel: pgtype.Text{String: model, Valid: true},
+		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
+		RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+	})
+	if err == nil {
+		s.trackTaskForReclaim(task, time.Now().Add(claimResponseRecoveryWindow+ReclaimCheckHintSafetyMargin))
+		s.recordClaimDecision(task.AgentID, task.RuntimeID, "reclaimed_dispatched", claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
+		return &task, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("reclaim admitted task: %w", err)
+	}
+	if err := s.PromoteDueDeferredTasksForRuntime(ctx, runtimeID); err != nil {
+		return nil, err
+	}
+	return s.claimTask(ctx, agentID, runtimeID, claimScope{claimPath: claimPathRuntime, expectedModel: &model})
 }
 
 // ErrClaimDeliveryAuthz signals that the final delivery gate rejected the

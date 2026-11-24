@@ -24,6 +24,10 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
+	// OpenCodeAttempt reports the run transport's step starts and structured
+	// HTTP 429 retry/error events. True identifies a throttled attempt.
+	OpenCodeAttempt func(throttled bool)
+
 	// SkillInvocation is set only for validated member-authored skill selections.
 	SkillInvocation *SkillInvocation
 	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server

@@ -443,6 +443,7 @@ type repoCacheBackend interface {
 
 // Daemon is the local agent runtime that polls for and executes tasks.
 type Daemon struct {
+	admission *admissionController
 	// accountPool is the fork's subscription account pool (account_pool_fork.go);
 	// nil when no provider has extra accounts.
 	accountPool *accountPool
@@ -855,6 +856,13 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.agentsAvailable.Store(&initialAgents)
 	d.executionEnvironmentCommand = defaultExecutionEnvironmentCommand
+	if cfg.Admission.Enabled {
+		path := strings.TrimSpace(cfg.Admission.AgentctlPath)
+		if path == "" {
+			path = "agentctl"
+		}
+		d.admission = newAdmissionController(agentctlAdmission{path: path}, logger)
+	}
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
 	return d
@@ -5741,7 +5749,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// queued task until the TTL (#7452). Intersect with the live runtime set
 		// so a runtime deleted since it was woken (#7969) is never force-rechecked.
 		forceRecheck := d.filterLiveRuntimes(d.drainWokenRuntimes())
-		claimResult, err := d.claimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots), forceRecheck...)
+		claimResult, err := d.claimTasksWithAdmission(pollerCtx, runtimeIDs, len(slots), forceRecheck)
 		if err != nil {
 			d.exitClaim()
 			releaseSlots(slots)
@@ -5809,10 +5817,14 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// negotiated WS RPC receives task-available pushes, so this poll is only
 		// a missed-event safety net and can run less often. Claim errors retain
 		// the configured fallback cadence above.
-		if dispatched > 0 && dispatched == len(slots) {
+		if claimResult.AdmissionClaimed || dispatched > 0 && dispatched == len(slots) {
 			continue
 		}
-		if err := sleepWithContextOrWakeup(pollerCtx, d.taskClaimPollInterval(claimResult), wakeup); err != nil {
+		interval := d.taskClaimPollInterval(claimResult)
+		if claimResult.AdmissionPolled {
+			interval = min(interval, d.normalTaskClaimPollInterval())
+		}
+		if err := sleepWithContextOrWakeup(pollerCtx, interval, wakeup); err != nil {
 			return
 		}
 	}
@@ -6137,6 +6149,7 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 }
 
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease) {
+	defer task.admission.release(ctx)
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
 	d.mu.Unlock()
@@ -6296,6 +6309,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot.index, taskLog)
+	task.admission.release(ctx)
 	if errors.Is(err, errStartClaimRejected) {
 		// The row belongs to another claim (or is terminal). A task-id-only
 		// failure callback from this stale delivery could kill its new owner.
@@ -9559,6 +9573,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		OpenclawModelOverride:  openclawModelOverride,
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
+	}
+	if task.admission != nil {
+		execOpts.OpenCodeAttempt = task.admission.countAttempt
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:

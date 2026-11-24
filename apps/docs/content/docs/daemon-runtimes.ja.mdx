@@ -111,6 +111,25 @@ multica daemon autostart disable
 
 Claude Code と Codex のランタイムのページには**利用上限**も表示されます。CLI のアカウントがプランの 5 時間セッションと週間の枠をどれだけ使ったか、いつリセットされるか、使用量が経過時間より速く進んでいるかがわかります。値は CLI がタスク実行中に報告するもので、ランタイムの最新の実行時点のものです。API キーのアカウントにはプランの上限はありません。
 
+### OpenCode プロバイダーの実行許可 [#opencode-admission]
+
+セルフホストの OpenCode デーモンは、ネイティブ実行と agentctl のホスト単位のプロバイダーバケットを共有できます。`admission` コマンドに対応する agentctl を使い、対象のバケットを設定してください。デーモンとネイティブの agentctl コマンドは同じ OS ユーザーと agentctl の状態ディレクトリを使います。
+
+デーモンのプロファイル設定（`~/.multica/config.json` または `~/.multica/profiles/<name>/config.json`）に以下を追加して再起動します。サーバーとデーモンの両方がこの機能に対応している必要があります。
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+エージェントのモデル欄に完全な `provider/model` を指定してください。実行許可の判定はこの欄を使います。OpenCode の既定値、起動ラッパー、カスタムフラグでもモデルを選択できます。許可されなかった実行はキューに残ります。agentctl やサーバーのプレビューを利用できない場合は、通常の同時実行制限を使います。OpenCode JSON run トランスポートはステップの開始と構造化された HTTP 429 イベントを報告します。ACP 実行にも許可は適用されますが、リクエスト試行回数は報告されません。
+
+元に戻すには `admission.enabled` を `false` に変更してデーモンを再起動します。
+
 ## ローカルの MCP 設定 [#local-mcp]
 
 エージェントに MCP 設定が保存されていない場合、Multica は MCP の設定を何も渡さず、ツールはそのコンピューター上の自身の設定をいつもどおり読み込みます。

@@ -112,6 +112,25 @@ multica daemon autostart disable
 
 Claude Code 和 Codex 运行时的页面上还有**额度**：CLI 账号在套餐的 5 小时会话和每周窗口里已经用了多少、什么时候重置，以及用量是否跑在时间前面。这些数据由 CLI 在执行任务时上报，反映的是这个运行时最近一次运行时的状态。API Key 账号没有套餐额度。
 
+### OpenCode 提供商准入 [#opencode-admission]
+
+自托管 OpenCode 守护进程可以与原生运行共用 agentctl 的本机提供商配额桶。请使用支持 `admission` 命令的 agentctl 版本，并配置相应的配额桶。守护进程和原生 agentctl 命令需使用同一个系统用户和 agentctl 状态目录。
+
+将以下配置添加到守护进程配置文件（`~/.multica/config.json` 或 `~/.multica/profiles/<name>/config.json`），然后重启守护进程。服务端和守护进程都需要支持准入。
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+在智能体的模型字段中填写完整的 `provider/model`。准入检查范围是此字段，OpenCode 默认配置、启动包装器和自定义参数也可以选择模型。未获准入的运行继续排队。agentctl 或服务端预览不可用时，守护进程使用常规并发限制。OpenCode JSON run 传输上报步骤开始和结构化 HTTP 429 事件。ACP 运行同样需要准入，其请求尝试次数不参与统计。
+
+如需回滚，将 `admission.enabled` 设为 `false` 并重启守护进程。
+
 ## 本机 MCP 配置 [#local-mcp]
 
 智能体没有保存 MCP 配置时，Multica 不向工具传任何 MCP 设置，工具照常读取这台电脑上它自己的配置。

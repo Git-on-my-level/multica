@@ -5994,6 +5994,57 @@ func (q *Queries) ListNonOwnerAgentsByRuntimeForUpdate(ctx context.Context, arg 
 	return items, nil
 }
 
+const listOpenCodeAdmissionCandidates = `-- name: ListOpenCodeAdmissionCandidates :many
+SELECT candidate.agent_id, candidate.model FROM (
+    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at
+    FROM agent_task_queue t
+    JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
+    JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
+    WHERE t.runtime_id = $1
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.fire_at <= now())
+          OR (t.status = 'dispatched' AND t.started_at IS NULL
+              AND t.dispatched_at < now() - make_interval(secs => $2::double precision)
+              AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
+      )
+    ORDER BY t.agent_id, t.priority DESC, t.created_at ASC
+) candidate
+ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.agent_id
+`
+
+type ListOpenCodeAdmissionCandidatesParams struct {
+	RuntimeID         pgtype.UUID `json:"runtime_id"`
+	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
+}
+
+type ListOpenCodeAdmissionCandidatesRow struct {
+	AgentID pgtype.UUID `json:"agent_id"`
+	Model   pgtype.Text `json:"model"`
+}
+
+// Read only. Include due deferred work and lost-response dispatches so a
+// denied agent can leave both paths untouched until a later poll.
+func (q *Queries) ListOpenCodeAdmissionCandidates(ctx context.Context, arg ListOpenCodeAdmissionCandidatesParams) ([]ListOpenCodeAdmissionCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCodeAdmissionCandidates, arg.RuntimeID, arg.ClaimRecoverySecs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCodeAdmissionCandidatesRow{}
+	for rows.Next() {
+		var i ListOpenCodeAdmissionCandidatesRow
+		if err := rows.Scan(&i.AgentID, &i.Model); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingDelegatedFailureRecoveries = `-- name: ListPendingDelegatedFailureRecoveries :many
 SELECT recovery.id, recovery.issue_id, recovery.author_type, recovery.author_id, recovery.content, recovery.type, recovery.created_at, recovery.updated_at, recovery.parent_id, recovery.workspace_id, recovery.resolved_at, recovery.resolved_by_type, recovery.resolved_by_id, recovery.source_task_id, recovery.quick_action_id, recovery.via_plugin_id, recovery.revision, recovery.recovery_settled_at, recovery.deleted_at, recovery.suppressed_agent_ids
 FROM comment recovery
@@ -8240,9 +8291,10 @@ SET dispatched_at = now(),
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
+      AND ($3::uuid IS NULL OR atq.agent_id = $3::uuid)
       AND atq.status = 'dispatched'
       AND atq.started_at IS NULL
-      AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
+      AND atq.dispatched_at < now() - make_interval(secs => $4::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
@@ -8252,6 +8304,7 @@ WHERE id = (
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
+            AND ($5::text IS NULL OR COALESCE(a.model, '') = $5::text)
             AND (
                 r.visibility = 'public'
                 OR (
@@ -8267,7 +8320,7 @@ WHERE id = (
             AND r.status = 'online'
           AND COALESCE(r.metadata->'offline_reason'->>'launcher_unavailable', 'false') <> 'true'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $6::double precision)
       )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
     LIMIT 1
@@ -8279,7 +8332,9 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 type ReclaimStaleDispatchedTaskForRuntimeParams struct {
 	RuntimeID         pgtype.UUID `json:"runtime_id"`
 	PrepareLeaseSecs  float64     `json:"prepare_lease_secs"`
+	AdmissionAgentID  pgtype.UUID `json:"admission_agent_id"`
 	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
+	AdmissionModel    pgtype.Text `json:"admission_model"`
 	RuntimeStaleSecs  float64     `json:"runtime_stale_secs"`
 }
 
@@ -8292,7 +8347,9 @@ func (q *Queries) ReclaimStaleDispatchedTaskForRuntime(ctx context.Context, arg 
 	row := q.db.QueryRow(ctx, reclaimStaleDispatchedTaskForRuntime,
 		arg.RuntimeID,
 		arg.PrepareLeaseSecs,
+		arg.AdmissionAgentID,
 		arg.ClaimRecoverySecs,
+		arg.AdmissionModel,
 		arg.RuntimeStaleSecs,
 	)
 	var i AgentTaskQueue

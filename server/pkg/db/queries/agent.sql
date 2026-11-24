@@ -1019,6 +1019,7 @@ SET dispatched_at = now(),
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
+      AND (sqlc.narg(admission_agent_id)::uuid IS NULL OR atq.agent_id = sqlc.narg(admission_agent_id)::uuid)
       AND atq.status = 'dispatched'
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
@@ -1031,6 +1032,7 @@ WHERE id = (
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
             AND a.runtime_id = atq.runtime_id
+            AND (sqlc.narg(admission_model)::text IS NULL OR COALESCE(a.model, '') = sqlc.narg(admission_model)::text)
             AND (
                 r.visibility = 'public'
                 OR (
@@ -2943,3 +2945,24 @@ RETURNING *;
 
 -- name: GetCommentThreadRootID :one
 SELECT comment_thread_root_id(@comment_id::uuid)::uuid AS id;
+
+
+-- name: ListOpenCodeAdmissionCandidates :many
+-- Read only. Include due deferred work and lost-response dispatches so a
+-- denied agent can leave both paths untouched until a later poll.
+SELECT candidate.agent_id, candidate.model FROM (
+    SELECT DISTINCT ON (t.agent_id) t.agent_id, a.model, t.priority, t.created_at
+    FROM agent_task_queue t
+    JOIN agent a ON a.id = t.agent_id AND a.runtime_id = t.runtime_id
+    JOIN agent_runtime r ON r.id = t.runtime_id AND r.workspace_id = a.workspace_id
+    WHERE t.runtime_id = @runtime_id
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.fire_at <= now())
+          OR (t.status = 'dispatched' AND t.started_at IS NULL
+              AND t.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
+              AND (t.prepare_lease_expires_at IS NULL OR t.prepare_lease_expires_at < now()))
+      )
+    ORDER BY t.agent_id, t.priority DESC, t.created_at ASC
+) candidate
+ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.agent_id;

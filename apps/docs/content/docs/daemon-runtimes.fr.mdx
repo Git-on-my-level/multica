@@ -111,6 +111,25 @@ La consommation de tokens, les coûts et les échecs des exécutions sont regrou
 
 Pour les runtimes Claude Code et Codex, la page du runtime affiche aussi les **Limites** : la part déjà utilisée des fenêtres de 5 heures et hebdomadaire du forfait du compte de la CLI, leur prochaine réinitialisation, et si la consommation va plus vite que le temps écoulé. La CLI les signale pendant l'exécution des tâches : les valeurs datent donc de la dernière exécution du runtime. Les comptes à clé API n'ont pas de limites de forfait.
 
+### Admission OpenCode par fournisseur [#opencode-admission]
+
+Un démon OpenCode auto-hébergé peut partager les quotas locaux d'agentctl avec les exécutions natives. Utilisez une version d'agentctl qui prend en charge les commandes `admission` et configurez le quota correspondant. Le démon et les commandes agentctl natives doivent utiliser le même compte système et le même répertoire d'état agentctl.
+
+Ajoutez cette configuration au profil du démon (`~/.multica/config.json` ou `~/.multica/profiles/<name>/config.json`), puis redémarrez le démon. Le serveur et le démon doivent tous deux prendre en charge l'admission.
+
+```json
+{
+  "admission": {
+    "enabled": true,
+    "agentctl_path": "/absolute/path/to/agentctl"
+  }
+}
+```
+
+Saisissez l'identifiant complet `provider/model` dans le champ de modèle de l'agent. Ce champ sert au contrôle d'admission. Les paramètres par défaut d'OpenCode, les scripts de lancement et les options personnalisées peuvent aussi sélectionner un modèle. Une exécution refusée reste en file d'attente. Si agentctl ou l'aperçu côté serveur est indisponible, le démon applique les limites de concurrence habituelles. Le transport JSON run d'OpenCode signale les débuts d'étape et les événements HTTP 429 structurés. L'admission s'applique également aux exécutions ACP, qui ne fournissent aucune mesure des tentatives de requête.
+
+Pour revenir en arrière, définissez `admission.enabled` sur `false` et redémarrez le démon.
+
 ## Configuration MCP locale [#local-mcp]
 
 Quand aucune configuration MCP n'est enregistrée sur un agent, Multica ne transmet aucun réglage MCP et l'outil lit comme d'habitude sa propre configuration sur cette machine.
