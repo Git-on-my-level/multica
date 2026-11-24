@@ -6149,7 +6149,7 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 }
 
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease) {
-	defer task.admission.release(ctx)
+	defer task.admission.release()
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
 	d.mu.Unlock()
@@ -6309,7 +6309,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot *taskSlotLease)
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot.index, taskLog)
-	task.admission.release(ctx)
+	task.admission.release()
 	if errors.Is(err, errStartClaimRejected) {
 		// The row belongs to another claim (or is terminal). A task-id-only
 		// failure callback from this stale delivery could kill its new owner.
@@ -9576,6 +9576,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	if task.admission != nil {
 		execOpts.OpenCodeAttempt = task.admission.countAttempt
+		execOpts.OpenCodeProcessStarted = task.admission.processStarted
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:
@@ -10600,8 +10601,9 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// terminal boundary is one whose result cannot outrank a force stop, so it
 	// must not be given a hand-off window it can never use. Every such backend
 	// keeps the previous behaviour, including a wedged one, which is force
-	// stopped and classified without waiting for anything.
-	handsOverTerminal := session.TerminalObserved != nil
+	// stopped and classified without waiting for anything. Sessions that use
+	// Result to acknowledge process cleanup still need the bounded hand-off.
+	handsOverTerminal := session.TerminalObserved != nil || session.CleanupRequired
 	terminalObserved := session.TerminalObserved
 	if terminalObserved == nil {
 		terminalObserved = func() bool { return false }

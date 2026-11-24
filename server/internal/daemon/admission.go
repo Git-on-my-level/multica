@@ -155,7 +155,7 @@ func (a *admissionController) reserve(ctx context.Context, runtimeID, model stri
 		a.retryAt = now.Add(DefaultPollInterval)
 		// A lost reply can hide a committed grant. Release this exact holder
 		// even though the claim may proceed under the normal concurrency caps.
-		lease.release(context.WithoutCancel(ctx))
+		lease.release()
 		return nil, true, err
 	}
 	if !granted {
@@ -181,6 +181,9 @@ type admissionLease struct {
 	bucket      string
 	holder      string
 	releaseOnce sync.Once
+	processMu   sync.Mutex
+	processes   int
+	taskEnded   bool
 	steps       atomic.Int64
 	throttled   atomic.Int64
 }
@@ -193,12 +196,40 @@ func (l *admissionLease) countAttempt(throttled bool) {
 	}
 }
 
-func (l *admissionLease) release(ctx context.Context) {
+// processStarted registers an OpenCode subprocess before Execute returns. The
+// drain loop can time out before that subprocess has actually been reaped.
+func (l *admissionLease) processStarted() func() {
+	l.processMu.Lock()
+	l.processes++
+	l.processMu.Unlock()
+	return func() {
+		l.processMu.Lock()
+		l.processes--
+		ready := l.taskEnded && l.processes == 0
+		l.processMu.Unlock()
+		if ready {
+			l.settle()
+		}
+	}
+}
+
+func (l *admissionLease) release() {
 	if l == nil {
 		return
 	}
+	l.processMu.Lock()
+	l.taskEnded = true
+	ready := l.processes == 0
+	l.processMu.Unlock()
+	if ready {
+		l.settle()
+	}
+}
+
+func (l *admissionLease) settle() {
 	l.releaseOnce.Do(func() {
-		ctx = context.WithoutCancel(ctx)
+		// A cancelled run still owns a live release operation.
+		ctx := context.Background()
 		a := l.controller
 		if err := a.client.release(ctx, l.bucket, l.holder); err != nil {
 			a.warnOnce(err)
@@ -263,7 +294,7 @@ func (d *Daemon) claimOpenCodeRuntime(ctx context.Context, runtimeID string) (ta
 		}
 		task, err := d.client.claimOpenCodeAdmission(ctx, runtimeID, candidate)
 		if task == nil || err != nil {
-			lease.release(ctx)
+			lease.release()
 			if err != nil {
 				return nil, true, err
 			}

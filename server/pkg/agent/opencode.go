@@ -343,6 +343,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		_ = stdout.Close()
 	}()
 
+	processDone := openCodeRecordProcessStart(opts)
 	go func() {
 		defer cancel()
 		defer close(msgCh)
@@ -355,6 +356,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		exitErr := cmd.Wait()
 		close(procDone)
 		releaseProcessGroup(cmd)
+		processDone()
 		duration := time.Since(startTime)
 
 		// Wait closes the process pipes, so a prompt write still blocked when
@@ -420,7 +422,14 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{Messages: msgCh, Result: resCh, CleanupRequired: opts.OpenCodeProcessStarted != nil}, nil
+}
+
+func openCodeRecordProcessStart(opts ExecOptions) func() {
+	if opts.OpenCodeProcessStarted != nil {
+		return opts.OpenCodeProcessStarted()
+	}
+	return func() {}
 }
 
 // ── Event handlers ──

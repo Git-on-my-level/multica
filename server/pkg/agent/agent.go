@@ -27,6 +27,9 @@ type ExecOptions struct {
 	// OpenCodeAttempt reports the run transport's step starts and structured
 	// HTTP 429 retry/error events. True identifies a throttled attempt.
 	OpenCodeAttempt func(throttled bool)
+	// OpenCodeProcessStarted registers a started run or ACP process. Its
+	// returned callback runs after that process has completed cleanup.
+	OpenCodeProcessStarted func() func()
 
 	// SkillInvocation is set only for validated member-authored skill selections.
 	SkillInvocation *SkillInvocation

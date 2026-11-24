@@ -121,10 +121,8 @@ func TestAdmissionClaimBoundary(t *testing.T) {
 				lease.countAttempt(false)
 				lease.countAttempt(true)
 				lease.countAttempt(false)
-				cancelled, cancel := context.WithCancel(t.Context())
-				cancel()
-				lease.release(cancelled)
-				lease.release(cancelled)
+				lease.release()
+				lease.release()
 				if !reflect.DeepEqual(fake.observations, [][2]int64{{3, 1}}) {
 					t.Fatalf("observations = %v", fake.observations)
 				}
@@ -164,6 +162,26 @@ func TestAdmissionDenialDoesNotSuppressOtherAgents(t *testing.T) {
 	}
 	if scopedClaims.Load() != 2 || fake.matches != 2 || fake.acquires != 2 || fake.releases != 0 {
 		t.Fatalf("scoped=%d matches=%d acquires=%d releases=%d", scopedClaims.Load(), fake.matches, fake.acquires, fake.releases)
+	}
+}
+
+func TestAdmissionCancellationRetainsSlotUntilOpenCodeExits(t *testing.T) {
+	fake := &fakeAdmission{granted: true}
+	controller := newAdmissionController(fake, slog.New(slog.NewTextHandler(noopWriter{}, nil)))
+	lease, allowed, err := controller.reserve(t.Context(), "rt", "morph/deepseek")
+	if !allowed || err != nil || lease == nil {
+		t.Fatalf("reserve = %v, %t, %v", lease, allowed, err)
+	}
+	exited := lease.processStarted()
+	lease.release()
+	if fake.releases != 0 {
+		t.Fatal("slot released while the cancelled process was still running")
+	}
+	// The stream can still deliver events during bounded cancellation cleanup.
+	lease.countAttempt(true)
+	exited()
+	if fake.releases != 1 || !reflect.DeepEqual(fake.observations, [][2]int64{{1, 1}}) {
+		t.Fatalf("releases=%d, observations=%v", fake.releases, fake.observations)
 	}
 }
 

@@ -450,6 +450,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 	var promptSent atomic.Bool
 
 	var stopOnce sync.Once
+	processDone := openCodeRecordProcessStart(opts)
 	stop := func(force bool) {
 		stopOnce.Do(func() {
 			_ = stdin.Close()
@@ -472,6 +473,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 			<-readerDone
 			<-stderrDone
 			releaseProcessGroup(cmd)
+			processDone()
 		})
 	}
 
@@ -506,6 +508,9 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 
 		startTime := time.Now()
 		result := func(status, errText, sessionID string, rejected bool) {
+			if opts.OpenCodeProcessStarted != nil {
+				stop(runCtx.Err() != nil)
+			}
 			resCh <- Result{Status: status, Error: errText, SessionID: sessionID, ResumeRejected: rejected, DurationMs: time.Since(startTime).Milliseconds()}
 		}
 
@@ -710,7 +715,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{Messages: msgCh, Result: resCh, CleanupRequired: opts.OpenCodeProcessStarted != nil}, nil
 }
 
 // opencodeACPNotify writes a JSON-RPC notification (no id, no response).

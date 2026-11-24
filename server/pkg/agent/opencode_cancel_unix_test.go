@@ -80,7 +80,8 @@ func runOpencodeCancellationTest(t *testing.T, script string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Cwd: tempDir})
+	exited := make(chan struct{})
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Cwd: tempDir, OpenCodeProcessStarted: func() func() { return func() { close(exited) } }})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -97,6 +98,11 @@ func runOpencodeCancellationTest(t *testing.T, script string) {
 
 	select {
 	case res := <-session.Result:
+		select {
+		case <-exited:
+		default:
+			t.Fatal("cancellation result arrived before process cleanup")
+		}
 		if res.Status != "aborted" {
 			t.Errorf("status = %q, want aborted", res.Status)
 		}
