@@ -173,7 +173,9 @@ Each run gets a directory under the workspaces root (default `~/multica_workspac
 | Autopilot (Run Only), quick create | On the next cleanup after the run ends |
 | No owner found (missing metadata, or the server no longer has the record) | After 72 hours without changes to the directory |
 
-While the issue is still open, 12 hours after a run completes only regenerable content is removed: `node_modules`, `.next`, and `.turbo` directories, plus these exact paths under `codex-home`: `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, and `cache/remote_plugin_catalog`. Other files, including SQLite databases and their WAL files, stay. Managed issue-run directories are also removed 14 days after completion by default, whether or not the issue is closed.
+While the issue is still open, 12 hours after a run completes only regenerable content is removed: `node_modules`, `.next`, and `.turbo` directories, plus these exact paths under `codex-home`: `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, and `cache/remote_plugin_catalog`. Other files, including SQLite databases and their WAL files, stay.
+
+After a run has completed, its managed issue-run directory is eligible for removal at 14 days of workspace age by default. Age starts when the daemon first claims the directory and later runs do not reset it. An independent 28-day ceiling also applies when the issue status is unavailable. Set `MULTICA_GC_WORKSPACE_MAX_AGE=0` to disable the ceiling.
 
 For an unarchived chat in a work directory managed by Multica, the daemon applies the same regenerable content cleanup 12 hours after its last run ends by default. After a successful cleanup, the daemon skips repeat scans for that run. A later completed run becomes eligible again after the same delay. For chats in a project's local directory, only the exact Codex cache paths above are cleaned.
 

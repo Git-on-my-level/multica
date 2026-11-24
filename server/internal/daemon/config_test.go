@@ -187,6 +187,7 @@ func TestLoadConfig_CompletedTaskTTLDefaultsBoundedOnEveryServer(t *testing.T) {
 			}
 
 			t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "")
+			t.Setenv("MULTICA_GC_WORKSPACE_MAX_AGE", "")
 			cfg, err := LoadConfig(overrides)
 			if err != nil {
 				t.Fatalf("LoadConfig with default completed-task TTL: %v", err)
@@ -195,23 +196,43 @@ func TestLoadConfig_CompletedTaskTTLDefaultsBoundedOnEveryServer(t *testing.T) {
 				t.Fatalf("GCCompletedTaskTTL = %s, want 14d", cfg.GCCompletedTaskTTL)
 			}
 
+			if cfg.GCWorkspaceMaxAge != 28*24*time.Hour {
+				t.Fatalf("GCWorkspaceMaxAge = %s, want 28d", cfg.GCWorkspaceMaxAge)
+			}
+
 			// An explicit 0 restores keep-until-terminal retention.
 			t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "0")
 			cfg, err = LoadConfig(overrides)
 			if err != nil {
 				t.Fatalf("LoadConfig with completed-task TTL opt-out: %v", err)
 			}
-			if cfg.GCCompletedTaskTTL != 0 {
-				t.Fatalf("GCCompletedTaskTTL = %s, want an explicit 0 to disable the default", cfg.GCCompletedTaskTTL)
+			if cfg.GCCompletedTaskTTL != 0 || cfg.GCWorkspaceMaxAge != 0 {
+				t.Fatalf("expected legacy opt-out to disable both policies: completed=%s max age=%s", cfg.GCCompletedTaskTTL, cfg.GCWorkspaceMaxAge)
 			}
 
 			t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "36h")
+			t.Setenv("MULTICA_GC_WORKSPACE_MAX_AGE", "0")
 			cfg, err = LoadConfig(overrides)
 			if err != nil {
 				t.Fatalf("LoadConfig with completed-task TTL override: %v", err)
 			}
-			if cfg.GCCompletedTaskTTL != 36*time.Hour {
-				t.Fatalf("GCCompletedTaskTTL = %s, want 36h", cfg.GCCompletedTaskTTL)
+			if cfg.GCCompletedTaskTTL != 36*time.Hour || cfg.GCWorkspaceMaxAge != 0 {
+				t.Fatalf("expected 36h completed TTL with ceiling disabled: completed=%s max age=%s", cfg.GCCompletedTaskTTL, cfg.GCWorkspaceMaxAge)
+			}
+
+			t.Setenv("MULTICA_GC_WORKSPACE_MAX_AGE", "48h")
+			cfg, err = LoadConfig(overrides)
+			if err != nil || cfg.GCWorkspaceMaxAge != 48*time.Hour {
+				t.Fatalf("expected 48h ceiling: max age=%s, err=%v", cfg.GCWorkspaceMaxAge, err)
+			}
+			var logs bytes.Buffer
+			d := New(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			d.gcLoop(ctx)
+			if !strings.Contains(logs.String(), "workspace_max_age=48h0m0s") ||
+				!strings.Contains(logs.String(), "completed_issue_task_age_basis=") {
+				t.Fatalf("missing age policy in startup log: %s", &logs)
 			}
 
 			t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "not-a-duration")

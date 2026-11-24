@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1380,6 +1381,38 @@ func (c *EnvRootClaim) Release() {
 	c.lock = nil
 }
 
+// RemoveExpiredRoot removes the workspace contents while retaining its run
+// lock. Once the lock is unlinked, only an empty directory can be removed,
+// so a new claimant cannot race a recursive deletion at the original path.
+func (c *EnvRootClaim) RemoveExpiredRoot() error {
+	root, err := os.OpenRoot(c.rootDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == envRootLockFile || entry.Name() == envRootOwnerFile || entry.Name() == gcMetaFile {
+			continue
+		}
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{gcMetaFile, envRootOwnerFile, envRootLockFile} {
+		if err := root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	// Windows can defer unlinking an open lock file until its handle closes.
+	c.Release()
+	root.Close()
+	return os.Remove(c.rootDir)
+}
+
 // ClaimEnvRoot takes the full claim for a fresh preparation of taskID: it
 // proves ownership, refuses a root a live execution or another task holds, and
 // resets a stale root this task owns so the caller receives a clean directory.
@@ -1558,7 +1591,12 @@ func claimEnvRoot(envRoot, workspaceID, taskID string) (lockFile *os.File, reset
 		// Upgrade legacy task-only markers while the lock makes the rewrite
 		// exclusive. Disk usage can then attribute active roots by workspace.
 		if owner.WorkspaceID == "" {
-			if err := writeEnvRootOwner(envRoot, workspaceID, taskID); err != nil {
+			// Preserve the marker's original age when upgrading its format.
+			createdAt, err := EnvRootOwnedAt(envRoot)
+			if err != nil {
+				return nil, false, err
+			}
+			if err := writeEnvRootOwnerAt(envRoot, workspaceID, taskID, createdAt); err != nil {
 				return nil, false, err
 			}
 		}
@@ -1613,6 +1651,10 @@ func releaseLockFile(f *os.File) {
 // safe from another execution racing mid-claim. The same-directory temp file
 // and rename keep lock-free readers from observing a truncated JSON marker.
 func writeEnvRootOwner(envRoot, workspaceID, taskID string) error {
+	return writeEnvRootOwnerAt(envRoot, workspaceID, taskID, time.Time{})
+}
+
+func writeEnvRootOwnerAt(envRoot, workspaceID, taskID string, ownedAt time.Time) error {
 	path := filepath.Join(envRoot, envRootOwnerFile)
 	data, err := json.Marshal(EnvRootOwner{WorkspaceID: workspaceID, TaskID: taskID})
 	if err != nil {
@@ -1640,6 +1682,11 @@ func writeEnvRootOwner(envRoot, workspaceID, taskID string) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp env root owner for %s: %w", envRoot, err)
+	}
+	if !ownedAt.IsZero() {
+		if err := os.Chtimes(tmpPath, ownedAt, ownedAt); err != nil {
+			return fmt.Errorf("preserve env root owner time for %s: %w", envRoot, err)
+		}
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace env root owner for %s: %w", envRoot, err)
@@ -1684,6 +1731,18 @@ func readEnvRootOwner(envRoot string) (string, error) {
 type EnvRootOwner struct {
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	TaskID      string `json:"task_id"`
+}
+
+// EnvRootOwnedAt reports when the daemon first claimed this physical workspace.
+func EnvRootOwnedAt(envRoot string) (time.Time, error) {
+	info, err := os.Lstat(filepath.Join(envRoot, envRootOwnerFile))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return time.Time{}, fmt.Errorf("env root owner in %s is not a regular file", envRoot)
+	}
+	return info.ModTime(), nil
 }
 
 // ReadEnvRootOwner reads both current JSON markers and legacy plain task IDs.

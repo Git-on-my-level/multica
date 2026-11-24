@@ -174,7 +174,9 @@ cd ~/.multica/cursor-mcp-auth/<agent-id>/user-login/workdir && CURSOR_DATA_DIR=~
 | 自动化（仅运行）、快速创建 | 运行结束后的下一轮清理 |
 | 找不到归属（目录缺少元数据，或服务器上已没有对应记录） | 目录 72 小时没有改动 |
 
-任务仍未关闭时，运行完成 12 小时后只删可以重新生成的内容：目录中的 `node_modules`、`.next`、`.turbo`，以及 `codex-home` 下的四个精确路径：`.sandbox-bin`、`.tmp/plugins`、`.tmp/marketplaces`、`cache/remote_plugin_catalog`。其他文件（包括 SQLite 数据库和 WAL 文件）保留。托管的任务运行目录默认还会在运行完成 14 天后整体删除，不论任务是否关闭。
+任务仍未关闭时，运行完成 12 小时后只删可以重新生成的内容：目录中的 `node_modules`、`.next`、`.turbo`，以及 `codex-home` 下的四个精确路径：`.sandbox-bin`、`.tmp/plugins`、`.tmp/marketplaces`、`cache/remote_plugin_catalog`。其他文件（包括 SQLite 数据库和 WAL 文件）保留。
+
+托管任务运行完成后，其目录默认在达到 14 天的目录年龄时可以删除。年龄从守护进程首次取得目录所有权时算起，重新运行不会重置。即使无法获取任务状态，也适用独立的 28 天上限。设为 `MULTICA_GC_WORKSPACE_MAX_AGE=0` 可关闭上限。
 
 未归档的聊天如果使用 Multica 管理的工作目录，守护进程默认会在最后一次运行结束 12 小时后按同样的规则清理可重新生成的内容。清理成功后，守护进程会跳过该次运行的重复扫描。后续运行结束后，经过同样的等待时间便可再次清理。聊天直接在项目本地目录中运行时，只清理上述精确路径中的 Codex 缓存。
 

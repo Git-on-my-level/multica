@@ -173,7 +173,9 @@ Chaque exécution a un répertoire sous la racine des espaces de travail (par d�
 | Automatisation (Exécution seule), création rapide | Au nettoyage suivant la fin de l'exécution |
 | Sans propriétaire identifié (métadonnées absentes, ou enregistrement disparu côté serveur) | Après 72 heures sans modification du répertoire |
 
-Tant que la tâche reste ouverte, seul le contenu régénérable est supprimé 12 heures après la fin d'une exécution : `node_modules`, `.next`, `.turbo` et les chemins exacts `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, `cache/remote_plugin_catalog` sous `codex-home`. Les autres fichiers, dont les bases SQLite et leurs WAL, sont conservés. Les répertoires d'exécution de tâches gérés sont aussi supprimés entièrement 14 jours après la fin par défaut, que la tâche soit fermée ou non.
+Tant que la tâche reste ouverte, seul le contenu régénérable est supprimé 12 heures après la fin d'une exécution : `node_modules`, `.next`, `.turbo` et les chemins exacts `.sandbox-bin`, `.tmp/plugins`, `.tmp/marketplaces`, `cache/remote_plugin_catalog` sous `codex-home`. Les autres fichiers, dont les bases SQLite et leurs WAL, sont conservés.
+
+Après une exécution terminée, son répertoire géré peut être supprimé à partir de 14 jours d’âge par défaut. L’âge est calculé depuis la première prise en charge du répertoire et les exécutions suivantes ne le réinitialisent pas. Un plafond indépendant de 28 jours s’applique aussi lorsque le statut de la tâche est indisponible. Définissez `MULTICA_GC_WORKSPACE_MAX_AGE=0` pour désactiver ce plafond.
 
 Pour un chat non archivé dans un répertoire de travail géré par Multica, le daemon applique le même nettoyage régénérable, par défaut 12 heures après la dernière exécution. Il mémorise le nettoyage réussi et évite les parcours répétés pour cette exécution. Une exécution ultérieure devient éligible après le même délai. Pour un chat directement dans le répertoire local d'un projet, seuls les chemins exacts de cache Codex ci-dessus sont nettoyés.
 
