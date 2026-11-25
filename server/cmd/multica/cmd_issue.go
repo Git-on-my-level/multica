@@ -565,6 +565,7 @@ var validIssueFields = []string{
 	"assignee_id", "creator_type", "creator_id", "requester_id", "parent_issue_id",
 	"duplicate_of", "project_id", "position", "stage", "start_date", "due_date", "created_at",
 	"updated_at", "revision", "last_activity_at", "metadata", "properties",
+	"current_state",
 	"labels",
 }
 
