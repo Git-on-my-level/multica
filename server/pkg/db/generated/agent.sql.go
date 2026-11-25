@@ -1606,6 +1606,18 @@ WHERE id = (
               )
             )
       )
+      -- A shutdown retry retains the interrupted chat turn's place through
+      -- promotion and claim, even when a follow-up has higher priority.
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_task_queue recovery
+          JOIN agent_task_queue interrupted ON interrupted.id = recovery.parent_task_id
+          WHERE recovery.agent_id = atq.agent_id
+            AND recovery.chat_session_id = atq.chat_session_id
+            AND recovery.status IN ('deferred', 'queued')
+            AND recovery.id <> atq.id
+            AND interrupted.failure_reason = 'runtime_recovery'
+            AND recovery.context ? 'same_session_retry'
+      )
     ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -3638,7 +3650,7 @@ WITH victims AS (
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
     WHERE retry.status = 'deferred'
       AND retry.fire_at < now() - make_interval(secs => $1::double precision)
-      AND parent.failure_reason = 'runtime_offline'
+      AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
       AND NOT EXISTS (
           SELECT 1 FROM agent_runtime runtime
           WHERE runtime.id = retry.runtime_id
@@ -3664,7 +3676,7 @@ WHERE retry.id = victims.id
   AND EXISTS (
       SELECT 1 FROM agent_task_queue parent
       WHERE parent.id = retry.parent_task_id
-        AND parent.failure_reason = 'runtime_offline'
+        AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
   )
   AND NOT EXISTS (
       SELECT 1 FROM agent_runtime runtime
@@ -3682,7 +3694,7 @@ type FailExpiredRuntimeReconnectRetriesParams struct {
 	MaxPerTick         int32   `json:"max_per_tick"`
 }
 
-// A runtime_offline retry waits in deferred until its runtime returns healthy.
+// A runtime_offline or runtime_recovery retry waits in deferred until its runtime returns healthy.
 // Give that recovery state a bounded exit: after one full reconnect grace,
 // fail it with a non-retryable reason so issues, agents, and runtime GC can
 // converge. A runtime that is healthy when this query runs wins the race and
@@ -5046,14 +5058,14 @@ func (q *Queries) HasRetryTaskForParent(ctx context.Context, parentTaskID pgtype
 	return column_1, err
 }
 
-const hasRuntimeOfflineRetryForParent = `-- name: HasRuntimeOfflineRetryForParent :one
+const hasRuntimeRetryForParent = `-- name: HasRuntimeRetryForParent :one
 SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
 `
 
-// A cancelled or completed recovery still consumes the one offline recovery.
-// Call while holding LockRuntimeOfflineRetryParent.
-func (q *Queries) HasRuntimeOfflineRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, hasRuntimeOfflineRetryForParent, parentTaskID)
+// A cancelled or completed recovery still consumes recovery.
+// Call while holding LockRuntimeRetryParent.
+func (q *Queries) HasRuntimeRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRuntimeRetryForParent, parentTaskID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -7279,14 +7291,15 @@ func (q *Queries) LockAgentTaskStartClaim(ctx context.Context, arg LockAgentTask
 	return i, err
 }
 
-const lockRuntimeOfflineRetryParent = `-- name: LockRuntimeOfflineRetryParent :exec
+const lockRuntimeRetryParent = `-- name: LockRuntimeRetryParent :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':runtime_offline_retry', 0))
 `
 
 // Serialize deferred recovery creation without taking a task-row lock ahead
 // of CreateRetryTask's workspace/owner fence (the teardown lock order).
-func (q *Queries) LockRuntimeOfflineRetryParent(ctx context.Context, taskID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, lockRuntimeOfflineRetryParent, taskID)
+// Keep the existing advisory-lock key so offline recovery serializes across upgrades.
+func (q *Queries) LockRuntimeRetryParent(ctx context.Context, taskID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockRuntimeRetryParent, taskID)
 	return err
 }
 
@@ -8622,7 +8635,12 @@ const recoverOrphanedTasksForRuntime = `-- name: RecoverOrphanedTasksForRuntime 
 UPDATE agent_task_queue
 SET status = 'failed',
     completed_at = now(),
-    error = 'daemon restarted while task was in flight',
+    error = CASE
+        WHEN status = 'running' OR started_at IS NOT NULL OR session_id IS NOT NULL
+          OR EXISTS (SELECT 1 FROM task_message m WHERE m.task_id = agent_task_queue.id)
+        THEN 'daemon restarted while task was in flight'
+        ELSE 'daemon restarted before task launch'
+    END,
     failure_reason = 'runtime_recovery',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
