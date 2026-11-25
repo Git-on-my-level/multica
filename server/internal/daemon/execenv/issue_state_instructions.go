@@ -32,8 +32,9 @@ import (
 //
 // The compared set is named in full in the unchanged rendering rather than
 // summarised as "the issue", because it is NOT the whole issue: labels, parent,
-// due date, stage, project and metadata are not compared, and an agent told
-// "unchanged" must be able to see that those were out of scope.
+// due date, stage, project and metadata other than current_state are not
+// compared, and an agent told "unchanged" must be able to see that those were
+// out of scope.
 //
 // Status and assignee ride along in both known renderings. They are what
 // workflow step 3 needs ("is it already in progress", "is it mine"), and a run
@@ -58,7 +59,7 @@ func BuildIssueStateHint(issueID, issueStatus, assigneeType, assigneeID string, 
 	state := fmt.Sprintf("status: %s; assignee: %s", issueStatus, issueAssigneeLabel(assigneeType, assigneeID))
 	if len(changedFields) == 0 {
 		return fmt.Sprintf(
-			"The issue is unchanged since your last run — the server compared title and description (%s). "+
+			"The issue is unchanged since your last run — the server compared title, description, and current_state (%s). "+
 				"That answers workflow step 1: continue from your resumed context, and re-read with %s only if resumed memory is not enough.\n\n",
 			state, readCommand,
 		)

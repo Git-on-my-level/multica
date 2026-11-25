@@ -1359,6 +1359,7 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 	if err := client.GetJSON(ctx, "/api/issues/"+issueRef.ID, &issue); err != nil {
 		return fmt.Errorf("get issue: %w", err)
 	}
+	projectCurrentStateForIssueGet(issue)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "table" {
@@ -1393,6 +1394,23 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return cli.PrintJSON(os.Stdout, issue)
+}
+
+// The HTTP API keeps metadata primitive-only for installed clients and returns
+// structured current_state as a top-level sibling. Agent runtime guidance and
+// the issue get contract use metadata.current_state, so project the sibling
+// back into the CLI's JSON view while retaining the additive top-level field.
+func projectCurrentStateForIssueGet(issue map[string]any) {
+	currentState, ok := issue["current_state"].(map[string]any)
+	if !ok {
+		return
+	}
+	metadata, ok := issue["metadata"].(map[string]any)
+	if !ok {
+		metadata = map[string]any{}
+		issue["metadata"] = metadata
+	}
+	metadata["current_state"] = currentState
 }
 
 // childStage extracts the integer stage from a child issue response map.

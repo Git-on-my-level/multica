@@ -92,6 +92,24 @@ func TestIssueWorkflowCarriesSourceContextPrecedenceOnce(t *testing.T) {
 	}
 }
 
+func TestIssueRuntimeGuidanceExplainsCurrentStateReadProjection(t *testing.T) {
+	t.Parallel()
+	for _, ctx := range []TaskContextForEnv{
+		{IssueID: "issue-1"},
+		{IssueID: "issue-2", HasProjectWorkflow: true},
+	} {
+		out := buildMetaSkillContent("claude", ctx)
+		for _, want := range []string{
+			"Read the live handoff at `metadata.current_state` in `multica issue get <this-issue-id> --output json`.",
+			"The HTTP issue API keeps `metadata` primitive-only and returns structured state as the top-level `current_state` sibling; the CLI projects that sibling under `metadata` for this agent-facing contract.",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("runtime guidance missing current-state read contract %q", want)
+			}
+		}
+	}
+}
+
 // The brief must no longer carry any parent-notification guidance. PR
 // #2918 added a "Tell the parent when you finish a child" rule that
 // turned into noise (self-mention loops, planner ack ping-pong,
