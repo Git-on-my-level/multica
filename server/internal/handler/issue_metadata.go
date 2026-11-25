@@ -19,9 +19,11 @@ import (
 )
 
 // Per-issue metadata is a small JSONB map agents use to record pipeline
-// details (PR number, pipeline_status, waiting_on, ...). The reserved
-// current_state entry is the single structured exception and is managed by
-// issue_current_state.go. The generic KV surface enforces these rules:
+// details (PR number, pipeline_status, waiting_on, ...). The structured
+// current_state exception is managed by issue_current_state.go and projected
+// as a sibling in API responses. Primitive values written under that key by
+// older clients remain readable and editable. The generic KV surface enforces
+// these rules:
 //
 //   - keys match `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (handler)
 //   - at most 50 keys per issue (handler)
@@ -152,7 +154,8 @@ func (h *Handler) ListIssueMetadata(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"metadata": parseIssueMetadata(issue.Metadata)})
+	metadata, currentState := issueMetadataForResponse(issue.Metadata)
+	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata, "current_state": currentState})
 }
 
 func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
@@ -163,11 +166,6 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if key == issueCurrentStateMetadataKey {
-		writeError(w, http.StatusBadRequest, "current_state is reserved; use the issue current-state endpoint")
-		return
-	}
-
 	var req SetIssueMetadataKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -182,6 +180,14 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	existing := parseIssueMetadata(issue.Metadata)
+	if key == issueCurrentStateMetadataKey {
+		legacyValue, present := existing[key]
+		if present && !isLegacyIssueMetadataPrimitive(legacyValue) {
+			writeError(w, http.StatusBadRequest, "current_state contains a structured record; use the issue current-state endpoint")
+			return
+		}
+	}
 	userID, ok := requireUserID(w, r)
 	if !ok {
 		return
@@ -190,7 +196,6 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 	// Enforce the key-count cap in the handler. The DB only guards size,
 	// and a clear 4xx for "too many keys" beats a CHECK violation that
 	// happens to fire on the size cap once enough keys accumulate.
-	existing := parseIssueMetadata(issue.Metadata)
 	if _, present := existing[key]; !present && len(existing) >= maxIssueMetadataKeys {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("metadata cannot exceed %d keys", maxIssueMetadataKeys))
 		return
@@ -226,8 +231,9 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.recordIssueMetadataMutation(r, "set", "noop", issueID, key, queryDuration)
+			metadata, currentState := issueMetadataForResponse(current.Metadata)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"metadata":       parseIssueMetadata(current.Metadata),
+				"metadata": metadata, "current_state": currentState,
 				"issue_revision": current.Revision,
 			})
 			return
@@ -245,13 +251,14 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 
 	workspaceID := uuidToString(updated.WorkspaceID)
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	metadata := parseIssueMetadata(updated.Metadata)
+	metadata, currentState := issueMetadataForResponse(updated.Metadata)
 	h.publish(protocol.EventIssueMetadataChanged, workspaceID, actorType, actorID, map[string]any{
 		"issue_id":       uuidToString(updated.ID),
 		"metadata":       metadata,
+		"current_state":  currentState,
 		"issue_revision": updated.Revision,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata, "issue_revision": updated.Revision})
+	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata, "current_state": currentState, "issue_revision": updated.Revision})
 }
 
 func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
@@ -262,14 +269,17 @@ func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if key == issueCurrentStateMetadataKey {
-		writeError(w, http.StatusBadRequest, "current_state is reserved; use the issue current-state endpoint")
-		return
-	}
-
 	issue, ok := h.loadIssueForUser(w, r, issueID)
 	if !ok {
 		return
+	}
+	existing := parseIssueMetadata(issue.Metadata)
+	if key == issueCurrentStateMetadataKey {
+		legacyValue, present := existing[key]
+		if present && !isLegacyIssueMetadataPrimitive(legacyValue) {
+			writeError(w, http.StatusBadRequest, "current_state contains a structured record; use the issue current-state endpoint")
+			return
+		}
 	}
 	userID, ok := requireUserID(w, r)
 	if !ok {
@@ -305,8 +315,9 @@ func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			h.recordIssueMetadataMutation(r, "delete", "noop", issueID, key, queryDuration)
+			metadata, currentState := issueMetadataForResponse(current.Metadata)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"metadata":       parseIssueMetadata(current.Metadata),
+				"metadata": metadata, "current_state": currentState,
 				"issue_revision": current.Revision,
 			})
 			return
@@ -320,11 +331,21 @@ func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request)
 
 	workspaceID := uuidToString(updated.WorkspaceID)
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	metadata := parseIssueMetadata(updated.Metadata)
+	metadata, currentState := issueMetadataForResponse(updated.Metadata)
 	h.publish(protocol.EventIssueMetadataChanged, workspaceID, actorType, actorID, map[string]any{
 		"issue_id":       uuidToString(updated.ID),
 		"metadata":       metadata,
+		"current_state":  currentState,
 		"issue_revision": updated.Revision,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata, "issue_revision": updated.Revision})
+	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata, "current_state": currentState, "issue_revision": updated.Revision})
+}
+
+func isLegacyIssueMetadataPrimitive(value any) bool {
+	switch value.(type) {
+	case string, bool, float64:
+		return true
+	default:
+		return false
+	}
 }

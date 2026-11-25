@@ -1596,7 +1596,6 @@ export const IssueCurrentStateSchema = z.object({
   updated_by: z.object({ type: z.string(), id: z.string() }).loose(),
   issue_revision: z.number().int().positive(),
 }).loose();
-export type IssueCurrentState = z.infer<typeof IssueCurrentStateSchema>;
 
 export const IssueCurrentStateUpdateSchema = z.object({
   state: z.string().min(1),
@@ -1613,23 +1612,9 @@ export const IssueCurrentStateResponseSchema = z.object({
 }).loose();
 export type IssueCurrentStateResponse = z.infer<typeof IssueCurrentStateResponseSchema>;
 
-// Metadata remains primitive-only except for the reserved current_state
-// record. A malformed additive record is dropped without invalidating the
-// otherwise usable issue response, which matters during mixed-version deploys.
-const IssueMetadataSchema = z.record(z.string(), z.unknown()).default({}).transform((metadata) => {
-  const parsed: Record<string, string | number | boolean | IssueCurrentState> = {};
-  for (const [key, value] of Object.entries(metadata)) {
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      parsed[key] = value;
-      continue;
-    }
-    if (key === "current_state") {
-      const currentState = IssueCurrentStateSchema.safeParse(value);
-      if (currentState.success) parsed[key] = currentState.data;
-    }
-  }
-  return parsed;
-});
+// Keep the established metadata wire contract primitive-only for installed
+// clients. The structured handoff is an additive sibling on Issue responses.
+const IssueMetadataSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({});
 
 const SourceContextAttachmentSchema = z.object({
   id: z.string(),
@@ -1788,6 +1773,10 @@ export const IssueSchema = z.object({
   start_date: z.string().nullable(),
   due_date: z.string().nullable(),
   metadata: IssueMetadataSchema,
+  // Additive sibling projection keeps metadata primitive-only for older
+  // installed clients. Invalid additive state is dropped without invalidating
+  // the rest of an issue or list response.
+  current_state: IssueCurrentStateSchema.nullable().optional().catch(undefined),
   // Older backends predate custom properties; default {} so consumers never
   // nil-guard issue.properties.
   properties: IssuePropertyValuesSchema,

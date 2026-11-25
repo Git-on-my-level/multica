@@ -544,15 +544,19 @@ type AgentTaskResponse struct {
 	NewCommentsDeltaKnown bool `json:"new_comments_delta_known,omitempty"`
 	// IssueStateDeltaKnown is the same contract as NewCommentsDeltaKnown, for
 	// the ISSUE record rather than its comments: the server compared this
-	// claim's title / description against the
-	// snapshot taken when this agent last ran on this issue, and both the
+	// claim's title, description, and current_state against the snapshot taken
+	// when this agent last ran on this issue, and both the
 	// lookup and the decode succeeded. Absent means NOT compared — a cold
 	// start, no prior snapshot, a read error, a shape-version mismatch, or an
 	// old server — and a daemon must then keep telling the agent to read the
 	// issue. An empty IssueChangedFields is only "unchanged" alongside this
 	// flag; on its own it is indistinguishable from "nobody looked" (MUL-7344).
-	IssueStateDeltaKnown     bool                 `json:"issue_state_delta_known,omitempty"`
-	IssueChangedFields       []string             `json:"issue_changed_fields,omitempty"`        // subset of title,description in that order; empty alongside IssueStateDeltaKnown means unchanged. Fields outside that set (status, assignee, priority, labels, parent, due date, stage, project, metadata) are NOT compared and must never be reported as checked. Status and assignee are out because IssueStatus / IssueAssigneeType / IssueAssigneeID ship their current values on every claim, so no comparison is needed to learn them; priority is out because it does not change what the agent does
+	IssueStateDeltaKnown bool `json:"issue_state_delta_known,omitempty"`
+	// Compared fields are emitted in the fixed order title, description,
+	// current_state. Empty alongside IssueStateDeltaKnown means unchanged.
+	// Status and assignee ship their current values on every claim; other
+	// metadata does not change the handoff and is outside the comparison.
+	IssueChangedFields       []string             `json:"issue_changed_fields,omitempty"`
 	IssueStatus              string               `json:"issue_status,omitempty"`                // the issue's status key at claim time. Sent whether or not the delta is known: the agent needs it to decide workflow step 3 ("already in progress?") without a read
 	IssueAssigneeType        string               `json:"issue_assignee_type,omitempty"`         // "agent", "member" or "squad" at claim time; empty when unassigned. With IssueAssigneeID, lets the agent tell "mine" from "someone else's" without a read
 	IssueAssigneeID          string               `json:"issue_assignee_id,omitempty"`           // assignee UUID at claim time; empty when unassigned

@@ -45,9 +45,10 @@ func seedPriorRunWithSnapshot(t *testing.T, agentID, runtimeID, issueID, snapsho
 func issueSnapshotJSON(t *testing.T, version int, title, description string) string {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
-		"v":                  version,
-		"title_sha256":       sha256Hex(title),
-		"description_sha256": sha256Hex(description),
+		"v":                    version,
+		"title_sha256":         sha256Hex(title),
+		"description_sha256":   sha256Hex(description),
+		"current_state_sha256": "",
 	})
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
@@ -623,57 +624,49 @@ func TestClaimTaskByRuntime_StartedRetryWithoutProviderMustNotWaiveReads(t *test
 	}
 }
 
-// TestClaimTaskByRuntime_LegacySnapshotWithStatusStillCompares pins the reason
-// dropping status did NOT bump issueSnapshotVersion.
-//
-// Rows written before the narrowing carry an extra "status" key. Removing a
-// field from the compared set is backward compatible: the fields that remain
-// are still present in those rows and still mean the same thing, so the
-// comparison stays correct and the stale key is simply ignored. Only ADDING a
-// field, or changing how a value is derived, leaves an old row unable to answer
-// the current question — and only that earns a bump.
-//
-// Without this test the compatibility claim is an assertion in a comment, and
-// the cost of it being wrong is a silent false "unchanged" on every dev row.
-func TestClaimTaskByRuntime_LegacySnapshotWithStatusStillCompares(t *testing.T) {
+// TestClaimTaskByRuntime_LegacySnapshotWithoutCurrentStateIsUnknown pins the
+// version bump required when a newly compared field is added. Old rows cannot
+// answer whether current_state changed, so they must trigger an unconditional
+// issue read rather than silently report unchanged.
+func TestClaimTaskByRuntime_LegacySnapshotWithoutCurrentStateIsUnknown(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	for _, tc := range []struct {
-		name        string
-		description string
-		wantChanged string
-	}{
-		{name: "body unchanged", description: "", wantChanged: ""},
-		{name: "description moved", description: "an older description", wantChanged: "description"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			runtimeID := createClaimReclaimRuntime(t, ctx, "legacy snapshot runtime "+tc.name)
-			name := "legacy snapshot agent " + tc.name
-			agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, name)
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "legacy snapshot runtime")
+	const name = "legacy snapshot agent"
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, name)
 
-			// A snapshot in the PREVIOUS shape: same version, extra status key.
-			legacy, err := json.Marshal(map[string]any{
-				"v":                  issueSnapshotVersion,
-				"status":             "todo", // the issue is in_progress now
-				"title_sha256":       sha256Hex(name + " issue"),
-				"description_sha256": sha256Hex(tc.description),
-			})
-			if err != nil {
-				t.Fatalf("marshal legacy snapshot: %v", err)
-			}
-			seedPriorRunWithSnapshot(t, agentID, runtimeID, issueID, string(legacy))
-			createCommentTriggeredClaimTask(t, ctx, agentID, runtimeID, issueID, nil)
+	// The previous shape lacks the current-state comparison. It must force the
+	// next turn to read the issue instead of claiming the record is unchanged.
+	legacy, err := json.Marshal(map[string]any{
+		"v":                  issueSnapshotVersion - 1,
+		"status":             "todo",
+		"title_sha256":       sha256Hex(name + " issue"),
+		"description_sha256": sha256Hex(""),
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy snapshot: %v", err)
+	}
+	seedPriorRunWithSnapshot(t, agentID, runtimeID, issueID, string(legacy))
+	createCommentTriggeredClaimTask(t, ctx, agentID, runtimeID, issueID, nil)
 
-			resp := claimCommentTask(t, runtimeID, "legacy-snapshot-claim")
-			if !resp.Task.IssueStateDeltaKnown {
-				t.Fatalf("a legacy row must still be comparable, not reported as unknown")
-			}
-			if got := strings.Join(resp.Task.IssueChangedFields, ","); got != tc.wantChanged {
-				t.Errorf("issue_changed_fields = %q, want %q — the stale status key must be ignored, not compared",
-					got, tc.wantChanged)
-			}
-		})
+	resp := claimCommentTask(t, runtimeID, "legacy-snapshot-claim")
+	if resp.Task.IssueStateDeltaKnown {
+		t.Errorf("a prior snapshot without current_state must be unknown, not unchanged")
+	}
+}
+
+func TestIssueSnapshotCurrentStateOnlyChangeIsReported(t *testing.T) {
+	previous := db.Issue{
+		Title:    "same title",
+		Metadata: []byte(`{"current_state":{"state":"blocked","issue_revision":4}}`),
+	}
+	current := previous
+	current.Metadata = []byte(`{"current_state":{"state":"in_progress","issue_revision":5}}`)
+
+	got := buildIssueStateSnapshot(current).changedFieldsSince(buildIssueStateSnapshot(previous))
+	if strings.Join(got, ",") != issueFieldCurrentState {
+		t.Fatalf("current-state-only change fields = %v, want [%s]", got, issueFieldCurrentState)
 	}
 }

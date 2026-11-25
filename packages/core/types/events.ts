@@ -1,4 +1,4 @@
-import type { Issue, IssueMetadata, IssueReaction } from "./issue";
+import type { Issue, IssueCurrentState, IssueMetadata, IssueReaction } from "./issue";
 import type { IssueProperty, IssuePropertyValues } from "./property";
 import type { Agent } from "./agent";
 import type { InboxItem } from "./inbox";
@@ -156,6 +156,8 @@ export interface IssueAttachmentsChangedPayload {
 export interface IssueMetadataChangedPayload {
   issue_id: string;
   metadata: IssueMetadata;
+  /** Present on current servers; sibling projection preserves primitive metadata for old clients. */
+  current_state?: IssueCurrentState | null;
   issue_revision?: number;
 }
 

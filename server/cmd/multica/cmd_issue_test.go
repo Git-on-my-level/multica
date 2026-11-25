@@ -3631,6 +3631,10 @@ func TestRunIssueCommentList_FoldDefaultAndFullEscape(t *testing.T) {
 		{name: "since never folds", setup: func(c *cobra.Command) {
 			_ = c.Flags().Set("since", "2026-01-01T00:00:00Z")
 		}, wantFold: false},
+		{name: "roots-only since preserves incremental roots", setup: func(c *cobra.Command) {
+			_ = c.Flags().Set("roots-only", "true")
+			_ = c.Flags().Set("since", "2026-01-01T00:00:00Z")
+		}, wantFold: false, wantFoldRepetitive: false},
 		{name: "thread+tail never folds", setup: func(c *cobra.Command) {
 			_ = c.Flags().Set("thread", "00000000-0000-0000-0000-000000000001")
 			_ = c.Flags().Set("tail", "5")

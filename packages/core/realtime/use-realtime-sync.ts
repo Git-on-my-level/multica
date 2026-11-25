@@ -1349,11 +1349,11 @@ export function useRealtimeSync(
     });
 
     const unsubIssueMetadataChanged = ws.on("issue_metadata:changed", (p) => {
-      const { issue_id, metadata, issue_revision } = p as IssueMetadataChangedPayload;
+      const { issue_id, metadata, current_state, issue_revision } = p as IssueMetadataChangedPayload;
       if (!issue_id) return;
       const wsId = getCurrentWsId();
       if (wsId) {
-        onIssueMetadataChanged(qc, wsId, issue_id, metadata ?? {}, issue_revision);
+        onIssueMetadataChanged(qc, wsId, issue_id, metadata ?? {}, issue_revision, current_state);
         scheduleProjectActivityRefresh(wsId);
       }
     });

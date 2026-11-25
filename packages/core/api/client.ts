@@ -382,7 +382,6 @@ import {
   IssueSchema,
   IssueCurrentStateResponseSchema,
   IssueCurrentStateUpdateSchema,
-  type IssueCurrentState,
   type IssueCurrentStateResponse,
   type IssueCurrentStateUpdate,
   AgentTaskSchema,
@@ -599,6 +598,7 @@ import {
   type IssueViewPreference,
   type CreateIssueViewRequest,
 } from "./schemas";
+import type { IssueCurrentState } from "../types/issue";
 
 /** Identifies the calling client to the server.
  *  Sent on every HTTP request as X-Client-Platform / X-Client-Version /

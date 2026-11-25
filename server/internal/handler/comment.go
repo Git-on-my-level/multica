@@ -456,6 +456,10 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "fold and since are mutually exclusive: since returns a partial thread, and a fold over a partial thread could hide a resolution that was not fetched")
 		return
 	}
+	if foldRepetitive && sinceTime.Valid {
+		writeError(w, http.StatusBadRequest, "fold_repetitive and since are mutually exclusive: since is an incremental read and must preserve every matching root")
+		return
+	}
 	if fold && tailStr != "" {
 		writeError(w, http.StatusBadRequest, "fold and tail are mutually exclusive: tail returns a partial thread, which cannot be folded safely")
 		return

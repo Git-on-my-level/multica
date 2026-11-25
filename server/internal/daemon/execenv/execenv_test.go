@@ -5979,7 +5979,7 @@ func TestInjectRuntimeConfigAssignmentTriggerScansRootsFirst(t *testing.T) {
 	// TestIssueCommentListHelpCarriesReadContract in cmd/multica); the brief
 	// keeps a pointer in the flag reference.
 	for _, want := range []string{
-		"paging cursors, and full flag semantics: `--help`",
+		"Resolved-thread folding and paging cursors: `--help`",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("assignment Workflow missing older-history pagination guidance %q\n---\n%s", want, s)

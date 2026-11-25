@@ -2774,7 +2774,7 @@ func runIssueCommentList(cmd *cobra.Command, args []string) error {
 	if foldEligible && !full {
 		params.Set("fold", "true")
 	}
-	if rootsOnly && !full {
+	if rootsOnly && since == "" && !full {
 		params.Set("fold_repetitive", "true")
 	}
 	if thread != "" {

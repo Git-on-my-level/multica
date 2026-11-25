@@ -262,6 +262,15 @@ func TestListComments_RootsOnlyWithSinceReturnsNewTopLevelComments(t *testing.T)
 		if row.ParentID != nil {
 			t.Fatalf("roots_only + since: expected root comment %s to have nil parent_id, got %q", row.ID, *row.ParentID)
 		}
+		if row.RepetitiveFoldedCount != nil {
+			t.Fatalf("roots_only + since unexpectedly folded incremental root %s", row.ID)
+		}
+	}
+
+	v.Set("fold_repetitive", "true")
+	w, _ := listComments(t, fx.IssueID, v.Encode())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "fold_repetitive and since are mutually exclusive") {
+		t.Fatalf("explicit folding on incremental roots: status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

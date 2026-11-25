@@ -165,6 +165,13 @@ func issueCurrentStateFromMetadata(raw []byte) (*IssueCurrentState, error) {
 	if !ok || bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
 		return nil, nil
 	}
+	// `current_state` was a valid primitive metadata key before the structured
+	// record shipped. Keep dedicated reads compatible with those rows instead
+	// of trying to decode a string/number/bool as the new record.
+	trimmed := bytes.TrimSpace(encoded)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, nil
+	}
 	var state IssueCurrentState
 	if err := json.Unmarshal(encoded, &state); err != nil {
 		return nil, fmt.Errorf("decode stored current state: %w", err)
@@ -196,6 +203,23 @@ func issueCurrentStateFromMetadata(raw []byte) (*IssueCurrentState, error) {
 		}
 	}
 	return &state, nil
+}
+
+// issueMetadataForResponse keeps the long-standing primitive-only metadata
+// wire contract for installed clients. The structured record is returned in
+// the additive top-level current_state field instead. Legacy primitive values
+// under the old metadata key stay in metadata until callers migrate them.
+func issueMetadataForResponse(raw []byte) (map[string]any, *IssueCurrentState) {
+	metadata := parseIssueMetadata(raw)
+	if _, structured := metadata[issueCurrentStateMetadataKey].(map[string]any); !structured {
+		return metadata, nil
+	}
+	delete(metadata, issueCurrentStateMetadataKey)
+	state, err := issueCurrentStateFromMetadata(raw)
+	if err != nil {
+		return metadata, nil
+	}
+	return metadata, state
 }
 
 func (h *Handler) GetIssueCurrentState(w http.ResponseWriter, r *http.Request) {
@@ -278,9 +302,11 @@ func (h *Handler) SetIssueCurrentState(w http.ResponseWriter, r *http.Request) {
 	state.UpdatedAt = timestampToString(updated.UpdatedAt)
 
 	workspaceID := uuidToString(issue.WorkspaceID)
+	metadata, _ = issueMetadataForResponse(updated.Metadata)
 	h.publish(protocol.EventIssueMetadataChanged, workspaceID, actorType, actorID, map[string]any{
 		"issue_id":       uuidToString(issue.ID),
-		"metadata":       parseIssueMetadata(updated.Metadata),
+		"metadata":       metadata,
+		"current_state":  state,
 		"issue_revision": updated.Revision,
 	})
 	writeJSON(w, http.StatusOK, issueCurrentStateResponse{CurrentState: state, IssueRevision: updated.Revision})
