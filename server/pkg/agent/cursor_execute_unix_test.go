@@ -375,23 +375,27 @@ func TestCursorExecuteTransientLaunchPreservesRequestedSession(t *testing.T) {
 
 func TestCursorExecuteTransientPromptWritePreservesSession(t *testing.T) {
 	t.Parallel()
-	fakePath := filepath.Join(t.TempDir(), "cursor-agent")
-	// Closing stdin explicitly and sending more than a pipe buffer removes
-	// the exit/write race: the writer must observe EPIPE before completion.
-	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\nexec 0<&-\nprintf '%s\n' 'RetriableError: [unavailable] Error' >&2\nexit 1\n"))
-	backend, err := New("cursor", Config{ExecutablePath: fakePath, Logger: slog.Default()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := backend.Execute(t.Context(), strings.Repeat("prompt", 1024*1024), ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: "existing-session"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := <-session.Result
-	if result.Status != "failed" || result.SessionID != "existing-session" ||
-		!strings.HasPrefix(result.Error, "cursor-agent prompt write failed: ") ||
-		!taskfailure.CursorPreActionNetworkError(result.Error) {
-		t.Fatalf("unexpected prompt-write failure: %+v", result)
+	for _, exitCode := range []string{"0", "1"} {
+		t.Run("exit "+exitCode, func(t *testing.T) {
+			fakePath := filepath.Join(t.TempDir(), "cursor-agent")
+			// Closing stdin explicitly and sending more than a pipe buffer removes
+			// the exit/write race: the writer must observe EPIPE before completion.
+			writeTestExecutable(t, fakePath, []byte("#!/bin/sh\nexec 0<&-\nprintf '%s\n' 'RetriableError: [unavailable] Error' >&2\nexit "+exitCode+"\n"))
+			backend, err := New("cursor", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := backend.Execute(t.Context(), strings.Repeat("prompt", 1024*1024), ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: "existing-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := <-session.Result
+			if result.Status != "failed" || result.SessionID != "existing-session" ||
+				!strings.HasPrefix(result.Error, "cursor-agent prompt write failed: ") ||
+				!taskfailure.CursorPreActionNetworkError(result.Error) {
+				t.Fatalf("unexpected prompt-write failure: %+v", result)
+			}
+		})
 	}
 }
 

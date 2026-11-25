@@ -30,6 +30,12 @@ func CursorPreActionNetworkError(raw string) bool {
 		return false
 	}
 	const diagnostic = " (result_seen=false, exit_code=1, scanner_error=false, event_count=0, invalid_event_count=0, last_event_type=none); actions completed before finalization may already have taken effect"
+	// A child that closes stdin before accepting the prompt can exit cleanly.
+	// Keep the same no-event boundary and require the prompt-write witness.
+	if strings.HasPrefix(header, "cursor-agent prompt write failed: ") &&
+		strings.HasSuffix(header, strings.Replace(diagnostic, "exit_code=1", "exit_code=0", 1)) {
+		return true
+	}
 	if !strings.HasSuffix(header, diagnostic) {
 		return false
 	}
