@@ -370,6 +370,29 @@ describe("onIssueMetadataChanged", () => {
     ).toEqual({ pr_number: 2 });
   });
 
+  it("patches the additive current-state sibling from metadata events", () => {
+    qc.setQueryData<Issue>(issueKeys.detail(WS_ID, ISSUE_ID), {
+      ...baseIssue,
+      current_state: null,
+    });
+    const currentState = {
+      state: "blocked",
+      blocker: "review",
+      next_action: "wait",
+      owner: "agent-1",
+      expiry: null,
+      updated_at: "2026-11-25T12:00:00Z",
+      updated_by: { type: "agent", id: "agent-1" },
+      issue_revision: 9,
+    };
+
+    onIssueMetadataChanged(qc, WS_ID, ISSUE_ID, { pr_number: 2 }, 9, currentState);
+
+    const detail = qc.getQueryData<Issue>(issueKeys.detail(WS_ID, ISSUE_ID));
+    expect(detail?.metadata).toEqual({ pr_number: 2 });
+    expect(detail?.current_state).toEqual(currentState);
+  });
+
   it("leaves untouched caches as undefined (no spurious writes)", () => {
     onIssueMetadataChanged(qc, WS_ID, ISSUE_ID, { foo: "bar" });
 

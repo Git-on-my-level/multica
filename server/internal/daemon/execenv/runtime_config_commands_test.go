@@ -63,9 +63,14 @@ func TestAvailableCommandsKeepsCompressedContracts(t *testing.T) {
 					"`multica issue wakeup create --help` and the multica-platform issues reference",
 					// comment list: the two bounded reads, the THREADS trap and
 					// the pagination pointer.
-					"scan with `--roots-only --summary`, then expand one thread with `--thread <id> --tail N`",
+					"Scan with `--roots-only --summary`",
+					"repeated watchdog/hold roots fold to the latest signal with a count",
+					"`--full` retrieves every original root",
+					"Expand a thread with `--thread <id> --tail N`",
 					"it caps THREADS, not comments",
-					"paging cursors, and full flag semantics: `--help`",
+					"Resolved-thread folding and paging cursors: `--help`",
+					"`multica issue current-state get <id> --output json`",
+					"replace the complete live handoff",
 					// issue create: long descriptions go through a workdir file.
 					"Put agent-authored long descriptions in `--description-file <path>`",
 					"heredoc stdin can swallow trailing flags, #4182",

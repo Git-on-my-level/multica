@@ -44,12 +44,25 @@ export interface IssueReaction {
   issue_revision?: number;
 }
 
+/** Structured live handoff stored under metadata.current_state on the server. */
+export interface IssueCurrentState {
+  state: string;
+  blocker: string;
+  next_action: string;
+  owner: string;
+  expiry: string | null;
+  updated_at: string;
+  updated_by: { type: string; id: string };
+  issue_revision: number;
+}
+
 /**
- * Per-issue metadata is a flat KV map agents use to record pipeline state
- * (PR number, pipeline_status, waiting_on, ...). Values are primitives only —
- * string / number / bool — enforced by both the API and the DB. Always
- * present in responses (empty object when unset) so reads don't need a
- * nil guard on the parent field.
+ * Per-issue metadata is the flat KV map agents use to record pipeline details
+ * (PR number, pipeline_status, waiting_on, ...). Its public values remain
+ * primitives — string / number / bool — for compatibility. The structured
+ * current-state record is exposed separately on Issue.current_state. Always
+ * present in responses (empty object when unset) so reads don't need a nil
+ * guard on the parent field.
  */
 export type IssueMetadataValue = string | number | boolean;
 export type IssueMetadata = Record<string, IssueMetadataValue>;
@@ -231,6 +244,8 @@ export interface Issue {
   start_date: string | null;
   due_date: string | null;
   metadata: IssueMetadata;
+  /** Additive sibling projection; absent on older backends. */
+  current_state?: IssueCurrentState | null;
   // Custom property values keyed by property definition id. Always present
   // in responses (empty object when unset), mirroring `metadata`.
   properties: IssuePropertyValues;

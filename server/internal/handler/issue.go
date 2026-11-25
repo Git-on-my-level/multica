@@ -92,8 +92,13 @@ type IssueResponse struct {
 	LastActivityAt *string `json:"last_activity_at"`
 	// Metadata is the per-issue KV map (see issue_metadata.go). Always emitted
 	// (empty object when unset) so frontend code can `issue.metadata[key]`
-	// without nil-guarding the parent field.
+	// without nil-guarding the parent field. It remains primitive-only on the
+	// wire for compatibility with clients installed before current_state.
 	Metadata map[string]any `json:"metadata"`
+	// CurrentState is stored under metadata.current_state but projected as an
+	// additive sibling so older clients keep seeing the primitive metadata
+	// contract. Always emitted; null means no structured record is present.
+	CurrentState *IssueCurrentState `json:"current_state"`
 	// Properties is the custom-property value bag keyed by property definition
 	// UUID (see property.go). Always emitted, mirroring Metadata.
 	Properties  map[string]any          `json:"properties"`
@@ -485,6 +490,7 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 	if issuestatus.IsBuiltIn(i.Status) {
 		statusCategory = i.Status
 	}
+	metadata, currentState := issueMetadataForResponse(i.Metadata)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -511,7 +517,8 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		UpdatedAt:          timestampToString(i.UpdatedAt),
 		Revision:           i.Revision,
 		LastActivityAt:     timestampToNanoPtr(i.LastActivityAt),
-		Metadata:           parseIssueMetadata(i.Metadata),
+		Metadata:           metadata,
+		CurrentState:       currentState,
 		Properties:         parseIssueProperties(i.Properties),
 	}
 }
@@ -524,6 +531,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		statusCategory = i.Status
 	}
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	metadata, currentState := issueMetadataForResponse(i.Metadata)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -550,7 +558,8 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		UpdatedAt:          timestampToString(i.UpdatedAt),
 		Revision:           i.Revision,
 		LastActivityAt:     timestampToNanoPtr(i.LastActivityAt),
-		Metadata:           parseIssueMetadata(i.Metadata),
+		Metadata:           metadata,
+		CurrentState:       currentState,
 		Properties:         parseIssueProperties(i.Properties),
 	}
 }
@@ -595,6 +604,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		statusCategory = i.Status
 	}
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	metadata, currentState := issueMetadataForResponse(i.Metadata)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -621,7 +631,8 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		UpdatedAt:          timestampToString(i.UpdatedAt),
 		Revision:           i.Revision,
 		LastActivityAt:     timestampToNanoPtr(i.LastActivityAt),
-		Metadata:           parseIssueMetadata(i.Metadata),
+		Metadata:           metadata,
+		CurrentState:       currentState,
 		Properties:         parseIssueProperties(i.Properties),
 	}
 }

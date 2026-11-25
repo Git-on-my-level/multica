@@ -25,6 +25,7 @@ import { cleanupDeletedIssueCaches } from "./delete-cache";
 import { patchInboxIssueProjection, refreshArchivedInboxMatches } from "../inbox/ws-updaters";
 import type {
   Issue,
+  IssueCurrentState,
   IssueLabelsResponse,
   IssueMetadata,
   IssuePropertyValues,
@@ -646,6 +647,7 @@ export function onIssueMetadataChanged(
   issueId: string,
   metadata: IssueMetadata,
   revision?: number,
+  currentState?: IssueCurrentState | null,
 ) {
   if (refetchForUnversionedIssueEvent(qc, wsId, issueId, revision)) return;
   if (
@@ -659,7 +661,13 @@ export function onIssueMetadataChanged(
   ) {
     return;
   }
-  patchIssueSnapshot(qc, wsId, issueId, { metadata }, revision);
+  patchIssueSnapshot(
+    qc,
+    wsId,
+    issueId,
+    { metadata, ...(currentState !== undefined ? { current_state: currentState } : {}) },
+    revision,
+  );
   onIssueAuxiliaryRevision(qc, wsId, issueId, revision, "metadata");
   invalidateLastActivitySortedIssueLists(qc, wsId);
   qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });

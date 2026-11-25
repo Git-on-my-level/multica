@@ -38,6 +38,10 @@ func TestBriefWithProjectWorkflowDropsBuiltInStatusRules(t *testing.T) {
 			"5. Before exiting, confirm the issue sits where things actually stand: you ran the matching command from `[Project workflow]`",
 			"**Issue status — this issue follows its project workflow**",
 			"Move this issue only with its commands.",
+			"Whenever your work changes the handoff, replace it",
+			"Read the live handoff at `metadata.current_state` in `multica issue get <this-issue-id> --output json`.",
+			"multica issue current-state set <this-issue-id>",
+			"Keep ordinary results and detail in comments.",
 			"run its Step done command",
 			"— flip status. This issue's statuses and commands are in `[Project workflow]`; for other issues, an invalid status errors with the full valid list.",
 			// The duplicate-mark bullet still rides on the status command.

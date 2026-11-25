@@ -29,14 +29,15 @@ import (
 // still present in old rows and still mean the same thing, so the comparison
 // stays correct and the extra key is simply ignored. Dropping status (MUL-7344
 // review) is that case, which is why this is still 1 even though rows written
-// by the previous shape already exist.
-const issueSnapshotVersion = 1
+// by the previous shape already exist. Adding current_state below requires
+// version 2 so older rows fall back to an unconditional issue read.
+const issueSnapshotVersion = 2
 
 // Compared field names, in the fixed order they are reported.
 //
-// The set answers exactly one question — "must the agent re-read the issue
-// BODY?" — so only title and description qualify. They are the task itself, and
-// nothing but a read can deliver them.
+// The set answers whether the agent must re-read the issue to refresh context.
+// Title and description are the task itself; current_state is the live handoff
+// that can change independently of the issue body.
 //
 // Everything else is excluded because the per-turn message already carries the
 // current value, or because changing it does not change the agent's work:
@@ -50,15 +51,18 @@ const issueSnapshotVersion = 1
 //     visible — the agent compares the shipped status against what it last set.
 //   - assignee: shipped as a current value; "is this mine now" needs no compare.
 //   - priority: only a read reveals it, but it does not change what the agent
-//     does.
+//     does;
+//   - metadata other than current_state: pipeline details do not change the
+//     handoff and remain outside this comparison.
 //
 // The agent is told exactly this set was compared, so a field absent here must
 // never be implied to have been checked: status, assignee, priority, labels,
-// parent, due date, stage, project and metadata are all out of scope, and an
-// issue whose ONLY change is one of them is reported as unchanged.
+// parent, due date, stage, project and metadata other than current_state are
+// out of scope, and an issue whose ONLY change is one of them is unchanged.
 const (
-	issueFieldTitle       = "title"
-	issueFieldDescription = "description"
+	issueFieldTitle        = "title"
+	issueFieldDescription  = "description"
+	issueFieldCurrentState = "current_state"
 )
 
 // issueStateSnapshot is the comparison key for one claim's view of an issue.
@@ -72,9 +76,10 @@ const (
 // fields, read straight off the issue row — they were never sourced from here,
 // so dropping status from the comparison did not affect them.
 type issueStateSnapshot struct {
-	Version           int    `json:"v"`
-	TitleSHA256       string `json:"title_sha256"`
-	DescriptionSHA256 string `json:"description_sha256"`
+	Version            int    `json:"v"`
+	TitleSHA256        string `json:"title_sha256"`
+	DescriptionSHA256  string `json:"description_sha256"`
+	CurrentStateSHA256 string `json:"current_state_sha256"`
 }
 
 func sha256Hex(s string) string {
@@ -85,10 +90,23 @@ func sha256Hex(s string) string {
 // buildIssueStateSnapshot captures the compared fields of an issue as of now.
 func buildIssueStateSnapshot(issue db.Issue) issueStateSnapshot {
 	return issueStateSnapshot{
-		Version:           issueSnapshotVersion,
-		TitleSHA256:       sha256Hex(issue.Title),
-		DescriptionSHA256: sha256Hex(issue.Description.String),
+		Version:            issueSnapshotVersion,
+		TitleSHA256:        sha256Hex(issue.Title),
+		DescriptionSHA256:  sha256Hex(issue.Description.String),
+		CurrentStateSHA256: currentStateMetadataSHA256(issue.Metadata),
 	}
+}
+
+func currentStateMetadataSHA256(raw []byte) string {
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return ""
+	}
+	value, ok := metadata[issueCurrentStateMetadataKey]
+	if !ok {
+		return ""
+	}
+	return sha256Hex(string(value))
 }
 
 // changedFieldsSince reports which compared fields differ from prev, in the
@@ -101,6 +119,9 @@ func (s issueStateSnapshot) changedFieldsSince(prev issueStateSnapshot) []string
 	}
 	if s.DescriptionSHA256 != prev.DescriptionSHA256 {
 		changed = append(changed, issueFieldDescription)
+	}
+	if s.CurrentStateSHA256 != prev.CurrentStateSHA256 {
+		changed = append(changed, issueFieldCurrentState)
 	}
 	return changed
 }

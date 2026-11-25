@@ -8708,6 +8708,12 @@ func resolveDuplicateOf(ctx context.Context, q IssueMapQuerier, issue db.Issue, 
 }
 
 func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
+	metadata := util.JSONObjectOrEmpty(issue.Metadata)
+	var currentState any
+	if structured, ok := metadata["current_state"].(map[string]any); ok {
+		currentState = structured
+		delete(metadata, "current_state")
+	}
 	return map[string]any{
 		"id":           util.UUIDToString(issue.ID),
 		"workspace_id": util.UUIDToString(issue.WorkspaceID),
@@ -8744,7 +8750,8 @@ func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
 		"updated_at":       util.TimestampToString(issue.UpdatedAt),
 		"last_activity_at": util.TimestampToNanoPtr(issue.LastActivityAt),
 		"revision":         issue.Revision,
-		"metadata":         util.JSONObjectOrEmpty(issue.Metadata),
+		"metadata":         metadata,
+		"current_state":    currentState,
 		"properties":       util.JSONObjectOrEmpty(issue.Properties),
 	}
 }

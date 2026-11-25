@@ -3581,14 +3581,13 @@ func TestRunIssueCommentList_SummaryPassesThrough(t *testing.T) {
 }
 
 // TestRunIssueCommentList_FoldDefaultAndFullEscape pins the CLI's resolve-aware
-// fold default and its --full escape hatch (MUL-3555):
+// and repeated-signal folds plus the --full audit escape hatch:
 //
 //   - the complete-thread reads (default list, --recent, untailed --thread) send
 //     fold=true by default, so an agent skips settled discussion automatically;
 //   - --full suppresses fold so a caller can pull the whole discussion back;
-//   - the partial-thread reads (--since, --thread + --tail) and --roots-only
-//     never send fold — folding them would be unsafe, and the server rejects it,
-//     so the CLI must not add the param there in the first place.
+//   - --roots-only sends fold_repetitive=true, while --full retrieves every
+//     watchdog/hold root; partial-thread reads never send either fold mode.
 func TestRunIssueCommentList_FoldDefaultAndFullEscape(t *testing.T) {
 	var gotQuery url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3614,9 +3613,10 @@ func TestRunIssueCommentList_FoldDefaultAndFullEscape(t *testing.T) {
 	t.Setenv("MULTICA_TOKEN", "test-token")
 
 	cases := []struct {
-		name     string
-		setup    func(c *cobra.Command)
-		wantFold bool
+		name               string
+		setup              func(c *cobra.Command)
+		wantFold           bool
+		wantFoldRepetitive bool
 	}{
 		{name: "default list folds", setup: func(c *cobra.Command) {}, wantFold: true},
 		{name: "recent folds", setup: func(c *cobra.Command) {
@@ -3631,13 +3631,21 @@ func TestRunIssueCommentList_FoldDefaultAndFullEscape(t *testing.T) {
 		{name: "since never folds", setup: func(c *cobra.Command) {
 			_ = c.Flags().Set("since", "2026-01-01T00:00:00Z")
 		}, wantFold: false},
+		{name: "roots-only since preserves incremental roots", setup: func(c *cobra.Command) {
+			_ = c.Flags().Set("roots-only", "true")
+			_ = c.Flags().Set("since", "2026-01-01T00:00:00Z")
+		}, wantFold: false, wantFoldRepetitive: false},
 		{name: "thread+tail never folds", setup: func(c *cobra.Command) {
 			_ = c.Flags().Set("thread", "00000000-0000-0000-0000-000000000001")
 			_ = c.Flags().Set("tail", "5")
 		}, wantFold: false},
-		{name: "roots-only never folds", setup: func(c *cobra.Command) {
+		{name: "roots-only folds repeated signals", setup: func(c *cobra.Command) {
 			_ = c.Flags().Set("roots-only", "true")
-		}, wantFold: false},
+		}, wantFold: false, wantFoldRepetitive: true},
+		{name: "full roots-only preserves audit", setup: func(c *cobra.Command) {
+			_ = c.Flags().Set("roots-only", "true")
+			_ = c.Flags().Set("full", "true")
+		}, wantFold: false, wantFoldRepetitive: false},
 	}
 
 	for _, tc := range cases {
@@ -3651,6 +3659,10 @@ func TestRunIssueCommentList_FoldDefaultAndFullEscape(t *testing.T) {
 			gotFold := gotQuery.Get("fold") == "true"
 			if gotFold != tc.wantFold {
 				t.Errorf("fold query = %q, want fold=%v", gotQuery.Get("fold"), tc.wantFold)
+			}
+			gotFoldRepetitive := gotQuery.Get("fold_repetitive") == "true"
+			if gotFoldRepetitive != tc.wantFoldRepetitive {
+				t.Errorf("fold_repetitive query = %q, want fold_repetitive=%v", gotQuery.Get("fold_repetitive"), tc.wantFoldRepetitive)
 			}
 		})
 	}

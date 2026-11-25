@@ -27,6 +27,45 @@ describe("ApiClient status reorder", () => {
   });
 });
 
+describe("ApiClient issue current state", () => {
+  const record = {
+    state: "blocked",
+    blocker: "review",
+    next_action: "wait for approval",
+    owner: "agent-1",
+    expiry: null,
+    updated_at: "2026-11-25T12:00:00Z",
+    updated_by: { type: "agent", id: "agent-1" },
+    issue_revision: 9,
+  };
+
+  it("reads the typed record from the dedicated API", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ current_state: record, issue_revision: 9 }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await new ApiClient("https://api.example.test").getIssueCurrentState("issue/1");
+    expect(result).toEqual(record);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.example.test/api/issues/issue%2F1/current-state");
+  });
+
+  it("writes a full snapshot including explicit empty values", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ current_state: { ...record, blocker: "", issue_revision: 10 }, issue_revision: 10 }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await new ApiClient("https://api.example.test").setIssueCurrentState("issue-1", {
+      state: "in_progress", blocker: "", next_action: "ship", owner: "agent-1", expiry: null,
+    });
+    const request = fetchMock.mock.calls[0]?.[1];
+    expect(request?.method).toBe("PUT");
+    expect(JSON.parse(String(request?.body))).toEqual({
+      state: "in_progress", blocker: "", next_action: "ship", owner: "agent-1", expiry: null,
+    });
+    expect(result.blocker).toBe("");
+  });
+});
+
 describe("ApiClient agent conversation-starter compatibility", () => {
   const prompt = {
     label: "Review a PR",

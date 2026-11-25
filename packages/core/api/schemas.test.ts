@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AgentTaskSchema,
   IssueSchema,
+  IssueCurrentStateResponseSchema,
   AppConfigSchema,
   WecomInstallationSchema,
   ListWecomInstallationsResponseSchema,
@@ -342,6 +343,33 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     });
   });
 
+  it("keeps metadata primitive-only and reads the additive current-state sibling", () => {
+    const currentState = {
+      state: "blocked",
+      blocker: "waiting for review",
+      next_action: "check the PR",
+      owner: "agent-1",
+      expiry: null,
+      updated_at: "2026-11-25T12:00:00Z",
+      updated_by: { type: "agent", id: "agent-1" },
+      issue_revision: 8,
+    };
+    const newPayload = {
+      ...baseIssue,
+      metadata: { pipeline_status: "waiting" },
+      current_state: currentState,
+    };
+    const parsed = IssueSchema.parse(newPayload);
+    expect(parsed.metadata).toEqual({ pipeline_status: "waiting" });
+    expect(parsed.current_state).toEqual(currentState);
+
+    // Models an installed pre-feature IssueSchema: it has the old primitive
+    // metadata contract and ignores the additive top-level field.
+    const legacyParsed = IssueSchema.omit({ current_state: true }).parse(newPayload);
+    expect(legacyParsed.metadata).toEqual({ pipeline_status: "waiting" });
+    expect(IssueCurrentStateResponseSchema.parse({ current_state: currentState }).current_state).toEqual(currentState);
+  });
+
   it("defaults metadata to {} when the server omits it (older backend)", () => {
     const { metadata: _omit, ...issueWithoutMetadata } = baseIssue;
     const payload = { issues: [issueWithoutMetadata], total: 1 };
@@ -349,12 +377,17 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     expect(parsed.issues[0]?.metadata).toEqual({});
   });
 
-  it("rejects metadata with non-primitive values (nested object)", () => {
-    const payload = {
-      issues: [{ ...baseIssue, metadata: { nested: { x: 1 } } }],
-      total: 1,
-    };
-    expect(ListIssuesResponseSchema.safeParse(payload).success).toBe(false);
+  it("drops malformed additive current state without invalidating the issue", () => {
+    const payload = { issues: [{ ...baseIssue, current_state: { state: "blocked" } }], total: 1 };
+    const parsed = ListIssuesResponseSchema.parse(payload);
+    expect(parsed.issues[0]?.id).toBe(baseIssue.id);
+    expect(parsed.issues[0]?.current_state).toBeUndefined();
+  });
+
+  it("does not accept malformed current state on the typed endpoint", () => {
+    expect(IssueCurrentStateResponseSchema.safeParse({
+      current_state: { state: "blocked", blocker: "missing provenance" },
+    }).success).toBe(false);
   });
 
   it("accepts a numeric stage", () => {

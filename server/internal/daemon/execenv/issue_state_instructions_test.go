@@ -23,7 +23,7 @@ func TestBuildIssueStateHintUnchangedReplacesTheRead(t *testing.T) {
 
 	for _, want := range []string{
 		"The issue is unchanged since your last run",
-		"the server compared title and description",
+		"the server compared title, description, and current_state",
 		"status: in_progress; assignee: agent agent-1",
 		"That answers workflow step 1",
 		"only if resumed memory is not enough",

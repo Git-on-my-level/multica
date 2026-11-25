@@ -1586,9 +1586,34 @@ export const IssueTriggerPreviewSchema = z.object({
   total_count: z.number().default(0),
 }).loose();
 
-// Metadata is primitive-only by API/DB contract. Stay lenient on shape:
-// unknown keys land as `unknown` to a caller, but the field itself defaults
-// to {} so consumers never need to nil-guard `issue.metadata`.
+export const IssueCurrentStateSchema = z.object({
+  state: z.string(),
+  blocker: z.string(),
+  next_action: z.string(),
+  owner: z.string(),
+  expiry: z.string().nullable(),
+  updated_at: z.string(),
+  updated_by: z.object({ type: z.string(), id: z.string() }).loose(),
+  issue_revision: z.number().int().positive(),
+}).loose();
+
+export const IssueCurrentStateUpdateSchema = z.object({
+  state: z.string().min(1),
+  blocker: z.string(),
+  next_action: z.string(),
+  owner: z.string(),
+  expiry: z.string().nullable(),
+}).strict();
+export type IssueCurrentStateUpdate = z.infer<typeof IssueCurrentStateUpdateSchema>;
+
+export const IssueCurrentStateResponseSchema = z.object({
+  current_state: IssueCurrentStateSchema.nullable(),
+  issue_revision: z.number().int().nonnegative().optional(),
+}).loose();
+export type IssueCurrentStateResponse = z.infer<typeof IssueCurrentStateResponseSchema>;
+
+// Keep the established metadata wire contract primitive-only for installed
+// clients. The structured handoff is an additive sibling on Issue responses.
 const IssueMetadataSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({});
 
 const SourceContextAttachmentSchema = z.object({
@@ -1748,6 +1773,10 @@ export const IssueSchema = z.object({
   start_date: z.string().nullable(),
   due_date: z.string().nullable(),
   metadata: IssueMetadataSchema,
+  // Additive sibling projection keeps metadata primitive-only for older
+  // installed clients. Invalid additive state is dropped without invalidating
+  // the rest of an issue or list response.
+  current_state: IssueCurrentStateSchema.nullable().optional().catch(undefined),
   // Older backends predate custom properties; default {} so consumers never
   // nil-guard issue.properties.
   properties: IssuePropertyValuesSchema,

@@ -208,6 +208,42 @@ func TestListComments_RootsOnlyReturnsTopLevelComments(t *testing.T) {
 	}
 }
 
+func TestListComments_RootsOnlyFoldsRepeatedWatchdogSignalsAndKeepsAudit(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newCommentListFixture(t)
+	insert := func(offset time.Duration, body string) string {
+		t.Helper()
+		var id string
+		if err := testPool.QueryRow(context.Background(), `
+			INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, created_at)
+			VALUES ($1, $2, 'agent', $3, $4, 'comment', $5)
+			RETURNING id
+		`, fx.IssueID, testWorkspaceID, testUserID, body, fx.Base.Add(offset)).Scan(&id); err != nil {
+			t.Fatalf("insert watchdog root: %v", err)
+		}
+		return id
+	}
+	insert(20*time.Minute, "[flow-watchdog] [0123456789abcdef] issue SCA-1: waiting for owner.\nObserved 2026-11-25T09:55:00Z")
+	wantLatest := insert(21*time.Minute, "[flow-watchdog] [1123456789abcdef] issue SCA-1: waiting for owner.\nObserved 2026-11-25T10:02:00Z")
+	wantDistinct := insert(22*time.Minute, "[flow-watchdog] [2123456789abcdef] issue SCA-1: fixed, no later owner run.")
+
+	_, folded := listComments(t, fx.IssueID, "roots_only=true&fold_repetitive=true")
+	eqIDs(t, ids(folded), []string{fx.Root1, fx.Root2, wantLatest, wantDistinct}, "folded repeated watchdogs")
+	if len(folded) != 4 || folded[2].ID != wantLatest || folded[2].RepetitiveFoldedCount == nil || *folded[2].RepetitiveFoldedCount != 1 {
+		t.Fatalf("folded latest signal lacks count or was not preserved: %+v", folded)
+	}
+	if !strings.Contains(folded[2].Content, "waiting for owner") {
+		t.Fatalf("latest actionable content was lost: %q", folded[2].Content)
+	}
+
+	_, audit := listComments(t, fx.IssueID, "roots_only=true&fold_repetitive=false")
+	if len(audit) != 5 {
+		t.Fatalf("full root audit returned %d comments, want 5", len(audit))
+	}
+}
+
 // TestListComments_RootsOnlyWithSinceReturnsNewTopLevelComments proves the
 // one allowed roots-only combination: `since` narrows the root list without
 // pulling newer replies into the response.
@@ -226,6 +262,15 @@ func TestListComments_RootsOnlyWithSinceReturnsNewTopLevelComments(t *testing.T)
 		if row.ParentID != nil {
 			t.Fatalf("roots_only + since: expected root comment %s to have nil parent_id, got %q", row.ID, *row.ParentID)
 		}
+		if row.RepetitiveFoldedCount != nil {
+			t.Fatalf("roots_only + since unexpectedly folded incremental root %s", row.ID)
+		}
+	}
+
+	v.Set("fold_repetitive", "true")
+	w, _ := listComments(t, fx.IssueID, v.Encode())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "fold_repetitive and since are mutually exclusive") {
+		t.Fatalf("explicit folding on incremental roots: status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

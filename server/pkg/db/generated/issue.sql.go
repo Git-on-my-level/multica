@@ -2116,6 +2116,47 @@ func (q *Queries) ResolveIssueRequester(ctx context.Context, arg ResolveIssueReq
 	return originator_user_id, err
 }
 
+const setIssueCurrentState = `-- name: SetIssueCurrentState :one
+UPDATE issue SET
+    metadata = jsonb_set(
+        metadata,
+        '{current_state}',
+        $1::jsonb || jsonb_build_object(
+            'updated_at', now(),
+            'issue_revision', revision + 1
+        ),
+        true
+    ),
+    revision = revision + 1,
+    last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now()),
+    updated_at = now()
+WHERE id = $2 AND workspace_id = $3
+RETURNING metadata, revision, updated_at
+`
+
+type SetIssueCurrentStateParams struct {
+	CurrentState []byte      `json:"current_state"`
+	ID           pgtype.UUID `json:"id"`
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+}
+
+type SetIssueCurrentStateRow struct {
+	Metadata  []byte             `json:"metadata"`
+	Revision  int64              `json:"revision"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Replaces the complete reserved current_state record atomically. The handler
+// validates every user field and supplies updated_by; the database stamps the
+// commit time and revision in the same write so provenance cannot lag the
+// metadata revision under concurrent issue updates.
+func (q *Queries) SetIssueCurrentState(ctx context.Context, arg SetIssueCurrentStateParams) (SetIssueCurrentStateRow, error) {
+	row := q.db.QueryRow(ctx, setIssueCurrentState, arg.CurrentState, arg.ID, arg.WorkspaceID)
+	var i SetIssueCurrentStateRow
+	err := row.Scan(&i.Metadata, &i.Revision, &i.UpdatedAt)
+	return i, err
+}
+
 const setIssueMetadataKey = `-- name: SetIssueMetadataKey :one
 
 UPDATE issue SET

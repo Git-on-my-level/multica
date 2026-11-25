@@ -565,6 +565,7 @@ var validIssueFields = []string{
 	"assignee_id", "creator_type", "creator_id", "requester_id", "parent_issue_id",
 	"duplicate_of", "project_id", "position", "stage", "start_date", "due_date", "created_at",
 	"updated_at", "revision", "last_activity_at", "metadata", "properties",
+	"current_state",
 	"labels",
 }
 
@@ -759,7 +760,7 @@ func init() {
 	issueCommentListCmd.Flags().Bool("roots-only", false, "Only return top-level comments (parent_id is null). Each root also carries reply_count + last_activity_at so you can triage which thread to open.")
 	issueCommentListCmd.Flags().Bool("compact", false, "JSON output only: drop response fields that carry no information for a reader — the issue_id echoed from the request path, source_task_id, updated_at when identical to created_at, null-valued fields, and empty arrays. Content and identity fields pass through untouched. Recommended for agent reads; composes with any mode.")
 	issueCommentListCmd.Flags().Bool("summary", false, "Clip each comment's content to a short preview (sets content_truncated) so you can scan a list without pulling full bodies. Composes with any mode.")
-	issueCommentListCmd.Flags().Bool("full", false, "Escape hatch: return every comment in resolved threads verbatim. By default the complete-thread reads (default list, --recent, --thread without --tail) are folded — a resolved thread collapses to its root + conclusion, with the dropped count reported on the root — so you do not pay tokens for settled discussion. Pass --full when you need the folded discussion. No effect on --since/--tail/--roots-only reads, which are never folded.")
+	issueCommentListCmd.Flags().Bool("full", false, "Escape hatch: return folded comments verbatim. Complete-thread reads fold resolved discussions; --roots-only folds repeated watchdog/hold roots and reports their count. With --roots-only, --full returns every original root; replies still require a thread read. No effect on --since/--tail reads.")
 	issueCommentListCmd.Flags().String("before", "", "Cursor (RFC3339Nano timestamp). With --recent: thread cursor (last_activity_at). With --thread + --tail: reply cursor (reply created_at). Read from the X-Multica-Next-Before response header, printed on stderr as \"Next thread cursor\" / \"Next reply cursor\"; must be paired with --before-id.")
 	issueCommentListCmd.Flags().String("before-id", "", "Cursor UUID. With --recent: thread root UUID. With --thread + --tail: oldest reply UUID. Read from the X-Multica-Next-Before-Id response header; must be paired with --before.")
 
@@ -1359,6 +1360,7 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 	if err := client.GetJSON(ctx, "/api/issues/"+issueRef.ID, &issue); err != nil {
 		return fmt.Errorf("get issue: %w", err)
 	}
+	projectCurrentStateForIssueGet(issue)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "table" {
@@ -1393,6 +1395,23 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return cli.PrintJSON(os.Stdout, issue)
+}
+
+// The HTTP API keeps metadata primitive-only for installed clients and returns
+// structured current_state as a top-level sibling. Agent runtime guidance and
+// the issue get contract use metadata.current_state, so project the sibling
+// back into the CLI's JSON view while retaining the additive top-level field.
+func projectCurrentStateForIssueGet(issue map[string]any) {
+	currentState, ok := issue["current_state"].(map[string]any)
+	if !ok {
+		return
+	}
+	metadata, ok := issue["metadata"].(map[string]any)
+	if !ok {
+		metadata = map[string]any{}
+		issue["metadata"] = metadata
+	}
+	metadata["current_state"] = currentState
 }
 
 // childStage extracts the integer stage from a child issue response map.
@@ -2766,17 +2785,16 @@ func runIssueCommentList(cmd *cobra.Command, args []string) error {
 	if summary {
 		params.Set("summary", "true")
 	}
-	// Resolve-aware folding is the default on the complete-thread reads (default
-	// list, --recent, --thread without --tail): a resolved thread collapses to
-	// root + conclusion so an agent does not pay tokens for settled discussion.
-	// --full opts out. The partial-thread reads (--since / --tail) and
-	// --roots-only cannot be folded safely (server rejects fold there), so we
-	// never send fold for them and --full is a harmless no-op. Sending fold only
-	// when eligible keeps every existing read command — including the prompt's
-	// `--thread <id> --tail 30` cold path — working unchanged.
+	// Resolve-aware folding is the default on complete-thread reads. The
+	// roots-only agent scan also folds exact repeated watchdog/hold roots; the
+	// latest root stays visible with a count and first timestamp. --full opts
+	// out of either projection so the full audit remains retrievable.
 	foldEligible := !rootsOnly && since == "" && !tailSet
 	if foldEligible && !full {
 		params.Set("fold", "true")
+	}
+	if rootsOnly && since == "" && !full {
+		params.Set("fold_repetitive", "true")
 	}
 	if thread != "" {
 		params.Set("thread", thread)

@@ -483,6 +483,45 @@ func TestRunIssueGetResolvesProperties(t *testing.T) {
 	}
 }
 
+func TestRunIssueGetProjectsCurrentStateUnderMetadata(t *testing.T) {
+	currentState := map[string]any{
+		"state": "blocked", "blocker": "waiting for review",
+		"next_action": "check the PR", "owner": "agent-1",
+		"expiry": nil, "updated_at": "2026-11-25T12:00:00Z",
+		"updated_by":     map[string]any{"type": "agent", "id": "agent-1"},
+		"issue_revision": float64(8),
+	}
+	newResolveTestServer(t, map[string]any{
+		"id": "issue-1", "identifier": "MUL-1", "title": "Current state",
+		"metadata":      map[string]any{"pipeline_status": "waiting"},
+		"current_state": currentState,
+	})
+
+	out, err := captureStdout(t, func() error {
+		return runIssueGet(newIssueGetTestCmd("json", false), []string{"MUL-1"})
+	})
+	if err != nil {
+		t.Fatalf("runIssueGet: %v", err)
+	}
+	var issue map[string]any
+	if err := json.Unmarshal([]byte(out), &issue); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, out)
+	}
+	metadata, ok := issue["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata has type %T, want object", issue["metadata"])
+	}
+	if got := metadata["current_state"]; !reflect.DeepEqual(got, currentState) {
+		t.Fatalf("metadata.current_state = %#v, want %#v", got, currentState)
+	}
+	if got := metadata["pipeline_status"]; got != "waiting" {
+		t.Fatalf("metadata.pipeline_status = %#v, want waiting", got)
+	}
+	if got := issue["current_state"]; !reflect.DeepEqual(got, currentState) {
+		t.Fatalf("additive current_state sibling = %#v, want %#v", got, currentState)
+	}
+}
+
 // --fields and --resolve-properties both rewrite the same properties key.
 // Keeping properties resolves it exactly as without --fields; dropping it is
 // rejected up front rather than silently ignoring the flag or paying for a
