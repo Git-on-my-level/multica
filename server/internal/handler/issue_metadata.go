@@ -18,13 +18,14 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// Per-issue metadata is a small JSONB KV map agents use to record pipeline
-// state (PR number, pipeline_status, waiting_on, ...). Three rules govern
-// the V1 surface — they're enforced both in the handler and at the DB:
+// Per-issue metadata is a small JSONB map agents use to record pipeline
+// details (PR number, pipeline_status, waiting_on, ...). The reserved
+// current_state entry is the single structured exception and is managed by
+// issue_current_state.go. The generic KV surface enforces these rules:
 //
 //   - keys match `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (handler)
 //   - at most 50 keys per issue (handler)
-//   - values are primitive: string / number / bool (handler)
+//   - generic values are primitive: string / number / bool (handler)
 //   - JSONB column is an object and ≤ 8KB (DB CHECK; defense in depth)
 //
 // All mutations are single-key atomic. UpdateIssue does NOT touch metadata —
@@ -162,6 +163,10 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if key == issueCurrentStateMetadataKey {
+		writeError(w, http.StatusBadRequest, "current_state is reserved; use the issue current-state endpoint")
+		return
+	}
 
 	var req SetIssueMetadataKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -255,6 +260,10 @@ func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request)
 	key := chi.URLParam(r, "key")
 	if err := validateIssueMetadataKey(key); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if key == issueCurrentStateMetadataKey {
+		writeError(w, http.StatusBadRequest, "current_state is reserved; use the issue current-state endpoint")
 		return
 	}
 

@@ -81,6 +81,12 @@ type CommentResponse struct {
 	// pulls the folded comments back with `comment list --full`.
 	ThreadResolved *bool `json:"thread_resolved,omitempty"`
 	FoldedCount    *int  `json:"folded_count,omitempty"`
+	// RepetitiveFoldedCount and RepetitiveFirstAt appear on the newest
+	// watchdog/hold root that represents older matching roots in a
+	// roots_only read. The original roots remain available with
+	// fold_repetitive=false (CLI: --full).
+	RepetitiveFoldedCount *int    `json:"repetitive_folded_count,omitempty"`
+	RepetitiveFirstAt     *string `json:"repetitive_first_at,omitempty"`
 	// TriggerOutcomes is the per-target result of every EXPLICIT @agent / @squad
 	// mention in this comment (MUL-4525 §2). It is additive and populated only on
 	// create/edit responses: old clients ignore it. A saved comment whose mention
@@ -433,6 +439,18 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	foldRepetitive := false
+	if value := q.Get("fold_repetitive"); value != "" {
+		switch value {
+		case "true":
+			foldRepetitive = true
+		case "false":
+		default:
+			writeError(w, http.StatusBadRequest, "invalid fold_repetitive parameter; expected boolean")
+			return
+		}
+	}
+
 	// --- combination validation ----------------------------------------
 	if fold && sinceTime.Valid {
 		writeError(w, http.StatusBadRequest, "fold and since are mutually exclusive: since returns a partial thread, and a fold over a partial thread could hide a resolution that was not fetched")
@@ -444,6 +462,10 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 	}
 	if fold && rootsOnly {
 		writeError(w, http.StatusBadRequest, "fold and roots_only are mutually exclusive: roots_only returns no replies to fold")
+		return
+	}
+	if foldRepetitive && !rootsOnly {
+		writeError(w, http.StatusBadRequest, "fold_repetitive requires roots_only")
 		return
 	}
 	if rootsOnly && threadStr != "" {
@@ -620,9 +642,15 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 			fc := st.FoldedCount
 			resp[i].FoldedCount = &fc
 		}
-		// Apply the summary projection last so it clips whatever content the
-		// chosen read mode produced, uniformly across every mode.
-		if summary {
+	}
+	if foldRepetitive {
+		resp = foldRepetitiveSignalRoots(resp)
+	}
+	// Apply the summary projection after signal grouping so signatures use the
+	// full stored body and cannot merge comments whose actionable details lie
+	// beyond the clipped preview.
+	if summary {
+		for i := range resp {
 			clipped, truncated := summarizeContent(resp[i].Content)
 			resp[i].Content = clipped
 			resp[i].ContentTruncated = &truncated

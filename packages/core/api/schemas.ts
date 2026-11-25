@@ -1586,10 +1586,50 @@ export const IssueTriggerPreviewSchema = z.object({
   total_count: z.number().default(0),
 }).loose();
 
-// Metadata is primitive-only by API/DB contract. Stay lenient on shape:
-// unknown keys land as `unknown` to a caller, but the field itself defaults
-// to {} so consumers never need to nil-guard `issue.metadata`.
-const IssueMetadataSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({});
+export const IssueCurrentStateSchema = z.object({
+  state: z.string(),
+  blocker: z.string(),
+  next_action: z.string(),
+  owner: z.string(),
+  expiry: z.string().nullable(),
+  updated_at: z.string(),
+  updated_by: z.object({ type: z.string(), id: z.string() }).loose(),
+  issue_revision: z.number().int().positive(),
+}).loose();
+export type IssueCurrentState = z.infer<typeof IssueCurrentStateSchema>;
+
+export const IssueCurrentStateUpdateSchema = z.object({
+  state: z.string().min(1),
+  blocker: z.string(),
+  next_action: z.string(),
+  owner: z.string(),
+  expiry: z.string().nullable(),
+}).strict();
+export type IssueCurrentStateUpdate = z.infer<typeof IssueCurrentStateUpdateSchema>;
+
+export const IssueCurrentStateResponseSchema = z.object({
+  current_state: IssueCurrentStateSchema.nullable(),
+  issue_revision: z.number().int().nonnegative().optional(),
+}).loose();
+export type IssueCurrentStateResponse = z.infer<typeof IssueCurrentStateResponseSchema>;
+
+// Metadata remains primitive-only except for the reserved current_state
+// record. A malformed additive record is dropped without invalidating the
+// otherwise usable issue response, which matters during mixed-version deploys.
+const IssueMetadataSchema = z.record(z.string(), z.unknown()).default({}).transform((metadata) => {
+  const parsed: Record<string, string | number | boolean | IssueCurrentState> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      parsed[key] = value;
+      continue;
+    }
+    if (key === "current_state") {
+      const currentState = IssueCurrentStateSchema.safeParse(value);
+      if (currentState.success) parsed[key] = currentState.data;
+    }
+  }
+  return parsed;
+});
 
 const SourceContextAttachmentSchema = z.object({
   id: z.string(),

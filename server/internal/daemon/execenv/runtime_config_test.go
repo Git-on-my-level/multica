@@ -198,6 +198,10 @@ func TestStatusRuleIsFactJudgmentAtBothMoments(t *testing.T) {
 		// The anchor: issue state, not run lifecycle, written when it changes.
 		"**Issue status — write the state the issue is in, whenever it changes**",
 		"Status reflects the state the ISSUE is in, not your run's lifecycle",
+		"Whenever your work changes the live execution handoff",
+		"multica issue current-state set <this-issue-id>",
+		"pass an empty blocker or expiry to clear stale values",
+		"Keep ordinary results and detail in comments",
 		// The start moment: INSIDE step 3, at the read→work boundary. A run
 		// on MUL-6460 proved a detached status-block bullet does not fire —
 		// the model is walking the numbered list when the condition triggers.

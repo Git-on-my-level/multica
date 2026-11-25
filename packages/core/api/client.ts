@@ -380,6 +380,11 @@ import {
   ListIssuesResponseSchema,
   CreateIssueResponseSchema,
   IssueSchema,
+  IssueCurrentStateResponseSchema,
+  IssueCurrentStateUpdateSchema,
+  type IssueCurrentState,
+  type IssueCurrentStateResponse,
+  type IssueCurrentStateUpdate,
   AgentTaskSchema,
   SourceContextPreviewSchema,
   CommentSubIssueTaskResponseSchema,
@@ -1626,6 +1631,35 @@ export class ApiClient {
       throw new Error("GET /api/issues/:id returned a malformed issue");
     }
     return issue;
+  }
+
+  async getIssueCurrentState(issueId: string): Promise<IssueCurrentState | null> {
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/current-state`);
+    const response = parseWithFallback<IssueCurrentStateResponse>(
+      raw,
+      IssueCurrentStateResponseSchema,
+      { current_state: null },
+      { endpoint: "GET /api/issues/:id/current-state" },
+    );
+    return response.current_state;
+  }
+
+  async setIssueCurrentState(issueId: string, input: IssueCurrentStateUpdate): Promise<IssueCurrentState> {
+    const request = IssueCurrentStateUpdateSchema.parse(input);
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/current-state`, {
+      method: "PUT",
+      body: JSON.stringify(request),
+    });
+    const response = parseWithFallback<IssueCurrentStateResponse | null>(
+      raw,
+      IssueCurrentStateResponseSchema,
+      null,
+      { endpoint: "PUT /api/issues/:id/current-state" },
+    );
+    if (!response?.current_state) {
+      throw new Error("PUT /api/issues/:id/current-state returned no current state");
+    }
+    return response.current_state;
   }
 
   async createIssue(

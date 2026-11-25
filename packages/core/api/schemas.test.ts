@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AgentTaskSchema,
   IssueSchema,
+  IssueCurrentStateResponseSchema,
   AppConfigSchema,
   WecomInstallationSchema,
   ListWecomInstallationsResponseSchema,
@@ -342,6 +343,22 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     });
   });
 
+  it("accepts a typed current-state metadata record", () => {
+    const currentState = {
+      state: "blocked",
+      blocker: "waiting for review",
+      next_action: "check the PR",
+      owner: "agent-1",
+      expiry: null,
+      updated_at: "2026-11-25T12:00:00Z",
+      updated_by: { type: "agent", id: "agent-1" },
+      issue_revision: 8,
+    };
+    const parsed = IssueSchema.parse({ ...baseIssue, metadata: { current_state: currentState } });
+    expect(parsed.metadata.current_state).toEqual(currentState);
+    expect(IssueCurrentStateResponseSchema.parse({ current_state: currentState }).current_state).toEqual(currentState);
+  });
+
   it("defaults metadata to {} when the server omits it (older backend)", () => {
     const { metadata: _omit, ...issueWithoutMetadata } = baseIssue;
     const payload = { issues: [issueWithoutMetadata], total: 1 };
@@ -349,12 +366,19 @@ describe("IssueSchema (via ListIssuesResponseSchema)", () => {
     expect(parsed.issues[0]?.metadata).toEqual({});
   });
 
-  it("rejects metadata with non-primitive values (nested object)", () => {
+  it("drops malformed nested metadata without invalidating the issue", () => {
     const payload = {
-      issues: [{ ...baseIssue, metadata: { nested: { x: 1 } } }],
+      issues: [{ ...baseIssue, metadata: { pipeline_status: "waiting", current_state: { state: "blocked" }, nested: { x: 1 } } }],
       total: 1,
     };
-    expect(ListIssuesResponseSchema.safeParse(payload).success).toBe(false);
+    const parsed = ListIssuesResponseSchema.parse(payload);
+    expect(parsed.issues[0]?.metadata).toEqual({ pipeline_status: "waiting" });
+  });
+
+  it("does not accept malformed current state on the typed endpoint", () => {
+    expect(IssueCurrentStateResponseSchema.safeParse({
+      current_state: { state: "blocked", blocker: "missing provenance" },
+    }).success).toBe(false);
   });
 
   it("accepts a numeric stage", () => {

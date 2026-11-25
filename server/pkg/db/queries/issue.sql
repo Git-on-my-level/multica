@@ -781,6 +781,27 @@ WHERE id = sqlc.arg('id') AND workspace_id = sqlc.arg('workspace_id')
   AND metadata ? sqlc.arg('key')::text
 RETURNING id, workspace_id, metadata, revision;
 
+-- name: SetIssueCurrentState :one
+-- Replaces the complete reserved current_state record atomically. The handler
+-- validates every user field and supplies updated_by; the database stamps the
+-- commit time and revision in the same write so provenance cannot lag the
+-- metadata revision under concurrent issue updates.
+UPDATE issue SET
+    metadata = jsonb_set(
+        metadata,
+        '{current_state}',
+        sqlc.arg('current_state')::jsonb || jsonb_build_object(
+            'updated_at', now(),
+            'issue_revision', revision + 1
+        ),
+        true
+    ),
+    revision = revision + 1,
+    last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now()),
+    updated_at = now()
+WHERE id = sqlc.arg('id') AND workspace_id = sqlc.arg('workspace_id')
+RETURNING metadata, revision, updated_at;
+
 -- name: MarkIssueFirstExecuted :one
 -- Flips first_executed_at from NULL to now() atomically. Returns the row if
 -- this was the first time the issue was executed; no rows otherwise. The
