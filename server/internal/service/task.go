@@ -5552,8 +5552,9 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
 		} else {
-			// Cursor retry policy uses the current failure diagnostics.
-			if failureReason == taskfailure.ReasonAgentProviderNetwork.String() {
+			// Cursor and per-minute throttle recovery use the current diagnostics.
+			if failureReason == taskfailure.ReasonAgentProviderNetwork.String() ||
+				failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) {
 				parent.Error = pgtype.Text{String: errMsg, Valid: true}
 			}
 			// The report can carry the first resume pointer. Cursor recovery
@@ -5747,6 +5748,9 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			createRetry = createRetry && hermesGatewayResumeRetryEligible(failureReason, errMsg, t)
 		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
 			createRetry = createRetry && retryEligible(failureReason, t)
+		}
+		if createRetry && failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) {
+			createRetry = retryEligible(failureReason, t)
 		}
 		if createRetry && launcherClaim == nil {
 			successor, herr := hasRunnableSuccessor(ctx, qtx, t)
@@ -6070,7 +6074,7 @@ func hermesGatewayRetryDelay() time.Duration {
 // etc.) are intentionally excluded — those are real problems that the user
 // should see, not infrastructure flakiness.
 //
-// The one agent_error.* exception is provider_network: a mid-stream provider
+// An agent_error.* exception is provider_network: a mid-stream provider
 // disconnect (e.g. Claude Code's "API Error: Connection closed mid-response")
 // is transient infrastructure flakiness, not an agent decision. Unattended
 // issue runs otherwise terminate on it, while interactive chat only survives
@@ -6082,13 +6086,16 @@ func hermesGatewayRetryDelay() time.Duration {
 // never started, so there is nothing to be idempotent about, and every bundle
 // that did download is already cached on disk — a retry resumes from there
 // instead of re-fetching the whole set (MUL-5370).
+// Capacity/rate-limit retries additionally require PerMinuteRateLimit in
+// retryEligible; the broad reason alone never authorizes a retry.
 var retryableReasons = map[string]bool{
-	string(taskfailure.ReasonRuntimeOffline):         true,
-	string(taskfailure.ReasonRuntimeRecovery):        true,
-	string(taskfailure.ReasonTimeout):                true,
-	"codex_semantic_inactivity":                      true,
-	string(taskfailure.ReasonAgentProviderNetwork):   true,
-	string(taskfailure.ReasonSkillBundleUnavailable): true,
+	string(taskfailure.ReasonAgentProviderCapacityOrRateLimit): true,
+	string(taskfailure.ReasonRuntimeOffline):                   true,
+	string(taskfailure.ReasonRuntimeRecovery):                  true,
+	string(taskfailure.ReasonTimeout):                          true,
+	"codex_semantic_inactivity":                                true,
+	string(taskfailure.ReasonAgentProviderNetwork):             true,
+	string(taskfailure.ReasonSkillBundleUnavailable):           true,
 }
 
 // runtime_offline retries start deferred, not queued: their positive fire_at
@@ -6108,6 +6115,9 @@ const (
 	providerNetworkMaxAttempts    = 3
 	providerNetworkFinalRetryWait = 5 * time.Second
 )
+
+// Explicit per-minute throttles wait one full window before their only retry.
+const providerPerMinuteRetryWait = 60 * time.Second
 
 // retryAttemptCeiling reports how many attempts the auto-retry path allows for
 // a failure reason. It only ever WIDENS the task's generic max_attempts, and
@@ -6143,6 +6153,9 @@ func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
 	if reason == string(taskfailure.ReasonAgentProviderNetwork) &&
 		failedAttempt >= providerNetworkMaxAttempts-1 {
 		return providerNetworkFinalRetryWait
+	}
+	if reason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) {
+		return providerPerMinuteRetryWait
 	}
 	return 0
 }
@@ -6262,6 +6275,16 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 			ResumeUnsafeFailure(t.FailureReason.String, t.Error.String) {
 			return false
 		}
+	}
+	if failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) &&
+		(!taskfailure.PerMinuteRateLimit(t.Error.String) ||
+			taskfailure.Classify(t.Error.String) != taskfailure.ReasonAgentProviderCapacityOrRateLimit || t.Attempt != 1 ||
+			!(t.IssueID.Valid || t.ChatSessionID.Valid) ||
+			!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
+			t.SessionRolloutMissing || IsFreshRerun(t) || (t.ForceFreshSession && !t.RerunOfTaskID.Valid) ||
+			(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) ||
+			ResumeUnsafeFailure(failureReason, t.Error.String)) {
+		return false
 	}
 	return retryableReasons[failureReason] &&
 		t.Attempt < taskRetryCeiling(failureReason, t) &&
