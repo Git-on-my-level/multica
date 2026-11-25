@@ -1606,6 +1606,18 @@ WHERE id = (
               )
             )
       )
+      -- A shutdown retry retains the interrupted chat turn's place through
+      -- promotion and claim, even when a follow-up has higher priority.
+      AND NOT EXISTS (
+          SELECT 1 FROM agent_task_queue recovery
+          JOIN agent_task_queue interrupted ON interrupted.id = recovery.parent_task_id
+          WHERE recovery.agent_id = atq.agent_id
+            AND recovery.chat_session_id = atq.chat_session_id
+            AND recovery.status IN ('deferred', 'queued')
+            AND recovery.id <> atq.id
+            AND interrupted.failure_reason = 'runtime_recovery'
+            AND interrupted.error LIKE 'daemon shut down while task%'
+      )
     ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -2987,6 +2999,12 @@ WHERE p.id = $1
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
   ))
+  -- Graceful shutdown recovery needs the original runtime's session.
+  AND (
+      NOT (p.failure_reason IS NOT DISTINCT FROM 'runtime_recovery'
+           AND COALESCE(p.error LIKE 'daemon shut down while task%', false))
+      OR COALESCE($3::uuid, a.runtime_id, p.runtime_id) = p.runtime_id
+  )
   AND lock_task_owner_rows(
       COALESCE($2::uuid, p.agent_id),
       p.issue_id,
@@ -3623,7 +3641,7 @@ WITH victims AS (
     JOIN agent_task_queue parent ON parent.id = retry.parent_task_id
     WHERE retry.status = 'deferred'
       AND retry.fire_at < now() - make_interval(secs => $1::double precision)
-      AND parent.failure_reason = 'runtime_offline'
+      AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
       AND NOT EXISTS (
           SELECT 1 FROM agent_runtime runtime
           WHERE runtime.id = retry.runtime_id
@@ -3649,7 +3667,7 @@ WHERE retry.id = victims.id
   AND EXISTS (
       SELECT 1 FROM agent_task_queue parent
       WHERE parent.id = retry.parent_task_id
-        AND parent.failure_reason = 'runtime_offline'
+        AND parent.failure_reason IN ('runtime_offline', 'runtime_recovery')
   )
   AND NOT EXISTS (
       SELECT 1 FROM agent_runtime runtime
@@ -3667,7 +3685,7 @@ type FailExpiredRuntimeReconnectRetriesParams struct {
 	MaxPerTick         int32   `json:"max_per_tick"`
 }
 
-// A runtime_offline retry waits in deferred until its runtime returns healthy.
+// A runtime_offline or runtime_recovery retry waits in deferred until its runtime returns healthy.
 // Give that recovery state a bounded exit: after one full reconnect grace,
 // fail it with a non-retryable reason so issues, agents, and runtime GC can
 // converge. A runtime that is healthy when this query runs wins the race and
@@ -5031,14 +5049,14 @@ func (q *Queries) HasRetryTaskForParent(ctx context.Context, parentTaskID pgtype
 	return column_1, err
 }
 
-const hasRuntimeOfflineRetryForParent = `-- name: HasRuntimeOfflineRetryForParent :one
+const hasRuntimeRetryForParent = `-- name: HasRuntimeRetryForParent :one
 SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE parent_task_id = $1)
 `
 
-// A cancelled or completed recovery still consumes the one offline recovery.
-// Call while holding LockRuntimeOfflineRetryParent.
-func (q *Queries) HasRuntimeOfflineRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, hasRuntimeOfflineRetryForParent, parentTaskID)
+// A cancelled or completed recovery still consumes recovery.
+// Call while holding LockRuntimeRetryParent.
+func (q *Queries) HasRuntimeRetryForParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRuntimeRetryForParent, parentTaskID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -7264,14 +7282,15 @@ func (q *Queries) LockAgentTaskStartClaim(ctx context.Context, arg LockAgentTask
 	return i, err
 }
 
-const lockRuntimeOfflineRetryParent = `-- name: LockRuntimeOfflineRetryParent :exec
+const lockRuntimeRetryParent = `-- name: LockRuntimeRetryParent :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':runtime_offline_retry', 0))
 `
 
 // Serialize deferred recovery creation without taking a task-row lock ahead
 // of CreateRetryTask's workspace/owner fence (the teardown lock order).
-func (q *Queries) LockRuntimeOfflineRetryParent(ctx context.Context, taskID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, lockRuntimeOfflineRetryParent, taskID)
+// Keep the existing advisory-lock key so offline recovery serializes across upgrades.
+func (q *Queries) LockRuntimeRetryParent(ctx context.Context, taskID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockRuntimeRetryParent, taskID)
 	return err
 }
 
@@ -8187,18 +8206,32 @@ const reassignPendingAgentTasksToRuntime = `-- name: ReassignPendingAgentTasksTo
 WITH fence AS MATERIALIZED (
     SELECT lock_task_owner_rows($1, NULL, $2) AS ok
 ),
+pending AS (
+    SELECT task.id,
+           (parent.failure_reason IS NOT DISTINCT FROM 'runtime_recovery'
+            AND COALESCE(parent.error LIKE 'daemon shut down while task%', false)) AS shutdown_retry
+    FROM agent_task_queue task
+    LEFT JOIN agent_task_queue parent ON parent.id = task.parent_task_id
+    WHERE task.agent_id = $1
+      AND task.status IN ('queued', 'deferred')
+      AND task.runtime_id IS DISTINCT FROM $2
+),
 reassigned AS (
-    UPDATE agent_task_queue
-    SET runtime_id = $2
-    WHERE agent_id = $1
-      AND status IN ('queued', 'deferred')
-      AND runtime_id IS DISTINCT FROM $2
+    UPDATE agent_task_queue task
+    SET runtime_id = CASE WHEN pending.shutdown_retry THEN task.runtime_id ELSE $2 END,
+        status = CASE WHEN pending.shutdown_retry THEN 'cancelled' ELSE task.status END,
+        completed_at = CASE WHEN pending.shutdown_retry THEN now() ELSE task.completed_at END,
+        cancelled_by_type = CASE WHEN pending.shutdown_retry THEN 'system' ELSE task.cancelled_by_type END
+    FROM pending
+    WHERE task.id = pending.id
+      AND task.status IN ('queued', 'deferred')
+      AND task.runtime_id IS DISTINCT FROM $2
       AND (SELECT ok FROM fence)
-    RETURNING id
+    RETURNING task.status
 )
 SELECT
     (SELECT ok FROM fence) AS fence_ok,
-    (SELECT count(*) FROM reassigned) AS reassigned_tasks
+    (SELECT count(*) FROM reassigned WHERE status <> 'cancelled') AS reassigned_tasks
 `
 
 type ReassignPendingAgentTasksToRuntimeParams struct {
@@ -8215,8 +8248,9 @@ type ReassignPendingAgentTasksToRuntimeRow struct {
 // to. Claims fence on agent.runtime_id = task.runtime_id (MUL-6697), so a
 // queued or deferred row left on the old runtime is claimable by neither
 // daemon. Deferred rows move too: promotion is per runtime and would otherwise
-// strand them later. Dispatched, running and waiting rows are already held by
-// the old runtime's daemon and stay. Callers hold the agent row FOR UPDATE.
+// strand them later. Cancel pending shutdown retries because their session is
+// local to the old runtime. Dispatched, running and waiting rows are already
+// held by the old runtime's daemon and stay. Callers hold the agent row FOR UPDATE.
 //
 // Same fence-verdict shape as ReassignTasksToRuntime: FenceOk = false must
 // abort the rebind rather than commit a binding with stranded rows.
