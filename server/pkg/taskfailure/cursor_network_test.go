@@ -133,8 +133,15 @@ func TestCursorTransientLaunchClassificationAndBoundary(t *testing.T) {
 			if !CursorPreActionNetworkError(raw) {
 				t.Fatal("complete pre-action diagnostics should permit recovery")
 			}
+			cleanExit := strings.Replace(raw, "exit_code=1", "exit_code=0", 1)
+			promptWrite := strings.Replace(cleanExit, "cursor-agent exited with error: exit status 1", "cursor-agent prompt write failed: broken pipe", 1)
+			if !CursorPreActionNetworkError(promptWrite) {
+				t.Fatal("clean exit with a prompt-write failure and no events should permit recovery")
+			}
 			for _, ambiguous := range []string{
 				witness,
+				cleanExit,
+				strings.Replace(promptWrite, "event_count=0", "event_count=1", 1),
 				strings.Replace(raw, "event_count=0", "event_count=14", 1),
 				strings.Replace(raw, "last_event_type=none", "last_event_type=connection", 1),
 				strings.Replace(raw, "invalid_event_count=0", "invalid_event_count=1", 1),
