@@ -3002,12 +3002,19 @@ WHERE p.id = $1
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
   ))
+  -- Admit pinned retries only when the original runtime registered support.
+  -- Claim delivery still checks the live daemon's advertised capabilities.
   AND (NOT COALESCE($6::boolean, false) OR (
       p.status = 'failed'
       AND NULLIF(btrim(p.session_id), '') IS NOT NULL
       AND NOT p.session_rollout_missing
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
+      AND EXISTS (
+          SELECT 1 FROM agent_runtime r
+          WHERE r.id = p.runtime_id
+            AND r.metadata @> '{"capabilities":["same-session-retry-v1"]}'::jsonb
+      )
       AND $2::uuid IS NULL
       AND $3::uuid IS NULL
       AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'

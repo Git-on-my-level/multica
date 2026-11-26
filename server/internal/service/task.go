@@ -5866,12 +5866,9 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 					retried = &child
 				}
 			case errors.Is(cerr, pgx.ErrNoRows):
-				// The statement wrote nothing: either the owning workspace was
-				// torn down mid-flight, or a rerun took the pending slot after
-				// the unlocked check above (ON CONFLICT DO NOTHING). Neither is
-				// a reason to abort — this transaction still owns the parent's
-				// failed status, and losing that would leave the task stuck in
-				// 'running'. Record the failure and move on without a retry.
+				// The insert can yield on teardown, a pending-slot conflict, or
+				// missing same-session custody or daemon capability. Commit the
+				// parent's original failure even when a retry cannot be queued.
 				slog.Info("fail task auto-retry not created: no row written",
 					"task_id", util.UUIDToString(taskID),
 					"issue_id", util.UUIDToString(t.IssueID),
@@ -6499,9 +6496,8 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Workspace torn down, or the pending slot was taken between the check
-		// above and this insert. Same contract as FailTask's path: no retry, no
-		// error.
+		// The insert fences teardown, pending-slot conflicts, and pinned
+		// retry admission. A refusal leaves the original failure in place.
 		slog.Info("task auto-retry not created: no row written",
 			"parent_task_id", util.UUIDToString(parent.ID),
 			"reason", reason,

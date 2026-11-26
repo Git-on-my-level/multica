@@ -105,7 +105,7 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 	fx := dbfx.New(pool, workspaceID, userID)
 	var runtimeID string
 	fx.QueryRow(t, `SELECT runtime_id::text FROM agent WHERE id=$1`, agentID).Scan(&runtimeID)
-	fx.Exec(t, `UPDATE agent_runtime SET status='online', last_seen_at=now() WHERE id=$1`, runtimeID)
+	fx.Exec(t, `UPDATE agent_runtime SET status='online', last_seen_at=now(), metadata=$2 WHERE id=$1`, runtimeID, sameSessionRetryCapabilities)
 	chatID := fx.ChatSession(t, agentID)
 	parentID := fx.Task(t, agentID, dbfx.Cols{
 		"runtime_id": runtimeID, "chat_session_id": chatID, "status": "running",

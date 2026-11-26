@@ -4,16 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 func TestRetryEligibleDaemonShutdownBudget(t *testing.T) {
@@ -88,10 +89,26 @@ func TestRetryEligibleDaemonShutdown(t *testing.T) {
 	}
 }
 
+const sameSessionRetryCapabilities = `{"capabilities":["` + protocol.DaemonCapabilitySameSessionRetryV1 + `"]}`
+
 func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
 	for _, callback := range []bool{true, false} {
-		for _, chat := range []bool{false, true} {
-			t.Run(fmt.Sprintf("callback=%v/chat=%v", callback, chat), func(t *testing.T) {
+		for _, tc := range []struct {
+			name, metadata, session string
+			chat, wantRetry         bool
+		}{
+			{name: "issue", metadata: sameSessionRetryCapabilities, session: "existing-session", wantRetry: true},
+			{name: "chat", metadata: sameSessionRetryCapabilities, session: "existing-session", chat: true, wantRetry: true},
+			{name: "legacy daemon", metadata: `{"capabilities":["` + protocol.DaemonCapabilityCursorRecoveryV1 + `"]}`, session: "existing-session"},
+			{name: "no capability registration", metadata: `{}`, session: "existing-session"},
+			{name: "invalid capability registration", metadata: `{"capabilities":"` + protocol.DaemonCapabilitySameSessionRetryV1 + `"}`, session: "existing-session"},
+			{name: "missing session", metadata: sameSessionRetryCapabilities},
+		} {
+			// The startup path separately preserves legacy sessionless orphan recovery.
+			if !callback && tc.session == "" {
+				continue
+			}
+			t.Run(fmt.Sprintf("callback=%v/%s", callback, tc.name), func(t *testing.T) {
 				ctx := context.Background()
 				pool := sharedTestPool(t)
 				bootstrap := testutil.New(pool, "", "")
@@ -100,10 +117,10 @@ func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
 				workspace := bootstrap.Workspace(t, "shutdown recovery", fmt.Sprintf("shutdown-%d", suffix))
 				fx := testutil.New(pool, workspace, user)
 				fx.Member(t, workspace, user, "owner")
-				runtime := fx.Runtime(t, "shutdown runtime")
+				runtime := fx.Runtime(t, "shutdown runtime", testutil.Cols{"metadata": tc.metadata})
 				agent := fx.Agent(t, "shutdown agent", runtime)
 				cols := testutil.Cols{"runtime_id": runtime, "status": "running", "attempt": 1, "max_attempts": 2}
-				if chat {
+				if tc.chat {
 					cols["chat_session_id"] = fx.ChatSession(t, agent)
 				} else {
 					cols["issue_id"] = fx.Issue(t, "interrupted work")
@@ -114,22 +131,33 @@ func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
 				svc := NewTaskService(q, pool, nil, events.New())
 				parentUUID := util.MustParseUUID(parent)
 				if callback {
-					if _, err := svc.FailTask(ctx, parentUUID, "daemon shut down while task was in flight", "existing-session", "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {
+					if _, err := svc.FailTask(ctx, parentUUID, "daemon shut down while task was in flight", tc.session, "/tmp/existing-work", "", "runtime_recovery", false, "", ""); err != nil {
 						t.Fatal(err)
 					}
 				} else {
-					fx.Exec(t, `UPDATE agent_task_queue SET session_id = 'existing-session', work_dir = '/tmp/existing-work' WHERE id = $1`, parentUUID)
+					fx.Exec(t, `UPDATE agent_task_queue SET session_id = NULLIF($2, ''), work_dir = '/tmp/existing-work' WHERE id = $1`, parentUUID, tc.session)
 					lost, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
 					if err != nil || len(lost) != 1 {
 						t.Fatalf("recover orphan: %v, %v", lost, err)
 					}
-					if child, err := svc.MaybeRetryFailedTask(ctx, lost[0]); err != nil || child == nil {
-						t.Fatalf("recover interrupted attempt: %v, %v", child, err)
+					if child, err := svc.MaybeRetryFailedTask(ctx, lost[0]); err != nil || (child != nil) != tc.wantRetry {
+						t.Fatalf("recovery created child = %v, want %v, err = %v", child != nil, tc.wantRetry, err)
 					}
 				}
 				failed, err := q.GetAgentTask(ctx, parentUUID)
 				if err != nil {
 					t.Fatal(err)
+				}
+				if failed.Status != "failed" || failed.FailureReason.String != "runtime_recovery" {
+					t.Fatalf("original failure was lost: status=%q reason=%q", failed.Status, failed.FailureReason.String)
+				}
+				if !tc.wantRetry {
+					var count int
+					fx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id = $1`, parent).Scan(&count)
+					if count != 0 {
+						t.Fatalf("recovery created %d children, want none", count)
+					}
+					return
 				}
 				var wg sync.WaitGroup
 				for i := 0; i < 2; i++ {
@@ -258,7 +286,7 @@ func TestRetryEligibleDaemonShutdownChatOrdering(t *testing.T) {
 			workspace := bootstrap.Workspace(t, "chat recovery", fmt.Sprintf("chat-recovery-%d", suffix))
 			fx := testutil.New(pool, workspace, user)
 			fx.Member(t, workspace, user, "owner")
-			runtime := fx.Runtime(t, "chat runtime", testutil.Cols{"status": "online", "last_seen_at": time.Now()})
+			runtime := fx.Runtime(t, "chat runtime", testutil.Cols{"status": "online", "last_seen_at": time.Now(), "metadata": sameSessionRetryCapabilities})
 			agent := fx.Agent(t, "chat recovery", runtime)
 			chat := fx.ChatSession(t, agent)
 			parent := fx.Task(t, agent, testutil.Cols{"runtime_id": runtime, "chat_session_id": chat, "status": "running", "attempt": 1, "max_attempts": 2})
