@@ -74,6 +74,7 @@ func testClaimPinnedRetryCustody(t *testing.T, sameSession bool) {
 				params.RequiredResumeSessionID = pgtype.Text{}
 				params.RequireSameSession = pgtype.Bool{Bool: true, Valid: true}
 				capability = protocol.DaemonCapabilitySameSessionRetryV1
+				dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, runtime, capability)
 			}
 			child, err := testHandler.Queries.CreateRetryTask(ctx, params)
 			if err != nil {

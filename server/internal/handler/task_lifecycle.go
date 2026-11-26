@@ -17,8 +17,8 @@ import (
 // RecoverOrphanedTasks is called by the daemon at startup for each runtime
 // it owns. It atomically fails any dispatched/running tasks the server still
 // believes belong to that runtime — those are the tasks the previous daemon
-// process was running when it died — and triggers MaybeRetryFailedTask for
-// each so retry-safe work gets a fresh attempt. Started Muse executions retain
+// process was running when it died — and attempts recovery for retry-safe
+// work. Started Muse executions retain
 // a cleanup fence because their workers can survive the daemon process.
 //
 // This is the targeted fix for "issue stuck at in_progress when daemon
@@ -31,19 +31,12 @@ func (h *Handler) RecoverOrphanedTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.TaskService.RecoverOrphanedTasksForRuntime(r.Context(), parseUUID(runtimeID))
+	rows, retried, err := h.TaskService.RecoverOrphanedTasksForRuntime(r.Context(), parseUUID(runtimeID))
 	if err != nil {
 		slog.Warn("recover-orphans failed", "runtime_id", runtimeID, "error", err)
 		writeError(w, http.StatusInternalServerError, "recover orphans failed")
 		return
 	}
-
-	// Funnel through the shared post-failure pipeline so we get the same
-	// task:failed events, agent reconcile, issue rollback, and auto-retry
-	// behaviour as the runtime sweeper. This was previously a fast-path
-	// that bypassed those side effects, leaving the UI stale when no retry
-	// was created (max_attempts exhausted, autopilot, non-retryable reason).
-	retried := h.TaskService.HandleFailedTasks(r.Context(), rows)
 
 	if len(rows) > 0 {
 		slog.Info("recover-orphans completed",

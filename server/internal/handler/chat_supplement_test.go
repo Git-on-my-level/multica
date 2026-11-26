@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -8,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -524,33 +528,95 @@ func TestChatSupplementDaemonRecoveryRetainsRetryInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	failed, err := testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), task.RuntimeID)
+	dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, task.RuntimeID, protocol.DaemonCapabilitySameSessionRetryV1)
+	failed, retried, err := testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), task.RuntimeID)
+	if err != nil || len(failed) != 1 || failed[0].ID != task.ID || retried != 1 {
+		t.Fatalf("orphan recovery returned %d failures, %d retries, err=%v", len(failed), retried, err)
+	}
+	var childID string
+	dbfx.QueryRow(t, `SELECT id::text FROM agent_task_queue WHERE retry_of_task_id=$1`, taskID).Scan(&childID)
+	child, err := testHandler.Queries.GetAgentTask(t.Context(), parseUUID(childID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var recovered bool
-	for _, parent := range failed {
-		if parent.ID != task.ID {
-			continue
-		}
-		child, err := testHandler.TaskService.MaybeRetryFailedTask(t.Context(), parent)
-		if err != nil || child == nil {
-			t.Fatalf("recovery retry=%+v err=%v", child, err)
-		}
-		if required, pinned := service.SameSessionRetry(*child); !required || pinned != providerSession {
-			t.Fatalf("retry custody = %v, %q", required, pinned)
-		}
-		inputs, err := testHandler.Queries.ListChatInputMessages(t.Context(), child.ChatInputTaskID)
-		if err != nil || len(inputs) != 2 || inputs[0].Content != "original objective" || inputs[1].Content != "guidance before daemon restart" {
-			t.Fatalf("recovery input=%+v err=%v", inputs, err)
-		}
-		recovered = true
+	if required, pinned := service.SameSessionRetry(child); !required || pinned != providerSession {
+		t.Fatalf("retry custody = %v, %q", required, pinned)
 	}
-	if !recovered {
-		t.Fatal("fixture task was not recovered")
+	inputs, err := testHandler.Queries.ListChatInputMessages(t.Context(), child.ChatInputTaskID)
+	if err != nil || len(inputs) != 2 || inputs[0].Content != "original objective" || inputs[1].Content != "guidance before daemon restart" {
+		t.Fatalf("recovery input=%+v err=%v", inputs, err)
 	}
 	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id=$1`, sessionID); n != 2 {
 		t.Fatalf("guidance escaped the retry batch: %d tasks", n)
+	}
+}
+
+func TestChatOrphanRecoveryWithoutCompatibleDaemonWritesFailureBeforeSuccessorClaim(t *testing.T) {
+	sessionID, taskID, agentID := newChatSupplementFixture(t, true)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	dbfx.Exec(t, `UPDATE agent_task_queue SET session_id='chat-provider-session' WHERE id=$1`, taskID)
+	parent, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(taskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guidance := sendChatGuidance(t, sessionID, map[string]any{"steer": true, "content": "guidance on interrupted turn"})
+	next := sendChatGuidance(t, sessionID, map[string]any{"content": "next question"})
+	dbfx.Exec(t, `UPDATE agent_runtime SET last_seen_at=now() WHERE id=$1`, parent.RuntimeID)
+	gate := &retryInsertGate{pool: testPool, ready: make(chan uint32, 1), resume: make(chan struct{})}
+	svc := service.NewTaskService(testHandler.Queries, gate, nil, events.New())
+	type recoveryResult struct {
+		failed  []db.AgentTaskQueue
+		retried int
+		err     error
+	}
+	result := make(chan recoveryResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		failed, retried, err := svc.RecoverOrphanedTasksForRuntime(ctx, parent.RuntimeID)
+		result <- recoveryResult{failed, retried, err}
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-gate.ready:
+	case got := <-result:
+		t.Fatalf("recovery ended before admission: %v", got.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	claim := db.ClaimAgentTaskParams{
+		AgentID: parseUUID(agentID), RuntimeID: parent.RuntimeID,
+		PrepareLeaseSecs: 60, RuntimeStaleSecs: 30,
+	}
+	if claimed, err := testHandler.Queries.ClaimAgentTask(ctx, claim); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("successor claim before recovery commit = %v, err=%v, want no rows", claimed.ID, err)
+	}
+	close(gate.resume)
+	got := <-result
+	if got.err != nil || len(got.failed) != 1 || got.failed[0].ID != parent.ID || got.retried != 0 {
+		t.Fatalf("orphan recovery returned %d failures, %d retries, err=%v", len(got.failed), got.retried, got.err)
+	}
+	if claimed, err := testHandler.Queries.ClaimAgentTask(ctx, claim); err != nil || claimed.ID != parseUUID(next.TaskID) {
+		t.Fatalf("successor claim after recovery commit = %v, err=%v", claimed.ID, err)
+	}
+	transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(sessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertChatTranscriptContents(t, transcript, []string{"original objective", "guidance on interrupted turn", got.failed[0].Error.String, "next question"})
+
+	if n := dbfx.Count(t, `SELECT count(*) FROM chat_task_supplement WHERE message_id=$1 AND task_id=$2 AND status='withdrawn'`, guidance.MessageID, taskID); n != 1 {
+		t.Fatalf("retained guidance = %d, want one", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id=$1`, sessionID); n != 2 {
+		t.Fatalf("chat has %d tasks, want only the original turn and its queued successor", n)
+	}
+
+	// Upgrading the daemon after refusal must not revive the settled turn.
+	dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, parent.RuntimeID, protocol.DaemonCapabilitySameSessionRetryV1)
+	if child, err := svc.MaybeRetryFailedTask(ctx, got.failed[0]); err != nil || child != nil {
+		t.Fatalf("recovery was revived after upgrade: child=%v, err=%v", child, err)
 	}
 }
 

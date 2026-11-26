@@ -3291,6 +3291,26 @@ func createAssistantChatMessage(ctx context.Context, qtx *db.Queries, params db.
 	return row, nil
 }
 
+func writeTerminalChatFailure(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue, message string) error {
+	// The next turn must inherit the onboarding kickoff when this input batch
+	// is finished. A retry inherits the same batch and keeps the kickoff bound.
+	if err := qtx.ReleaseOnboardingKickoffFromTask(ctx, chatInputOwnerID(task)); err != nil {
+		return fmt.Errorf("release onboarding kickoff: %w", err)
+	}
+	if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+		ID:            dbid.NewV7(),
+		ChatSessionID: task.ChatSessionID,
+		Role:          "assistant",
+		Content:       redact.Text(message),
+		TaskID:        task.ID,
+		FailureReason: task.FailureReason,
+		ElapsedMs:     computeChatElapsedMs(task),
+	}); err != nil {
+		return fmt.Errorf("write chat failure outcome: %w", err)
+	}
+	return nil
+}
+
 func (s *TaskService) settleQueuedChatInput(
 	ctx context.Context,
 	qtx *db.Queries,
@@ -5866,14 +5886,13 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 					retried = &child
 				}
 			case errors.Is(cerr, pgx.ErrNoRows):
-				// The statement wrote nothing: either the owning workspace was
-				// torn down mid-flight, or a rerun took the pending slot after
-				// the unlocked check above (ON CONFLICT DO NOTHING). Neither is
-				// a reason to abort — this transaction still owns the parent's
-				// failed status, and losing that would leave the task stuck in
-				// 'running'. Record the failure and move on without a retry.
+				// The insert can yield on teardown, a pending-slot conflict, or
+				// missing same-session custody or daemon capability. Commit the
+				// parent's original failure even when a retry cannot be queued.
 				slog.Info("fail task auto-retry not created: no row written",
 					"task_id", util.UUIDToString(taskID),
+					"runtime_id", util.UUIDToString(t.RuntimeID),
+					"same_session_required", params.RequireSameSession.Bool,
 					"issue_id", util.UUIDToString(t.IssueID),
 					"agent_id", util.UUIDToString(t.AgentID),
 				)
@@ -5904,32 +5923,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		// be claimed between the status flip and this row, placing its user input
 		// before the failure it follows.
 		if t.ChatSessionID.Valid && retried == nil {
-			// This turn is dead, so anything it owned has to move on. An adopted
-			// onboarding kickoff would otherwise stay bound to a task that will
-			// never run again: the next turn would reach Mika with no onboarding
-			// context and no record that she had already greeted the member, and
-			// she would introduce herself a second time (MUL-5827). The query
-			// hands it to the session's next queued turn — including one the
-			// member queued while THIS turn was still running, which adoption at
-			// send time could not have caught.
-			//
-			// Gated on retried == nil on purpose. A retry child inherits the
-			// root's chat_input_task_id, and the kickoff stays bound to that
-			// root, so the retry still reads it — releasing here would strip
-			// the context off a turn that is about to run.
-			if err := qtx.ReleaseOnboardingKickoffFromTask(ctx, chatInputOwnerID(t)); err != nil {
-				return fmt.Errorf("release onboarding kickoff: %w", err)
-			}
-			if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
-				ID:            dbid.NewV7(),
-				ChatSessionID: t.ChatSessionID,
-				Role:          "assistant",
-				Content:       redact.Text(errMsg),
-				TaskID:        t.ID,
-				FailureReason: pgtype.Text{String: failureReason, Valid: failureReason != ""},
-				ElapsedMs:     computeChatElapsedMs(t),
-			}); err != nil {
-				return fmt.Errorf("write chat failure outcome: %w", err)
+			if err := writeTerminalChatFailure(ctx, qtx, t, errMsg); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -6412,20 +6407,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		return nil, nil
 	}
 
-	var runtimeMCPOverlay runtimeMCPOverlayData
-	agent, agentErr := s.Queries.GetAgent(ctx, parent.AgentID)
-	if agentErr != nil {
-		// Best-effort: failing to resolve the agent for the overlay is not
-		// retry-fatal. Log and continue — the daemon will reject the claim
-		// later if the agent is genuinely gone.
-		slog.Warn("task auto-retry: load agent for overlay failed",
-			"parent_task_id", util.UUIDToString(parent.ID),
-			"agent_id", util.UUIDToString(parent.AgentID),
-			"error", agentErr,
-		)
-	} else {
-		runtimeMCPOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
-	}
+	runtimeMCPOverlay := s.failedTaskRetryOverlay(ctx, parent)
 	// Mirror FailTask's in-tx backoff + effective-budget persistence: defer the
 	// final provider_network attempt ~5s via fire_at (zero delay leaves fire_at
 	// NULL for an immediate child), and write the reason-aware ceiling into the
@@ -6457,6 +6439,20 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+	requireSameSession := requiresSameSessionRetry(parent)
+	pinnedChat := requireSameSession && parent.ChatSessionID.Valid
+	if pinnedChat {
+		if _, err := qtx.LockChatSessionForTask(ctx, parent.ID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("lock chat session for retry: %w", err)
+		}
+		// A terminal reply consumes this turn even if the daemon later upgrades.
+		if hasOutcome, err := qtx.HasChatTaskAssistantOutcome(ctx, parent.ID); err != nil || hasOutcome {
+			return nil, err
+		}
+	}
 	if err := guardIssueNotInTriage(ctx, qtx, parent.IssueID, OriginDerived); err != nil {
 		if errors.Is(err, ErrIssueInTriage) {
 			slog.Info("task auto-retry skipped: issue is in triage",
@@ -6466,7 +6462,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		}
 		return nil, err
 	}
-	if reason == taskfailure.ReasonRuntimeOffline.String() || reason == taskfailure.ReasonRuntimeRecovery.String() || requiresSameSessionRetry(parent) {
+	if reason == taskfailure.ReasonRuntimeOffline.String() || reason == taskfailure.ReasonRuntimeRecovery.String() || requireSameSession {
 		// Deferred and chat retries do not occupy the queued-task unique slot. Serialize
 		// by parent without reversing the workspace-to-task teardown lock order.
 		if err := qtx.LockRuntimeRetryParent(ctx, parent.ID); err != nil {
@@ -6487,27 +6483,14 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 			return nil, nil
 		}
 	}
-	var child db.AgentTaskQueue
-	_, err = qtx.LockAgentForTaskEnqueue(ctx, parent.AgentID)
-	if err == nil {
-		child, err = qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-			NewTaskID:               dbid.NewV7(),
-			ID:                      parent.ID,
-			FireAt:                  retryFireAt,
-			MaxAttempts:             pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
-			RequiredResumeSessionID: cursorRetrySession(parent.Error.String, parent.SessionID.String),
-			RequiredResumeRuntimeID: parent.RuntimeID,
-			RequireSameSession:      pgtype.Bool{Bool: requiresSameSessionRetry(parent), Valid: true},
-			RuntimeMcpOverlay:       runtimeMCPOverlay.Overlay,
-			RuntimeConnectedApps:    runtimeMCPOverlay.ConnectedApps,
-		})
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Workspace torn down, or the pending slot was taken between the check
-		// above and this insert. Same contract as FailTask's path: no retry, no
-		// error.
+	child, err := insertFailedTaskRetry(ctx, qtx, parent, retryFireAt, runtimeMCPOverlay)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && child == nil) {
+		// The insert fences teardown, pending-slot conflicts, and pinned
+		// retry admission. A refusal leaves the original failure in place.
 		slog.Info("task auto-retry not created: no row written",
 			"parent_task_id", util.UUIDToString(parent.ID),
+			"runtime_id", util.UUIDToString(parent.RuntimeID),
+			"same_session_required", requireSameSession,
 			"reason", reason,
 		)
 		return nil, nil
@@ -6520,14 +6503,60 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		)
 		return nil, err
 	}
-	if err := transferPendingSourceContextToRetry(ctx, qtx, parent, child); err != nil {
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("task auto-retry: commit: %w", err)
+	}
+	s.publishFailedTaskRetry(ctx, parent, child)
+	return child, nil
+}
+
+func (s *TaskService) failedTaskRetryOverlay(ctx context.Context, parent db.AgentTaskQueue) runtimeMCPOverlayData {
+	var runtimeMCPOverlay runtimeMCPOverlayData
+	agent, agentErr := s.Queries.GetAgent(ctx, parent.AgentID)
+	if agentErr != nil {
+		// Best-effort: failing to resolve the agent for the overlay is not
+		// retry-fatal. Log and continue — the daemon will reject the claim
+		// later if the agent is genuinely gone.
+		slog.Warn("task auto-retry: load agent for overlay failed",
+			"parent_task_id", util.UUIDToString(parent.ID),
+			"agent_id", util.UUIDToString(parent.AgentID),
+			"error", agentErr,
+		)
+	} else {
+		runtimeMCPOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
+	}
+	return runtimeMCPOverlay
+}
+
+// insertFailedTaskRetry is called after the caller fences the parent. A nil
+// child represents a refusal, including a missing compatible registration.
+func insertFailedTaskRetry(ctx context.Context, qtx *db.Queries, parent db.AgentTaskQueue, fireAt pgtype.Timestamptz, overlay runtimeMCPOverlayData) (*db.AgentTaskQueue, error) {
+	if _, err := qtx.LockAgentForTaskEnqueue(ctx, parent.AgentID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			slog.Info("task auto-retry skipped: source context already transferred or attached",
-				"parent_task_id", util.UUIDToString(parent.ID),
-				"source_context_retry_id", util.UUIDToString(child.ID),
-			)
 			return nil, nil
 		}
+		return nil, err
+	}
+	reason := parent.FailureReason.String
+	child, err := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
+		NewTaskID:               dbid.NewV7(),
+		ID:                      parent.ID,
+		FireAt:                  fireAt,
+		MaxAttempts:             pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
+		RequiredResumeSessionID: cursorRetrySession(parent.Error.String, parent.SessionID.String),
+		RequiredResumeRuntimeID: parent.RuntimeID,
+		RequireSameSession:      pgtype.Bool{Bool: requiresSameSessionRetry(parent), Valid: true},
+		RuntimeMcpOverlay:       overlay.Overlay,
+		RuntimeConnectedApps:    overlay.ConnectedApps,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := transferPendingSourceContextToRetry(ctx, qtx, parent, child); err != nil {
+		// The caller must roll back the child on transfer refusal.
 		return nil, err
 	}
 	if err := qtx.CopyChannelTaskDelivery(ctx, db.CopyChannelTaskDeliveryParams{
@@ -6535,13 +6564,14 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	}); err != nil {
 		return nil, fmt.Errorf("copy auto-retry channel delivery: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("task auto-retry: commit: %w", err)
-	}
+	return &child, nil
+}
+
+func (s *TaskService) publishFailedTaskRetry(ctx context.Context, parent db.AgentTaskQueue, child *db.AgentTaskQueue) {
 	slog.Info("task auto-retry enqueued",
 		"parent_task_id", util.UUIDToString(parent.ID),
 		"child_task_id", util.UUIDToString(child.ID),
-		"reason", reason,
+		"reason", parent.FailureReason.String,
 		"attempt", child.Attempt,
 		"max_attempts", child.MaxAttempts,
 		"status", child.Status,
@@ -6551,10 +6581,9 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	// rationale. A deferred child (backoff armed) stays inert until
 	// PromoteDueDeferredTasksForRuntime fires its queued event + wakeup.
 	if child.Status == "queued" {
-		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, child)
-		s.NotifyTaskEnqueued(ctx, child)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, *child)
+		s.NotifyTaskEnqueued(ctx, *child)
 	}
-	return &child, nil
 }
 
 func transferPendingSourceContextToRetry(ctx context.Context, q *db.Queries, parent, child db.AgentTaskQueue) error {
@@ -6956,11 +6985,110 @@ func (s *TaskService) ExpireStaleQueuedTasks(ctx context.Context, arg db.ExpireS
 	})
 }
 
-// RecoverOrphanedTasksForRuntime fails work a restarted daemon reports it lost.
-func (s *TaskService) RecoverOrphanedTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	return s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
-		return qtx.RecoverOrphanedTasksForRuntime(ctx, runtimeID)
+// RecoverOrphanedTasksForRuntime settles work a restarted daemon lost before
+// publishing the failure and reporting how many attempts were retried.
+func (s *TaskService) RecoverOrphanedTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]db.AgentTaskQueue, int, error) {
+	if s.TxStarter == nil {
+		return nil, 0, errors.New("recover orphans: transaction starter is required")
+	}
+	candidates, err := s.Queries.ListOrphanedChatTasksForRuntime(ctx, runtimeID)
+	if err != nil {
+		return nil, 0, err
+	}
+	failed, err := s.terminateTasksInTx(ctx, func(qtx *db.Queries) ([]db.AgentTaskQueue, error) {
+		return qtx.RecoverOrphanedTasksForRuntime(ctx, db.RecoverOrphanedTasksForRuntimeParams{RuntimeID: runtimeID})
 	})
+	if err != nil {
+		return nil, 0, err
+	}
+	chatRetries := make(map[pgtype.UUID]bool, len(candidates))
+	for _, candidate := range candidates {
+		var task, child *db.AgentTaskQueue
+		task, child, err = s.recoverOrphanedChatTask(ctx, candidate)
+		if err != nil {
+			break
+		}
+		if task == nil {
+			continue
+		}
+		failed = append(failed, *task)
+		chatRetries[task.ID] = child != nil
+		if child != nil {
+			s.publishFailedTaskRetry(ctx, *task, child)
+		}
+	}
+	// A later chat failure must not suppress effects for already committed rows.
+	return failed, s.handleFailedTasks(ctx, failed, chatRetries), err
+}
+
+func (s *TaskService) recoverOrphanedChatTask(ctx context.Context, candidate db.AgentTaskQueue) (*db.AgentTaskQueue, *db.AgentTaskQueue, error) {
+	// Overlay preparation may do network I/O. Startup recovery has the same
+	// attempt ceiling whether the task was interrupted or had yet to launch.
+	// Use only eligibility that can be known before recovery classifies the
+	// interruption. The transaction rechecks with the persisted diagnosis.
+	var overlay runtimeMCPOverlayData
+	candidate.Error = pgtype.Text{}
+	if retryEligible(taskfailure.ReasonRuntimeRecovery.String(), candidate) {
+		overlay = s.failedTaskRetryOverlay(ctx, candidate)
+	}
+	var failed, child *db.AgentTaskQueue
+	var queuedChat []db.AgentTaskQueue
+	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		// Keep the live failure path's session -> task order. Claims keep
+		// seeing the active parent until the retry or failure reply commits.
+		if _, err := qtx.LockChatSessionForTask(ctx, candidate.ID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		rows, err := qtx.RecoverOrphanedTasksForRuntime(ctx, db.RecoverOrphanedTasksForRuntimeParams{
+			RuntimeID: candidate.RuntimeID, ChatSessionID: candidate.ChatSessionID, TaskID: candidate.ID,
+		})
+		if err != nil || len(rows) == 0 {
+			return err
+		}
+		if err := markBulkRecoveryCleanup(ctx, qtx, rows); err != nil {
+			return err
+		}
+		failed = &rows[0]
+		if retryEligible(failed.FailureReason.String, *failed) {
+			child, err = admitOrphanedChatRetry(ctx, qtx, *failed, overlay)
+			if err != nil {
+				return err
+			}
+			// Keep guidance with the interrupted input batch even if admission
+			// refuses it. A refusal must not dispatch the guidance by itself.
+			if err := qtx.RetainChatTaskSupplementsForRetry(ctx, failed.ID); err != nil {
+				return err
+			}
+		}
+		queuedChat, err = settleTerminalTaskState(ctx, qtx, *failed)
+		if err != nil {
+			return err
+		}
+		if child == nil && requiresSameSessionRetry(*failed) {
+			return writeTerminalChatFailure(ctx, qtx, *failed, failed.Error.String)
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	s.publishRequeuedChatTasks(ctx, queuedChat)
+	return failed, child, nil
+}
+
+func admitOrphanedChatRetry(ctx context.Context, qtx *db.Queries, failed db.AgentTaskQueue, overlay runtimeMCPOverlayData) (*db.AgentTaskQueue, error) {
+	if err := guardIssueNotInTriage(ctx, qtx, failed.IssueID, OriginDerived); err != nil {
+		if errors.Is(err, ErrIssueInTriage) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if successor, err := hasRunnableSuccessor(ctx, qtx, failed); err != nil || successor {
+		return nil, err
+	}
+	return insertFailedTaskRetry(ctx, qtx, failed, pgtype.Timestamptz{}, overlay)
 }
 
 // CancelTasksForArchivedAgent cancels every active task belonging to an agent
@@ -7002,25 +7130,8 @@ func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Quer
 		if err != nil {
 			return err
 		}
-		// A terminal infrastructure error does not stop an independent Muse
-		// worker. Persist that uncertainty in this transaction, before retry
-		// decisions or another claim can observe the failed rows.
-		var startedIDs []pgtype.UUID
-		indices := make(map[pgtype.UUID]int)
-		for i, task := range failed {
-			if task.Status == "failed" && task.StartedAt.Valid {
-				startedIDs = append(startedIDs, task.ID)
-				indices[task.ID] = i
-			}
-		}
-		if len(startedIDs) > 0 {
-			unconfirmed, err := qtx.MarkMuseAppRecoveryCleanupUnconfirmed(ctx, startedIDs)
-			if err != nil {
-				return fmt.Errorf("record Muse recovery cleanup: %w", err)
-			}
-			for _, task := range unconfirmed {
-				failed[indices[task.ID]] = task
-			}
+		if err := markBulkRecoveryCleanup(ctx, qtx, failed); err != nil {
+			return err
 		}
 		// Infrastructure sweeps schedule their retries after this transaction.
 		// Retain guidance in that same input batch instead of creating a turn
@@ -7041,6 +7152,30 @@ func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Quer
 	return failed, nil
 }
 
+func markBulkRecoveryCleanup(ctx context.Context, qtx *db.Queries, failed []db.AgentTaskQueue) error {
+	// A terminal infrastructure error does not stop an independent Muse
+	// worker. Persist that uncertainty in this transaction, before retry
+	// decisions or another claim can observe the failed rows.
+	var startedIDs []pgtype.UUID
+	indices := make(map[pgtype.UUID]int)
+	for i, task := range failed {
+		if task.Status == "failed" && task.StartedAt.Valid {
+			startedIDs = append(startedIDs, task.ID)
+			indices[task.ID] = i
+		}
+	}
+	if len(startedIDs) > 0 {
+		unconfirmed, err := qtx.MarkMuseAppRecoveryCleanupUnconfirmed(ctx, startedIDs)
+		if err != nil {
+			return fmt.Errorf("record Muse recovery cleanup: %w", err)
+		}
+		for _, task := range unconfirmed {
+			failed[indices[task.ID]] = task
+		}
+	}
+	return nil
+}
+
 // HandleFailedTasks runs the post-failure side effects for a batch of
 // freshly-failed tasks: optional auto-retry, task:failed event broadcast,
 // agent status reconciliation, and (when an issue has no remaining active
@@ -7051,6 +7186,10 @@ func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Quer
 // here so the same UI-consistency guarantees apply on each of them.
 // FailTaskWithTransition runs its own failure side effects.
 func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTaskQueue) int {
+	return s.handleFailedTasks(ctx, tasks, nil)
+}
+
+func (s *TaskService) handleFailedTasks(ctx context.Context, tasks []db.AgentTaskQueue, chatRetries map[pgtype.UUID]bool) int {
 	if len(tasks) == 0 {
 		return 0
 	}
@@ -7063,9 +7202,12 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 	for _, t := range tasks {
 		// Auto-retry first so the issue stays in_progress rather than
 		// flapping todo → in_progress within a tick.
-		retryPending := false
-		if child, _ := s.MaybeRetryFailedTask(ctx, t); child != nil {
-			retryPending = true
+		retryPending, settled := chatRetries[t.ID]
+		if !settled {
+			child, _ := s.MaybeRetryFailedTask(ctx, t)
+			retryPending = child != nil
+		}
+		if retryPending {
 			retried++
 			if t.IssueID.Valid {
 				retriedIssues[util.UUIDToString(t.IssueID)] = true

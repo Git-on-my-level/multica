@@ -45,8 +45,8 @@ func TestRetryPreservesChildAcrossRuntimeBindingChanges(t *testing.T) {
 			workspaceID := bootstrap.Workspace(t, "runtime retry binding", fmt.Sprintf("runtime-retry-%d", suffix))
 			fx := testutil.New(pool, workspaceID, userID)
 			fx.Member(t, workspaceID, userID, "owner")
-			runtimeA := fx.Runtime(t, "original runtime")
-			runtimeB := fx.Runtime(t, "replacement runtime")
+			runtimeA := fx.Runtime(t, "original runtime", testutil.Cols{"metadata": sameSessionRetryCapabilities})
+			runtimeB := fx.Runtime(t, "replacement runtime", testutil.Cols{"metadata": sameSessionRetryCapabilities})
 			agentID := fx.Agent(t, "retry agent", runtimeA)
 			issueID := fx.Issue(t, "retry after runtime binding change")
 			status := "failed"
