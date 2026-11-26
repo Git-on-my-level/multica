@@ -484,6 +484,7 @@ type AgentTaskResponse struct {
 	// (no-gap) case and for old daemons.
 	PriorSessionResumeUnavailable bool   `json:"prior_session_resume_unavailable,omitempty"`
 	RequireCursorResume           bool   `json:"require_cursor_resume,omitempty"`
+	RequireSameSession            bool   `json:"require_same_session,omitempty"`
 	WorkDir                       string `json:"work_dir,omitempty"` // local working directory pinned for this task; populated once the daemon reports it
 	// RelativeWorkDir is a privacy-safe display form of WorkDir intended for
 	// the UI. For standard tasks it strips the daemon's workspaces root while

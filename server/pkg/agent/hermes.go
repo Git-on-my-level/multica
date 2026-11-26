@@ -753,6 +753,10 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			sessionResult = result
 			sessionID, resumeLanded = resolveHermesResumedSessionID(opts.ResumeSessionID, result)
 			if !resumeLanded {
+				if opts.RequireSameSession {
+					resCh <- Result{Status: "failed", Error: "Hermes resumed a different session"}
+					return
+				}
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "hermes",
 					"requested", opts.ResumeSessionID,

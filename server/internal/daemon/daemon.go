@@ -8394,6 +8394,19 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return TaskResult{}, errors.New("Cursor recovery cannot resume the original session")
 	}
 
+	if task.RequireSameSession {
+		if task.PriorSessionID == "" {
+			return TaskResult{}, errors.New("automatic recovery requires the original session")
+		}
+		switch provider {
+		case "claude", "codex", "hermes", "opencode":
+		case "cursor":
+			task.RequireCursorResume = true
+		default:
+			return TaskResult{}, fmt.Errorf("automatic recovery cannot guarantee same-session resume for %s", provider)
+		}
+	}
+
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
 	// CLI would otherwise silently fall back to the user-global config — a
@@ -8475,7 +8488,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	// Fork: pick the subscription account before anything reads the resume
 	// pointer, so a task moving accounts builds a cold prompt (account_pool_fork.go).
+	if task.RequireSameSession && usesCustomProfileCommand {
+		return TaskResult{}, errors.New("automatic recovery cannot verify same-session resume with a custom runtime command")
+	}
 	taskAccount := d.selectTaskAccount(provider, &task, usesCustomProfileCommand, taskLog)
+	if task.RequireSameSession && task.PriorSessionID == "" {
+		return TaskResult{}, errors.New("automatic recovery cannot use the original session's account")
+	}
 	defer taskAccount.release()
 	defer d.registerTaskAccount(task.ID, taskAccount)()
 	baseExecutable := entry.Path
@@ -9233,8 +9252,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
 
-	if task.RequireCursorResume && task.PriorSessionID == "" {
-		return TaskResult{}, errors.New("Cursor recovery cannot reach the original session")
+	if (task.RequireSameSession || task.RequireCursorResume) && task.PriorSessionID == "" {
+		return TaskResult{}, errors.New("automatic recovery cannot reach the original session")
 	}
 
 	// Build the runtime brief and inject it into the provider-specific
@@ -9446,6 +9465,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}()
 	retiredSessionID = gateOpenCodeResumeToSaneClock(ctx, &task, &taskCtx, provider, backendConfig, env.WorkDir, effectiveMcpConfig, taskLog)
 	if retiredSessionID != "" {
+		if task.RequireSameSession {
+			return TaskResult{}, errors.New("automatic recovery cannot resume the retired OpenCode session")
+		}
 		if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
 			return TaskResult{}, fmt.Errorf("prepare fresh OpenCode session after clock check: %w", briefErr)
 		} else {
@@ -9541,6 +9563,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		ThreadHandshakeTimeout:     d.cfg.CodexThreadHandshakeTimeout,
 		ResumeSessionID:            task.PriorSessionID,
 		RequireCursorResume:        task.RequireCursorResume,
+		RequireSameSession:         task.RequireSameSession,
 		// Post-gate intent: PriorSessionID here already reflects the pre-flight
 		// resume gates (a dropped resume is surfaced via the prompt instead). If it
 		// survived to here, the backend must disclose the loss when the live
@@ -9765,7 +9788,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	lastAttempt := result
-	if !task.RequireCursorResume && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
+	if !task.RequireSameSession && !task.RequireCursorResume && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
@@ -9820,7 +9843,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Fork: a run that failed on a spent plan window re-runs on the next pool
 	// account with headroom (account_pool_fork.go). Its session belonged to
 	// the spent account, so the re-run starts cold.
-	for !task.RequireCursorResume && taskAccount.failover(lastAttempt, taskLog) {
+	for !task.RequireSameSession && !task.RequireCursorResume && taskAccount.failover(lastAttempt, taskLog) {
 		hadSession := task.PriorSessionID != "" || result.SessionID != ""
 		firstUsage := result.Usage
 		if err := taskAccount.applyEnv(agentEnv, env.CodexHome); err != nil {
@@ -10284,7 +10307,7 @@ func (d *Daemon) repairWorktreeDelivery(ctx context.Context, backend agent.Backe
 	opts := withPriorTaskUsage(execOpts, result.Usage)
 	// Continue the conversation when there is one, so the agent knows what it
 	// just did; the prompt is self-contained for the backends that cannot.
-	if !opts.RequireCursorResume {
+	if !opts.RequireSameSession && !opts.RequireCursorResume {
 		opts.ResumeSessionID = result.SessionID
 	}
 	opts.ResumeContinuityNotice = ""

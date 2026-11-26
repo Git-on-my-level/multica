@@ -86,6 +86,7 @@ type ExecOptions struct {
 	// HandshakeTimeout; when both are zero Codex uses separate built-in defaults.
 	ThreadHandshakeTimeout time.Duration
 	ResumeSessionID        string // if non-empty, resume a previous agent session
+	RequireSameSession     bool   // Never create a new conversation for a pinned retry.
 	RequireCursorResume    bool   // Cursor recovery must use ResumeSessionID without CLI overrides.
 	// ResumeExpected records that this task intended to continue a prior
 	// conversation, independent of ResumeSessionID (which a fallback retry may

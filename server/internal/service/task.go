@@ -5812,6 +5812,7 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 				MaxAttempts:             retryMaxAttempts,
 				RequiredResumeSessionID: cursorRetrySession(t.Error.String, sessionID),
 				RequiredResumeRuntimeID: t.RuntimeID,
+				RequireSameSession:      pgtype.Bool{Bool: requiresSameSessionRetry(t), Valid: true},
 				RuntimeMcpOverlay:       chosenOverlay.Overlay,
 				RuntimeConnectedApps:    chosenOverlay.ConnectedApps,
 			}
@@ -6249,6 +6250,9 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // a human may have edited in the meantime, so replaying the failed attempt is
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
+	if required, _ := SameSessionRetry(t); required {
+		return false
+	}
 	if required, _ := CursorRecoverySession(t); required {
 		// A recovery is already the last attempt, even if its next failure
 		// would ordinarily qualify for a raised provider-network budget.
@@ -6425,7 +6429,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		}
 		return nil, err
 	}
-	if reason == string(taskfailure.ReasonRuntimeOffline) {
+	if reason == string(taskfailure.ReasonRuntimeOffline) || requiresSameSessionRetry(parent) {
 		// Deferred retries do not occupy the queued-task unique slot. Serialize
 		// by parent without reversing the workspace-to-task teardown lock order.
 		if err := qtx.LockRuntimeOfflineRetryParent(ctx, parent.ID); err != nil {
@@ -6456,6 +6460,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 			MaxAttempts:             pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
 			RequiredResumeSessionID: cursorRetrySession(parent.Error.String, parent.SessionID.String),
 			RequiredResumeRuntimeID: parent.RuntimeID,
+			RequireSameSession:      pgtype.Bool{Bool: requiresSameSessionRetry(parent), Valid: true},
 			RuntimeMcpOverlay:       runtimeMCPOverlay.Overlay,
 			RuntimeConnectedApps:    runtimeMCPOverlay.ConnectedApps,
 		})

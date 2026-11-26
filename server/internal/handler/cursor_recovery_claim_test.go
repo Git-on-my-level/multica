@@ -15,6 +15,14 @@ import (
 )
 
 func TestClaimTaskCursorRecoveryCustody(t *testing.T) {
+	testClaimPinnedRetryCustody(t, false)
+}
+
+func TestClaimTaskSameSessionRetryCustody(t *testing.T) {
+	testClaimPinnedRetryCustody(t, true)
+}
+
+func testClaimPinnedRetryCustody(t *testing.T, sameSession bool) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -27,6 +35,7 @@ func TestClaimTaskCursorRecoveryCustody(t *testing.T) {
 		{name: "issue uses pinned session"},
 		{name: "chat uses pinned session", chat: true},
 		{name: "rebound after insertion", change: "runtime"},
+		{name: "chat rebound after insertion", change: "runtime", chat: true},
 		{name: "session lost after insertion", change: "missing"},
 		{name: "session replaced after insertion", change: "replaced"},
 		{name: "legacy daemon", legacy: true},
@@ -56,10 +65,17 @@ func TestClaimTaskCursorRecoveryCustody(t *testing.T) {
 				})
 			}
 			parent := dbfx.Task(t, agentID, cols)
-			child, err := testHandler.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{
+			params := db.CreateRetryTaskParams{
 				ID: parseUUID(parent), RequiredResumeRuntimeID: runtime,
 				RequiredResumeSessionID: pgtype.Text{String: session, Valid: true},
-			})
+			}
+			capability := protocol.DaemonCapabilityCursorRecoveryV1
+			if sameSession {
+				params.RequiredResumeSessionID = pgtype.Text{}
+				params.RequireSameSession = pgtype.Bool{Bool: true, Valid: true}
+				capability = protocol.DaemonCapabilitySameSessionRetryV1
+			}
+			child, err := testHandler.Queries.CreateRetryTask(ctx, params)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +98,7 @@ func TestClaimTaskCursorRecoveryCustody(t *testing.T) {
 			req := newOwnerDaemonRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil)
 			req = withURLParam(req, "runtimeId", runtimeID)
 			if !tc.legacy {
-				req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCursorRecoveryV1)
+				req.Header.Set("X-Client-Capabilities", capability)
 			}
 			testHandler.ClaimTaskByRuntime(w, req)
 			if w.Code != http.StatusOK {
@@ -103,7 +119,7 @@ func TestClaimTaskCursorRecoveryCustody(t *testing.T) {
 				return
 			}
 
-			if result.Task == nil || !result.Task.RequireCursorResume ||
+			if result.Task == nil || result.Task.RequireSameSession != sameSession || result.Task.RequireCursorResume == sameSession ||
 				result.Task.PriorSessionID != session || result.Task.PriorWorkDir != "/tmp/cursor-parent" {
 				t.Fatalf("claim did not pin the original session: %+v", result.Task)
 			}

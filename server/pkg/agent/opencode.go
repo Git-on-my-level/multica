@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,7 +208,16 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--session", opts.ResumeSessionID)
 	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, opencodeBlockedArgs, b.cfg.Logger)...)
+	blockedArgs := opencodeBlockedArgs
+	if opts.RequireSameSession {
+		blockedArgs = maps.Clone(blockedArgs)
+		blockedArgs["--session"] = blockedWithValue
+		blockedArgs["-s"] = blockedWithValue
+		blockedArgs["--continue"] = blockedStandalone
+		blockedArgs["-c"] = blockedStandalone
+		blockedArgs["--fork"] = blockedStandalone
+	}
+	args = append(args, filterCustomArgs(opts.CustomArgs, blockedArgs, b.cfg.Logger)...)
 	// The task prompt is delivered on stdin, never argv — see the StdinPipe
 	// wiring below. `opencode run` merges its variadic [message..] positional
 	// with whatever is piped in, so an invocation that passes no positional

@@ -125,6 +125,9 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if required, pinned := SameSessionRetry(child); !required || pinned != "existing-session" {
+		t.Fatalf("retry custody = %v, %q", required, pinned)
+	}
 	if child.Status != "deferred" || !child.FireAt.Valid || child.FireAt.Time.Before(start.Add(60*time.Second)) {
 		t.Fatalf("retry must be deferred >=60s: status=%s fire_at=%v", child.Status, child.FireAt)
 	}
@@ -134,6 +137,13 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 	// A replay of the failure notification must not create another pending child.
 	if _, err := svc.FailTask(ctx, util.MustParseUUID(parentID), raw, "existing-session", "/test/workdir", "", "agent_error.context_overflow", false, "", ""); err != nil {
 		t.Fatal(err)
+	}
+	failed, err := q.GetAgentTask(ctx, util.MustParseUUID(parentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := svc.MaybeRetryFailedTask(ctx, failed); err != nil || duplicate != nil {
+		t.Fatalf("repeat recovery = %v, %v", duplicate, err)
 	}
 	if n := fx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, parentID); n != 1 {
 		t.Fatalf("retry children=%d, want 1", n)
@@ -149,6 +159,20 @@ func testPerMinuteRateLimitLifecycle(t *testing.T) {
 	}
 	if claimed.ChatInputTaskID == child.ChatInputTaskID {
 		t.Fatal("distinct chat turns must keep distinct input owners")
+	}
+	// Rebinding before the failure must leave no child on the replacement runtime.
+	replacement := fx.Runtime(t, "replacement")
+	fx.Exec(t, `UPDATE agent SET runtime_id=$1 WHERE id=$2`, replacement, agentID)
+	reboundParent := fx.Task(t, agentID, dbfx.Cols{
+		"runtime_id": runtimeID, "chat_session_id": chatID, "status": "running",
+		"attempt": 1, "max_attempts": 2, "session_id": "existing-session",
+	})
+	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, reboundParent)
+	if _, err := svc.FailTask(ctx, util.MustParseUUID(reboundParent), raw, "existing-session", "", "", "", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := fx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, reboundParent); n != 0 {
+		t.Fatalf("rebound retry children=%d, want 0", n)
 	}
 	// Even a larger inherited budget must not permit a second throttle retry.
 	fx.Exec(t, `UPDATE agent_task_queue SET status='completed' WHERE id=$1`, newerID)

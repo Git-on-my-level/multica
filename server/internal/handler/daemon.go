@@ -3041,6 +3041,21 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		resp.PriorSessionID = recoverySessionID
 		resp.PriorWorkDir = task.WorkDir.String
 	}
+	sameSession, pinnedSessionID := service.SameSessionRetry(*task)
+	if sameSession {
+		if pinnedSessionID == "" ||
+			!requestHasClientCapability(r, protocol.DaemonCapabilitySameSessionRetryV1) ||
+			h.rerunSessionRetired(r.Context(), task.AgentID, pinnedSessionID) {
+			return resp, nil, nil, 0, 0, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task, "Automatic recovery requires the original runtime, session and a compatible daemon.",
+				taskfailure.ReasonInvalidTaskIdentity, "error_same_session_retry", http.StatusConflict,
+				"Automatic recovery cannot resume the original session",
+			)
+		}
+		resp.RequireSameSession = true
+		resp.PriorSessionID = pinnedSessionID
+		resp.PriorWorkDir = task.WorkDir.String
+	}
 	if err := (&service.IssueWakeupService{Tasks: h.TaskService}).CheckClaim(r.Context(), *task); err != nil {
 		if !errors.Is(err, service.ErrWakeupForbidden) {
 			return resp, nil, nil, 0, 0, h.rejectClaimSourceLoad(r.Context(), task, err, "wakeup", resp.WakeupID)
@@ -3730,7 +3745,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				)
 				resp.PriorSessionResumeUnavailable = true
 			}
-		} else if !cursorRecovery && !task.ForceFreshSession {
+		} else if !cursorRecovery && !sameSession && !task.ForceFreshSession {
 			// Non-rerun follow-up on the same issue: resume the most recent
 			// (agent, issue) session so the agent keeps the issue's conversation
 			// context across turns. The "Focus on THIS comment" guard in
@@ -3920,7 +3935,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			}
 		}
 		projectCtx.applyTo(&resp)
-		if !cursorRecovery && !task.ForceFreshSession && !task.ChannelContextRevision.Valid {
+		if !cursorRecovery && !sameSession && !task.ForceFreshSession && !task.ChannelContextRevision.Valid {
 			// Resume chat sessions only when the stored pointer was produced
 			// by the same runtime as the claiming task. When the chat_session
 			// pointer is missing (legacy NULL runtime_id), stale (last task
@@ -3978,7 +3993,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		// Input ownership is the claim's fail-closed boundary. Resume-history
 		// reads belong after it: a task that cannot load its input is preserved
 		// for redelivery and must not spend two more queries before returning.
-		if !cursorRecovery && !task.ForceFreshSession {
+		if !cursorRecovery && !sameSession && !task.ForceFreshSession {
 			contextRevision := pgtype.Int8{}
 			if task.ChannelContextRevision.Valid {
 				contextRevision = task.ChannelContextRevision

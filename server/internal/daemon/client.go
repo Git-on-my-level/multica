@@ -209,6 +209,7 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityLocalWorktreeV1,
 		protocol.DaemonCapabilityCursorRecoveryV1,
+		protocol.DaemonCapabilitySameSessionRetryV1,
 		protocol.DaemonCapabilitySourceContextQuickCreateV1,
 		protocol.DaemonCapabilityRPCV1,
 		protocol.DaemonCapabilityPlatformSkillV1,
