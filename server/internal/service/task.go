@@ -3291,7 +3291,7 @@ func createAssistantChatMessage(ctx context.Context, qtx *db.Queries, params db.
 	return row, nil
 }
 
-func writeTerminalChatFailure(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue) error {
+func writeTerminalChatFailure(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue, message string) error {
 	// The next turn must inherit the onboarding kickoff when this input batch
 	// is finished. A retry inherits the same batch and keeps the kickoff bound.
 	if err := qtx.ReleaseOnboardingKickoffFromTask(ctx, chatInputOwnerID(task)); err != nil {
@@ -3301,7 +3301,7 @@ func writeTerminalChatFailure(ctx context.Context, qtx *db.Queries, task db.Agen
 		ID:            dbid.NewV7(),
 		ChatSessionID: task.ChatSessionID,
 		Role:          "assistant",
-		Content:       redact.Text(task.Error.String),
+		Content:       redact.Text(message),
 		TaskID:        task.ID,
 		FailureReason: task.FailureReason,
 		ElapsedMs:     computeChatElapsedMs(task),
@@ -5923,7 +5923,7 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		// be claimed between the status flip and this row, placing its user input
 		// before the failure it follows.
 		if t.ChatSessionID.Valid && retried == nil {
-			if err := writeTerminalChatFailure(ctx, qtx, t); err != nil {
+			if err := writeTerminalChatFailure(ctx, qtx, t, errMsg); err != nil {
 				return err
 			}
 		}
@@ -6517,7 +6517,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 			"reason", reason,
 		)
 		if pinnedChat {
-			if err := writeTerminalChatFailure(ctx, qtx, parent); err != nil {
+			if err := writeTerminalChatFailure(ctx, qtx, parent, parent.Error.String); err != nil {
 				return nil, err
 			}
 			if err := tx.Commit(ctx); err != nil {
