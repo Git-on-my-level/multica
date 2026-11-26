@@ -59,7 +59,10 @@ import (
 // HERMES_HOME to the overlay, and is written even when the source has none so
 // Hermes' project-.env fallback (loaded with override=True only when no user
 // .env loaded) can't relocate the home either.
-const hermesTaskLocalStateMarker = ".multica-task-local-state-v1"
+const (
+	hermesTaskLocalStateMarker = ".multica-task-local-state-v1"
+	hermesTaskLocalStateBody   = "task-local Hermes state\n"
+)
 
 var hermesOverriddenEntries = map[string]struct{}{
 	"skills":                   {},
@@ -604,7 +607,7 @@ func prepareHermesTaskLocalState(hermesHome string) error {
 			return fmt.Errorf("remove legacy task state %s: %w", path, err)
 		}
 	}
-	return writeFileAtomic(marker, []byte("task-local Hermes state\n"), 0o600)
+	return writeFileAtomic(marker, []byte(hermesTaskLocalStateBody), 0o600)
 }
 
 // linkSharedHermesEntry symlinks dst → src, idempotent across Reuse: an existing

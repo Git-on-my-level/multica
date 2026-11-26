@@ -66,6 +66,7 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
 type gcStats struct {
+	hermesPrepOrphans        hermesPrepGCStats
 	cleaned                  int // whole task dirs removed by a parent-lifecycle or completed-task policy
 	orphaned                 int // whole task dirs removed (no meta / unreachable issue)
 	skipped                  int // task dirs retained, possibly after partial cleanup
@@ -179,10 +180,19 @@ func (d *Daemon) runGC(ctx context.Context) {
 		}
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.localDirectoriesRetained > 0 || stats.codexHomesReclaimed > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
+	if stats.hermesPrepOrphans.found > 0 || stats.cleaned > 0 || stats.orphaned > 0 || stats.localDirectoriesRetained > 0 || stats.codexHomesReclaimed > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
+			"hermes_prep_roots_before", stats.hermesPrepOrphans.found,
+			"hermes_prep_bytes_before", stats.hermesPrepOrphans.bytes,
+			"hermes_prep_roots_after", stats.hermesPrepOrphans.found-stats.hermesPrepOrphans.removed,
+			"hermes_prep_bytes_after", stats.hermesPrepOrphans.bytes-stats.hermesPrepOrphans.bytesRemoved,
+			"hermes_prep_roots_past_ttl_after", stats.hermesPrepOrphans.aged-stats.hermesPrepOrphans.removed,
+			"hermes_prep_roots_unproven", stats.hermesPrepOrphans.unproven,
+			"hermes_prep_roots_reclaimed", stats.hermesPrepOrphans.removed,
+			"hermes_prep_root_dirs_removed", stats.hermesPrepOrphans.dirsRemoved,
+			"hermes_prep_bytes_reclaimed", stats.hermesPrepOrphans.bytesRemoved,
 			"skipped", stats.skipped,
 			"local_directories_retained", stats.localDirectoriesRetained,
 			"codex_homes_reclaimed", stats.codexHomesReclaimed,
@@ -223,6 +233,9 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			continue
 		}
 		meta, metaErr := execenv.ReadGCMeta(taskDir)
+		if errors.Is(metaErr, os.ErrNotExist) && d.gcHermesPrepOrphan(ctx, taskDir, stats) {
+			continue
+		}
 		if metaErr == nil && meta.LocalDirectory {
 			stats.localDirectoriesRetained++
 		}
