@@ -9788,6 +9788,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	lastAttempt := result
+	if task.RequireSameSession && result.Status == "failed" && result.ResumeRejected && !result.ResumeRejectedTransient {
+		retiredSessionID = task.PriorSessionID
+		result.SessionID = ""
+	}
 	if !task.RequireSameSession && !task.RequireCursorResume && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage

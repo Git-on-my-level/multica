@@ -543,7 +543,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, execPath, prompt strin
 			sessionID, changed = resolveResumedSessionID(opts.ResumeSessionID, loaded)
 			if changed {
 				if opts.RequireSameSession {
-					result("failed", "OpenCode resumed a different session", "", false)
+					result("failed", "OpenCode resumed a different session", "", true)
 					return
 				}
 				b.cfg.Logger.Warn("opencode returned a different session id on resume; continuing with the new id",

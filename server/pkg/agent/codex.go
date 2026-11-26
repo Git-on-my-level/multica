@@ -1567,7 +1567,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				Status:         finalStatus,
 				Error:          finalError,
 				DurationMs:     time.Since(startTime).Milliseconds(),
-				ResumeRejected: isCodexResumeOverflow(opts, err),
+				ResumeRejected: isCodexResumeOverflow(opts, err) || errors.Is(err, errCodexPinnedThreadMismatch),
 			}
 			return
 		}
@@ -1966,6 +1966,8 @@ func codexTurnInput(prompt string, resumeExpected, resumed bool, notice string) 
 	return []map[string]any{{"type": "text", "text": text}}
 }
 
+var errCodexPinnedThreadMismatch = errors.New("codex resumed a different thread")
+
 // startOrResumeThread picks between Codex's thread/resume and thread/start
 // based on opts.ResumeSessionID. When a prior thread ID is provided it first
 // tries thread/resume; recoverable protocol errors (unknown thread, schema
@@ -2011,7 +2013,7 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 		if err == nil {
 			if threadID := extractThreadID(resumeResult); threadID != "" {
 				if opts.RequireSameSession && threadID != priorThreadID {
-					return "", false, errors.New("codex resumed a different thread")
+					return "", false, errCodexPinnedThreadMismatch
 				}
 				logger.Info("codex lifecycle",
 					"phase", "thread_resume_response",
