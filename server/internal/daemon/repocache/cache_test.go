@@ -835,27 +835,27 @@ func TestCreateWorktreeReportsFailedFetch(t *testing.T) {
 				t.Fatalf("remove origin: %v", err)
 			}
 
-			// The reused checkout and a new one for another task both come from the
-			// cached copy and must say so instead of reading as current.
-			result, err = cache.CreateWorktree(params)
-			if err != nil {
-				t.Fatalf("CreateWorktree on the existing checkout failed: %v", err)
+			// A failed target fetch must preserve existing work and refuse a new checkout.
+			originalPath := result.Path
+			originalHead := gitHead(t, originalPath)
+			for _, existing := range []bool{true, false} {
+				if !existing {
+					params.WorkDir = t.TempDir()
+					params.TaskID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
+				}
+				result, err = cache.CreateWorktree(params)
+				if err == nil || result != nil || !strings.Contains(err.Error(), "git fetch") || !strings.Contains(err.Error(), sourceRepo) {
+					t.Fatalf("expected target fetch failure, got result=%+v err=%v", result, err)
+				}
+				if !existing {
+					entries, err := os.ReadDir(params.WorkDir)
+					if err != nil || len(entries) != 0 {
+						t.Fatalf("failed fetch created a partial checkout: %v, %v", entries, err)
+					}
+				}
 			}
-			if !strings.Contains(result.FetchError, "git fetch") {
-				t.Fatalf("existing checkout FetchError = %q, want the git fetch error", result.FetchError)
-			}
-
-			params.WorkDir = t.TempDir()
-			params.TaskID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
-			result, err = cache.CreateWorktree(params)
-			if err != nil {
-				t.Fatalf("CreateWorktree with an unreachable origin failed: %v", err)
-			}
-			if !strings.Contains(result.FetchError, "git fetch") {
-				t.Fatalf("new checkout FetchError = %q, want the git fetch error", result.FetchError)
-			}
-			if _, err := os.Stat(result.Path); err != nil {
-				t.Fatalf("checkout from the cached copy is missing: %v", err)
+			if got := gitHead(t, originalPath); got != originalHead {
+				t.Fatalf("existing checkout HEAD changed: %s, want %s", got, originalHead)
 			}
 		})
 	}

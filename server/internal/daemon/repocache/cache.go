@@ -422,19 +422,19 @@ func (c *Cache) SyncContext(ctx context.Context, workspaceID string, repos []Rep
 		}
 		if isBareRepo(barePath) {
 			// Already cached — fetch latest.
-			c.logger.Info("repo cache: fetching", "url", repo.URL, "path", barePath)
+			c.logger.Info("repo cache: fetching", "url", redact.URLUserinfo(repo.URL), "path", barePath)
 			c.configureRepoCABundleLogged(ctx, barePath)
 			if err := gitFetchContext(ctx, barePath); err != nil {
-				c.logger.Warn("repo cache: fetch failed", "url", repo.URL, "error", err)
+				c.logger.Warn("repo cache: fetch failed", "url", redact.URLUserinfo(repo.URL), "error", redact.URLUserinfo(err.Error()))
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		} else {
 			// Not cached — bare clone.
-			c.logger.Info("repo cache: cloning", "url", repo.URL, "path", barePath)
+			c.logger.Info("repo cache: cloning", "url", redact.URLUserinfo(repo.URL), "path", barePath)
 			if err := gitCloneBareContext(ctx, repo.URL, barePath); err != nil {
-				c.logger.Error("repo cache: clone failed", "url", repo.URL, "error", err)
+				c.logger.Error("repo cache: clone failed", "url", redact.URLUserinfo(repo.URL), "error", redact.URLUserinfo(err.Error()))
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -886,9 +886,8 @@ type WorktreeResult struct {
 	// that no remote-tracking ref reaches.
 	UncommittedFiles int `json:"uncommitted_files,omitempty"`
 	UnpushedCommits  int `json:"unpushed_commits,omitempty"`
-	// FetchError is set when refreshing the cache from the remote failed and
-	// the checkout was based on what the cache already held, so it may be
-	// behind the remote. It carries the redacted git error for the caller.
+	// FetchError is retained for response-schema compatibility. It is no longer
+	// populated: a failed target fetch aborts the checkout.
 	FetchError string `json:"fetch_error,omitempty"`
 }
 
@@ -955,19 +954,11 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	// to the modern remote-tracking layout on first run, so subsequent fetches
 	// never collide with the refs/heads/agent/* branches that worktree creation
 	// locks in this same bare repo.
-	var fetchErr string
 	if err := gitFetchContext(ctx, barePath); err != nil {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}
-		// Non-fatal: preserve cached state and continue. The agent will
-		// receive an older snapshot than the remote head, so the result
-		// carries the error back to the CLI as well as the daemon log.
-		fetchErr = redact.Text(err.Error())
-		c.logger.Warn("repo checkout: fetch failed, agent will see possibly stale code",
-			"url", params.RepoURL,
-			"error", err,
-		)
+		return nil, fmt.Errorf("fetch target %s: %s", redact.Text(redact.URLUserinfo(params.RepoURL)), redact.Text(redact.URLUserinfo(err.Error())))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, context.Cause(ctx)
@@ -1011,7 +1002,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, fmt.Errorf("move orphaned worktree aside: %w", err)
 		}
 		c.logger.Warn("repo checkout: moved orphaned worktree aside",
-			"url", params.RepoURL,
+			"url", redact.URLUserinfo(params.RepoURL),
 			"path", worktreePath,
 			"reason", reason,
 			"moved_to", movedTo,
@@ -1023,7 +1014,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	// another repository's checkout must be refused before any of them runs.
 	if other := otherRepoCheckout(ctx, barePath, worktreePath); other != "" {
 		return nil, fmt.Errorf("%w: %s already holds %s, not %s; run the checkout from a different directory",
-			ErrCheckoutPathTaken, worktreePath, other, redact.Text(params.RepoURL))
+			ErrCheckoutPathTaken, worktreePath, other, redact.Text(redact.URLUserinfo(params.RepoURL)))
 	}
 
 	// Once a workdir has moved to isolated metadata, keep using that safer
@@ -1055,7 +1046,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, context.Cause(ctx)
 		}
 
-		result.FetchError = fetchErr
 		c.logCheckoutReady("repo checkout: isolated checkout ready", params.RepoURL, baseRef, result)
 		return result, nil
 	}
@@ -1086,7 +1076,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 			return nil, context.Cause(ctx)
 		}
 
-		result.FetchError = fetchErr
 		c.logCheckoutReady("repo checkout: existing worktree updated", params.RepoURL, baseRef, result)
 		return result, nil
 	}
@@ -1116,7 +1105,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	}
 
 	c.logger.Info("repo checkout: worktree created",
-		"url", params.RepoURL,
+		"url", redact.URLUserinfo(params.RepoURL),
 		"path", worktreePath,
 		"branch", actualBranch,
 		"base", baseRef,
@@ -1125,7 +1114,6 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 	return &WorktreeResult{
 		Path:       worktreePath,
 		BranchName: actualBranch,
-		FetchError: fetchErr,
 	}, nil
 }
 
@@ -1135,7 +1123,7 @@ func (c *Cache) CreateWorktreeContext(ctx context.Context, params WorktreeParams
 func (c *Cache) logCheckoutReady(msg, repoURL, baseRef string, result *WorktreeResult) {
 	if result.Kept != "" {
 		c.logger.Info("repo checkout: existing checkout kept",
-			"url", repoURL,
+			"url", redact.URLUserinfo(repoURL),
 			"path", result.Path,
 			"branch", result.BranchName,
 			"reason", result.Kept,
@@ -1145,7 +1133,7 @@ func (c *Cache) logCheckoutReady(msg, repoURL, baseRef string, result *WorktreeR
 		return
 	}
 	c.logger.Info(msg,
-		"url", repoURL,
+		"url", redact.URLUserinfo(repoURL),
 		"path", result.Path,
 		"branch", result.BranchName,
 		"base", baseRef,
@@ -1265,7 +1253,7 @@ func otherRepoCheckout(ctx context.Context, barePath, path string) string {
 	if isIsolatedCheckoutContext(ctx, path) {
 		origin, err := isolatedCheckoutOriginContext(ctx, path)
 		if err == nil && !isolatedOriginCachedAt(origin, barePath) {
-			return "a checkout of " + redact.Text(origin)
+			return "a checkout of " + redact.Text(redact.URLUserinfo(origin))
 		}
 	}
 	return ""

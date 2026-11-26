@@ -149,6 +149,13 @@ func redactValue(v any, depth int) any {
 	}
 }
 
+var urlUserinfo = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@`)
+
+// URLUserinfo removes userinfo from URLs in diagnostic text, including Git stderr.
+func URLUserinfo(s string) string {
+	return urlUserinfo.ReplaceAllString(s, "${1}")
+}
+
 // Text scans the input string for known secret patterns and replaces
 // matches with safe placeholders.
 //
