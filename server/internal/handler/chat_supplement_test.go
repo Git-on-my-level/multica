@@ -517,6 +517,8 @@ func TestChatSupplementSubmissionReplayPreservesSendMode(t *testing.T) {
 
 func TestChatSupplementDaemonRecoveryRetainsRetryInput(t *testing.T) {
 	sessionID, taskID, _ := newChatSupplementFixture(t, true)
+	const providerSession = "chat-provider-session"
+	dbfx.Exec(t, `UPDATE agent_task_queue SET session_id=$2 WHERE id=$1`, taskID, providerSession)
 	sendChatGuidance(t, sessionID, map[string]any{"steer": true, "content": "guidance before daemon restart"})
 	task, err := testHandler.Queries.GetAgentTask(t.Context(), parseUUID(taskID))
 	if err != nil {
@@ -534,6 +536,9 @@ func TestChatSupplementDaemonRecoveryRetainsRetryInput(t *testing.T) {
 		child, err := testHandler.TaskService.MaybeRetryFailedTask(t.Context(), parent)
 		if err != nil || child == nil {
 			t.Fatalf("recovery retry=%+v err=%v", child, err)
+		}
+		if required, pinned := service.SameSessionRetry(*child); !required || pinned != providerSession {
+			t.Fatalf("retry custody = %v, %q", required, pinned)
 		}
 		inputs, err := testHandler.Queries.ListChatInputMessages(t.Context(), child.ChatInputTaskID)
 		if err != nil || len(inputs) != 2 || inputs[0].Content != "original objective" || inputs[1].Content != "guidance before daemon restart" {
