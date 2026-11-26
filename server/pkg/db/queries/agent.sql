@@ -1413,13 +1413,21 @@ WHERE id = $1
     OR (status = 'cancelled' AND session_id IS NULL)
   );
 
+-- name: ListOrphanedChatTasksForRuntime :many
+SELECT * FROM agent_task_queue
+WHERE runtime_id = $1 AND chat_session_id IS NOT NULL
+  AND status IN ('dispatched', 'running', 'waiting_local_directory')
+ORDER BY id;
+
 -- name: RecoverOrphanedTasksForRuntime :many
 -- Called by the daemon at startup. Atomically fails any dispatched/running/
 -- waiting_local_directory task that the prior incarnation of this runtime
 -- owned but did not finalize. Returns the failed rows so callers can hand
 -- them to the auto-retry path. waiting_local_directory rows are included
 -- because the daemon holding the path lock is the same process that just
--- died — without us, the row would sit waiting forever.
+-- died — without us, the row would sit waiting forever. The NULL chat session
+-- selects the non-chat batch. For chat, the caller already holds the session
+-- lock and recovers only the task observed in its startup snapshot.
 UPDATE agent_task_queue
 SET status = 'failed',
     completed_at = now(),
@@ -1432,7 +1440,9 @@ SET status = 'failed',
     failure_reason = 'runtime_recovery',
     wait_reason = NULL,
     prepare_lease_expires_at = NULL
-WHERE runtime_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE runtime_id = @runtime_id AND status IN ('dispatched', 'running', 'waiting_local_directory')
+  AND chat_session_id IS NOT DISTINCT FROM sqlc.narg('chat_session_id')::uuid
+  AND (sqlc.narg('task_id')::uuid IS NULL OR id = sqlc.narg('task_id')::uuid)
 RETURNING *;
 
 -- name: FailStaleTasks :many

@@ -136,12 +136,12 @@ func TestRetryEligibleDaemonShutdownTransitions(t *testing.T) {
 					}
 				} else {
 					fx.Exec(t, `UPDATE agent_task_queue SET session_id = NULLIF($2, ''), work_dir = '/tmp/existing-work' WHERE id = $1`, parentUUID, tc.session)
-					lost, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
+					lost, retried, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
 					if err != nil || len(lost) != 1 {
 						t.Fatalf("recover orphan: %v, %v", lost, err)
 					}
-					if child, err := svc.MaybeRetryFailedTask(ctx, lost[0]); err != nil || (child != nil) != tc.wantRetry {
-						t.Fatalf("recovery created child = %v, want %v, err = %v", child != nil, tc.wantRetry, err)
+					if (retried == 1) != tc.wantRetry {
+						t.Fatalf("recovery created %d retries, want retry = %v", retried, tc.wantRetry)
 					}
 				}
 				failed, err := q.GetAgentTask(ctx, parentUUID)
@@ -265,13 +265,15 @@ func TestRetryEligibleDaemonShutdownPreservesUnlaunchedChild(t *testing.T) {
 	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, dispatched)
 
 	svc := NewTaskService(db.New(pool), pool, nil, events.New())
-	lost, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
+	lost, retried, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
 	if err != nil || len(lost) != 1 || lost[0].Error.String != "daemon restarted before task launch" {
 		t.Fatalf("unlaunched task misclassified: %v, %v", lost, err)
 	}
-	retry, err := svc.MaybeRetryFailedTask(ctx, lost[0])
-	if err != nil || retry == nil || retry.Attempt != 3 || retry.Status != "queued" {
-		t.Fatalf("unlaunched task did not retain retry budget: %v, %v", retry, err)
+	var attempt int
+	var status string
+	fx.QueryRow(t, `SELECT attempt, status FROM agent_task_queue WHERE retry_of_task_id=$1`, dispatched).Scan(&attempt, &status)
+	if retried != 1 || attempt != 3 || status != "queued" {
+		t.Fatalf("unlaunched recovery = %d retries, child attempt=%d status=%q", retried, attempt, status)
 	}
 }
 

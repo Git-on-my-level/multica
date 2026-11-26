@@ -101,7 +101,7 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 				wantReason := "runtime_recovery"
 				switch path {
 				case "restart":
-					rows, err = testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), parseUUID(runtimeID))
+					rows, _, err = testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), parseUUID(runtimeID))
 				case "offline":
 					wantReason = "runtime_offline"
 					rows, err = testHandler.TaskService.FailTasksForOfflineRuntimes(t.Context(), db.FailTasksForOfflineRuntimesParams{ReconnectGraceSecs: 60, MaxPerTick: 10000})
@@ -142,7 +142,9 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 				if tc.protected && !strings.Contains(recovered.Error.String, "worker may still be running") {
 					t.Fatalf("missing recovery guidance: %s", recovered.Error.String)
 				}
-				testHandler.TaskService.HandleFailedTasks(t.Context(), []db.AgentTaskQueue{*recovered})
+				if path != "restart" {
+					testHandler.TaskService.HandleFailedTasks(t.Context(), []db.AgentTaskQueue{*recovered})
+				}
 				var retries int
 				dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE retry_of_task_id=$1`, taskID).Scan(&retries)
 				wantRetries := 1

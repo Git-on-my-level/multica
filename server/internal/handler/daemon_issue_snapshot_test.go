@@ -596,7 +596,7 @@ func TestClaimTaskByRuntime_StartedRetryWithoutProviderMustNotWaiveReads(t *test
 	if started, err := testHandler.TaskService.StartTask(ctx, child.ID); err != nil || !started.StartedAt.Valid {
 		t.Fatalf("StartTask did not record started_at: %v", err)
 	}
-	recovered, err := testHandler.Queries.RecoverOrphanedTasksForRuntime(ctx, parseUUID(runtimeID))
+	recovered, err := testHandler.Queries.RecoverOrphanedTasksForRuntime(ctx, db.RecoverOrphanedTasksForRuntimeParams{RuntimeID: parseUUID(runtimeID)})
 	if err != nil {
 		t.Fatalf("recover orphaned tasks: %v", err)
 	}
