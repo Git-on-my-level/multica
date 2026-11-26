@@ -19,13 +19,19 @@ func TestHandleTask_ShutdownDisposition(t *testing.T) {
 	for _, tc := range []struct {
 		name, status, reason, serverStatus, wantEndpoint, wantReason string
 		shutdown                                                     bool
+		comment                                                      string
 	}{
-		{"shutdown", "cancelled", "", "running", "/fail", "runtime_recovery", true},
-		{"explicit agent cancellation", "cancelled", "", "running", "/fail", "cancelled", false},
-		{"server cancellation during shutdown", "cancelled", "", "cancelled", "/cancel-ack", "", true},
-		{"timeout during shutdown", "blocked", "timeout", "running", "/fail", "timeout", true},
-		{"completed before shutdown", "completed", "", "running", "/complete", "", true},
-		{"cleanup uncertainty", "cancelled", "process_cleanup_unconfirmed", "running", "/fail", "process_cleanup_unconfirmed", true},
+		{"shutdown", "cancelled", "", "running", "/fail", "runtime_recovery", true, ""},
+		{"explicit agent cancellation", "cancelled", "", "running", "/fail", "cancelled", false, ""},
+		{"server cancellation during shutdown", "cancelled", "", "cancelled", "/cancel-ack", "", true, ""},
+		{"timeout during shutdown", "blocked", "timeout", "running", "/fail", "timeout", true, ""},
+		{"completed before shutdown", "completed", "", "running", "/complete", "", true, ""},
+		{"cleanup uncertainty", "cancelled", "process_cleanup_unconfirmed", "running", "/fail", "process_cleanup_unconfirmed", true, ""},
+		{"legacy message without provenance", "cancelled", "", "running", "/fail", "cancelled", false, "task cancelled by server"},
+		{"legacy message with shutdown provenance", "cancelled", "", "running", "/fail", "runtime_recovery", true, "task cancelled by server"},
+		{"legacy message on terminal server row", "cancelled", "", "cancelled", "/cancel-ack", "", true, "task cancelled by server"},
+		{"explicit cancellation reason during shutdown", "cancelled", "cancelled", "running", "/fail", "cancelled", true, "task cancelled by server"},
+		{"provider error during shutdown", "blocked", "agent_error.provider_auth_or_access", "running", "/fail", "agent_error.provider_auth_or_access", true, "provider authentication failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -68,6 +74,7 @@ func TestHandleTask_ShutdownDisposition(t *testing.T) {
 				}
 				return TaskResult{
 					Status: tc.status, FailureReason: tc.reason,
+					Comment:   tc.comment,
 					SessionID: "session", WorkDir: "/workdir", BranchName: "agent/work",
 					Usage: []TaskUsageEntry{{Provider: "openai", Model: "test", InputTokens: 100, OutputTokens: 50}},
 				}, nil
@@ -84,8 +91,8 @@ func TestHandleTask_ShutdownDisposition(t *testing.T) {
 			if tc.wantReason == "runtime_recovery" && terminal["error"] != "daemon shut down while task was in flight" {
 				t.Errorf("missing shutdown diagnostic: %v", terminal)
 			}
-			if tc.wantReason == "cancelled" && terminal["error"] != "" {
-				t.Errorf("explicit cancellation has untranslated error: %v", terminal)
+			if tc.wantReason == "cancelled" && terminal["error"] != tc.comment {
+				t.Errorf("cancellation diagnostic changed: %v", terminal)
 			}
 			if tc.wantEndpoint != "/cancel-ack" {
 				for k, want := range map[string]string{"session_id": "session", "work_dir": "/workdir", "branch_name": "agent/work"} {
