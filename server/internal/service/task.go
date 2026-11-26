@@ -5552,7 +5552,7 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
 		} else {
-			// Cursor and per-minute throttle recovery use the current diagnostics.
+			// Cursor and transient capacity recovery use the current diagnostics.
 			if failureReason == taskfailure.ReasonAgentProviderNetwork.String() ||
 				failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) {
 				parent.Error = pgtype.Text{String: errMsg, Valid: true}
@@ -6090,7 +6090,7 @@ func hermesGatewayRetryDelay() time.Duration {
 // never started, so there is nothing to be idempotent about, and every bundle
 // that did download is already cached on disk — a retry resumes from there
 // instead of re-fetching the whole set (MUL-5370).
-// Capacity/rate-limit retries additionally require PerMinuteRateLimit in
+// Capacity/rate-limit retries additionally require an explicit transient witness in
 // retryEligible; the broad reason alone never authorizes a retry.
 var retryableReasons = map[string]bool{
 	string(taskfailure.ReasonAgentProviderCapacityOrRateLimit): true,
@@ -6122,7 +6122,7 @@ const (
 	providerNetworkFinalRetryWait = 5 * time.Second
 )
 
-// Explicit per-minute throttles wait one full window before their only retry.
+// Explicit transient capacity failures wait one minute before their only retry.
 const providerPerMinuteRetryWait = 60 * time.Second
 
 // retryAttemptCeiling reports how many attempts the auto-retry path allows for
@@ -6149,9 +6149,9 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 // retryDelayForAttempt reports how long to defer the NEXT attempt after a
 // failure at failedAttempt. runtime_offline always gets a positive fire_at so
 // it waits for the health-gated promotion path. provider_network's final
-// attempt and runtime recovery are deferred ~5s. Other retries are immediate
-// (zero delay creates a claimable queued child). Callers pass the returned
-// delay to CreateRetryTask via fire_at.
+// attempt and runtime recovery are deferred ~5s. Explicit capacity failures wait
+// 60s. Zero delay creates an immediately claimable child. Callers pass the
+// returned delay to CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
 	if reason == string(taskfailure.ReasonRuntimeRecovery) {
 		return runtimeRecoveryRetryDeferral
@@ -6266,6 +6266,8 @@ func isInterruptedDaemonRecovery(reason string, t db.AgentTaskQueue) bool {
 // not an autopilot run, not a Triage run, and linked to an issue or chat
 // session. Shared by FailTask's in-transaction retry and the orphan sweeper's
 // MaybeRetryFailedTask so both agree on which failures re-run.
+// Selected-model capacity recovery additionally requires a usable existing
+// session: no missing rollout, fresh-session request, or retired resume pointer.
 //
 // A Triage run is excluded for the reason autopilot runs are (MUL-7189 §5.6):
 // it has its own recovery. Re-triaging reads the entry as it stands now, which
@@ -6313,8 +6315,10 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 			return false
 		}
 	}
+	selectedCapacity := taskfailure.SelectedModelAtCapacity(t.Error.String)
 	if failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) &&
-		(!taskfailure.PerMinuteRateLimit(t.Error.String) ||
+		(!(taskfailure.PerMinuteRateLimit(t.Error.String) || selectedCapacity) ||
+			(selectedCapacity && (t.ForceFreshSession || t.Status == "cancelled")) ||
 			taskfailure.Classify(t.Error.String) != taskfailure.ReasonAgentProviderCapacityOrRateLimit || t.Attempt != 1 ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) ||
 			!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||

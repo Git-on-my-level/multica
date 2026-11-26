@@ -33,7 +33,7 @@ var providerHTTP5xxRe = regexp.MustCompile(`(^|[^0-9a-z])5[0-9][0-9]([^0-9a-z]|$
 // filed under a provider bucket, masking the real cause on failure dashboards.
 // (A misfire here still can't cause a spurious retry: the auth / quota /
 // capacity buckets these regexes guard cannot cause a retry on their own.
-// Capacity retries additionally require the explicit per-minute witness.)
+// Capacity retries additionally require an explicit transient witness.)
 // The 5xx bucket was already anchored for exactly this reason
 // (MUL-1949); these codes were not. #9146 widened every boundary from
 // digits-only to alphanumerics because hex workspace IDs put these digit runs
@@ -102,6 +102,12 @@ func PerMinuteRateLimit(raw string) bool {
 
 var perMinuteRateLimitRe = regexp.MustCompile(`rate limit exceeded\. please slow down your requests\. limit: [0-9]+ uncached input tokens/minute\.`)
 
+// SelectedModelAtCapacity matches the complete transient Codex failure, not
+// incidental mentions or errors combined with a different failure.
+func SelectedModelAtCapacity(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "Selected model is at capacity. Please try a different model.")
+}
+
 // concurrentRequestLimitWitness is emitted by Anthropic-compatible providers
 // that use HTTP 403 for a transient concurrency rejection. Claude Code may
 // prefix it with an authentication or access-token failure, but credentials
@@ -128,8 +134,8 @@ func isUsageLimit403(lower string) bool {
 // when the two diverge, this Go classifier is wrong and should be
 // updated to match. Keeping them in lock-step is required so that
 // in-flight rows and historically backfilled rows share the same
-// taxonomy. The explicit per-minute throttle rule is a deliberate live-classifier
-// exception to this agreement; do not mirror it into the historical backfill SQL.
+// taxonomy. The explicit transient-capacity rules are deliberate live-classifier
+// exceptions to this agreement; do not mirror it into the historical backfill SQL.
 // Historical rows retain their existing classification and are outside its scope.
 //
 // Matching is case-insensitive substring against the lowercased input.
@@ -174,6 +180,9 @@ func Classify(rawError string) Reason {
 	}
 
 	switch {
+	case SelectedModelAtCapacity(lower):
+		return ReasonAgentProviderCapacityOrRateLimit
+
 	case PerMinuteRateLimit(lower):
 		// Separate the throttle witness so a token count like 401 cannot be
 		// mistaken for an auth status. Signals outside the witness still win.
@@ -808,6 +817,12 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 		}
 	}
 
+	if SelectedModelAtCapacity(rawError) {
+		switch Reason(reason) {
+		case ReasonAgentModelNotFoundOrUnavailable, ReasonAgentUnknown, ReasonAgentProviderCapacityOrRateLimit, Reason("agent_error"):
+			return ReasonAgentProviderCapacityOrRateLimit
+		}
+	}
 	return Reason(reason)
 }
 
