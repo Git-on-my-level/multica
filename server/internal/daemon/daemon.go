@@ -8399,7 +8399,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			return TaskResult{}, errors.New("automatic recovery requires the original session")
 		}
 		switch provider {
-		case "claude", "codex", "hermes", "opencode":
+		case "codex", "hermes", "opencode":
 		case "cursor":
 			task.RequireCursorResume = true
 		default:

@@ -33,7 +33,14 @@ func TestClassifyPerMinuteRateLimit(t *testing.T) {
 			}
 		}
 	}
-	for _, raw := range []string{witness, strings.ToUpper(witness), strings.ReplaceAll(witness, "24290", "1000")} {
+	for _, raw := range []string{
+		witness,
+		strings.ToUpper(witness),
+		strings.ReplaceAll(witness, "24290", "1000"),
+		strings.ReplaceAll(witness, "24290", "401"),
+		strings.ReplaceAll(witness, "24290", "402"),
+		strings.ReplaceAll(witness, "24290", "403"),
+	} {
 		if got := Classify(raw); got != ReasonAgentProviderCapacityOrRateLimit {
 			t.Errorf("Classify(%q) = %s", raw, got)
 		}

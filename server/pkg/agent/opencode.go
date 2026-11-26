@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -151,6 +150,8 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	// as the fallback.
 	if useACP, reason := opencodeUsesACP(b.cfg, opts); useACP {
 		return b.executeACP(ctx, execPath, prompt, opts)
+	} else if opts.RequireSameSession {
+		return nil, fmt.Errorf("OpenCode recovery requires ACP to verify the original session: %s", reason)
 	} else {
 		b.cfg.Logger.Info("opencode: using the run transport", "reason", reason)
 	}
@@ -208,16 +209,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--session", opts.ResumeSessionID)
 	}
-	blockedArgs := opencodeBlockedArgs
-	if opts.RequireSameSession {
-		blockedArgs = maps.Clone(blockedArgs)
-		blockedArgs["--session"] = blockedWithValue
-		blockedArgs["-s"] = blockedWithValue
-		blockedArgs["--continue"] = blockedStandalone
-		blockedArgs["-c"] = blockedStandalone
-		blockedArgs["--fork"] = blockedStandalone
-	}
-	args = append(args, filterCustomArgs(opts.CustomArgs, blockedArgs, b.cfg.Logger)...)
+	args = append(args, filterCustomArgs(opts.CustomArgs, opencodeBlockedArgs, b.cfg.Logger)...)
 	// The task prompt is delivered on stdin, never argv — see the StdinPipe
 	// wiring below. `opencode run` merges its variadic [message..] positional
 	// with whatever is piped in, so an invocation that passes no positional
