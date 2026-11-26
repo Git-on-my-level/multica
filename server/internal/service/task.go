@@ -6179,7 +6179,7 @@ func taskRetryCeiling(reason string, task db.AgentTaskQueue) int32 {
 }
 
 func taskRetryDelay(reason string, task db.AgentTaskQueue) time.Duration {
-	if reason == string(taskfailure.ReasonRuntimeRecovery) && !strings.HasPrefix(task.Error.String, "daemon shut down while task") {
+	if reason == string(taskfailure.ReasonRuntimeRecovery) && !strings.HasPrefix(task.Error.String, daemonShutdownDuringTurn) {
 		return 0
 	}
 	if taskfailure.CursorTransientNetworkError(task.Error.String) {
@@ -6250,11 +6250,13 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 	return taskfailure.UnresumableHistory(errorText)
 }
 
+const daemonShutdownDuringTurn = "daemon shut down while task was in flight"
+
 // Work interrupted after launch can only resume. Orphan recovery labels
 // work that never launched separately so its original retry policy still applies.
 func isInterruptedDaemonRecovery(reason string, t db.AgentTaskQueue) bool {
 	return reason == taskfailure.ReasonRuntimeRecovery.String() &&
-		(strings.HasPrefix(t.Error.String, "daemon shut down while task") ||
+		(strings.HasPrefix(t.Error.String, daemonShutdownDuringTurn) ||
 			t.Error.String == "daemon restarted while task was in flight")
 }
 

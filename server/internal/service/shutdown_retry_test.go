@@ -209,6 +209,42 @@ func TestRetryEligibleDaemonShutdownPreservesStartupRecovery(t *testing.T) {
 			t.Fatalf("ambiguous in-flight work could relaunch for %s", status)
 		}
 	}
+	waiting := db.AgentTaskQueue{
+		Status: "waiting_local_directory", Attempt: 1, MaxAttempts: 2, IssueID: pgtype.UUID{Valid: true},
+		Error: pgtype.Text{String: "daemon shut down while task was waiting for its local directory lock", Valid: true},
+	}
+	if !retryEligible("runtime_recovery", waiting) || taskRetryDelay("runtime_recovery", waiting) != 0 {
+		t.Fatal("shutdown before obtaining the local directory lock must preserve unlaunched recovery")
+	}
+}
+
+func TestRetryEligibleDaemonShutdownPreservesUnlaunchedChild(t *testing.T) {
+	ctx := context.Background()
+	pool := sharedTestPool(t)
+	bootstrap := testutil.New(pool, "", "")
+	suffix := time.Now().UnixNano()
+	user := bootstrap.User(t, "shutdown-owner", fmt.Sprintf("unlaunched-%d@example.com", suffix))
+	workspace := bootstrap.Workspace(t, "unlaunched retry", fmt.Sprintf("unlaunched-%d", suffix))
+	fx := testutil.New(pool, workspace, user)
+	fx.Member(t, workspace, user, "owner")
+	runtime := fx.Runtime(t, "shutdown runtime")
+	agent := fx.Agent(t, "shutdown agent", runtime)
+	issue := fx.Issue(t, "unlaunched retry")
+	dispatched := fx.Task(t, agent, testutil.Cols{
+		"runtime_id": runtime, "issue_id": issue, "status": "dispatched",
+		"attempt": 2, "max_attempts": 3, "session_id": "inherited-session",
+	})
+	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE parent_task_id=$1`, dispatched)
+
+	svc := NewTaskService(db.New(pool), pool, nil, events.New())
+	lost, err := svc.RecoverOrphanedTasksForRuntime(ctx, util.MustParseUUID(runtime))
+	if err != nil || len(lost) != 1 || lost[0].Error.String != "daemon restarted before task launch" {
+		t.Fatalf("unlaunched task misclassified: %v, %v", lost, err)
+	}
+	retry, err := svc.MaybeRetryFailedTask(ctx, lost[0])
+	if err != nil || retry == nil || retry.Attempt != 3 || retry.Status != "queued" {
+		t.Fatalf("unlaunched task did not retain retry budget: %v, %v", retry, err)
+	}
 }
 
 func TestRetryEligibleDaemonShutdownChatOrdering(t *testing.T) {

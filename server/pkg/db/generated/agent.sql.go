@@ -8636,7 +8636,7 @@ UPDATE agent_task_queue
 SET status = 'failed',
     completed_at = now(),
     error = CASE
-        WHEN status = 'running' OR started_at IS NOT NULL OR session_id IS NOT NULL
+        WHEN status = 'running' OR started_at IS NOT NULL
           OR EXISTS (SELECT 1 FROM task_message m WHERE m.task_id = agent_task_queue.id)
         THEN 'daemon restarted while task was in flight'
         ELSE 'daemon restarted before task launch'
