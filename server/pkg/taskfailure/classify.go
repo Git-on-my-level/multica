@@ -175,16 +175,17 @@ func Classify(rawError string) Reason {
 
 	switch {
 	case PerMinuteRateLimit(lower):
-		// The token/minute witness beats the generic token-window heuristic,
-		// but it must never turn a config, auth or quota failure into a retry.
+		// Separate the throttle witness so a token count like 401 cannot be
+		// mistaken for an auth status. Signals outside the witness still win.
+		diagnostic := perMinuteRateLimitRe.ReplaceAllString(lower, " ")
 		switch {
-		case isMissingConfig(lower):
+		case isMissingConfig(diagnostic):
 			return ReasonAgentMissingConfig
-		case isUsageLimit403(lower):
+		case isUsageLimit403(diagnostic):
 			return ReasonAgentProviderQuotaLimit
-		case isProviderAuthOrAccess(lower):
+		case isProviderAuthOrAccess(diagnostic):
 			return ReasonAgentProviderAuthOrAccess
-		case isProviderQuotaLimit(lower):
+		case isProviderQuotaLimit(diagnostic):
 			return ReasonAgentProviderQuotaLimit
 		default:
 			return ReasonAgentProviderCapacityOrRateLimit

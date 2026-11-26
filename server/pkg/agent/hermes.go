@@ -751,10 +751,10 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				return
 			}
 			sessionResult = result
-			sessionID, resumeLanded = resolveHermesResumedSessionID(opts.ResumeSessionID, result)
+			sessionID, resumeLanded = resolveHermesResumedSessionID(opts.ResumeSessionID, result, opts.RequireSameSession)
 			if !resumeLanded {
 				if opts.RequireSameSession {
-					resCh <- Result{Status: "failed", Error: "Hermes resumed a different session"}
+					resCh <- Result{Status: "failed", Error: "Hermes did not confirm the original session"}
 					return
 				}
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
@@ -2694,19 +2694,20 @@ func resolveResumedSessionID(requested string, response json.RawMessage) (string
 // `_meta.hermes.sessionProvenance`, which is the only signal available. A
 // response carrying neither shape falls back to the requested id and reports
 // landed=true, so a runtime that reports nothing keeps its previous behaviour
-// rather than declaring every turn's history lost.
+// rather than declaring every turn's history lost. A pinned automatic retry
+// instead requires positive identity confirmation before submitting its prompt.
 //
 // That residual blind spot is bounded on the daemon side: the resume gate only
 // hands a session id to a run whose session store actually holds a transcript
 // (sessionHomeReachable), so a silent runtime can misreport a stale session but
 // never an absent one.
-func resolveHermesResumedSessionID(requested string, response json.RawMessage) (string, bool) {
+func resolveHermesResumedSessionID(requested string, response json.RawMessage, requireConfirmation bool) (string, bool) {
 	got := extractACPSessionID(response)
 	if got == "" {
 		got = extractACPProvenanceSessionID(response)
 	}
 	if got == "" {
-		return requested, true
+		return requested, !requireConfirmation
 	}
 	return got, got == requested
 }

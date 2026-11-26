@@ -1220,7 +1220,7 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
 	blockedArgs := claudeBlockedArgs
-	if opts.ClaudeSettingsPath != "" || opts.RequireSameSession {
+	if opts.ClaudeSettingsPath != "" {
 		// The daemon-owned --settings file is the enforcement layer for disabled
 		// inherited skills. Drop competing per-agent/default flags only while that
 		// policy is active, then append the managed file last.
@@ -1228,17 +1228,7 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		for key, mode := range claudeBlockedArgs {
 			blockedArgs[key] = mode
 		}
-		if opts.ClaudeSettingsPath != "" {
-			blockedArgs["--settings"] = blockedWithValue
-		}
-		if opts.RequireSameSession {
-			blockedArgs["--resume"] = blockedOptionalValue
-			blockedArgs["-r"] = blockedOptionalValue
-			blockedArgs["--continue"] = blockedStandalone
-			blockedArgs["-c"] = blockedStandalone
-			blockedArgs["--fork-session"] = blockedStandalone
-			blockedArgs["--session-id"] = blockedWithValue
-		}
+		blockedArgs["--settings"] = blockedWithValue
 	}
 	args = append(args, filterCustomArgs(opts.ExtraArgs, blockedArgs, logger)...)
 	args = append(args, filterCustomArgs(opts.CustomArgs, blockedArgs, logger)...)

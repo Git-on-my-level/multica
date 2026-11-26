@@ -53,7 +53,7 @@ done
 func TestResolveHermesResumedSessionIDPrefersTopLevelID(t *testing.T) {
 	t.Parallel()
 
-	id, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(`{"sessionId":"ses_old"}`))
+	id, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(`{"sessionId":"ses_old"}`), true)
 	if id != "ses_old" || !landed {
 		t.Fatalf("got (%q, %v), want (ses_old, true)", id, landed)
 	}
@@ -74,7 +74,7 @@ func TestResolveHermesResumedSessionIDReadsProvenanceMeta(t *testing.T) {
 		"models":{"currentModelId":"openai:gpt-5"}
 	}`)
 
-	id, landed := resolveHermesResumedSessionID("ses_old", response)
+	id, landed := resolveHermesResumedSessionID("ses_old", response, true)
 	if id != "ses_new" {
 		t.Fatalf("session id = %q, want ses_new (the session hermes silently rebound to)", id)
 	}
@@ -88,7 +88,7 @@ func TestResolveHermesResumedSessionIDProvenanceMatchingIsALanding(t *testing.T)
 
 	response := json.RawMessage(`{"_meta":{"hermes":{"sessionProvenance":{"acpSessionId":"ses_old"}}}}`)
 
-	id, landed := resolveHermesResumedSessionID("ses_old", response)
+	id, landed := resolveHermesResumedSessionID("ses_old", response, true)
 	if id != "ses_old" || !landed {
 		t.Fatalf("got (%q, %v), want (ses_old, true)", id, landed)
 	}
@@ -108,10 +108,16 @@ func TestResolveHermesResumedSessionIDSilentResponseKeepsRequested(t *testing.T)
 	// only has to cover a store that DOES hold history and a runtime that will
 	// not say which session it used.
 	for _, response := range []string{`{}`, `{"models":{}}`, `not json`} {
-		id, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(response))
+		id, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(response), false)
 		if id != "ses_old" || !landed {
 			t.Fatalf("response %q: got (%q, %v), want (ses_old, true)", response, id, landed)
 		}
+	}
+}
+
+func TestResolveHermesResumedSessionIDRequiresConfirmationForPinnedRetry(t *testing.T) {
+	if _, landed := resolveHermesResumedSessionID("ses_old", json.RawMessage(`{}`), true); landed {
+		t.Fatal("a silent resume response cannot confirm the pinned session")
 	}
 }
 

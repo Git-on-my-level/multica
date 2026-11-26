@@ -100,3 +100,14 @@ printf '%s\n' '{"type":"result","result":"done","is_error":false}'
 		})
 	}
 }
+
+func TestRunTaskSameSessionRetryRejectsUnverifiedTransport(t *testing.T) {
+	task := Task{
+		AgentID: "test-agent", Agent: &AgentData{ID: "test-agent"},
+		PriorSessionID: "original-session", RequireSameSession: true,
+	}
+	if _, err := (&Daemon{}).runTask(context.Background(), task, "claude", 0, slog.Default()); err == nil ||
+		!strings.Contains(err.Error(), "cannot guarantee same-session resume for claude") {
+		t.Fatalf("unverified transport was not rejected before preparation: %v", err)
+	}
+}
