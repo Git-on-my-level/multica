@@ -26,7 +26,8 @@ func SameSessionRetry(task db.AgentTaskQueue) (required bool, sessionID string) 
 }
 
 func requiresSameSessionRetry(task db.AgentTaskQueue) bool {
-	return task.FailureReason.String == taskfailure.ReasonAgentProviderCapacityOrRateLimit.String()
+	return task.FailureReason.String == taskfailure.ReasonAgentProviderCapacityOrRateLimit.String() ||
+		isInterruptedDaemonRecovery(task.FailureReason.String, task)
 }
 
 func pinnedRetrySession(task db.AgentTaskQueue, key string) (required bool, sessionID string) {

@@ -5566,6 +5566,9 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			if retiredSessionID != "" {
 				parent.RetiredSessionID = pgtype.Text{String: retiredSessionID, Valid: true}
 			}
+			if failureReason == taskfailure.ReasonRuntimeRecovery.String() {
+				parent.Error = pgtype.Text{String: errMsg, Valid: true}
+			}
 			ordinaryRetry := retryEligible(failureReason, parent) &&
 				(failureReason != string(taskfailure.ReasonRuntimeOffline) || !ResumeUnsafeFailure(failureReason, errMsg))
 			startupRecovery := launcherClaim == nil && hermesGatewayResumeRetryEligible(failureReason, errMsg, parent)
@@ -5746,7 +5749,7 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 			createRetry = launcherRecoveryEligible(t, retryEligible(failureReason, t))
 		} else if hermesStartupFailure {
 			createRetry = createRetry && hermesGatewayResumeRetryEligible(failureReason, errMsg, t)
-		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) {
+		} else if failureReason == string(taskfailure.ReasonRuntimeOffline) || isInterruptedDaemonRecovery(failureReason, t) {
 			createRetry = createRetry && retryEligible(failureReason, t)
 		}
 		if createRetry && failureReason == string(taskfailure.ReasonAgentProviderCapacityOrRateLimit) {
@@ -6109,10 +6112,12 @@ var retryableReasons = map[string]bool{
 // Transient provider stream cuts (provider_network) get a bespoke three-tier
 // schedule (MUL-4910): first run + immediate retry + one retry deferred ~5s.
 // A blip that survives the immediate retry gets a short cooldown before the
-// final attempt instead of firing back-to-back. Every other retryable reason
-// keeps the task's generic max_attempts ceiling and retries immediately.
+// final attempt instead of firing back-to-back. Runtime recovery waits five
+// seconds and uses the same health-gated deferred promotion. Other reasons
+// keep the task's generic max_attempts ceiling and retry immediately.
 const (
 	runtimeOfflineRetryDeferral   = time.Second
+	runtimeRecoveryRetryDeferral  = 5 * time.Second
 	providerNetworkMaxAttempts    = 3
 	providerNetworkFinalRetryWait = 5 * time.Second
 )
@@ -6144,10 +6149,13 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 // retryDelayForAttempt reports how long to defer the NEXT attempt after a
 // failure at failedAttempt. runtime_offline always gets a positive fire_at so
 // it waits for the health-gated promotion path. provider_network's final
-// attempt is deferred ~5s; every other retry remains immediate (zero delay →
-// the child is created 'queued', claimable at once). Callers pass the returned
+// attempt and runtime recovery are deferred ~5s. Other retries are immediate
+// (zero delay creates a claimable queued child). Callers pass the returned
 // delay to CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
+	if reason == string(taskfailure.ReasonRuntimeRecovery) {
+		return runtimeRecoveryRetryDeferral
+	}
 	if reason == string(taskfailure.ReasonRuntimeOffline) {
 		return runtimeOfflineRetryDeferral
 	}
@@ -6171,6 +6179,9 @@ func taskRetryCeiling(reason string, task db.AgentTaskQueue) int32 {
 }
 
 func taskRetryDelay(reason string, task db.AgentTaskQueue) time.Duration {
+	if reason == string(taskfailure.ReasonRuntimeRecovery) && !strings.HasPrefix(task.Error.String, daemonShutdownDuringTurn) {
+		return 0
+	}
 	if taskfailure.CursorTransientNetworkError(task.Error.String) {
 		return providerNetworkFinalRetryWait
 	}
@@ -6239,6 +6250,17 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 	return taskfailure.UnresumableHistory(errorText)
 }
 
+const daemonShutdownDuringTurn = "daemon shut down while task was in flight"
+
+// Graceful shutdown requires a resumable session. At daemon startup, pin a
+// recorded session on interrupted work while retaining legacy immediate
+// recovery when the orphan has no session.
+func isInterruptedDaemonRecovery(reason string, t db.AgentTaskQueue) bool {
+	return reason == taskfailure.ReasonRuntimeRecovery.String() &&
+		(strings.HasPrefix(t.Error.String, daemonShutdownDuringTurn) ||
+			(t.Error.String == "daemon restarted while task was in flight" && t.SessionID.Valid && strings.TrimSpace(t.SessionID.String) != ""))
+}
+
 // retryEligible reports whether a failed task qualifies for an automatic retry
 // attempt: an infrastructure-shaped failure_reason, remaining attempt budget,
 // not an autopilot run, not a Triage run, and linked to an issue or chat
@@ -6262,6 +6284,17 @@ func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 		if failureReason != taskfailure.ReasonAgentProviderNetwork.String() ||
 			!taskfailure.CursorPreActionNetworkError(t.Error.String) ||
 			!t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
+			!(t.IssueID.Valid || t.ChatSessionID.Valid) {
+			return false
+		}
+	}
+	if isInterruptedDaemonRecovery(failureReason, t) {
+		// Recovery continues one interrupted conversation; never open a fresh
+		// session or extend a chain already on its second attempt.
+		if t.Attempt >= 2 || !t.SessionID.Valid || strings.TrimSpace(t.SessionID.String) == "" ||
+			t.SessionRolloutMissing || IsFreshRerun(t) || (t.ForceFreshSession && !t.RerunOfTaskID.Valid) ||
+			(t.RetiredSessionID.Valid && t.RetiredSessionID.String == t.SessionID.String) ||
+			ResumeUnsafeFailure(failureReason, t.Error.String) ||
 			!(t.IssueID.Valid || t.ChatSessionID.Valid) {
 			return false
 		}
@@ -6429,10 +6462,10 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		}
 		return nil, err
 	}
-	if reason == string(taskfailure.ReasonRuntimeOffline) || requiresSameSessionRetry(parent) {
-		// Deferred retries do not occupy the queued-task unique slot. Serialize
+	if reason == taskfailure.ReasonRuntimeOffline.String() || reason == taskfailure.ReasonRuntimeRecovery.String() || requiresSameSessionRetry(parent) {
+		// Deferred and chat retries do not occupy the queued-task unique slot. Serialize
 		// by parent without reversing the workspace-to-task teardown lock order.
-		if err := qtx.LockRuntimeOfflineRetryParent(ctx, parent.ID); err != nil {
+		if err := qtx.LockRuntimeRetryParent(ctx, parent.ID); err != nil {
 			return nil, err
 		}
 		current, err := qtx.GetAgentTask(ctx, parent.ID)
@@ -6442,7 +6475,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		if current.Status != "failed" || current.FailureReason.String != reason || !retryEligible(reason, current) {
 			return nil, nil
 		}
-		hasRetry, err := qtx.HasRuntimeOfflineRetryForParent(ctx, parent.ID)
+		hasRetry, err := qtx.HasRuntimeRetryForParent(ctx, parent.ID)
 		if err != nil {
 			return nil, err
 		}
