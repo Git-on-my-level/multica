@@ -560,6 +560,7 @@ func TestChatOrphanRecoveryWithoutCompatibleDaemonWritesFailureBeforeSuccessorCl
 	if err != nil {
 		t.Fatal(err)
 	}
+	guidance := sendChatGuidance(t, sessionID, map[string]any{"steer": true, "content": "guidance on interrupted turn"})
 	next := sendChatGuidance(t, sessionID, map[string]any{"content": "next question"})
 	dbfx.Exec(t, `UPDATE agent_runtime SET last_seen_at=now() WHERE id=$1`, parent.RuntimeID)
 	gate := &retryInsertGate{pool: testPool, ready: make(chan uint32, 1), resume: make(chan struct{})}
@@ -603,7 +604,14 @@ func TestChatOrphanRecoveryWithoutCompatibleDaemonWritesFailureBeforeSuccessorCl
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertChatTranscriptContents(t, transcript, []string{"original objective", got.failed[0].Error.String, "next question"})
+	assertChatTranscriptContents(t, transcript, []string{"original objective", "guidance on interrupted turn", got.failed[0].Error.String, "next question"})
+
+	if n := dbfx.Count(t, `SELECT count(*) FROM chat_task_supplement WHERE message_id=$1 AND task_id=$2 AND status='withdrawn'`, guidance.MessageID, taskID); n != 1 {
+		t.Fatalf("retained guidance = %d, want one", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id=$1`, sessionID); n != 2 {
+		t.Fatalf("chat has %d tasks, want only the original turn and its queued successor", n)
+	}
 
 	// Upgrading the daemon after refusal must not revive the settled turn.
 	dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, parent.RuntimeID, protocol.DaemonCapabilitySameSessionRetryV1)

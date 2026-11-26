@@ -7053,8 +7053,8 @@ func (s *TaskService) recoverOrphanedChatTask(ctx context.Context, candidate db.
 			if err != nil {
 				return err
 			}
-		}
-		if child != nil {
+			// Keep guidance with the interrupted input batch even if admission
+			// refuses it. A refusal must not dispatch the guidance by itself.
 			if err := qtx.RetainChatTaskSupplementsForRetry(ctx, failed.ID); err != nil {
 				return err
 			}
