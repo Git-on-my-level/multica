@@ -2633,6 +2633,34 @@ func TestCodexStartOrResumeThreadFallsBackOnResumeError(t *testing.T) {
 	}
 }
 
+func TestCodexStartOrResumeThreadRequiresPinnedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response rpcResponse
+	}{
+		{"rejected", rpcResponse{method: "thread/resume", errMsg: "unknown thread", errCode: -32602}},
+		{"empty", rpcResponse{method: "thread/resume", result: json.RawMessage(`{"thread":{}}`)}},
+		{"different", rpcResponse{method: "thread/resume", result: json.RawMessage(`{"thread":{"id":"thr_other"}}`)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, fs, _ := newTestCodexClient(t)
+			wait := drainRPCScript(t, c, fs, []rpcResponse{tc.response})
+			defer wait()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			id, resumed, err := c.startOrResumeThread(ctx, ExecOptions{
+				Cwd: "/work", ResumeSessionID: "thr_prior", RequireSameSession: true,
+			}, slog.Default())
+			if err == nil || errors.Is(err, context.DeadlineExceeded) || id != "" || resumed {
+				t.Fatalf("pinned resume returned thread=%q resumed=%v err=%v", id, resumed, err)
+			}
+			if rejected := errors.Is(err, errCodexPinnedThreadMismatch); rejected != (tc.name == "different") {
+				t.Fatalf("definitive mismatch recorded=%v for %s: %v", rejected, tc.name, err)
+			}
+		})
+	}
+}
+
 // codexTurnInput carries the user-visible disclosure when a resume was expected
 // but the backend landed on a fresh thread. Paired with
 // TestCodexStartOrResumeThreadFallsBackOnResumeError (which proves the live

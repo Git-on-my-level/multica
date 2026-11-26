@@ -2941,7 +2941,10 @@ SELECT
     CASE WHEN $5::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
-    CASE WHEN $6::text IS NULL THEN p.context
+    CASE WHEN COALESCE($6::boolean, false)
+         THEN COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('same_session_retry', jsonb_build_object(
+             'runtime_id', p.runtime_id, 'session_id', p.session_id))
+         WHEN $7::text IS NULL THEN p.context
          ELSE COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('cursor_recovery', jsonb_build_object(
              'runtime_id', p.runtime_id, 'session_id', p.session_id))
     END,
@@ -2952,7 +2955,7 @@ SELECT
          ELSE p.session_id END,
     p.work_dir,
     p.attempt + CASE WHEN COALESCE($4::boolean, false) THEN 0 ELSE 1 END,
-    COALESCE($7::int, p.max_attempts), p.id,
+    COALESCE($8::int, p.max_attempts), p.id,
     CASE WHEN COALESCE($4::boolean, false)
          THEN p.force_fresh_session OR $2::uuid IS NOT NULL
          ELSE p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' END,
@@ -2960,8 +2963,8 @@ SELECT
     p.squad_id,
     p.originator_user_id,
     p.accountable_user_id,
-    $8,
     $9,
+    $10,
     p.originator_source, p.delegated_from_task_id, p.rule_version_id,
     p.trigger_evidence_kind, p.trigger_evidence_ref_id, p.id,
     p.chat_input_task_id, $5,
@@ -2972,20 +2975,30 @@ SELECT
     -- A retry continues its parent's work, so it keeps the parent's step (MUL-7420).
     p.workflow_step,
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
-    COALESCE($10::uuid, gen_random_uuid())
+    COALESCE($11::uuid, gen_random_uuid())
 FROM agent_task_queue p
 LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = $1
   -- A Cursor recovery is safe only on the parent session and runtime.
   -- The agent enqueue lock serializes this insert with runtime rebinding.
-  AND ($6::text IS NULL OR (
+  AND ($7::text IS NULL OR (
       p.status = 'failed'
       AND p.failure_reason = 'agent_error.provider_network'
-      AND p.session_id = $6::text
-      AND p.runtime_id = $11::uuid
+      AND p.session_id = $7::text
+      AND p.runtime_id = $12::uuid
       AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
+  ))
+  AND (NOT COALESCE($6::boolean, false) OR (
+      p.status = 'failed'
+      AND NULLIF(btrim(p.session_id), '') IS NOT NULL
+      AND NOT p.session_rollout_missing
+      AND p.retired_session_id IS DISTINCT FROM p.session_id
+      AND a.runtime_id = p.runtime_id
+      AND $2::uuid IS NULL
+      AND $3::uuid IS NULL
+      AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
   ))
   AND lock_task_owner_rows(
       COALESCE($2::uuid, p.agent_id),
@@ -3006,6 +3019,7 @@ type CreateRetryTaskParams struct {
 	TargetRuntimeID         pgtype.UUID        `json:"target_runtime_id"`
 	UnstartedHandoff        pgtype.Bool        `json:"unstarted_handoff"`
 	FireAt                  pgtype.Timestamptz `json:"fire_at"`
+	RequireSameSession      pgtype.Bool        `json:"require_same_session"`
 	RequiredResumeSessionID pgtype.Text        `json:"required_resume_session_id"`
 	MaxAttempts             pgtype.Int4        `json:"max_attempts"`
 	RuntimeMcpOverlay       []byte             `json:"runtime_mcp_overlay"`
@@ -3050,6 +3064,7 @@ func (q *Queries) CreateRetryTask(ctx context.Context, arg CreateRetryTaskParams
 		arg.TargetRuntimeID,
 		arg.UnstartedHandoff,
 		arg.FireAt,
+		arg.RequireSameSession,
 		arg.RequiredResumeSessionID,
 		arg.MaxAttempts,
 		arg.RuntimeMcpOverlay,
@@ -8189,7 +8204,10 @@ WITH fence AS MATERIALIZED (
 ),
 reassigned AS (
     UPDATE agent_task_queue
-    SET runtime_id = $2
+    SET runtime_id = $2,
+        -- Preserve the retry marker for terminal claim settlement, but never
+        -- expose the old runtime's session as history on the replacement.
+        session_id = CASE WHEN context ? 'same_session_retry' THEN NULL ELSE session_id END
     WHERE agent_id = $1
       AND status IN ('queued', 'deferred')
       AND runtime_id IS DISTINCT FROM $2

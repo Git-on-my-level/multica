@@ -44,6 +44,7 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 			// dropping it from the list can never be a silent change.
 			protocol.DaemonCapabilityLocalWorktreeV1,
 			protocol.DaemonCapabilityCursorRecoveryV1,
+			protocol.DaemonCapabilitySameSessionRetryV1,
 			// Same shape, opposite default: this daemon's brief names the
 			// merged multica-platform skill, and advertising that is what
 			// stops the server shipping it a redirect stub under the old name

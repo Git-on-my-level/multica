@@ -13,6 +13,28 @@ import (
 	"time"
 )
 
+func TestOpenCodePinnedRetryDoesNotLaunchRunTransport(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "opencode")
+	launched := filepath.Join(dir, "launched")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\ntouch launched\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backend := opencodeBackend{cfg: Config{
+		ExecutablePath: bin, BuiltinRuntime: true, CLIVersion: "1.19.4",
+		Logger: slog.Default(), Env: map[string]string{opencodeTransportEnv: "run"},
+	}}
+	session, err := backend.Execute(context.Background(), "do not send", ExecOptions{
+		Cwd: dir, ResumeSessionID: "ses_original", RequireSameSession: true,
+	})
+	if session != nil || err == nil || !strings.Contains(err.Error(), "requires ACP") {
+		t.Fatalf("legacy transport returned session=%v error=%v", session, err)
+	}
+	if _, err := os.Stat(launched); !os.IsNotExist(err) {
+		t.Fatalf("legacy transport must never launch, marker stat: %v", err)
+	}
+}
+
 // fakeOpencodeACPScript speaks enough of `opencode acp` to drive executeACP,
 // with the frame shapes recorded from opencode-ai 1.19.4 and @opencode/cli
 // 2.2.0. FAKE_MODE=cancel holds the prompt open until session/cancel arrives.

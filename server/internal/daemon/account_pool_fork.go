@@ -397,6 +397,9 @@ func (d *Daemon) selectTaskAccount(provider string, task *Task, customCommand bo
 	ranked := p.rankLocked(provider, nil, facts)
 	if len(ranked) == 0 {
 		p.mu.Unlock()
+		if task.RequireSameSession {
+			task.PriorSessionID = ""
+		}
 		return nil
 	}
 	chosen := ranked[0]
@@ -414,6 +417,11 @@ func (d *Daemon) selectTaskAccount(provider string, task *Task, customCommand bo
 				break
 			}
 		}
+	}
+	if task.RequireSameSession && chosen.spec.ID != sessionAccount {
+		p.mu.Unlock()
+		task.PriorSessionID = ""
+		return nil
 	}
 	p.reserveLocked(provider, chosen.spec.ID)
 	p.mu.Unlock()

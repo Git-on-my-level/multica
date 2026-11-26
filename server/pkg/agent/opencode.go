@@ -150,6 +150,8 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	// as the fallback.
 	if useACP, reason := opencodeUsesACP(b.cfg, opts); useACP {
 		return b.executeACP(ctx, execPath, prompt, opts)
+	} else if opts.RequireSameSession {
+		return nil, fmt.Errorf("OpenCode recovery requires ACP to verify the original session: %s", reason)
 	} else {
 		b.cfg.Logger.Info("opencode: using the run transport", "reason", reason)
 	}

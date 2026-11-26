@@ -579,7 +579,10 @@ SELECT
     CASE WHEN sqlc.narg(fire_at)::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary,
-    CASE WHEN sqlc.narg(required_resume_session_id)::text IS NULL THEN p.context
+    CASE WHEN COALESCE(sqlc.narg(require_same_session)::boolean, false)
+         THEN COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('same_session_retry', jsonb_build_object(
+             'runtime_id', p.runtime_id, 'session_id', p.session_id))
+         WHEN sqlc.narg(required_resume_session_id)::text IS NULL THEN p.context
          ELSE COALESCE(p.context, '{}'::jsonb) || jsonb_build_object('cursor_recovery', jsonb_build_object(
              'runtime_id', p.runtime_id, 'session_id', p.session_id))
     END,
@@ -624,6 +627,16 @@ WHERE p.id = $1
       AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
+  ))
+  AND (NOT COALESCE(sqlc.narg(require_same_session)::boolean, false) OR (
+      p.status = 'failed'
+      AND NULLIF(btrim(p.session_id), '') IS NOT NULL
+      AND NOT p.session_rollout_missing
+      AND p.retired_session_id IS DISTINCT FROM p.session_id
+      AND a.runtime_id = p.runtime_id
+      AND sqlc.narg(target_agent_id)::uuid IS NULL
+      AND sqlc.narg(target_runtime_id)::uuid IS NULL
+      AND COALESCE(jsonb_typeof(p.context), 'object') = 'object'
   ))
   AND lock_task_owner_rows(
       COALESCE(sqlc.narg(target_agent_id)::uuid, p.agent_id),
@@ -751,7 +764,10 @@ WITH fence AS MATERIALIZED (
 ),
 reassigned AS (
     UPDATE agent_task_queue
-    SET runtime_id = @new_runtime_id
+    SET runtime_id = @new_runtime_id,
+        -- Preserve the retry marker for terminal claim settlement, but never
+        -- expose the old runtime's session as history on the replacement.
+        session_id = CASE WHEN context ? 'same_session_retry' THEN NULL ELSE session_id END
     WHERE agent_id = @agent_id
       AND status IN ('queued', 'deferred')
       AND runtime_id IS DISTINCT FROM @new_runtime_id

@@ -18,7 +18,8 @@ const (
 	// that implements the mode says so; one that does not, cannot.
 	DaemonCapabilityLocalWorktreeV1 = "local-worktree-v1"
 	// Cursor recovery must fail closed if its pinned session becomes unavailable.
-	DaemonCapabilityCursorRecoveryV1 = "cursor-recovery-v1"
+	DaemonCapabilityCursorRecoveryV1   = "cursor-recovery-v1"
+	DaemonCapabilitySameSessionRetryV1 = "same-session-retry-v1"
 	// DaemonCapabilitySourceContextQuickCreateV1 advertises support for the
 	// two-section quick-create prompt that keeps a new instruction separate
 	// from immutable historical source context.

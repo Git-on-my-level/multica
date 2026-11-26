@@ -1030,7 +1030,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
 				return
 			}
-			if !result.codexStartupRefreshRetrySafe || attempt == 2 {
+			if opts.RequireSameSession || !result.codexStartupRefreshRetrySafe || attempt == 2 {
 				flushHeldPins()
 				resCh <- result
 				return
@@ -1567,7 +1567,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				Status:         finalStatus,
 				Error:          finalError,
 				DurationMs:     time.Since(startTime).Milliseconds(),
-				ResumeRejected: isCodexResumeOverflow(opts, err),
+				ResumeRejected: isCodexResumeOverflow(opts, err) || errors.Is(err, errCodexPinnedThreadMismatch),
 			}
 			return
 		}
@@ -1966,6 +1966,8 @@ func codexTurnInput(prompt string, resumeExpected, resumed bool, notice string) 
 	return []map[string]any{{"type": "text", "text": text}}
 }
 
+var errCodexPinnedThreadMismatch = errors.New("codex resumed a different thread")
+
 // startOrResumeThread picks between Codex's thread/resume and thread/start
 // based on opts.ResumeSessionID. When a prior thread ID is provided it first
 // tries thread/resume; recoverable protocol errors (unknown thread, schema
@@ -2010,6 +2012,9 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 		resumeResult, err := c.request(ctx, "thread/resume", resumeParams)
 		if err == nil {
 			if threadID := extractThreadID(resumeResult); threadID != "" {
+				if opts.RequireSameSession && threadID != priorThreadID {
+					return "", false, errCodexPinnedThreadMismatch
+				}
 				logger.Info("codex lifecycle",
 					"phase", "thread_resume_response",
 					"task_id", c.cfg.TaskID,
@@ -2023,8 +2028,14 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 				)
 				return threadID, true, nil
 			}
+			if opts.RequireSameSession {
+				return "", false, errors.New("codex thread/resume returned no thread ID")
+			}
 			logger.Warn("codex thread/resume returned no thread ID; falling back to thread/start", "prior_thread_id", priorThreadID)
 		} else {
+			if opts.RequireSameSession {
+				return "", false, fmt.Errorf("codex thread/resume failed: %w", err)
+			}
 			if isCodexTransportError(err) {
 				logger.Warn("codex thread/resume failed due to transport error; not falling back to thread/start", "prior_thread_id", priorThreadID, "error", err)
 				return "", false, fmt.Errorf("codex thread/resume failed: %w", err)

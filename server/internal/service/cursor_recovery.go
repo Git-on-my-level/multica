@@ -17,17 +17,28 @@ func cursorRetrySession(errorText, sessionID string) pgtype.Text {
 // CursorRecoverySession reads the custody recorded at retry insertion. An
 // empty session for a marked retry means delivery must refuse the claim.
 func CursorRecoverySession(task db.AgentTaskQueue) (required bool, sessionID string) {
-	var context struct {
-		Recovery json.RawMessage `json:"cursor_recovery"`
-	}
-	if json.Unmarshal(task.Context, &context) != nil || len(context.Recovery) == 0 {
+	return pinnedRetrySession(task, "cursor_recovery")
+}
+
+// SameSessionRetry returns an empty session for a retry whose custody was lost.
+func SameSessionRetry(task db.AgentTaskQueue) (required bool, sessionID string) {
+	return pinnedRetrySession(task, "same_session_retry")
+}
+
+func requiresSameSessionRetry(task db.AgentTaskQueue) bool {
+	return task.FailureReason.String == taskfailure.ReasonAgentProviderCapacityOrRateLimit.String()
+}
+
+func pinnedRetrySession(task db.AgentTaskQueue, key string) (required bool, sessionID string) {
+	var context map[string]json.RawMessage
+	if json.Unmarshal(task.Context, &context) != nil || len(context[key]) == 0 {
 		return false, ""
 	}
 	var custody struct {
 		RuntimeID pgtype.UUID `json:"runtime_id"`
 		SessionID string      `json:"session_id"`
 	}
-	if json.Unmarshal(context.Recovery, &custody) != nil ||
+	if json.Unmarshal(context[key], &custody) != nil ||
 		!custody.RuntimeID.Valid || custody.RuntimeID != task.RuntimeID ||
 		!task.SessionID.Valid || strings.TrimSpace(custody.SessionID) == "" ||
 		custody.SessionID != task.SessionID.String || task.ForceFreshSession {
