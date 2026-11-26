@@ -8,7 +8,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
-type hermesPrepGCStats struct {
+type hermesGatewayGCStats struct {
 	found        int
 	aged         int
 	unproven     int
@@ -18,17 +18,17 @@ type hermesPrepGCStats struct {
 	bytesRemoved int64
 }
 
-// gcHermesPrepOrphan handles the narrow ownerless Hermes layout separately
+// gcHermesGatewayOrphan handles the narrow ownerless Hermes layout separately
 // from the normal whole-root cleanup, which requires an owner marker.
-func (d *Daemon) gcHermesPrepOrphan(ctx context.Context, taskDir string, stats *gcStats) bool {
+func (d *Daemon) gcHermesGatewayOrphan(ctx context.Context, taskDir string, stats *gcStats) bool {
 	now := time.Now()
-	orphan := execenv.OpenHermesPrepOrphan(d.cfg.WorkspacesRoot, taskDir, now)
+	orphan := execenv.OpenHermesGatewayOrphan(d.cfg.WorkspacesRoot, taskDir, now)
 	if orphan == nil {
 		return false
 	}
 	defer orphan.Close()
 
-	census := &stats.hermesPrepOrphans
+	census := &stats.hermesGatewayOrphans
 	census.found++
 	census.bytes += orphan.Bytes
 	expired := orphan.Age > d.cfg.GCOrphanTTL
@@ -62,7 +62,7 @@ func (d *Daemon) gcHermesPrepOrphan(ctx context.Context, taskDir string, stats *
 	}
 	bytes, removed, err := orphan.Remove(now, d.cfg.GCOrphanTTL, retainRoot)
 	if err != nil {
-		d.logger.Warn("gc: remove abandoned Hermes preparation failed", "dir", taskDir, "error", err)
+		d.logger.Warn("gc: remove abandoned Hermes gateway home failed", "dir", taskDir, "error", err)
 	}
 	if !removed {
 		stats.skipped++
@@ -76,7 +76,7 @@ func (d *Daemon) gcHermesPrepOrphan(ctx context.Context, taskDir string, stats *
 	}
 	stats.bytesReclaimed += bytes
 	d.gcUnownedWarnings.Delete(taskDir)
-	d.logger.Info("gc: removed", "dir", taskDir, "reason", "abandoned Hermes preparation",
+	d.logger.Info("gc: removed", "dir", taskDir, "reason", "abandoned Hermes gateway home",
 		"bytes_reclaimed", bytes, "retention", d.cfg.GCOrphanTTL, "age", orphan.Age, "retained_index_anchor", retainRoot)
 	return true
 }

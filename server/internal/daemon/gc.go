@@ -66,7 +66,7 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
 type gcStats struct {
-	hermesPrepOrphans        hermesPrepGCStats
+	hermesGatewayOrphans     hermesGatewayGCStats
 	cleaned                  int // whole task dirs removed by a parent-lifecycle or completed-task policy
 	orphaned                 int // whole task dirs removed (no meta / unreachable issue)
 	skipped                  int // task dirs retained, possibly after partial cleanup
@@ -180,19 +180,19 @@ func (d *Daemon) runGC(ctx context.Context) {
 		}
 	}
 
-	if stats.hermesPrepOrphans.found > 0 || stats.cleaned > 0 || stats.orphaned > 0 || stats.localDirectoriesRetained > 0 || stats.codexHomesReclaimed > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
+	if stats.hermesGatewayOrphans.found > 0 || stats.cleaned > 0 || stats.orphaned > 0 || stats.localDirectoriesRetained > 0 || stats.codexHomesReclaimed > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
-			"hermes_prep_roots_before", stats.hermesPrepOrphans.found,
-			"hermes_prep_bytes_before", stats.hermesPrepOrphans.bytes,
-			"hermes_prep_roots_after", stats.hermesPrepOrphans.found-stats.hermesPrepOrphans.removed,
-			"hermes_prep_bytes_after", stats.hermesPrepOrphans.bytes-stats.hermesPrepOrphans.bytesRemoved,
-			"hermes_prep_roots_past_ttl_after", stats.hermesPrepOrphans.aged-stats.hermesPrepOrphans.removed,
-			"hermes_prep_roots_unproven", stats.hermesPrepOrphans.unproven,
-			"hermes_prep_roots_reclaimed", stats.hermesPrepOrphans.removed,
-			"hermes_prep_root_dirs_removed", stats.hermesPrepOrphans.dirsRemoved,
-			"hermes_prep_bytes_reclaimed", stats.hermesPrepOrphans.bytesRemoved,
+			"hermes_gateway_orphan_roots_before", stats.hermesGatewayOrphans.found,
+			"hermes_gateway_orphan_bytes_before", stats.hermesGatewayOrphans.bytes,
+			"hermes_gateway_orphan_roots_after", stats.hermesGatewayOrphans.found-stats.hermesGatewayOrphans.removed,
+			"hermes_gateway_orphan_bytes_after", stats.hermesGatewayOrphans.bytes-stats.hermesGatewayOrphans.bytesRemoved,
+			"hermes_gateway_orphan_roots_past_ttl_after", stats.hermesGatewayOrphans.aged-stats.hermesGatewayOrphans.removed,
+			"hermes_gateway_orphan_roots_unproven", stats.hermesGatewayOrphans.unproven,
+			"hermes_gateway_orphan_roots_reclaimed", stats.hermesGatewayOrphans.removed,
+			"hermes_gateway_orphan_root_dirs_removed", stats.hermesGatewayOrphans.dirsRemoved,
+			"hermes_gateway_orphan_bytes_reclaimed", stats.hermesGatewayOrphans.bytesRemoved,
 			"skipped", stats.skipped,
 			"local_directories_retained", stats.localDirectoriesRetained,
 			"codex_homes_reclaimed", stats.codexHomesReclaimed,
@@ -233,7 +233,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			continue
 		}
 		meta, metaErr := execenv.ReadGCMeta(taskDir)
-		if errors.Is(metaErr, os.ErrNotExist) && d.gcHermesPrepOrphan(ctx, taskDir, stats) {
+		if errors.Is(metaErr, os.ErrNotExist) && d.gcHermesGatewayOrphan(ctx, taskDir, stats) {
 			continue
 		}
 		if metaErr == nil && meta.LocalDirectory {
@@ -390,7 +390,7 @@ func (d *Daemon) applyGCActionWithChatMeta(ctx context.Context, taskDir string, 
 	removedBefore := stats.artifactRemoved
 	switch action {
 	case gcActionClean, gcActionOrphan:
-		bytes, removed := d.cleanTaskDirWithClaim(taskDir, claim)
+		bytes, removed := d.cleanTaskDirWithClaim(taskDir, claim, checkedMeta)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -893,8 +893,7 @@ func (d *Daemon) gcDecisionAutopilotRun(ctx context.Context, taskDir string, met
 	// envRoot). So the moment the run reaches a terminal state the directory is
 	// dead weight and we reclaim it immediately, without waiting out GCTTL — the
 	// same reasoning gcDecisionQuickCreate applies to quick-create dirs. The
-	// active-env-root short-circuit in shouldCleanTaskDir still protects a run
-	// that is mid-flight, so this can't pull the rug from under live work.
+	// removal path also waits for any detached Hermes gateway to finish.
 	if isAutopilotRunTerminal(status.Status) {
 		return gcActionClean, gcRemovalDetails{reason: "autopilot run finished", status: status.Status}
 	}
@@ -994,10 +993,10 @@ func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
 // reclaimed bytes for the removal log and cycle summary. A failed or
 // refused removal reports removed=false.
 func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
-	return d.cleanTaskDirWithClaim(taskDir, nil)
+	return d.cleanTaskDirWithClaim(taskDir, nil, nil)
 }
 
-func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootGCClaim) (bytes int64, removed bool) {
+func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootGCClaim, checkedMeta *execenv.GCMeta) (bytes int64, removed bool) {
 	// Measure first, prove ownership second. dirSize walks the entire tree,
 	// which on a large task directory takes long enough for the validated
 	// directory to be replaced underneath us — checking before that walk would
@@ -1007,6 +1006,12 @@ func (d *Daemon) cleanTaskDirWithClaim(taskDir string, claim *execenv.EnvRootGCC
 	owner, ownerErr := d.gcTaskDirOwner(taskDir)
 	if ownerErr != nil {
 		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
+		return 0, false
+	}
+	// Terminal autopilot runs can still have a detached Hermes gateway. Its
+	// final writes can recreate a removed root after its owner markers are gone.
+	if checkedMeta != nil && checkedMeta.Kind == execenv.GCKindAutopilotRun && execenv.HermesGatewayMayWrite(taskDir) {
+		d.logger.Debug("gc: waiting for Hermes gateway shutdown", "dir", taskDir)
 		return 0, false
 	}
 	var removeLinkErr, err error
