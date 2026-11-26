@@ -6150,8 +6150,8 @@ func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
 // failure at failedAttempt. runtime_offline always gets a positive fire_at so
 // it waits for the health-gated promotion path. provider_network's final
 // attempt and runtime recovery are deferred ~5s. Explicit capacity failures wait
-// 60s. Other retries are immediate (zero delay creates a claimable queued child). Callers pass the returned
-// delay to CreateRetryTask via fire_at.
+// 60s. Zero delay creates an immediately claimable child. Callers pass the
+// returned delay to CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
 	if reason == string(taskfailure.ReasonRuntimeRecovery) {
 		return runtimeRecoveryRetryDeferral

@@ -135,7 +135,7 @@ func isUsageLimit403(lower string) bool {
 // updated to match. Keeping them in lock-step is required so that
 // in-flight rows and historically backfilled rows share the same
 // taxonomy. The explicit transient-capacity rules are deliberate live-classifier
-// exception to this agreement; do not mirror it into the historical backfill SQL.
+// exceptions to this agreement; do not mirror it into the historical backfill SQL.
 // Historical rows retain their existing classification and are outside its scope.
 //
 // Matching is case-insensitive substring against the lowercased input.

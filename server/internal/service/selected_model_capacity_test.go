@@ -11,6 +11,7 @@ import (
 	dbfx "github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -93,6 +94,8 @@ func testSelectedCapacityResumeBoundary(t *testing.T) {
 	fx := dbfx.New(pool, workspaceID, userID)
 	var runtimeID string
 	fx.QueryRow(t, `SELECT runtime_id::text FROM agent WHERE id=$1`, agentID).Scan(&runtimeID)
+	fx.Exec(t, `UPDATE agent_runtime SET metadata=$2 WHERE id=$1`, runtimeID,
+		`{"capabilities":["`+protocol.DaemonCapabilitySameSessionRetryV1+`"]}`)
 	q := db.New(pool)
 	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
 	for _, tc := range []struct {
