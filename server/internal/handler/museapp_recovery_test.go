@@ -58,16 +58,15 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 		for _, tc := range []struct {
 			name, provider, status, capability string
 			rebound                            bool
-			protected, hasSession              bool
+			protected                          bool
 		}{
-			{"started", "museapp", "running", "museapp-process-cleanup-v1", false, true, false},
-			{"legacy daemon", "museapp", "running", "", false, true, false},
-			{"runtime changed", "museapp", "running", "museapp-process-cleanup-v1", true, true, false},
-			{"not started", "museapp", "dispatched", "", false, false, false},
-			{"waiting for workdir", "museapp", "waiting_local_directory", "", false, false, false},
-			{"Codex", "codex", "running", "", false, false, true},
-			{"Codex without recorded session", "codex", "running", "", false, false, false},
-			{"Pi", "pi", "running", "pi-process-cleanup-v1", false, false, true},
+			{"started", "museapp", "running", "museapp-process-cleanup-v1", false, true},
+			{"legacy daemon", "museapp", "running", "", false, true},
+			{"runtime changed", "museapp", "running", "museapp-process-cleanup-v1", true, true},
+			{"not started", "museapp", "dispatched", "", false, false},
+			{"waiting for workdir", "museapp", "waiting_local_directory", "", false, false},
+			{"Codex", "codex", "running", "", false, false},
+			{"Pi", "pi", "running", "pi-process-cleanup-v1", false, false},
 		} {
 			t.Run(path+"/"+tc.name, func(t *testing.T) {
 				runtimeID := dbfx.Runtime(t, "recovery policy", testutil.Cols{"provider": tc.provider})
@@ -80,9 +79,6 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 				}
 				if tc.status == "running" {
 					cols["started_at"] = testutil.Raw("now() - interval '4 hours'")
-				}
-				if tc.hasSession {
-					cols["session_id"] = "recovery-policy-session"
 				}
 				if tc.capability != "" {
 					cols["result"] = `{"process_cleanup_capability":"` + tc.capability + `"}`
@@ -150,14 +146,14 @@ func TestMuseAppInfrastructureRecoveryPolicies(t *testing.T) {
 				var retries int
 				dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE retry_of_task_id=$1`, taskID).Scan(&retries)
 				wantRetries := 1
-				if tc.protected || (path == "restart" && tc.status == "running" && !tc.hasSession) {
+				if tc.protected {
 					wantRetries = 0
 				}
 				if retries != wantRetries {
 					t.Fatalf("retries = %d, want %d", retries, wantRetries)
 				}
 				var successor string
-				if wantRetries == 0 {
+				if tc.protected {
 					successor = dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID, "status": "dispatched"})
 				} else {
 					var state string

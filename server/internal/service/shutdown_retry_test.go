@@ -205,8 +205,8 @@ func TestRetryEligibleDaemonShutdownPreservesStartupRecovery(t *testing.T) {
 			t.Fatalf("unlaunched startup recovery changed for %s", status)
 		}
 		task.Error.String = "daemon restarted while task was in flight"
-		if retryEligible("runtime_recovery", task) {
-			t.Fatalf("ambiguous in-flight work could relaunch for %s", status)
+		if !retryEligible("runtime_recovery", task) || taskRetryDelay("runtime_recovery", task) != 0 {
+			t.Fatalf("legacy sessionless startup recovery changed for %s", status)
 		}
 	}
 	waiting := db.AgentTaskQueue{

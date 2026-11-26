@@ -6252,12 +6252,13 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 
 const daemonShutdownDuringTurn = "daemon shut down while task was in flight"
 
-// Work interrupted after launch can only resume. Orphan recovery labels
-// work that never launched separately so its original retry policy still applies.
+// Graceful shutdown requires a resumable session. At daemon startup, pin a
+// recorded session on interrupted work while retaining legacy immediate
+// recovery when the orphan has no session.
 func isInterruptedDaemonRecovery(reason string, t db.AgentTaskQueue) bool {
 	return reason == taskfailure.ReasonRuntimeRecovery.String() &&
 		(strings.HasPrefix(t.Error.String, daemonShutdownDuringTurn) ||
-			t.Error.String == "daemon restarted while task was in flight")
+			(t.Error.String == "daemon restarted while task was in flight" && t.SessionID.Valid && strings.TrimSpace(t.SessionID.String) != ""))
 }
 
 // retryEligible reports whether a failed task qualifies for an automatic retry
