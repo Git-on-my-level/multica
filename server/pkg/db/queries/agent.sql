@@ -628,8 +628,8 @@ WHERE p.id = $1
       AND p.retired_session_id IS DISTINCT FROM p.session_id
       AND a.runtime_id = p.runtime_id
   ))
-  -- Admit pinned retries only when the original runtime registered support.
-  -- Claim delivery still checks the live daemon's advertised capabilities.
+  -- Require support in the original runtime's registration at insert time. A
+  -- deferred retry cannot rely on a future upgrade. Claims check the live daemon.
   AND (NOT COALESCE(sqlc.narg(require_same_session)::boolean, false) OR (
       p.status = 'failed'
       AND NULLIF(btrim(p.session_id), '') IS NOT NULL

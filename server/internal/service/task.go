@@ -3291,6 +3291,26 @@ func createAssistantChatMessage(ctx context.Context, qtx *db.Queries, params db.
 	return row, nil
 }
 
+func writeTerminalChatFailure(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue) error {
+	// The next turn must inherit the onboarding kickoff when this input batch
+	// is finished. A retry inherits the same batch and keeps the kickoff bound.
+	if err := qtx.ReleaseOnboardingKickoffFromTask(ctx, chatInputOwnerID(task)); err != nil {
+		return fmt.Errorf("release onboarding kickoff: %w", err)
+	}
+	if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
+		ID:            dbid.NewV7(),
+		ChatSessionID: task.ChatSessionID,
+		Role:          "assistant",
+		Content:       redact.Text(task.Error.String),
+		TaskID:        task.ID,
+		FailureReason: task.FailureReason,
+		ElapsedMs:     computeChatElapsedMs(task),
+	}); err != nil {
+		return fmt.Errorf("write chat failure outcome: %w", err)
+	}
+	return nil
+}
+
 func (s *TaskService) settleQueuedChatInput(
 	ctx context.Context,
 	qtx *db.Queries,
@@ -5871,6 +5891,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 				// parent's original failure even when a retry cannot be queued.
 				slog.Info("fail task auto-retry not created: no row written",
 					"task_id", util.UUIDToString(taskID),
+					"runtime_id", util.UUIDToString(t.RuntimeID),
+					"same_session_required", params.RequireSameSession.Bool,
 					"issue_id", util.UUIDToString(t.IssueID),
 					"agent_id", util.UUIDToString(t.AgentID),
 				)
@@ -5901,32 +5923,8 @@ func (s *TaskService) failTaskWithTransition(ctx context.Context, taskID pgtype.
 		// be claimed between the status flip and this row, placing its user input
 		// before the failure it follows.
 		if t.ChatSessionID.Valid && retried == nil {
-			// This turn is dead, so anything it owned has to move on. An adopted
-			// onboarding kickoff would otherwise stay bound to a task that will
-			// never run again: the next turn would reach Mika with no onboarding
-			// context and no record that she had already greeted the member, and
-			// she would introduce herself a second time (MUL-5827). The query
-			// hands it to the session's next queued turn — including one the
-			// member queued while THIS turn was still running, which adoption at
-			// send time could not have caught.
-			//
-			// Gated on retried == nil on purpose. A retry child inherits the
-			// root's chat_input_task_id, and the kickoff stays bound to that
-			// root, so the retry still reads it — releasing here would strip
-			// the context off a turn that is about to run.
-			if err := qtx.ReleaseOnboardingKickoffFromTask(ctx, chatInputOwnerID(t)); err != nil {
-				return fmt.Errorf("release onboarding kickoff: %w", err)
-			}
-			if _, err := createAssistantChatMessage(ctx, qtx, db.CreateChatMessageParams{
-				ID:            dbid.NewV7(),
-				ChatSessionID: t.ChatSessionID,
-				Role:          "assistant",
-				Content:       redact.Text(errMsg),
-				TaskID:        t.ID,
-				FailureReason: pgtype.Text{String: failureReason, Valid: failureReason != ""},
-				ElapsedMs:     computeChatElapsedMs(t),
-			}); err != nil {
-				return fmt.Errorf("write chat failure outcome: %w", err)
+			if err := writeTerminalChatFailure(ctx, qtx, t); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -6450,6 +6448,20 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+	requireSameSession := requiresSameSessionRetry(parent)
+	pinnedChat := requireSameSession && parent.ChatSessionID.Valid
+	if pinnedChat {
+		if _, err := qtx.LockChatSessionForTask(ctx, parent.ID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("lock chat session for retry: %w", err)
+		}
+		// A terminal reply consumes this turn even if the daemon later upgrades.
+		if hasOutcome, err := qtx.HasChatTaskAssistantOutcome(ctx, parent.ID); err != nil || hasOutcome {
+			return nil, err
+		}
+	}
 	if err := guardIssueNotInTriage(ctx, qtx, parent.IssueID, OriginDerived); err != nil {
 		if errors.Is(err, ErrIssueInTriage) {
 			slog.Info("task auto-retry skipped: issue is in triage",
@@ -6459,7 +6471,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		}
 		return nil, err
 	}
-	if reason == taskfailure.ReasonRuntimeOffline.String() || reason == taskfailure.ReasonRuntimeRecovery.String() || requiresSameSessionRetry(parent) {
+	if reason == taskfailure.ReasonRuntimeOffline.String() || reason == taskfailure.ReasonRuntimeRecovery.String() || requireSameSession {
 		// Deferred and chat retries do not occupy the queued-task unique slot. Serialize
 		// by parent without reversing the workspace-to-task teardown lock order.
 		if err := qtx.LockRuntimeRetryParent(ctx, parent.ID); err != nil {
@@ -6490,7 +6502,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 			MaxAttempts:             pgtype.Int4{Int32: taskRetryCeiling(reason, parent), Valid: true},
 			RequiredResumeSessionID: cursorRetrySession(parent.Error.String, parent.SessionID.String),
 			RequiredResumeRuntimeID: parent.RuntimeID,
-			RequireSameSession:      pgtype.Bool{Bool: requiresSameSessionRetry(parent), Valid: true},
+			RequireSameSession:      pgtype.Bool{Bool: requireSameSession, Valid: true},
 			RuntimeMcpOverlay:       runtimeMCPOverlay.Overlay,
 			RuntimeConnectedApps:    runtimeMCPOverlay.ConnectedApps,
 		})
@@ -6500,8 +6512,18 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 		// retry admission. A refusal leaves the original failure in place.
 		slog.Info("task auto-retry not created: no row written",
 			"parent_task_id", util.UUIDToString(parent.ID),
+			"runtime_id", util.UUIDToString(parent.RuntimeID),
+			"same_session_required", requireSameSession,
 			"reason", reason,
 		)
+		if pinnedChat {
+			if err := writeTerminalChatFailure(ctx, qtx, parent); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, fmt.Errorf("commit refused chat retry: %w", err)
+			}
+		}
 		return nil, nil
 	}
 	if err != nil {

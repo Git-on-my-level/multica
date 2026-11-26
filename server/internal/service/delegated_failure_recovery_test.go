@@ -1105,6 +1105,7 @@ func TestHandleFailedTasksTerminalFailureCommentsOnTaskIssue(t *testing.T) {
 func TestHandleFailedTasksRetryPendingDoesNotCommentOnTaskIssue(t *testing.T) {
 	f, svc := seedDelegatedFailureFixture(t)
 	ctx := context.Background()
+	dbfx.New(f.pool, f.workspaceID, f.userID).Exec(t, `UPDATE agent_runtime SET metadata=$2 WHERE id=$1`, f.runtimeID, sameSessionRetryCapabilities)
 	failed := f.insertOrphanedWorkerTask(t, 1, 2)
 
 	if retried := svc.HandleFailedTasks(ctx, []db.AgentTaskQueue{failed}); retried != 1 {

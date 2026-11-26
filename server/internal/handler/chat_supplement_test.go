@@ -524,6 +524,7 @@ func TestChatSupplementDaemonRecoveryRetainsRetryInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, task.RuntimeID, protocol.DaemonCapabilitySameSessionRetryV1)
 	failed, err := testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), task.RuntimeID)
 	if err != nil {
 		t.Fatal(err)
@@ -551,6 +552,43 @@ func TestChatSupplementDaemonRecoveryRetainsRetryInput(t *testing.T) {
 	}
 	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id=$1`, sessionID); n != 2 {
 		t.Fatalf("guidance escaped the retry batch: %d tasks", n)
+	}
+}
+
+func TestChatOrphanRecoveryWithoutCompatibleDaemonWritesFailure(t *testing.T) {
+	sessionID, taskID, _ := newChatSupplementFixture(t, true)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET session_id='chat-provider-session' WHERE id=$1`, taskID)
+	task, err := testHandler.Queries.GetAgentTask(t.Context(), parseUUID(taskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := testHandler.TaskService.RecoverOrphanedTasksForRuntime(t.Context(), task.RuntimeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent db.AgentTaskQueue
+	for _, row := range failed {
+		if row.ID == task.ID {
+			parent = row
+			break
+		}
+	}
+	if !parent.ID.Valid {
+		t.Fatal("fixture task was not recovered")
+	}
+	if retried := testHandler.TaskService.HandleFailedTasks(t.Context(), []db.AgentTaskQueue{parent}); retried != 0 {
+		t.Fatalf("retry count = %d, want zero", retried)
+	}
+	// Upgrading the daemon after refusal must not revive a settled turn.
+	dbfx.Exec(t, `UPDATE agent_runtime SET metadata = jsonb_build_object('capabilities', jsonb_build_array($2::text)) WHERE id = $1`, task.RuntimeID, protocol.DaemonCapabilitySameSessionRetryV1)
+	if retried := testHandler.TaskService.HandleFailedTasks(t.Context(), []db.AgentTaskQueue{parent}); retried != 0 {
+		t.Fatalf("retry count after upgrade = %d, want zero", retried)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM chat_message WHERE chat_session_id=$1 AND task_id=$2 AND role='assistant' AND failure_reason='runtime_recovery' AND content=$3`, sessionID, taskID, parent.Error.String); n != 1 {
+		t.Fatalf("failure replies for original turn = %d, want one", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE retry_of_task_id=$1`, taskID); n != 0 {
+		t.Fatalf("retry children = %d, want zero", n)
 	}
 }
 
