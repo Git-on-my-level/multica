@@ -2654,6 +2654,9 @@ func TestCodexStartOrResumeThreadRequiresPinnedSession(t *testing.T) {
 			if err == nil || errors.Is(err, context.DeadlineExceeded) || id != "" || resumed {
 				t.Fatalf("pinned resume returned thread=%q resumed=%v err=%v", id, resumed, err)
 			}
+			if rejected := errors.Is(err, errCodexPinnedThreadMismatch); rejected != (tc.name == "different") {
+				t.Fatalf("definitive mismatch recorded=%v for %s: %v", rejected, tc.name, err)
+			}
 		})
 	}
 }
