@@ -393,14 +393,23 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("zcode session created", "session_id", sessionID)
 
-		// 3. If the caller picked a model (via agent.model from the UI
-		// dropdown — the catalog comes from the bridge's ACP
-		// configOptions), switch the session to it before sending any
-		// prompt. This MUST fail the task on error: silently falling back
-		// to the bridge's configured default model would let the user
-		// believe their pick was honoured while the task ran on something
-		// else.
+		// 3. The bridge can interpret an unknown ID as a bare model on a
+		// different provider. Validate against the same IDs as discovery
+		// before asking it to select an explicit model.
 		if opts.Model != "" {
+			if err := validateZcodeSessionModel(sessionResult, opts.Model); err != nil {
+				resCh <- Result{
+					Status:     "failed",
+					Error:      fmt.Sprintf("zcode could not switch to model %q: %v", opts.Model, err),
+					DurationMs: time.Since(startTime).Milliseconds(),
+					SessionID:  opts.ResumeSessionID,
+				}
+				return
+			}
+
+			// The bridge can report a catalog default on lazy session/new
+			// or when it cannot read a resumed session's settings. Require
+			// acknowledgement instead of treating currentValue as proof.
 			if _, err := c.request(runCtx, "session/setModel", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
@@ -408,6 +417,9 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				b.cfg.Logger.Warn("zcode setModel failed", "error", err, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("zcode could not switch to model %q: %v", opts.Model, err)
+				if setupFailureWithholdsSessionID(opts) {
+					sessionID = ""
+				}
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					// On a resumed session with a model override, the dead
 					// session can surface here instead of at session/prompt.
@@ -569,6 +581,30 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func validateZcodeSessionModel(sessionResult json.RawMessage, requested string) error {
+	models := parseACPSessionNewModels(sessionResult)
+	if len(models) == 0 {
+		// Older bridges can omit the catalog, especially on resume. Allow
+		// the setter to validate an observed ID or an explicit ZCode
+		// provider\model pair that cannot trigger bare-name resolution.
+		provider, model, qualified := strings.Cut(requested, `\`)
+		if (qualified && provider != "" && model != "") ||
+			requested == acpModelOptionCurrentValue(sessionResult) ||
+			requested == extractACPCurrentModelID(sessionResult) {
+			return nil
+		}
+		return fmt.Errorf("the session advertised no model IDs; use an explicit provider-qualified ID from ZCode discovery")
+	}
+	accepted := make([]string, 0, len(models))
+	for _, model := range models {
+		if model.ID == requested {
+			return nil
+		}
+		accepted = append(accepted, fmt.Sprintf("%q", model.ID))
+	}
+	return fmt.Errorf("configured ID is absent from the session model catalog; advertised IDs: %s", strings.Join(accepted, ", "))
 }
 
 // zcodeSendSessionCancel writes a best-effort ACP session/cancel notification
