@@ -407,9 +407,9 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				return
 			}
 
-			// On lazy session/new, currentValue is a catalog default.
-			// The backing session may start on a different model, so an
-			// explicit selection still needs acknowledgement.
+			// The bridge can report a catalog default on lazy session/new
+			// or when it cannot read a resumed session's settings. Require
+			// acknowledgement instead of treating currentValue as proof.
 			if _, err := c.request(runCtx, "session/setModel", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
@@ -417,6 +417,9 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				b.cfg.Logger.Warn("zcode setModel failed", "error", err, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("zcode could not switch to model %q: %v", opts.Model, err)
+				if setupFailureWithholdsSessionID(opts) {
+					sessionID = ""
+				}
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					// On a resumed session with a model override, the dead
 					// session can surface here instead of at session/prompt.
@@ -583,7 +586,16 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 func validateZcodeSessionModel(sessionResult json.RawMessage, requested string) error {
 	models := parseACPSessionNewModels(sessionResult)
 	if len(models) == 0 {
-		return fmt.Errorf("the session advertised no model IDs for explicit selection")
+		// Older bridges can omit the catalog, especially on resume. Allow
+		// the setter to validate an observed ID or an explicit ZCode
+		// provider\model pair that cannot trigger bare-name resolution.
+		provider, model, qualified := strings.Cut(requested, `\`)
+		if (qualified && provider != "" && model != "") ||
+			requested == acpModelOptionCurrentValue(sessionResult) ||
+			requested == extractACPCurrentModelID(sessionResult) {
+			return nil
+		}
+		return fmt.Errorf("the session advertised no model IDs; use an explicit provider-qualified ID from ZCode discovery")
 	}
 	accepted := make([]string, 0, len(models))
 	for _, model := range models {

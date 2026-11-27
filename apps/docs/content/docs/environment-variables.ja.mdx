@@ -346,7 +346,7 @@ QwenPaw と MiniMax Code には、Multica がモデルを渡さないためモ�
 
 マシン全体のデフォルト引数 `MULTICA_<PREFIX>_ARGS` は、現在 Claude Code、Codex、CodeBuddy、Qwen Code、QwenPaw の 5 ツールに対応しています。対応する変数は `MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS`、`MULTICA_QWEN_ARGS`、`MULTICA_QWENPAW_ARGS` です。例:
 
-ZCode は `MULTICA_ZCODE_PATH`(ブリッジ `zcode-acp-server` の実行ファイル)と `MULTICA_ZCODE_MODEL`(ブリッジが提供するカタログのモデル id、例: `glm-5.3`)をサポートします。
+ZCode は `MULTICA_ZCODE_PATH`（ブリッジ `zcode-acp-server` の実行ファイル）と `MULTICA_ZCODE_MODEL` に対応します。モデル ID はブリッジが提供するカタログからそのままコピーし、表示されているプロバイダーの接頭辞も含めてください。
 
 ```dotenv
 MULTICA_CLAUDE_PATH=/opt/bin/claude
