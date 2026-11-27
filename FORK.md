@@ -132,3 +132,31 @@ MULTICA_GITHUB_BRANCH=main
 Use `scripts/install-fork.sh` for the curl entrypoint; it skips upstream
 Homebrew and persists the fork repository for `multica update`. Fork GHCR
 namespaces are lowercase (`ghcr.io/git-on-my-level/...`).
+
+## Verify a Multica server activation
+
+Release reads serving identity from the production API for `multica-01` after
+the authorized activation. Use the same HTTPS endpoint that workers and members
+normally reach. Set `MULTICA_SERVER_URL` to that API's HTTPS base URL and use the
+current task token or a member token in `MULTICA_TOKEN`.
+
+```bash
+printf 'Authorization: Bearer %s\n' "$MULTICA_TOKEN" |
+  curl --fail --silent --show-error --max-time 15 --header @- "${MULTICA_SERVER_URL%/}/api/version"
+```
+
+1. Compare the returned full `commit` to the expected deployed SHA. Check that
+   `started_at` agrees with the activation window. `built_at`, when present, is
+   the build timestamp in UTC.
+2. Once both checks pass, post `SERVING: multica-01 <commit> <UTC> ro-prod` on
+   the activation issue. Use the response commit and the UTC time of the read
+   (`date -u +%Y-%m-%dT%H:%M:%SZ`). Release can collect this evidence with its
+   existing API credential.
+3. If the route is unavailable, the SHA is missing or mismatched, or the start
+   time falls outside the activation window, report the observed result on the
+   issue and withhold the serving receipt.
+
+The route uses standard member and agent task authentication and requires no
+workspace header or admin scope. Use the full revision in `COMMIT` when
+building a backend image from a source snapshot. The release workflow supplies
+it automatically.

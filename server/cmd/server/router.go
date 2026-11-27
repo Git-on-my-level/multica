@@ -1521,6 +1521,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// tasks.claim) through the same handlers as the HTTP endpoints.
 	daemonHub.SetRPCHandler(h.DaemonRPCHandler)
 	health := newServerHealth(pool)
+	serverVersion := newServerVersion(health.startedAt)
 
 	r := chi.NewRouter()
 
@@ -1783,6 +1784,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Get("/api/theme-store/themes", h.ListStoreThemes)
 		r.Get("/api/theme-store/themes/{themeId}/package", h.GetStoreThemePackage)
 		r.Get("/api/theme-store/themes/{themeId}/screenshots/{mode}", h.GetStoreThemeScreenshot)
+		// Serving identity is authenticated and independent of workspace roles.
+		r.Get("/api/version", serverVersion.handler)
 		r.Get("/api/me", h.GetMe)
 		r.Patch("/api/me", h.UpdateMe)
 		r.Patch("/api/me/onboarding", h.PatchOnboarding)

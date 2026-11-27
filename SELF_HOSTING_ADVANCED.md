@@ -740,6 +740,14 @@ dependency-aware readiness probes and external monitoring that should fail when
 the database is unavailable or migrations are not fully applied. `/healthz` is
 kept as an alias for operator familiarity.
 
+### Build identity
+
+`GET /api/version` reports the serving server's `version`, full Git `commit`,
+`built_at`, and `started_at`. Unavailable values are omitted. Timestamps are in
+UTC. A valid member session, personal access token, or agent task token can
+read this endpoint without a workspace header or admin scope. The fork runbook
+describes the serving check. [Verify a Multica server activation](FORK.md#verify-a-multica-server-activation)
+
 ## Prometheus Metrics
 
 The backend can expose Prometheus metrics on a separate management listener:
