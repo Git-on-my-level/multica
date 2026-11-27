@@ -393,14 +393,23 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		c.sessionID = sessionID
 		b.cfg.Logger.Info("zcode session created", "session_id", sessionID)
 
-		// 3. If the caller picked a model (via agent.model from the UI
-		// dropdown — the catalog comes from the bridge's ACP
-		// configOptions), switch the session to it before sending any
-		// prompt. This MUST fail the task on error: silently falling back
-		// to the bridge's configured default model would let the user
-		// believe their pick was honoured while the task ran on something
-		// else.
+		// 3. The bridge can interpret an unknown ID as a bare model on a
+		// different provider. Validate against the same IDs as discovery
+		// before asking it to select an explicit model.
 		if opts.Model != "" {
+			if err := validateZcodeSessionModel(sessionResult, opts.Model); err != nil {
+				resCh <- Result{
+					Status:     "failed",
+					Error:      fmt.Sprintf("zcode could not switch to model %q: %v", opts.Model, err),
+					DurationMs: time.Since(startTime).Milliseconds(),
+					SessionID:  opts.ResumeSessionID,
+				}
+				return
+			}
+
+			// On lazy session/new, currentValue is a catalog default.
+			// The backing session may start on a different model, so an
+			// explicit selection still needs acknowledgement.
 			if _, err := c.request(runCtx, "session/setModel", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
@@ -569,6 +578,21 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func validateZcodeSessionModel(sessionResult json.RawMessage, requested string) error {
+	models := parseACPSessionNewModels(sessionResult)
+	if len(models) == 0 {
+		return fmt.Errorf("the session advertised no model IDs for explicit selection")
+	}
+	accepted := make([]string, 0, len(models))
+	for _, model := range models {
+		if model.ID == requested {
+			return nil
+		}
+		accepted = append(accepted, fmt.Sprintf("%q", model.ID))
+	}
+	return fmt.Errorf("configured ID is absent from the session model catalog; advertised IDs: %s", strings.Join(accepted, ", "))
 }
 
 // zcodeSendSessionCancel writes a best-effort ACP session/cancel notification
