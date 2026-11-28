@@ -9028,6 +9028,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	phaseRecorder.Mark(taskPhaseEnvironmentReady)
+	if auth := env.CodexAuthPreparation; auth != nil {
+		level := slog.LevelInfo
+		if auth.LinkFailed {
+			level = slog.LevelWarn
+		}
+		d.logger.Log(ctx, level, "codex lifecycle", "phase", "auth_preparation",
+			"task_id", task.ID, "runtime_id", task.RuntimeID, "observed_at", auth.ObservedAt,
+			"shared_auth_file", auth.SharedFile, "task_auth_file", auth.TaskFile,
+			"task_link_points_to_shared", auth.LinksToShared, "auth_link_failed", auth.LinkFailed)
+	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from ResolveRootDir.
 	if env.RootDir != resolvedRoot && env.RootDir != "" {

@@ -120,6 +120,53 @@ func TestPreparationHelperRoundTripsReuse(t *testing.T) {
 	}
 }
 
+func TestPreparationHelperReturnsCodexAuthObservation(t *testing.T) {
+	sharedHome := t.TempDir()
+	t.Setenv("CODEX_HOME", sharedHome)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	params := PrepareParams{
+		WorkspacesRoot: t.TempDir(),
+		WorkspaceID:    "ws-codex-auth-observation",
+		TaskID:         "99999999-8888-7777-6666-555555555555",
+		Provider:       "codex",
+		Task:           TaskContextForEnv{IssueID: "issue-codex-auth-observation"},
+	}
+	env, err := PrepareIsolated(ctx, preparationHelperTestCommand(), params, logger)
+	if err != nil {
+		t.Fatalf("PrepareIsolated: %v", err)
+	}
+	if receipt := env.CodexAuthPreparation; receipt == nil || receipt.ObservedAt.IsZero() ||
+		receipt.SharedFile != "absent" || receipt.TaskFile != "absent" ||
+		receipt.LinkFailed || receipt.LinksToShared {
+		t.Fatalf("missing auth observation: %+v", receipt)
+	}
+
+	// The shared source is now a dangling link. Reuse must report that
+	// separately from an absent task file, even though neither can be opened.
+	if err := os.Symlink(filepath.Join(sharedHome, "missing"), filepath.Join(sharedHome, "auth.json")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	reused, err := ReuseIsolated(ctx, preparationHelperTestCommand(), ReuseParams{
+		WorkspacesRoot: params.WorkspacesRoot,
+		WorkDir:        env.WorkDir,
+		Provider:       params.Provider,
+		Task:           params.Task,
+	}, logger)
+	if err != nil || reused == nil {
+		t.Fatalf("ReuseIsolated: environment=%t error=%v", reused != nil, err)
+	}
+	if receipt := reused.CodexAuthPreparation; receipt == nil || receipt.ObservedAt.Before(env.CodexAuthPreparation.ObservedAt) ||
+		receipt.SharedFile != "dangling_symlink" || receipt.TaskFile != "absent" ||
+		receipt.LinkFailed || receipt.LinksToShared {
+		t.Fatalf("dangling auth observation: %+v", receipt)
+	}
+}
+
 func TestPreparationHelperRoundTripsProjectResources(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

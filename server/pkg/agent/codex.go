@@ -1192,6 +1192,22 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	stderrBuf := newStderrTail(io.Discard, codexStderrTailBytes)
 	cmd.Stderr = stderrBuf
 
+	codexVersion := strings.TrimSpace(b.cfg.CodexVersion)
+	if codexVersion == "" {
+		codexVersion = "unknown"
+	}
+	// Codex selects the provider and auth mechanism inside the child. A file
+	// or environment variable can be present without supplying usable auth.
+	childEnv := cmd.Environ()
+	b.cfg.Logger.Info("codex lifecycle",
+		"phase", "auth_pre_spawn",
+		"task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "attempt", attempt,
+		"codex_version", codexVersion, "daemon_version", b.cfg.DaemonVersion,
+		"provider_auth_readiness", "unknown",
+		"OPENAI_API_KEY_nonempty", envHasNonEmpty(childEnv, "OPENAI_API_KEY"),
+		"CODEX_API_KEY_nonempty", envHasNonEmpty(childEnv, "CODEX_API_KEY"),
+	)
+
 	// Start and take ownership of the process tree in one step. On Windows the
 	// child is created suspended and placed in a Job Object before it runs, so
 	// the cleanup below reaches the Node wrapper, the native app-server, and the
@@ -1212,10 +1228,6 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}
 	launchStarted := time.Now()
-	codexVersion := strings.TrimSpace(b.cfg.CodexVersion)
-	if codexVersion == "" {
-		codexVersion = "unknown"
-	}
 
 	b.cfg.Logger.Info("codex lifecycle", "phase", "spawn", "task_id", b.cfg.TaskID, "runtime_id", b.cfg.RuntimeID, "pid", cmd.Process.Pid, "process_group", cmd.Process.Pid, "cwd", opts.Cwd, "attempt", attempt, "active_launches", activeLaunches, "codex_version", codexVersion, "daemon_version", b.cfg.DaemonVersion)
 

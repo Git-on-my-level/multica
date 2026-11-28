@@ -280,6 +280,8 @@ type SkillFileContextForEnv struct {
 
 // Environment represents a prepared, isolated execution environment.
 type Environment struct {
+	// CodexAuthPreparation carries safe file metadata back from the prep helper.
+	CodexAuthPreparation *CodexAuthPreparation `json:",omitempty"`
 	// SkillDirectories records successful writes by skill ID, including any
 	// filesystem collision suffix. It crosses the preparation-helper JSON
 	// boundary like PreparedSkillNames.
@@ -666,9 +668,18 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// For Codex, set up a per-task CODEX_HOME seeded from ~/.codex/ with skills.
 	if params.Provider == "codex" {
 		codexHome := filepath.Join(envRoot, codexHomeDirName)
-		if err := prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{CodexVersion: params.CodexVersion, IsLocalDirectory: params.LocalWorkDir != "" || params.LocalWorktree != nil, SessionStoreKey: codexSessionStoreKey(params.Profile, params.Task), CodexCustomArgs: params.CodexCustomArgs}, logger); err != nil {
+		authPreparation := new(CodexAuthPreparation)
+		opts := CodexHomeOptions{
+			CodexVersion:     params.CodexVersion,
+			IsLocalDirectory: params.LocalWorkDir != "" || params.LocalWorktree != nil,
+			SessionStoreKey:  codexSessionStoreKey(params.Profile, params.Task),
+			CodexCustomArgs:  params.CodexCustomArgs,
+			authPreparation:  authPreparation,
+		}
+		if err := prepareCodexHomeWithOpts(codexHome, opts, logger); err != nil {
 			return nil, fmt.Errorf("execenv: prepare codex-home: %w", err)
 		}
+		env.CodexAuthPreparation = authPreparation
 		if env.PreparedSkillNames, err = hydrateCodexSkillsTracked(codexHome, params.Task.AgentSkills, params.Task.DisabledRuntimeSkills, logger, env.SkillDirectories); err != nil {
 			return nil, fmt.Errorf("execenv: hydrate codex skills: %w", err)
 		}
@@ -975,7 +986,16 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	// config (especially sandbox/network access) is up to date.
 	if params.Provider == "codex" {
 		codexHome := filepath.Join(env.RootDir, codexHomeDirName)
-		if err := prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{CodexVersion: params.CodexVersion, ResumeSessionID: params.ResumeSessionID, IsLocalDirectory: params.LocalDirectory, SessionStoreKey: codexSessionStoreKey(params.Profile, params.Task), CodexCustomArgs: params.CodexCustomArgs}, logger); err != nil {
+		authPreparation := new(CodexAuthPreparation)
+		opts := CodexHomeOptions{
+			CodexVersion:     params.CodexVersion,
+			ResumeSessionID:  params.ResumeSessionID,
+			IsLocalDirectory: params.LocalDirectory,
+			SessionStoreKey:  codexSessionStoreKey(params.Profile, params.Task),
+			CodexCustomArgs:  params.CodexCustomArgs,
+			authPreparation:  authPreparation,
+		}
+		if err := prepareCodexHomeWithOpts(codexHome, opts, logger); err != nil {
 			// Leaving env.CodexHome empty does not launch Codex against an
 			// ambient home: configureCodexTaskShellEnvironment rejects the empty
 			// value ("task CODEX_HOME is missing") and the run fails before
@@ -987,6 +1007,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 			return nil
 		}
 		env.CodexHome = codexHome
+		env.CodexAuthPreparation = authPreparation
 		preparedSkillNames, err := hydrateCodexSkillsTracked(codexHome, params.Task.AgentSkills, params.Task.DisabledRuntimeSkills, logger, env.SkillDirectories)
 		if err != nil && preparedSkillNames == nil {
 			logger.Warn("execenv: refresh codex skills failed before materialization completed; forcing fresh prepare", "error", err)

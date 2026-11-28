@@ -3113,6 +3113,64 @@ func TestCodexExecuteThreadStartResponseRequiresThreadID(t *testing.T) {
 	}
 }
 
+func TestCodexAuthObservationPrecedesSpawnAndAuthFailureStaysTerminal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	for _, failure := range []string{
+		"401 Unauthorized: Missing bearer or basic authentication in header",
+		"403 Forbidden: explicit authorization denial",
+	} {
+		t.Run(failure[:3], func(t *testing.T) {
+			fakePath := writeFakeCodexAppServer(t, fmt.Sprintf(`
+read line
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read line
+read line
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"auth-test"}}}'
+read line
+echo '{"jsonrpc":"2.0","id":3,"result":{}}'
+echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"auth-test","turn":{"id":"turn-auth"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"auth-test","turn":{"id":"turn-auth","status":"failed","error":{"message":"%s"}}}}'
+`, failure))
+			const marker = "fixture-value-never-logged"
+			var logs bytes.Buffer
+			result, _ := executeFakeCodexCollectingMessagesWithConfig(t, fakePath, Config{
+				Logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
+				TaskID:        "task-auth",
+				RuntimeID:     "runtime-auth",
+				DaemonVersion: "daemon-test",
+				CodexVersion:  "codex-test",
+				Env:           map[string]string{"OPENAI_API_KEY": marker, "CODEX_API_KEY": ""},
+			}, ExecOptions{Timeout: 5 * time.Second}, 10*time.Second)
+			if result.Status != "failed" || !strings.Contains(result.Error, failure) {
+				t.Fatalf("expected terminal auth failure, got %+v", result)
+			}
+			raw := logs.String()
+			if strings.Contains(raw, marker) {
+				t.Fatal("logs contain the fixture credential value")
+			}
+			entries := parseJSONLogEntries(t, raw)
+			observation := findCodexLifecyclePhase(t, entries, "auth_pre_spawn")
+			for key, want := range map[string]any{
+				"task_id": "task-auth", "runtime_id": "runtime-auth", "attempt": float64(1),
+				"codex_version": "codex-test", "daemon_version": "daemon-test",
+				"provider_auth_readiness": "unknown", "OPENAI_API_KEY_nonempty": true, "CODEX_API_KEY_nonempty": false,
+			} {
+				if got := observation[key]; got != want {
+					t.Errorf("%s = %v, want %v", key, got, want)
+				}
+			}
+			preSpawnCount := strings.Count(raw, `"phase":"auth_pre_spawn"`)
+			spawnCount := strings.Count(raw, `"phase":"spawn"`)
+			if preSpawnCount != 1 || spawnCount != 1 ||
+				strings.Index(raw, `"phase":"auth_pre_spawn"`) >= strings.Index(raw, `"phase":"spawn"`) {
+				t.Fatal("expected exactly one auth observation followed by one spawn")
+			}
+		})
+	}
+}
+
 func parseJSONLogEntries(t *testing.T, raw string) []map[string]any {
 	t.Helper()
 	var entries []map[string]any
