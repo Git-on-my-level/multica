@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ func OpenHermesGatewayOrphan(workspacesRoot, taskDir string, now time.Time) *Her
 		claim.Release()
 		return nil
 	}
-	bytes, newest, proven, matches := inspectHermesGateway(claim.root, false, claim.info.ModTime())
+	bytes, newest, proven, matches := inspectHermesGateway(claim.root, false, claim.info.ModTime(), false)
 	if !matches {
 		claim.Release()
 		return nil
@@ -80,7 +81,7 @@ func hasTaskKey(s string) bool {
 	return err == nil
 }
 
-func inspectHermesGateway(root *os.Root, locked bool, newest time.Time) (bytes int64, lastWrite time.Time, proven, matches bool) {
+func inspectHermesGateway(root *os.Root, locked bool, newest time.Time, gatewayLockHeld bool) (bytes int64, lastWrite time.Time, proven, matches bool) {
 	entries, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
 		return 0, newest, false, false
@@ -121,7 +122,7 @@ func inspectHermesGateway(root *os.Root, locked bool, newest time.Time) (bytes i
 	if err != nil {
 		return 0, newest, false, false
 	}
-	return bytes, newest, inspectHermesGatewayStatus(root) == hermesGatewayStopped, true
+	return bytes, newest, inspectHermesGatewayStatus(root, gatewayLockHeld) == hermesGatewayStopped, true
 }
 
 func (o *HermesGatewayOrphan) Close() {
@@ -172,7 +173,24 @@ func (o *HermesGatewayOrphan) Remove(now time.Time, ttl time.Duration, retainRoo
 			}
 		}
 	}()
-	bytes, newest, proven, matches := inspectHermesGateway(c.root, true, info.ModTime())
+	home, err := c.root.OpenRoot(hermesGatewayHome)
+	if err != nil {
+		return 0, false, err
+	}
+	hermesLock, reserved, lockErr := acquireHermesGatewayLock(home)
+	closeErr := home.Close()
+	if lockErr != nil || closeErr != nil || reserved {
+		if hermesLock != nil {
+			lockErr = errors.Join(lockErr, releaseHermesGatewayLock(hermesLock))
+		}
+		return 0, false, errors.Join(lockErr, closeErr)
+	}
+	if hermesLock != nil {
+		defer func() {
+			err = errors.Join(err, releaseHermesGatewayLock(hermesLock))
+		}()
+	}
+	bytes, newest, proven, matches := inspectHermesGateway(c.root, true, info.ModTime(), hermesLock != nil)
 	if !matches || !proven || now.Sub(newest) <= ttl {
 		return 0, false, nil
 	}
@@ -199,11 +217,11 @@ func HermesGatewayMayWrite(taskDir string) bool {
 	}
 	defer root.Close()
 
-	status := inspectHermesGatewayStatus(root)
+	status := inspectHermesGatewayStatus(root, false)
 	return status != hermesGatewayAbsent && status != hermesGatewayStopped
 }
 
-func inspectHermesGatewayStatus(root *os.Root) hermesGatewayStatus {
+func inspectHermesGatewayStatus(root *os.Root, gatewayLockHeld bool) (status hermesGatewayStatus) {
 	homeInfo, err := root.Lstat(hermesGatewayHome)
 	if errors.Is(err, os.ErrNotExist) {
 		return hermesGatewayAbsent
@@ -219,12 +237,24 @@ func inspectHermesGatewayStatus(root *os.Root) hermesGatewayStatus {
 	if info, err := home.Stat("."); err != nil || !os.SameFile(info, homeInfo) {
 		return hermesGatewayUnknown
 	}
-	// Check runtime reservations even when the status file says stopped:
-	// a new gateway can reserve its home before publishing its own state.
-	for _, name := range []string{"gateway.pid", "gateway.lock"} {
-		if _, err := home.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+	// Probe the lock itself: Hermes intentionally leaves the lock file behind
+	// after shutdown, so file existence is not evidence of a live gateway.
+	if !gatewayLockHeld {
+		lock, reserved, err := acquireHermesGatewayLock(home)
+		if err != nil || reserved {
 			return hermesGatewayUnknown
 		}
+		if lock != nil {
+			defer func() {
+				if err := releaseHermesGatewayLock(lock); err != nil {
+					status = hermesGatewayUnknown
+				}
+			}()
+		}
+	}
+	pidFile, pidFilePresent, err := readHermesGatewayPID(home)
+	if err != nil || (pidFilePresent && !hermesGatewayPIDGone(pidFile)) {
+		return hermesGatewayUnknown
 	}
 
 	const stateFile = "gateway_state.json"
@@ -261,4 +291,80 @@ func inspectHermesGatewayStatus(root *os.Root) hermesGatewayStatus {
 		return hermesGatewayUnknown
 	}
 	return hermesGatewayStopped
+}
+
+func readHermesGatewayPID(home *os.Root) (int, bool, error) {
+	info, err := home.Lstat("gateway.pid")
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, false, fs.ErrInvalid
+	}
+	f, err := home.Open("gateway.pid")
+	if err != nil {
+		return 0, false, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return 0, false, errors.Join(err, fs.ErrInvalid)
+	}
+	const maxPIDBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(f, maxPIDBytes+1))
+	if err != nil || len(data) > maxPIDBytes {
+		return 0, false, errors.Join(err, fs.ErrInvalid)
+	}
+	var record struct {
+		PID json.RawMessage `json:"pid"`
+	}
+	var pid int
+	if json.Unmarshal(data, &record) == nil && len(record.PID) > 0 {
+		if err := json.Unmarshal(record.PID, &pid); err != nil {
+			return 0, false, err
+		}
+	} else {
+		pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return 0, false, err
+		}
+	}
+	if pid <= 0 || pid > math.MaxInt32 {
+		return 0, false, fs.ErrInvalid
+	}
+	return pid, true, nil
+}
+
+func acquireHermesGatewayLock(home *os.Root) (*os.File, bool, error) {
+	info, err := home.Lstat("gateway.lock")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fs.ErrInvalid
+	}
+	f, err := openHermesGatewayLock(home)
+	if err != nil {
+		return nil, false, err
+	}
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		f.Close()
+		return nil, false, errors.Join(err, fs.ErrInvalid)
+	}
+	reserved, err := tryLockHermesGateway(f)
+	if err != nil || reserved {
+		return nil, reserved, errors.Join(err, f.Close())
+	}
+	return f, false, nil
+}
+
+func releaseHermesGatewayLock(f *os.File) error {
+	return errors.Join(unlockHermesGateway(f), f.Close())
 }

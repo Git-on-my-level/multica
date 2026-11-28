@@ -60,6 +60,7 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 		active       bool
 		outside      bool
 		lock         bool
+		pidFile      bool
 		noState      bool
 		path         string
 		bytes        int64
@@ -78,7 +79,7 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 		{name: "additional workspace data", extraWorkdir: true},
 		{name: "active root", active: true},
 		{name: "outside workspaces root", outside: true},
-		{name: "gateway lock present", lock: true},
+		{name: "stale PID and lock records", lock: true, pidFile: true},
 	}
 	for i := range cases {
 		c := &cases[i]
@@ -120,7 +121,12 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 			}
 		}
 		if c.lock {
-			if err := os.WriteFile(filepath.Join(home, "gateway.lock"), nil, 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(home, "gateway.lock"), []byte(`{"pid":2147483647}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if c.pidFile {
+			if err := os.WriteFile(filepath.Join(home, "gateway.pid"), []byte(`{"pid":2147483647}`), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -159,10 +165,10 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 	stats := &gcStats{}
 	wsDir := filepath.Dir(cases[0].path)
 	d.gcWorkspace(ctx, wsDir, stats)
-	reclaimed := cases[0].bytes + cases[1].bytes
+	reclaimed := cases[0].bytes + cases[1].bytes + cases[13].bytes
 	got := stats.hermesGatewayOrphans
-	if got.found != 11 || got.aged != 10 || got.unproven != 8 ||
-		got.removed != 2 || got.dirsRemoved != 1 || got.bytesRemoved != reclaimed || got.bytes <= reclaimed {
+	if got.found != 11 || got.aged != 10 || got.unproven != 7 ||
+		got.removed != 3 || got.dirsRemoved != 2 || got.bytesRemoved != reclaimed || got.bytes <= reclaimed {
 		t.Fatalf("unexpected gateway census: %+v", got)
 	}
 	if _, err := os.Lstat(cases[0].path); !os.IsNotExist(err) {
@@ -176,6 +182,12 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 		t.Fatalf("expected the stable root record to survive: %v", err)
 	}
 	for _, c := range cases[2:] {
+		if c.pidFile {
+			if _, err := os.Stat(c.path); !os.IsNotExist(err) {
+				t.Errorf("%s: stale Hermes task root should be reclaimed: %v", c.name, err)
+			}
+			continue
+		}
 		if _, err := os.Stat(filepath.Join(c.path, "hermes-home")); err != nil {
 			t.Errorf("%s: expected gateway home to survive: %v", c.name, err)
 		}
@@ -190,7 +202,7 @@ func TestGCHermesGatewayOrphans(t *testing.T) {
 	}
 	after := &gcStats{}
 	d.gcWorkspace(ctx, wsDir, after)
-	if got := after.hermesGatewayOrphans; got.found != 9 || got.aged != 8 || got.removed != 0 ||
+	if got := after.hermesGatewayOrphans; got.found != 8 || got.aged != 7 || got.removed != 0 ||
 		got.bytes != stats.hermesGatewayOrphans.bytes-reclaimed {
 		t.Fatalf("unexpected second census: %+v", got)
 	}
@@ -229,7 +241,7 @@ func TestGCAutopilotWaitsForHermesGateway(t *testing.T) {
 
 	writeHermesGatewayState(t, taskDir, "hermes-gateway", "stopped", "", 2147483647)
 	reservation := filepath.Join(taskDir, "hermes-home", "gateway.pid")
-	if err := os.WriteFile(reservation, []byte("2147483647"), 0o600); err != nil {
+	if err := os.WriteFile(reservation, []byte(fmt.Sprintf("%d", os.Getpid())), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertKept()
