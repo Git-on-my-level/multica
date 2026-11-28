@@ -35,16 +35,21 @@ func serverVersionFromBuild(version, fullCommit, displayCommit, builtAt string, 
 	}
 
 	var vcsRevision string
+	var vcsModified bool
 	if info != nil {
 		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
+			switch setting.Key {
+			case "vcs.revision":
 				vcsRevision = setting.Value
-				break
+			case "vcs.modified":
+				vcsModified = setting.Value == "true"
 			}
 		}
 	}
-	// Source builds can use Go's embedded VCS revision when no linker stamp
-	// supplies a full Git object ID. vcs.time records the commit, not the build.
+	// A revision cannot identify the running code when Go detects local edits.
+	if vcsModified {
+		return resp
+	}
 	for _, candidate := range []string{fullCommit, displayCommit, vcsRevision} {
 		candidate = strings.TrimSpace(candidate)
 		if len(candidate) != 40 && len(candidate) != 64 {

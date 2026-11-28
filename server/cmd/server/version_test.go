@@ -28,7 +28,7 @@ func TestServerVersionMetadata(t *testing.T) {
 	}{
 		{
 			name: "explicit full revision wins",
-			full: testFullRevision, display: testFullRevision[:8], info: info,
+			full: testFullRevision, display: strings.Repeat("b", 40), info: info,
 			stamp: "2026-11-26T15:31:24-05:00",
 			want:  versionResponse{Version: "v0.4.28", Commit: testFullRevision, BuiltAt: "2026-11-26T20:31:24Z"},
 		},
@@ -41,6 +41,15 @@ func TestServerVersionMetadata(t *testing.T) {
 			name: "embedded VCS revision with no build timestamp",
 			full: "unknown", display: testFullRevision[:8], stamp: "unknown", info: info,
 			want: versionResponse{Version: "v0.4.28", Commit: vcsRevision},
+		},
+		{
+			name: "omit embedded and linker revisions for a dirty source build",
+			full: testFullRevision,
+			info: &debug.BuildInfo{Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: vcsRevision},
+				{Key: "vcs.modified", Value: "true"},
+			}},
+			want: versionResponse{Version: "v0.4.28"},
 		},
 		{
 			name: "omit unusable metadata",

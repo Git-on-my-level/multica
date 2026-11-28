@@ -144,7 +144,12 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 # Internal: see selfhost-start.
 selfhost-build-start:
 	@echo "==> Building Multica from the current checkout..."
-	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
+	@if worktree_status=$$(git status --porcelain 2>/dev/null) && [ -z "$$worktree_status" ]; then \
+		revision="$(BUILD_COMMIT)"; \
+	else \
+		revision=unknown; \
+	fi; \
+		COMMIT="$$revision" VERSION="$(VERSION)" $(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack

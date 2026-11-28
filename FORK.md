@@ -136,13 +136,13 @@ namespaces are lowercase (`ghcr.io/git-on-my-level/...`).
 ## Verify a Multica server activation
 
 Release reads serving identity from the production API for `multica-01` after
-the authorized activation. Use the same HTTPS endpoint that workers and members
-normally reach. Set `MULTICA_SERVER_URL` to that API's HTTPS base URL and use the
-current task token or a member token in `MULTICA_TOKEN`.
+the authorized activation. Set `MULTICA_API_BASE_URL` to the HTTPS base URL
+members normally reach. Use the current task token or a member token in
+`MULTICA_TOKEN`.
 
 ```bash
 printf 'Authorization: Bearer %s\n' "$MULTICA_TOKEN" |
-  curl --fail --silent --show-error --max-time 15 --header @- "${MULTICA_SERVER_URL%/}/api/version"
+  curl --fail --silent --show-error --max-time 15 --header @- "${MULTICA_API_BASE_URL%/}/api/version"
 ```
 
 1. Compare the returned full `commit` to the expected deployed SHA. Check that
@@ -159,4 +159,5 @@ printf 'Authorization: Bearer %s\n' "$MULTICA_TOKEN" |
 The route uses standard member and agent task authentication and requires no
 workspace header or admin scope. Use the full revision in `COMMIT` when
 building a backend image from a source snapshot. The release workflow supplies
-it automatically.
+it automatically. `make selfhost-build` also supplies it from a clean checkout.
+The server omits the revision when Go reports local changes in the source tree.
