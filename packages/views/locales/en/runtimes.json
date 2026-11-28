@@ -184,6 +184,11 @@
       "public": "Any workspace member can create agents on this runtime.",
       "members": "Only you and the selected members can create agents on this runtime."
     },
+    "visibility_policy_peer_notice": "Operator policy lets {{name}} place and run agents on this runtime.",
+    "visibility_hint_policy": {
+      "private": "Clear explicit shares. Access granted by operator policy still applies.",
+      "members": "Share with specific members in addition to the operator policy."
+    },
     "visibility_hint_readonly": {
       "private": "Only the runtime owner can create agents on this runtime, and only they can switch it to Public.",
       "public": "Any workspace member can create agents on this runtime. Only the runtime owner can switch it back to Private.",

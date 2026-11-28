@@ -15,7 +15,7 @@ import (
 )
 
 func TestLauncherHealthNoticeUsesSanitizedDiagnosis(t *testing.T) {
-	v := runtimeVerdict(db.AgentRuntime{Status: "offline", Metadata: []byte(`{"offline_reason":{"code":"not_executable","launcher_unavailable":true,"detail":"secret setting value"}}`)}, db.Agent{})
+	v := runtimeVerdict(db.AgentRuntime{Status: "offline", Metadata: []byte(`{"offline_reason":{"code":"not_executable","launcher_unavailable":true,"detail":"secret setting value"}}`)})
 	notice := RuntimeUnusableNotice("OpenCode agent", v)
 	if !v.Blocked() || !strings.Contains(notice, "127") || strings.Contains(notice, "secret") || strings.Contains(notice, "Reinstall") {
 		t.Fatalf("launcher diagnosis not represented safely: %q", notice)

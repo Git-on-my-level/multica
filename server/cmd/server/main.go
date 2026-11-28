@@ -381,8 +381,13 @@ func main() {
 		dbURL = "postgres://multica:multica@localhost:5432/multica?sslmode=disable"
 	}
 
+	privateRuntimePeers, err := parsePrivateRuntimePeers(os.Getenv(privateRuntimePeersEnv))
+	if err != nil {
+		slog.Error("invalid private runtime peer policy", "error", err)
+		os.Exit(1)
+	}
 	startupSettings := dbstartup.SettingsFromEnv()
-	pool, err := newDBPool(context.Background(), dbURL, startupSettings.ConnectTimeout)
+	pool, err := newSizedDBPool(context.Background(), dbURL, startupSettings.ConnectTimeout, primaryPoolSizing, privateRuntimePeers)
 	if err != nil {
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)
@@ -413,9 +418,11 @@ func main() {
 	// replica connections are validated as read-only by the pool configuration,
 	// while request-driven fallback and a passive circuit breaker handle runtime
 	// failures without background SQL.
+	// The peer grant depends on current membership and is only configured on
+	// the primary pool.
 	var replicaPool *pgxpool.Pool
 	if replicaURL := strings.TrimSpace(os.Getenv("DATABASE_REPLICA_URL")); replicaURL != "" {
-		replicaPool, err = newReplicaDBPool(context.Background(), replicaURL, startupSettings.ConnectTimeout)
+		replicaPool, err = newSizedDBPool(context.Background(), replicaURL, startupSettings.ConnectTimeout, replicaPoolSizing, "")
 		if err != nil {
 			slog.Warn("database replica configuration is invalid; using primary for reads", "error", err)
 			replicaPool = nil

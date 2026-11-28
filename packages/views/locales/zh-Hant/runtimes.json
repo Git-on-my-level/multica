@@ -181,6 +181,11 @@
       "public": "工作區內任何成員都可以在此執行時上建立 AI 代理。",
       "members": "僅你和所選成員可以在此執行時上建立 AI 代理。"
     },
+    "visibility_policy_peer_notice": "根據維運政策，{{name}} 可以在此執行時上部署及執行 AI 代理。",
+    "visibility_hint_policy": {
+      "private": "清除手動授予的共享權限。維運政策授予的存取權限仍然有效。",
+      "members": "在維運政策授予的權限之外，向指定成員授予共享權限。"
+    },
     "visibility_hint_readonly": {
       "private": "僅執行時所有者可以在此執行時上建立 AI 代理，也只有他們能切換為「公開」。",
       "public": "工作區內任何成員都可以在此執行時上建立 AI 代理。只有執行時所有者能切回「私有」。",

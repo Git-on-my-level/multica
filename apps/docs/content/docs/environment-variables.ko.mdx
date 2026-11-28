@@ -36,6 +36,7 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `DATABASE_MIN_CONNS` | `5` | API 프로세스 하나가 유지하는 최소 연결 수 |
 | `DATABASE_SEARCH_WORK_MEM_MB` | `64` | 검색 계획의 각 노드에 적용되는 PostgreSQL `work_mem` 상한(MB). `1`~`64`로 낮추거나 `0`으로 데이터베이스/세션 기본값 사용 |
 | `DATABASE_REPLICA_URL` | 비어 있음 | 선택적 PostgreSQL 읽기 전용 복제본 연결 주소. 새 연결은 읽기 전용 상태를 검증하며 각 기능은 코드에서 최종 일관성 읽기를 명시적으로 선택해야 함 |
+| `MULTICA_PRIVATE_RUNTIME_PEERS` | 비어 있음 | 같은 워크스페이스에 속한 두 멤버가 서로의 비공개 런타임을 사용할 수 있게 하는 선택 사항입니다. 워크스페이스 UUID와 서로 다른 사용자 UUID 두 개를 쉼표로 구분해 입력합니다. 값이 올바르지 않으면 API가 시작되지 않습니다. 비활성화하려면 값을 비웁니다. Docker Compose에서는 백엔드 컨테이너를 다시 만들고, 직접 관리하는 API 서버는 변경된 환경으로 다시 시작합니다. |
 | `DATABASE_REPLICA_MAX_CONNS` | `10` | API 프로세스당 최대 복제본 연결 수 |
 | `DATABASE_REPLICA_MIN_CONNS` | `0` | API 프로세스가 유지하는 최소 복제본 연결 수 |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | 컨테이너 시작 중 migration과 API가 공유하는 일시적인 데이터베이스 장애 재시도 시간. `0`으로 설정하면 각 단계에서 한 번만 시도 |

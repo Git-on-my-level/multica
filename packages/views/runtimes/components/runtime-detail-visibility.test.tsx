@@ -234,10 +234,38 @@ describe("RuntimeDetail visibility section", () => {
 
   it("shows owner-editable visibility choices when the caller owns the runtime", () => {
     renderDetail(makeRuntime({ owner_id: "user-me" }));
+    expect(screen.queryByText(/Operator policy/)).not.toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Visibility" })).toBeInTheDocument();
     for (const name of ["Private", "Public", "Members"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument();
     }
+  });
+
+  it("shows the operator-policy peer when the runtime has no explicit shares", async () => {
+    mockQueryData.members = [
+      { user_id: "user-alice", role: "member", name: "Alice" },
+    ];
+    renderDetail(makeRuntime({ policy_peer_id: "user-alice" }));
+
+    expect(screen.getByText(
+      "Operator policy lets Alice place and run agents on this runtime.",
+    )).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Private" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: /Alice/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Members" }));
+    expect(await screen.findByRole("checkbox", { name: "Alice" })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(mockUpdateRuntime).not.toHaveBeenCalled();
+  });
+
+  it("identifies the operator-policy peer while the member list is unavailable", () => {
+    const peerId = "00000000-0000-4000-8000-000000000003";
+    renderDetail(makeRuntime({ policy_peer_id: peerId }));
+
+    expect(screen.getByText(
+      `Operator policy lets ${peerId} place and run agents on this runtime.`,
+    )).toBeInTheDocument();
   });
 
   it("opens a reviewed revocation plan instead of silently making an in-use public runtime private", async () => {
@@ -368,20 +396,29 @@ describe("RuntimeDetail visibility section", () => {
     expect(mockUpdateRuntime).not.toHaveBeenCalled();
   });
 
-  it("summarizes current recipients and reopens the picker with them selected", async () => {
-    mockQueryData.members = [
-      { user_id: "user-me", role: "member", name: "Me" },
-      { user_id: "user-alice", role: "member", name: "Alice" },
-      { user_id: "user-bob", role: "member", name: "Bob" },
-    ];
-    renderDetail(makeRuntime({ shared_with: ["user-alice"] }));
-    expect(screen.getByRole("button", { name: "Members" })).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(screen.getByRole("button", { name: /Alice.*Edit/ }));
-    expect(await screen.findByRole("checkbox", { name: "Alice" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Bob" })).not.toBeChecked();
-    // An unchanged selection is not saveable.
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-  });
+  it.each([null, "user-bob"])(
+    "summarizes explicit recipients and reopens the picker with them selected (policy peer: %s)",
+    async (policyPeerId) => {
+      mockQueryData.members = [
+        { user_id: "user-me", role: "member", name: "Me" },
+        { user_id: "user-alice", role: "member", name: "Alice" },
+        { user_id: "user-bob", role: "member", name: "Bob" },
+      ];
+      renderDetail(makeRuntime({ shared_with: ["user-alice"], policy_peer_id: policyPeerId }));
+      const notice = screen.queryByText("Operator policy lets Bob place and run agents on this runtime.");
+      if (policyPeerId) {
+        expect(notice).toBeInTheDocument();
+      } else {
+        expect(notice).not.toBeInTheDocument();
+      }
+      expect(screen.getByRole("button", { name: "Members" })).toHaveAttribute("aria-pressed", "true");
+      fireEvent.click(screen.getByRole("button", { name: /Alice.*Edit/ }));
+      expect(await screen.findByRole("checkbox", { name: "Alice" })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Bob" })).not.toBeChecked();
+      // An unchanged selection is not saveable.
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    },
+  );
 
   it("filters a long member list by name", async () => {
     mockQueryData.members = [

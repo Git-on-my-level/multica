@@ -94,27 +94,51 @@ func resolveRuntimeAccess(ctx context.Context, q *db.Queries, rt db.AgentRuntime
 	return next, nil
 }
 
+// Runtime owners can edit explicit grants independently. Dependency checks
+// must keep agents whose owners are still authorized by the operator policy.
+// During membership removal, a departing peer disables the whole pair.
+func runtimeSharesAfterPolicy(ctx context.Context, q *db.Queries, rt db.AgentRuntime, departingUser pgtype.UUID) ([]pgtype.UUID, error) {
+	members, err := q.GetPrivateRuntimePolicyMembers(ctx, rt.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	peer := service.PrivateRuntimePolicyPeer(rt, members)
+	if !peer.Valid || slices.Contains(members, departingUser) || slices.Contains(rt.SharedWith, peer) {
+		return rt.SharedWith, nil
+	}
+	locked, err := q.LockRuntimeShareMembers(ctx, db.LockRuntimeShareMembersParams{
+		WorkspaceID: rt.WorkspaceID, UserIds: members,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(locked) != len(members) {
+		return rt.SharedWith, nil
+	}
+	return append(slices.Clone(rt.SharedWith), peer), nil
+}
+
 // Both explicit access changes and workspace departure use the same lock order
 // and cancellation settlement, inside their caller's transaction.
-func lockRuntimeRevocationPlan(ctx context.Context, qtx *db.Queries, next db.AgentRuntime) (runtimeWorkspaceAccessRevocationPlan, error) {
+func lockRuntimeRevocationPlan(ctx context.Context, qtx *db.Queries, next db.AgentRuntime, effective []pgtype.UUID) (runtimeWorkspaceAccessRevocationPlan, error) {
 	agents, err := qtx.ListNonOwnerAgentsByRuntimeForUpdate(ctx, db.ListNonOwnerAgentsByRuntimeForUpdateParams{
-		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: next.SharedWith,
+		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: effective,
 	})
 	if err != nil {
 		return runtimeWorkspaceAccessRevocationPlan{}, err
 	}
 	if _, err := qtx.LockRuntimeRevocationChatSessions(ctx, db.LockRuntimeRevocationChatSessionsParams{
-		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: next.SharedWith,
+		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: effective,
 	}); err != nil {
 		return runtimeWorkspaceAccessRevocationPlan{}, err
 	}
 	tasks, err := qtx.ListNonOwnerActiveTasksByRuntimeForUpdate(ctx, db.ListNonOwnerActiveTasksByRuntimeForUpdateParams{
-		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: next.SharedWith,
+		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: effective,
 	})
 	return runtimeWorkspaceAccessRevocationPlan{Agents: agents, Tasks: tasks}, err
 }
 
-func applyRuntimeAccessRevocation(ctx context.Context, qtx *db.Queries, next db.AgentRuntime) (db.AgentRuntime, service.RuntimeTeardownResult, []pgtype.UUID, error) {
+func applyRuntimeAccessRevocation(ctx context.Context, qtx *db.Queries, next db.AgentRuntime, effective []pgtype.UUID) (db.AgentRuntime, service.RuntimeTeardownResult, []pgtype.UUID, error) {
 	var result service.RuntimeTeardownResult
 	updated, err := qtx.UpdateAgentRuntimeVisibility(ctx, db.UpdateAgentRuntimeVisibilityParams{
 		ID: next.ID, Visibility: next.Visibility, SharedWith: next.SharedWith,
@@ -123,7 +147,7 @@ func applyRuntimeAccessRevocation(ctx context.Context, qtx *db.Queries, next db.
 		return updated, result, nil, err
 	}
 	result.CancelledTasks, err = qtx.CancelNonOwnerTasksByRuntime(ctx, db.CancelNonOwnerTasksByRuntimeParams{
-		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: next.SharedWith,
+		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: effective,
 		FailureReason: string(taskfailure.ReasonRuntimeAccessRevoked),
 	})
 	if err != nil {
@@ -134,7 +158,7 @@ func applyRuntimeAccessRevocation(ctx context.Context, qtx *db.Queries, next db.
 		return updated, result, nil, err
 	}
 	result.UnboundAgents, err = qtx.UnbindNonOwnerAgentsFromRuntime(ctx, db.UnbindNonOwnerAgentsFromRuntimeParams{
-		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: next.SharedWith,
+		RuntimeID: next.ID, RuntimeOwnerID: next.OwnerID, SharedWith: effective,
 	})
 	if err != nil {
 		return updated, result, nil, err

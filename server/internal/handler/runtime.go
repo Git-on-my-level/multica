@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,9 @@ type AgentRuntimeResponse struct {
 	// canUseRuntimeForAgent.
 	Visibility string   `json:"visibility"`
 	SharedWith []string `json:"shared_with"`
+	// PolicyPeerID identifies the runtime owner's operator-configured peer.
+	// Both policy members can read the grant, including the runtime owner.
+	PolicyPeerID string `json:"policy_peer_id,omitempty"`
 	// ProfileID is set when this runtime is an instance of a custom
 	// runtime_profile (MUL-3284); null for built-in runtimes.
 	ProfileID *string `json:"profile_id"`
@@ -795,10 +799,14 @@ func (h *Handler) updateRuntimeAccessIfNoDependencies(ctx context.Context, rt db
 	}
 
 	if runtimeAccessNarrows(lockedRuntime, next) {
+		effective, err := runtimeSharesAfterPolicy(ctx, qtx, next, pgtype.UUID{})
+		if err != nil {
+			return lockedRuntime, runtimeWorkspaceAccessRevocationPlan{}, false, err
+		}
 		agents, err := qtx.ListNonOwnerAgentsByRuntime(ctx, db.ListNonOwnerAgentsByRuntimeParams{
 			RuntimeID:      lockedRuntime.ID,
 			RuntimeOwnerID: lockedRuntime.OwnerID,
-			SharedWith:     next.SharedWith,
+			SharedWith:     effective,
 		})
 		if err != nil {
 			return db.AgentRuntime{}, runtimeWorkspaceAccessRevocationPlan{}, false, fmt.Errorf("list non-owner agents: %w", err)
@@ -806,7 +814,7 @@ func (h *Handler) updateRuntimeAccessIfNoDependencies(ctx context.Context, rt db
 		tasks, err := qtx.ListNonOwnerActiveTasksByRuntime(ctx, db.ListNonOwnerActiveTasksByRuntimeParams{
 			RuntimeID:      lockedRuntime.ID,
 			RuntimeOwnerID: lockedRuntime.OwnerID,
-			SharedWith:     next.SharedWith,
+			SharedWith:     effective,
 		})
 		if err != nil {
 			return db.AgentRuntime{}, runtimeWorkspaceAccessRevocationPlan{}, false, fmt.Errorf("list non-owner tasks: %w", err)
@@ -871,6 +879,16 @@ func (h *Handler) runtimeWorkspaceAccessRevocationResponse(plan runtimeWorkspace
 // several 500ms browser poll loops, and counting them together would hide the
 // polling the metric exists to measure.
 func (h *Handler) requireRuntimeReadAccess(w http.ResponseWriter, r *http.Request, source, runtimeID string) (db.AgentRuntime, db.Member, bool) {
+	return h.requireRuntimeAccess(w, r, source, runtimeID, false)
+}
+
+// Model discovery is part of placement. Usage, local skills and machine
+// controls keep their existing access rules.
+func (h *Handler) requireRuntimeModelAccess(w http.ResponseWriter, r *http.Request, source, runtimeID string) (db.AgentRuntime, db.Member, bool) {
+	return h.requireRuntimeAccess(w, r, source, runtimeID, true)
+}
+
+func (h *Handler) requireRuntimeAccess(w http.ResponseWriter, r *http.Request, source, runtimeID string, allowPolicyPeer bool) (db.AgentRuntime, db.Member, bool) {
 	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
 	if !ok {
 		return db.AgentRuntime{}, db.Member{}, false
@@ -886,10 +904,19 @@ func (h *Handler) requireRuntimeReadAccess(w http.ResponseWriter, r *http.Reques
 	}
 
 	member, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found")
-	if !ok || !canUseRuntimeForAgent(member, rt) {
-		if ok {
-			writeError(w, http.StatusNotFound, "runtime not found")
+	if !ok {
+		return db.AgentRuntime{}, db.Member{}, false
+	}
+	allowed := canUseRuntimeForAgent(member, rt)
+	if !allowed && allowPolicyPeer {
+		allowed, err = service.RuntimeAllowsUserWithPolicy(r.Context(), h.Queries, rt, member.UserID, false)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check runtime access")
+			return db.AgentRuntime{}, db.Member{}, false
 		}
+	}
+	if !allowed {
+		writeError(w, http.StatusNotFound, "runtime not found")
 		return db.AgentRuntime{}, db.Member{}, false
 	}
 
@@ -1074,12 +1101,26 @@ func (h *Handler) profileInstanceRefusalBlockers(ctx context.Context, runtimeID 
 	return profileInstanceBlockers{agents: agents, undrainedTasks: tasks, known: true}
 }
 
-// canUseRuntimeForAgent checks runtime-owner consent after workspace membership.
-// Private runtimes admit their owner and SharedWith recipients; public runtimes
-// admit every workspace member. Workspace roles never override this decision.
-// An ownerless runtime cannot mint task tokens and remains unusable.
+// canUseRuntimeForAgent checks the owner's explicit grants after workspace
+// membership. Machine controls and usage use this baseline permission.
 func canUseRuntimeForAgent(member db.Member, rt db.AgentRuntime) bool {
 	return service.RuntimeAllowsUser(rt, member.UserID)
+}
+
+// requireRuntimePlacement authorizes both regular and policy grants on the
+// caller's connection. Binding callers recheck with the runtime locked.
+func requireRuntimePlacement(w http.ResponseWriter, r *http.Request, q *db.Queries, rt db.AgentRuntime, userID pgtype.UUID, lockMembership bool, denied string) bool {
+	allowed, err := service.RuntimeAllowsUserWithPolicy(r.Context(), q, rt, userID, lockMembership)
+	if err != nil {
+		if !writeRuntimeRevocationBusy(w, err) {
+			writeError(w, http.StatusInternalServerError, "failed to check runtime access")
+		}
+		return false
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, denied)
+	}
+	return allowed
 }
 
 // canSetRuntimeVisibility reports whether a member may flip this runtime
@@ -1194,7 +1235,14 @@ func (h *Handler) RevokeRuntimeWorkspaceAccess(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	plan, err := lockRuntimeRevocationPlan(r.Context(), qtx, next)
+	effective, err := runtimeSharesAfterPolicy(r.Context(), qtx, next, pgtype.UUID{})
+	if err != nil {
+		if !writeRuntimeRevocationBusy(w, err) {
+			writeError(w, http.StatusInternalServerError, "failed to check runtime access")
+		}
+		return
+	}
+	plan, err := lockRuntimeRevocationPlan(r.Context(), qtx, next, effective)
 	if err != nil {
 		if !writeRuntimeRevocationBusy(w, err) {
 			writeError(w, http.StatusInternalServerError, "failed to lock runtime dependencies")
@@ -1209,7 +1257,7 @@ func (h *Handler) RevokeRuntimeWorkspaceAccess(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	updated, result, readyChats, err := applyRuntimeAccessRevocation(r.Context(), qtx, next)
+	updated, result, readyChats, err := applyRuntimeAccessRevocation(r.Context(), qtx, next, effective)
 	if err != nil {
 		slog.Error("revoke runtime access failed", "error", err, "runtime_id", runtimeID)
 		writeError(w, http.StatusInternalServerError, "failed to revoke runtime access")
@@ -1277,9 +1325,17 @@ func (h *Handler) ListAgentRuntimes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	policyMembers, err := h.Queries.GetPrivateRuntimePolicyMembers(r.Context(), member.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load runtime policy")
+		return
+	}
 	resp := make([]AgentRuntimeResponse, len(runtimes))
 	for i, rt := range runtimes {
 		resp[i] = runtimeToResponse(rt)
+		if slices.Contains(policyMembers, member.UserID) {
+			resp[i].PolicyPeerID = uuidToString(service.PrivateRuntimePolicyPeer(rt, policyMembers))
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)

@@ -4,7 +4,7 @@ import { useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, AgentRuntime } from "@multica/core/types";
 import {
-  isRuntimeUsableForUser,
+  isRuntimePlaceableForUser,
   runtimeModelsOptions,
 } from "@multica/core/runtimes";
 import { buildModelChangeUpdate, type ModelCatalog } from "./model-change-cleanup";
@@ -33,7 +33,7 @@ export function useExecutionControls({
   const qoderRuntime = runtime?.provider === "qoder_cloud";
   const isOnline = runtime?.status === "online";
   const canReadRuntime =
-    runtime != null && isRuntimeUsableForUser(runtime, currentUserId);
+    runtime != null && isRuntimePlaceableForUser(runtime, currentUserId);
   const canDiscoverRuntimeModels = isOnline && canReadRuntime && !qoderRuntime;
   const runtimeOptions = useMemo(
     () =>

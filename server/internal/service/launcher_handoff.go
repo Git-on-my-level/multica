@@ -110,8 +110,17 @@ func (s *TaskService) launcherPeer(ctx context.Context, q *db.Queries, task db.A
 				LauncherUnavailable bool `json:"launcher_unavailable"`
 			} `json:"offline_reason"`
 		}
-		if json.Unmarshal(rt.Metadata, &health) != nil || health.Version == "" || health.OfflineReason.LauncherUnavailable || (rt.Visibility == "private" && !RuntimeAllowsUser(rt, peer.OwnerID)) {
+		if json.Unmarshal(rt.Metadata, &health) != nil || health.Version == "" || health.OfflineReason.LauncherUnavailable {
 			continue
+		}
+		if rt.Visibility == "private" {
+			allowed, err := RuntimeAllowsAgentWithPolicy(ctx, q, rt, peer, false)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
+				continue
+			}
 		}
 		probe := task
 		probe.AgentID = peer.ID

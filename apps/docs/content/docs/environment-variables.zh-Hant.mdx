@@ -36,6 +36,7 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `DATABASE_MIN_CONNS` | `5` | 單個 API 程序保留的最小連線數 |
 | `DATABASE_SEARCH_WORK_MEM_MB` | `64` | 每個搜尋計劃運算元的 PostgreSQL `work_mem` 上限（MB）；設為 `1`–`64` 可調低，設為 `0` 則沿用資料庫/會話預設值 |
 | `DATABASE_REPLICA_URL` | 空 | 可選的 PostgreSQL 只讀從庫連線地址；新連線會強制校驗只讀狀態，業務仍需在程式碼中顯式選擇最終一致讀取 |
+| `MULTICA_PRIVATE_RUNTIME_PEERS` | 空 | 選用。允許同一工作區的兩位現有成員使用彼此的私有執行時。填入工作區 UUID 和兩個不同的使用者 UUID，並以逗號分隔。設定無效時，API 無法啟動。若要停用此權限，請清空此設定。使用 Docker Compose 時重新建立後端容器。直接管理 API 伺服器時，以更新後的環境變數重新啟動程序。 |
 | `DATABASE_REPLICA_MAX_CONNS` | `10` | 單個 API 程序的最大從庫連線數 |
 | `DATABASE_REPLICA_MIN_CONNS` | `0` | 單個 API 程序保留的最小從庫連線數 |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | 容器啟動過程中，migration 與 API 共享的暫時性資料庫故障重試時長；設為 `0` 時每個階段只嘗試一次 |

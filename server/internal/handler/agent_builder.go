@@ -115,7 +115,7 @@ func (h *Handler) CreateAgentBuilderSession(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid runtime_id")
 		return
 	}
-	if !h.authorizeBuilderRuntime(w, r, workspaceID, runtime, "start") {
+	if !h.authorizeBuilderRuntime(w, r, qtx, workspaceID, runtime, "start", true) {
 		return
 	}
 
@@ -373,19 +373,18 @@ func (h *Handler) resolveBuilderRuntime(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "invalid runtime_id")
 		return db.AgentRuntime{}, false
 	}
-	if !h.authorizeBuilderRuntime(w, r, workspaceID, runtime, verb) {
+	if !h.authorizeBuilderRuntime(w, r, h.Queries, workspaceID, runtime, verb, false) {
 		return db.AgentRuntime{}, false
 	}
 	return runtime, true
 }
 
-func (h *Handler) authorizeBuilderRuntime(w http.ResponseWriter, r *http.Request, workspaceID string, runtime db.AgentRuntime, verb string) bool {
+func (h *Handler) authorizeBuilderRuntime(w http.ResponseWriter, r *http.Request, q *db.Queries, workspaceID string, runtime db.AgentRuntime, verb string, lockMembership bool) bool {
 	member, ok := h.workspaceMember(w, r, workspaceID)
 	if !ok {
 		return false
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "this runtime is private; ask its owner to grant you access")
+	if !requireRuntimePlacement(w, r, q, runtime, member.UserID, lockMembership, "this runtime is private; ask its owner to grant you access") {
 		return false
 	}
 	if runtime.Status != "online" {
@@ -493,7 +492,7 @@ func (h *Handler) SwitchAgentBuilderRuntime(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid runtime_id")
 		return
 	}
-	if !h.authorizeBuilderRuntime(w, r, workspaceID, runtime, "switch") {
+	if !h.authorizeBuilderRuntime(w, r, qtx, workspaceID, runtime, "switch", true) {
 		return
 	}
 

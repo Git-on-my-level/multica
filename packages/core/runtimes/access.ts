@@ -1,22 +1,8 @@
 import type { RuntimeDevice } from "../types";
 
 /**
- * Whether this member may run an agent on `runtime`.
- *
- * A private runtime is usable by its owner and explicitly selected members; a public one by anyone in the
- * workspace; an ownerless one by nobody. Workspace role does not enter into
- * it: a private runtime is someone's own machine, so not even an admin may
- * bind an agent without a grant, and only the owner may change sharing. The server
- * enforces exactly this predicate (`canUseRuntimeForAgent`), so the picker and
- * the API/CLI never disagree (MUL-6126).
- *
- * An unknown viewer (no session yet) is treated as allowed so a still-loading
- * auth state never hides a runtime the user does own — every write path
- * re-checks server-side.
- *
- * This is the single source of truth for "can this runtime be picked": every
- * create / duplicate / builder / reassign surface must call it rather than
- * re-deriving the rule.
+ * Runtime details follow the owner's explicit grants or public workspace access.
+ * The server authenticates reads and writes while the viewer's session loads.
  */
 export function isRuntimeUsableForUser(
   runtime: RuntimeDevice,
@@ -30,4 +16,14 @@ export function isRuntimeUsableForUser(
   if (runtime.owner_id === currentUserId) return true;
   return runtime.visibility === "public" ||
     (runtime.visibility === "private" && (runtime.shared_with ?? []).includes(currentUserId));
+}
+
+// Placement and model discovery also honor an operator-configured peer grant.
+export function isRuntimePlaceableForUser(
+  runtime: RuntimeDevice,
+  currentUserId: string | null,
+): boolean {
+  return isRuntimeUsableForUser(runtime, currentUserId) ||
+    (!!runtime.owner_id && !!currentUserId && runtime.visibility === "private" &&
+      runtime.policy_peer_id === currentUserId);
 }

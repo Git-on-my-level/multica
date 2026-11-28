@@ -16,6 +16,7 @@ export const AgentRuntimeSchema = z.object({
   owner_id: z.string().nullable().catch(null),
   visibility: z.enum(["private", "public"]).catch("private"),
   shared_with: z.array(z.string().uuid()).catch([]),
+  policy_peer_id: z.string().uuid().nullable().catch(null),
   profile_id: z.string().nullable().catch(null),
   max_concurrent_tasks: z.number().int().nullable().catch(null),
   last_seen_at: z.string().nullable().catch(null),

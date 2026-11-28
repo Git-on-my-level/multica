@@ -139,8 +139,7 @@ func (h *Handler) resolveMikaAgent(w http.ResponseWriter, r *http.Request, works
 		writeError(w, http.StatusBadRequest, "runtime not found in this workspace")
 		return db.Agent{}, false, false
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "you cannot bind an agent to this runtime")
+	if !requireRuntimePlacement(w, r, h.Queries, runtime, member.UserID, false, "you cannot bind an agent to this runtime") {
 		return db.Agent{}, false, false
 	}
 
@@ -192,8 +191,7 @@ func (h *Handler) resolveMikaAgent(w http.ResponseWriter, r *http.Request, works
 		writeError(w, http.StatusBadRequest, "runtime not found in this workspace")
 		return db.Agent{}, false, false
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "you cannot bind an agent to this runtime")
+	if !requireRuntimePlacement(w, r, qtx, runtime, member.UserID, true, "you cannot bind an agent to this runtime") {
 		return db.Agent{}, false, false
 	}
 
