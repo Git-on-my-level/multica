@@ -211,7 +211,7 @@ rewrite configuration. Its backend fallback therefore accepts
 
 A self-host operator can set `MULTICA_PRIVATE_RUNTIME_PEERS` on the backend as `<workspace UUID>,<first user UUID>,<second user UUID>`. Use the user IDs from the workspace member records. Set the same value on every API server and use direct or session-pooled PostgreSQL connections that preserve the server's startup parameters.
 
-While both users belong to that workspace, each can place and run their agents on the other's private runtimes. New runtimes owned by either user are covered automatically. Runtime visibility remains private and the owner still controls explicit shares. The runtime list API reports the policy recipient to members of the pair as `policy_peer_id`. The explicit recipients stay in `shared_with`. Other workspaces and other workspace members keep their existing access.
+While both users belong to that workspace, each can place and run their agents on the other's private runtimes. New runtimes owned by either user are covered automatically. Runtime visibility remains private and the owner still controls explicit shares. The runtime list API reports the runtime owner's policy peer as `policy_peer_id` to both members of the pair. The explicit recipients stay in `shared_with`. Other workspaces and other workspace members keep their existing access.
 
 To disable the policy, first move policy-dependent agents to runtimes they can otherwise use and drain their work. Then clear the setting and recreate or restart every API server. Existing explicit shares remain in effect.
 

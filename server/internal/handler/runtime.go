@@ -46,7 +46,8 @@ type AgentRuntimeResponse struct {
 	// canUseRuntimeForAgent.
 	Visibility string   `json:"visibility"`
 	SharedWith []string `json:"shared_with"`
-	// PolicyPeerID is a placement grant independent of the editable ACL.
+	// PolicyPeerID identifies the runtime owner's operator-configured peer.
+	// Both policy members can read the grant, including the runtime owner.
 	PolicyPeerID string `json:"policy_peer_id,omitempty"`
 	// ProfileID is set when this runtime is an instance of a custom
 	// runtime_profile (MUL-3284); null for built-in runtimes.

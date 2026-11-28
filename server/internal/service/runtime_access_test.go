@@ -1,10 +1,14 @@
 package service
 
 import (
+	"testing"
+
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/dispatch"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"testing"
 )
 
 func TestRuntimeSharedMemberAccess(t *testing.T) {
@@ -28,5 +32,43 @@ func TestRuntimeSharedMemberAccess(t *testing.T) {
 	rt.OwnerID = pgtype.UUID{}
 	if RuntimeAllowsUser(rt, member) {
 		t.Fatal("ownerless runtime grants access")
+	}
+}
+
+func TestAgentReadinessRuntimeAccess(t *testing.T) {
+	pool := sharedTestPool(t)
+	fixture := testutil.New(pool, "", "")
+	tag := uuid.NewString()
+	workspace := fixture.Workspace(t, "Runtime readiness workspace", "runtime-readiness-"+tag)
+	owner := fixture.User(t, "Runtime owner", "owner-"+tag+"@example.test")
+	other := fixture.User(t, "Other member", "member-"+tag+"@example.test")
+	fixture.Member(t, workspace, owner, "owner")
+	fixture.Member(t, workspace, other, "member")
+	fx := testutil.New(pool, workspace, owner)
+	privateRuntime := util.MustParseUUID(fx.Runtime(t, "Private runtime"))
+	publicRuntime := util.MustParseUUID(fx.Runtime(t, "Public runtime", testutil.Cols{"visibility": "public"}))
+	ownerless := util.MustParseUUID(fx.Runtime(t, "Ownerless runtime", testutil.Cols{"owner_id": nil}))
+	lookup := RuntimeLookup{Queries: db.New(pool)}
+
+	for _, tc := range []struct {
+		name      string
+		runtimeID pgtype.UUID
+		userID    pgtype.UUID
+		reason    dispatch.ReasonCode
+	}{
+		{"runtime owner", privateRuntime, util.MustParseUUID(owner), ""},
+		{"private mismatch", privateRuntime, util.MustParseUUID(other), dispatch.ReasonRuntimeAccessDenied},
+		{"public mismatch", publicRuntime, util.MustParseUUID(other), ""},
+		{"ownerless agent", privateRuntime, pgtype.UUID{}, dispatch.ReasonRuntimeAccessDenied},
+		{"legacy ownerless runtime", ownerless, util.MustParseUUID(other), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			verdict, err := AgentReadiness(t.Context(), lookup, db.Agent{
+				WorkspaceID: util.MustParseUUID(workspace), RuntimeID: tc.runtimeID, OwnerID: tc.userID,
+			})
+			if err != nil || verdict.Reason != tc.reason || verdict.Ready() != (tc.reason == "") {
+				t.Fatalf("readiness=%+v, error=%v, want reason=%q", verdict, err, tc.reason)
+			}
+		})
 	}
 }

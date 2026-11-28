@@ -127,6 +127,14 @@ func TestPrivateRuntimePeerPolicyExecution(t *testing.T) {
 			if err != nil || !baseline.Blocked() {
 				t.Fatalf("the unset policy should block the cross-owner agent: %+v, %v", baseline, err)
 			}
+			if mode == "claim" {
+				foreign := agent
+				foreign.WorkspaceID = parseUUID(uuid.NewString())
+				ready, err := service.AgentReadiness(ctx, service.RuntimeLookup{Queries: h.Queries}, foreign)
+				if err != nil || !ready.Blocked() {
+					t.Fatalf("the policy crossed the agent workspace boundary: %+v, %v", ready, err)
+				}
+			}
 			task := seedQueuedIssueTask(t, ctx, agentID, runtime, issue)
 			if mode != "claim" {
 				dbfx.Exec(t, "UPDATE agent_task_queue SET status = 'dispatched', dispatched_at = now() - interval '10 minutes', prepare_lease_expires_at = NULL WHERE id = $1", task)
@@ -191,5 +199,29 @@ func TestPrivateRuntimePeerPolicyRevokesOnDeparture(t *testing.T) {
 				t.Fatalf("departed owner's task remains active: %+v, %v", task, err)
 			}
 		})
+	}
+}
+
+func TestPrivateRuntimePeerPolicyPlacementDuringRemoval(t *testing.T) {
+	runtime, owner, peer := runtimeVisibilityFixture(t)
+	h := runtimePeerPolicyHandler(t, testWorkspaceID, owner, peer)
+	ctx := t.Context()
+	removal, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removal.Rollback(ctx)
+	if _, err := testHandler.Queries.WithTx(removal).LockRuntimeShareMemberRemoval(ctx, db.LockRuntimeShareMemberRemovalParams{
+		WorkspaceID: parseUUID(testWorkspaceID), UserID: parseUUID(peer),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const name = "Placement during policy peer departure"
+	req := newRequestAs(peer, http.MethodPost, "/api/agents", map[string]any{"name": name, "runtime_id": runtime})
+	testutil.Call(t, h.CreateAgent, req).Want(http.StatusConflict)
+	var count int
+	dbfx.QueryRow(t, "SELECT count(*) FROM agent WHERE runtime_id = $1 AND name = $2", runtime, name).Scan(&count)
+	if count != 0 {
+		t.Fatalf("placement raced member removal and wrote %d agents", count)
 	}
 }

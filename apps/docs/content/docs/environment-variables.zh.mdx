@@ -36,6 +36,7 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `DATABASE_MIN_CONNS` | `5` | 单个 API 进程保留的最小连接数 |
 | `DATABASE_SEARCH_WORK_MEM_MB` | `64` | 每个搜索计划算子的 PostgreSQL `work_mem` 上限（MB）；设为 `1`–`64` 可调低，设为 `0` 则沿用数据库/会话默认值 |
 | `DATABASE_REPLICA_URL` | 空 | 可选的 PostgreSQL 只读从库连接地址；新连接会强制校验只读状态，业务仍需在代码中显式选择最终一致读取 |
+| `MULTICA_PRIVATE_RUNTIME_PEERS` | 空 | 可选。允许同一工作区的两位当前成员使用对方的私有运行时。填入工作区 UUID 和两个不同的用户 UUID，用逗号分隔。配置无效时，API 无法启动。清空该值并重启 API 服务即可停用。 |
 | `DATABASE_REPLICA_MAX_CONNS` | `10` | 单个 API 进程的最大从库连接数 |
 | `DATABASE_REPLICA_MIN_CONNS` | `0` | 单个 API 进程保留的最小从库连接数 |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | 容器启动过程中，migration 与 API 共享的暂时性数据库故障重试时长；设为 `0` 时每个阶段只尝试一次 |

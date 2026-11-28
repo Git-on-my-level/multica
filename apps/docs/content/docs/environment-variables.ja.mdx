@@ -36,6 +36,7 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `DATABASE_MIN_CONNS` | `5` | API プロセスが保持する最小接続数 |
 | `DATABASE_SEARCH_WORK_MEM_MB` | `64` | 検索プランの各ノードに対する PostgreSQL `work_mem` 上限（MB）。`1`～`64` で引き下げ、`0` でデータベース／セッションの既定値を使用 |
 | `DATABASE_REPLICA_URL` | 空 | オプションの PostgreSQL 読み取り専用レプリカ接続文字列。新しい接続では読み取り専用状態が検証され、各機能はコードで結果整合性読み取りを明示的に選択する必要があります |
+| `MULTICA_PRIVATE_RUNTIME_PEERS` | 空 | 同じワークスペースに所属する 2 人のメンバーが互いのプライベートランタイムを利用できるようにするオプションです。ワークスペースの UUID と、異なる 2 つのユーザー UUID をコンマ区切りで指定します。値が無効な場合、API は起動しません。無効にするには値を消去し、API サーバーを再起動します。 |
 | `DATABASE_REPLICA_MAX_CONNS` | `10` | API プロセスあたりの最大レプリカ接続数 |
 | `DATABASE_REPLICA_MIN_CONNS` | `0` | API プロセスが保持する最小レプリカ接続数 |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | コンテナ起動時に migration と API が共有する、一時的なデータベース障害への再試行時間。`0` にすると各フェーズで 1 回だけ試行します |
