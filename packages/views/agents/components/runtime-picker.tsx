@@ -5,7 +5,7 @@ import { ChevronDown, Cloud, Loader2, Lock, Search } from "@multica/ui/icons";
 import { ProviderLogo } from "../../runtimes/components/provider-logo";
 import { ActorAvatar } from "../../common/actor-avatar";
 import {
-  isRuntimeUsableForUser,
+  isRuntimePlaceableForUser,
   runtimeDisplayName,
 } from "@multica/core/runtimes";
 import type { MemberWithUser, RuntimeDevice } from "@multica/core/types";
@@ -95,7 +95,7 @@ export function RuntimePicker({
   useEffect(() => {
     if (!autoSelect || selectedRuntimeId !== "") return;
     const firstUsable = filteredRuntimes.find((r) =>
-      isRuntimeUsableForUser(r, currentUserId),
+      isRuntimePlaceableForUser(r, currentUserId),
     );
     if (firstUsable) onSelect(firstUsable.id);
   }, [autoSelect, filteredRuntimes, selectedRuntimeId, currentUserId, onSelect]);
@@ -109,7 +109,7 @@ export function RuntimePicker({
     if (!autoSelect) return;
     const nextList = computeFilteredRuntimes(runtimes, next, currentUserId);
     const firstUsable = nextList.find((r) =>
-      isRuntimeUsableForUser(r, currentUserId),
+      isRuntimePlaceableForUser(r, currentUserId),
     );
     onSelect(firstUsable?.id ?? "");
   };
@@ -244,7 +244,7 @@ export function RuntimePicker({
                   </div>
                   {machine.runtimes.map((device) => {
                     const ownerMember = getOwnerMember(device.owner_id);
-                    const disabled = !isRuntimeUsableForUser(
+                    const disabled = !isRuntimePlaceableForUser(
                       device,
                       currentUserId,
                     );
@@ -344,8 +344,8 @@ function computeFilteredRuntimes(
     const bMine = b.owner_id === currentUserId;
     if (aMine && !bMine) return -1;
     if (!aMine && bMine) return 1;
-    const aUsable = isRuntimeUsableForUser(a, currentUserId);
-    const bUsable = isRuntimeUsableForUser(b, currentUserId);
+    const aUsable = isRuntimePlaceableForUser(a, currentUserId);
+    const bUsable = isRuntimePlaceableForUser(b, currentUserId);
     if (aUsable && !bUsable) return -1;
     if (!aUsable && bUsable) return 1;
     return 0;

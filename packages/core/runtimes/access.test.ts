@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { AgentRuntime } from "../types";
-import { isRuntimeUsableForUser } from "./access";
+import { isRuntimePlaceableForUser, isRuntimeUsableForUser } from "./access";
 
 const OWNER = "user-owner";
 const OTHER = "user-other";
@@ -28,11 +28,6 @@ function makeRuntime(overrides: Partial<AgentRuntime> = {}): AgentRuntime {
   };
 }
 
-// This truth table is the client half of a contract the server enforces with
-// the identical predicate (canUseRuntimeForAgent in
-// server/internal/handler/runtime.go). Keep the two in step: a runtime this
-// says is usable but the server refuses is a picker that 403s on submit —
-// the MUL-6126 bug — and the reverse is a runtime the UI hides for no reason.
 describe("isRuntimeUsableForUser", () => {
   it("lets the owner use their own private runtime", () => {
     expect(isRuntimeUsableForUser(makeRuntime(), OWNER)).toBe(true);
@@ -72,5 +67,16 @@ describe("isRuntimeUsableForUser", () => {
 
   it("allows everything while the viewer is unknown, so a loading session never hides the user's own runtime", () => {
     expect(isRuntimeUsableForUser(makeRuntime(), null)).toBe(true);
+  });
+});
+
+describe("isRuntimePlaceableForUser", () => {
+  it("honors an operator peer grant for placement and model discovery", () => {
+    const runtime = makeRuntime({ policy_peer_id: OTHER });
+    expect(isRuntimePlaceableForUser(runtime, OTHER)).toBe(true);
+    expect(isRuntimePlaceableForUser(runtime, OWNER)).toBe(true);
+    expect(isRuntimePlaceableForUser(runtime, "third-member")).toBe(false);
+    expect(isRuntimePlaceableForUser({ ...runtime, owner_id: null }, OTHER)).toBe(false);
+    expect(isRuntimeUsableForUser(runtime, OTHER)).toBe(false);
   });
 });

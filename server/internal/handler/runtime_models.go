@@ -342,7 +342,7 @@ func modelListRequestTerminal(status ModelListStatus) bool {
 // HeartbeatInterval away.
 func (h *Handler) InitiateListModels(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
+	rt, _, ok := h.requireRuntimeModelAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if !ok {
 		return
 	}
@@ -457,7 +457,7 @@ func (h *Handler) requestDaemonPendingWork(runtimeID, kind string) {
 // GetModelListRequest returns the status of a model list request.
 func (h *Handler) GetModelListRequest(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeModelPoll, runtimeID)
+	rt, _, ok := h.requireRuntimeModelAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeModelPoll, runtimeID)
 	if !ok {
 		return
 	}

@@ -12,6 +12,17 @@ describe("runtime sharing response contract", () => {
   it.each([null, "all", [123], ["not-a-uuid"]])("fails closed for malformed grants: %j", (shared_with) => {
     expect(AgentRuntimeSchema.parse({ id: "r", workspace_id: "w", shared_with }).shared_with).toEqual([]);
   });
+  it("keeps the operator grant separate from editable sharing", () => {
+    const peer = "11111111-1111-4111-8111-111111111111";
+    const base = { id: "r", workspace_id: "w" };
+    expect(AgentRuntimeSchema.parse({ ...base, policy_peer_id: peer })).toMatchObject({
+      shared_with: [],
+      policy_peer_id: peer,
+    });
+    for (const policy_peer_id of [undefined, true, "all"]) {
+      expect(AgentRuntimeSchema.parse({ ...base, policy_peer_id }).policy_peer_id).toBeNull();
+    }
+  });
   it("falls back safely for a malformed runtime", () => {
     expect(parseWithFallback({ id: 123 }, AgentRuntimeSchema, EMPTY_RUNTIME, { endpoint: "test" })).toEqual(EMPTY_RUNTIME);
   });

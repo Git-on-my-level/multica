@@ -79,7 +79,7 @@ var (
 	}
 )
 
-// newDBPool builds a pgxpool with sane production defaults and env overrides.
+// newSizedDBPool builds a pgxpool with sane production defaults and env overrides.
 //
 // pgxpool.New(ctx, url) — used previously — silently picks MaxConns =
 // max(4, NumCPU). On our prod pods (small CPU request) that resolved to 4,
@@ -94,20 +94,15 @@ var (
 //
 // pgx's own built-in default (max(4, NumCPU)) is intentionally NOT used as a
 // fallback — it is the value that caused the prod incident.
-func newDBPool(ctx context.Context, dbURL string, connectTimeout time.Duration) (*pgxpool.Pool, error) {
-	return newSizedDBPool(ctx, dbURL, connectTimeout, primaryPoolSizing)
-}
-
-func newReplicaDBPool(ctx context.Context, dbURL string, connectTimeout time.Duration) (*pgxpool.Pool, error) {
-	return newSizedDBPool(ctx, dbURL, connectTimeout, replicaPoolSizing)
-}
-
-func newSizedDBPool(ctx context.Context, dbURL string, connectTimeout time.Duration, sizing dbPoolSizing) (*pgxpool.Pool, error) {
+func newSizedDBPool(ctx context.Context, dbURL string, connectTimeout time.Duration, sizing dbPoolSizing, privateRuntimePeers string) (*pgxpool.Pool, error) {
 	cfg, err := dbstartup.ParsePoolConfig(dbURL, connectTimeout)
 	if err != nil {
 		return nil, err
 	}
 	applyPoolSizing(cfg, dbURL, sizing)
+	if privateRuntimePeers != "" {
+		cfg.ConnConfig.RuntimeParams[privateRuntimePeersSetting] = privateRuntimePeers
+	}
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 

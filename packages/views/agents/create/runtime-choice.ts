@@ -1,5 +1,5 @@
 import {
-  isRuntimeUsableForUser,
+  isRuntimePlaceableForUser,
   providerDisplayName,
 } from "@multica/core/runtimes";
 import type { RuntimeDevice } from "@multica/core/types";
@@ -81,7 +81,7 @@ export function buildRuntimeChoiceGroups(
 
   for (const machine of machines) {
     const usable = machine.runtimes.filter((runtime) =>
-      isRuntimeUsableForUser(runtime, currentUserId),
+      isRuntimePlaceableForUser(runtime, currentUserId),
     );
     if (machine.section === "local") {
       local = {

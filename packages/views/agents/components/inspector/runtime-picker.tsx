@@ -9,7 +9,7 @@ import {
   Lock,
   Monitor,
 } from "@multica/ui/icons";
-import { isRuntimeUsableForUser } from "@multica/core/runtimes";
+import { isRuntimePlaceableForUser } from "@multica/core/runtimes";
 import type { AgentRuntime, MemberWithUser } from "@multica/core/types";
 import { ActorAvatar } from "../../../common/actor-avatar";
 import {
@@ -74,7 +74,7 @@ export function RuntimePicker({
   // runtime this picker locks is exactly the one the API and CLI refuse
   // (MUL-6126) — no workspace-role exception on either side.
   const isDisabled = (r: AgentRuntime): boolean =>
-    !isRuntimeUsableForUser(r, currentUserId);
+    !isRuntimePlaceableForUser(r, currentUserId);
 
   // Machine grouping over the unfiltered list — resolves the selected
   // runtime's machine for the trigger label regardless of the Mine/All

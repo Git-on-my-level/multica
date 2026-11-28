@@ -17,7 +17,7 @@ import {
 } from "@multica/core/agents";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { isRuntimeUsableForUser, runtimeListOptions } from "@multica/core/runtimes";
+import { isRuntimePlaceableForUser, runtimeListOptions } from "@multica/core/runtimes";
 import type {
   MemberWithUser,
   RuntimeDevice,
@@ -116,7 +116,7 @@ export function useCreateAgentForm(options?: {
       runtimes.filter(
         (runtime) =>
           runtime.status === "online" &&
-          isRuntimeUsableForUser(runtime, currentUserId),
+          isRuntimePlaceableForUser(runtime, currentUserId),
       ),
     [currentUserId, runtimes],
   );
@@ -168,7 +168,7 @@ export function useCreateAgentForm(options?: {
     currentUserId,
     draftReady:
       selectedRuntime != null &&
-      isRuntimeUsableForUser(selectedRuntime, currentUserId) &&
+      isRuntimePlaceableForUser(selectedRuntime, currentUserId) &&
       (selectedRuntime.provider !== "qoder_cloud" || !!draft.qoderAgentId) &&
       isDraftDescriptionWithinLimit(draft.description) &&
       !accessInvalid &&

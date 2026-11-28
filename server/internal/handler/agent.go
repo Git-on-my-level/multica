@@ -1184,6 +1184,11 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 	if err != nil {
 		return nil, err
 	}
+	policyMembers, err := h.Queries.GetPrivateRuntimePolicyMembers(ctx, parseUUID(workspaceID))
+	if err != nil {
+		return nil, err
+	}
+	viewer := parseUUID(viewerID)
 	for _, runtime := range runtimes {
 		// Agent/runtime workspace consistency is normally enforced at bind time;
 		// keep the projection fail-closed if a legacy row violates it.
@@ -1194,7 +1199,8 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 		// owner/shared/public rows to regular members. Keep the coarse bridge for the
 		// rows that the viewer's runtime list cannot carry.
 		if runtime.Visibility == "public" ||
-			service.RuntimeAllowsUser(runtime, parseUUID(viewerID)) {
+			service.RuntimeAllowsUser(runtime, viewer) ||
+			service.PrivateRuntimePolicyPeer(runtime, policyMembers) == viewer {
 			continue
 		}
 		result[uuidToString(runtime.ID)] = deriveAgentRuntimeAvailability(runtime, now)
@@ -1549,8 +1555,7 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "this runtime is private; ask its owner to grant you access before creating agents")
+	if !requireRuntimePlacement(w, r, h.Queries, runtime, member.UserID, false, "this runtime is private; ask its owner to grant you access before creating agents") {
 		return
 	}
 
@@ -1696,8 +1701,7 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid runtime_id")
 		return
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "this runtime is private; ask its owner to grant you access before creating agents")
+	if !requireRuntimePlacement(w, r, qtx, runtime, member.UserID, true, "this runtime is private; ask its owner to grant you access before creating agents") {
 		return
 	}
 
@@ -2125,15 +2129,14 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		if !canUseRuntimeForAgent(member, runtime) {
-			writeError(w, http.StatusForbidden, "this runtime is private; ask its owner to grant you access before moving agents onto it")
+		if !requireRuntimePlacement(w, r, h.Queries, runtime, member.UserID, false, "this runtime is private; ask its owner to grant you access before moving agents onto it") {
 			return
 		}
 		// Task delivery authorizes private runtimes against the agent owner,
 		// not the member making this update. Admin management permission must
 		// not save a binding that the existing delivery gate will reject.
-		if runtime.Visibility == "private" && !service.RuntimeAllowsUser(runtime, existing.OwnerID) {
-			writeError(w, http.StatusForbidden, "this runtime is private; its owner must grant the agent owner access")
+		if runtime.Visibility == "private" && existing.OwnerID != member.UserID &&
+			!requireRuntimePlacement(w, r, h.Queries, runtime, existing.OwnerID, false, "this runtime is private; its owner must grant the agent owner access") {
 			return
 		}
 		params.RuntimeID = runtime.ID
@@ -2481,12 +2484,11 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid runtime_id")
 			return
 		}
-		if !canUseRuntimeForAgent(member, runtime) {
-			writeError(w, http.StatusForbidden, "this runtime is private; ask its owner to grant you access before moving agents onto it")
+		if !requireRuntimePlacement(w, r, updateQueries, runtime, member.UserID, true, "this runtime is private; ask its owner to grant you access before moving agents onto it") {
 			return
 		}
-		if runtime.Visibility == "private" && !service.RuntimeAllowsUser(runtime, existing.OwnerID) {
-			writeError(w, http.StatusForbidden, "the agent owner does not have access to this runtime")
+		if runtime.Visibility == "private" && existing.OwnerID != member.UserID &&
+			!requireRuntimePlacement(w, r, updateQueries, runtime, existing.OwnerID, true, "the agent owner does not have access to this runtime") {
 			return
 		}
 		params.RuntimeMode = pgtype.Text{String: runtime.RuntimeMode, Valid: true}

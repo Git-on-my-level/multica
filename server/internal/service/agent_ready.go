@@ -115,7 +115,7 @@ func RuntimeBlockedNeedsNotice(code dispatch.ReasonCode) bool {
 // runtime read is attributed to (MUL-6884), so each admission path stays
 // distinguishable in multica_agent_runtime_lookup_total.
 //
-// err is non-nil only on DB lookup failure for the runtime row. Callers that
+// err is non-nil on a runtime or access policy lookup failure. Callers that
 // treat a transient DB error as "do not skip" (the autopilot admission gate)
 // should swallow it; callers that need a hard yes/no (the squad-leader
 // pre-enqueue check in the handler) should fail closed.
@@ -150,19 +150,28 @@ func AgentReadiness(ctx context.Context, lookup RuntimeLookup, agent db.Agent) (
 	if err != nil {
 		return AgentVerdict{}, err
 	}
-	return runtimeVerdict(rt, agent), nil
-}
-
-// runtimeVerdict combines runtime health with the ownership binding that
-// determines whether this agent can execute there.
-func runtimeVerdict(rt db.AgentRuntime, agent db.Agent) AgentVerdict {
-	if rt.Visibility == "private" && rt.OwnerID.Valid && !RuntimeAllowsUser(rt, agent.OwnerID) {
-		return AgentVerdict{
-			Availability: AgentBlocked,
-			Reason:       dispatch.ReasonRuntimeAccessDenied,
-			Detail:       "agent owner does not have access to the private runtime",
+	if rt.Visibility == "private" && rt.OwnerID.Valid {
+		allowed, err := RuntimeAllowsAgentWithPolicy(ctx, lookup.Queries, rt, agent, false)
+		if err != nil {
+			return AgentVerdict{}, err
+		}
+		if !allowed {
+			return runtimeAccessDeniedVerdict(), nil
 		}
 	}
+	return runtimeVerdict(rt), nil
+}
+
+func runtimeAccessDeniedVerdict() AgentVerdict {
+	return AgentVerdict{
+		Availability: AgentBlocked,
+		Reason:       dispatch.ReasonRuntimeAccessDenied,
+		Detail:       "agent owner does not have access to the private runtime",
+	}
+}
+
+// runtimeVerdict evaluates runtime health after the ownership check.
+func runtimeVerdict(rt db.AgentRuntime) AgentVerdict {
 	if reason, ok := parseRuntimeOfflineReason(rt.Metadata); ok && reason.Code == runtimeOfflineCodeNotExecutable && reason.LauncherUnavailable {
 		return AgentVerdict{Availability: AgentBlocked, Reason: dispatch.ReasonRuntimeUnusable, Detail: reason.Detail, LauncherUnavailable: true}
 	}

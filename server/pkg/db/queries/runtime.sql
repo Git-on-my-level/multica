@@ -14,8 +14,13 @@ ORDER BY id ASC;
 -- sees only runtimes shared with them or with the entire workspace.
 SELECT * FROM agent_runtime
 WHERE workspace_id = $1
-  AND (owner_id = $2 OR visibility = 'public' OR (visibility = 'private' AND $2 = ANY(shared_with)))
+  AND (owner_id = $2 OR visibility = 'public'
+       OR (visibility = 'private' AND ($2 = ANY(shared_with)
+           OR ARRAY[owner_id, $2::uuid] <@ (SELECT private_runtime_policy_members($1)))))
 ORDER BY created_at ASC;
+
+-- name: GetPrivateRuntimePolicyMembers :one
+SELECT private_runtime_policy_members(@workspace_id::uuid)::uuid[] AS user_ids;
 
 -- name: GetAgentRuntime :one
 SELECT * FROM agent_runtime
@@ -745,7 +750,11 @@ FOR UPDATE;
 
 -- name: ListSharedAgentRuntimesForUpdate :many
 SELECT * FROM agent_runtime
-WHERE workspace_id = @workspace_id AND @user_id::uuid = ANY(shared_with)
+WHERE workspace_id = @workspace_id AND (
+    @user_id::uuid = ANY(shared_with)
+    OR (visibility = 'private' AND owner_id <> @user_id
+        AND ARRAY[owner_id, @user_id::uuid] <@ (SELECT private_runtime_policy_members(@workspace_id)))
+)
 ORDER BY id
 FOR NO KEY UPDATE;
 

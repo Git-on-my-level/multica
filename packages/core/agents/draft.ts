@@ -1,5 +1,5 @@
 import { qoderAgentId } from "./qoder-runtime-config";
-import { isRuntimeUsableForUser } from "../runtimes/access";
+import { isRuntimePlaceableForUser } from "../runtimes/access";
 import type {
   Agent,
   AgentInvocationTargetInput,
@@ -188,7 +188,7 @@ export function buildDuplicateDraft(
     options.runtimes.some(
       (runtime) =>
         runtime.id === source.runtime_id &&
-        isRuntimeUsableForUser(runtime, options.currentUserId),
+        isRuntimePlaceableForUser(runtime, options.currentUserId),
     );
   return {
     ...EMPTY_AGENT_DRAFT,

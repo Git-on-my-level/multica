@@ -52,54 +52,12 @@ func TestAgentReadinessVerdict(t *testing.T) {
 		t.Errorf("archived agent: got %+v, want blocked/target_unavailable", got)
 	}
 
-	// The runtime half. A private runtime with an owner admits only an agent
-	// owned by that same member; ownerless agents are blocked for new work.
-	ownerA := pgtype.UUID{Bytes: [16]byte{2}, Valid: true}
-	ownerB := pgtype.UUID{Bytes: [16]byte{3}, Valid: true}
-	if got := runtimeVerdict(db.AgentRuntime{Status: "online"}, db.Agent{OwnerID: ownerA}); !got.Ready() {
+	if got := runtimeVerdict(db.AgentRuntime{Status: "online"}); !got.Ready() {
 		t.Errorf("online runtime: got %+v, want ready", got)
-	}
-	for name, tc := range map[string]struct {
-		runtime db.AgentRuntime
-		agent   db.Agent
-		blocked bool
-		reason  dispatch.ReasonCode
-	}{
-		"private mismatch": {
-			runtime: db.AgentRuntime{Status: "online", Visibility: "private", OwnerID: ownerA},
-			agent:   db.Agent{OwnerID: ownerB},
-			blocked: true,
-			reason:  dispatch.ReasonRuntimeAccessDenied,
-		},
-		"private ownerless agent": {
-			runtime: db.AgentRuntime{Status: "online", Visibility: "private", OwnerID: ownerA},
-			agent:   db.Agent{},
-			blocked: true,
-			reason:  dispatch.ReasonRuntimeAccessDenied,
-		},
-		"private same owner": {
-			runtime: db.AgentRuntime{Status: "online", Visibility: "private", OwnerID: ownerA},
-			agent:   db.Agent{OwnerID: ownerA},
-		},
-		"public mismatch": {
-			runtime: db.AgentRuntime{Status: "online", Visibility: "public", OwnerID: ownerA},
-			agent:   db.Agent{OwnerID: ownerB},
-		},
-		"ownerless runtime": {
-			runtime: db.AgentRuntime{Status: "online", Visibility: "private"},
-			agent:   db.Agent{OwnerID: ownerB},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			got := runtimeVerdict(tc.runtime, tc.agent)
-			if got.Blocked() != tc.blocked || (tc.blocked && got.Reason != tc.reason) {
-				t.Fatalf("got %+v, want blocked=%v reason=%q", got, tc.blocked, tc.reason)
-			}
-		})
 	}
 	// Offline with no explanation is the sleeping-laptop case: work waits for it,
 	// so this must NOT be blocked.
-	offline := runtimeVerdict(db.AgentRuntime{Status: "offline"}, db.Agent{OwnerID: ownerA})
+	offline := runtimeVerdict(db.AgentRuntime{Status: "offline"})
 	if offline.Blocked() || offline.Reason != dispatch.ReasonRuntimeOffline {
 		t.Errorf("plain offline runtime: got %+v, want waitable/runtime_offline", offline)
 	}
@@ -109,7 +67,7 @@ func TestAgentReadinessVerdict(t *testing.T) {
 	unusable := runtimeVerdict(db.AgentRuntime{
 		Status:   "offline",
 		Metadata: []byte(`{"offline_reason":{"code":"not_executable","detail":"agent CLI is not executable","repair":{"package":"@anthropic-ai/claude-code","command":"cd '/pkg' && node install.cjs"}}}`),
-	}, db.Agent{OwnerID: ownerA})
+	})
 	if !unusable.Blocked() || unusable.Reason != dispatch.ReasonRuntimeUnusable {
 		t.Fatalf("unusable runtime: got %+v, want blocked/runtime_unusable", unusable)
 	}
@@ -124,7 +82,7 @@ func TestAgentReadinessVerdict(t *testing.T) {
 	profile := runtimeVerdict(db.AgentRuntime{
 		Status:   "offline",
 		Metadata: []byte(`{"offline_reason":{"code":"dsh_profile","detail":"the Multica runtime profile is not installed","repair":{"package":"DeepSeek Harness runtime profile"}}}`),
-	}, db.Agent{OwnerID: ownerA})
+	})
 	if !profile.Blocked() || profile.Reason != dispatch.ReasonRuntimeProfileMissing {
 		t.Fatalf("missing DSH profile: got %+v, want blocked/runtime_profile_missing", profile)
 	}
@@ -161,14 +119,14 @@ func TestAgentReadinessVerdict(t *testing.T) {
 	}
 	// The one exception is an install the daemon is running right now: that wait
 	// DOES end by itself, so the work queues instead of being refused.
-	fresh := runtimeVerdict(installingRow(time.Now()), db.Agent{OwnerID: ownerA})
+	fresh := runtimeVerdict(installingRow(time.Now()))
 	if fresh.Blocked() {
 		t.Errorf("install in flight: got %+v, want the waitable verdict", fresh)
 	}
 	if fresh.Reason != dispatch.ReasonRuntimeOffline {
 		t.Errorf("install in flight: reason = %q, want %q", fresh.Reason, dispatch.ReasonRuntimeOffline)
 	}
-	stale := runtimeVerdict(installingRow(time.Now().Add(-runtimeInstallClaimWindow-time.Minute)), db.Agent{OwnerID: ownerA})
+	stale := runtimeVerdict(installingRow(time.Now().Add(-runtimeInstallClaimWindow - time.Minute)))
 	if !stale.Blocked() || stale.Reason != dispatch.ReasonRuntimeProfileMissing {
 		t.Fatalf("stale install claim: got %+v, want blocked/runtime_profile_missing", stale)
 	}
@@ -177,7 +135,7 @@ func TestAgentReadinessVerdict(t *testing.T) {
 	unbounded := runtimeVerdict(db.AgentRuntime{
 		Status:   "offline",
 		Metadata: []byte(`{"offline_reason":{"code":"dsh_profile","installing":true}}`),
-	}, db.Agent{OwnerID: ownerA})
+	})
 	if !unbounded.Blocked() {
 		t.Errorf("install claim with no updated_at: got %+v, want blocked", unbounded)
 	}
@@ -189,7 +147,7 @@ func TestAgentReadinessVerdict(t *testing.T) {
 		"malformed":    `{"offline_reason":`,
 		"empty":        ``,
 	} {
-		got := runtimeVerdict(db.AgentRuntime{Status: "offline", Metadata: []byte(metadata)}, db.Agent{OwnerID: ownerA})
+		got := runtimeVerdict(db.AgentRuntime{Status: "offline", Metadata: []byte(metadata)})
 		if got.Blocked() {
 			t.Errorf("%s: got %+v, want the plain offline verdict", name, got)
 		}
@@ -237,7 +195,7 @@ func TestRuntimeProfileNoticeIncludesManualMigrationPath(t *testing.T) {
 	verdict := runtimeVerdict(db.AgentRuntime{
 		Status:   "offline",
 		Metadata: []byte(`{"offline_reason":{"code":"dsh_profile","detail":"the multica DSH profile needs manual migration","installing":false}}`),
-	}, db.Agent{})
+	})
 	if !verdict.Blocked() || verdict.Reason != dispatch.ReasonRuntimeProfileMissing {
 		t.Fatalf("migration must refuse the trigger with the existing profile reason: %+v", verdict)
 	}

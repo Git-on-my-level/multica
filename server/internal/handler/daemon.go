@@ -2659,11 +2659,17 @@ func (h *Handler) finalizeClaimDelivery(
 				Detail: "agent runtime changed before delivery",
 			}
 		}
-		if locked.Visibility == "private" && locked.OwnerID.Valid && !service.RuntimeAllowsUser(locked, agent.OwnerID) {
-			agentOwnerID = agent.OwnerID
-			return &service.ClaimDeliveryAuthzError{
-				Reason: "error_runtime_access_denied",
-				Detail: "private runtime does not permit task agent at delivery gate",
+		if locked.Visibility == "private" && locked.OwnerID.Valid {
+			allowed, err := service.RuntimeAllowsAgentWithPolicy(ctx, qtx, locked, agent, true)
+			if err != nil {
+				return fmt.Errorf("authorize private runtime delivery: %w", err)
+			}
+			if !allowed {
+				agentOwnerID = agent.OwnerID
+				return &service.ClaimDeliveryAuthzError{
+					Reason: "error_runtime_access_denied",
+					Detail: "private runtime does not permit task agent at delivery gate",
+				}
 			}
 		}
 		if !locked.OwnerID.Valid {
@@ -3168,23 +3174,38 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			"error_agent_runtime_changed", http.StatusConflict, "agent runtime changed before task delivery",
 		)
 	}
-	if runtime.Visibility == "private" && runtime.OwnerID.Valid && !service.RuntimeAllowsUser(runtime, agent.OwnerID) {
-		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
-		if !agent.OwnerID.Valid {
-			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+	if runtime.Visibility == "private" && runtime.OwnerID.Valid {
+		allowed, err := service.RuntimeAllowsAgentWithPolicy(r.Context(), h.Queries, runtime, agent, false)
+		if err != nil {
+			slog.Error("daemon claim: check runtime access failed; requeueing claim",
+				"task_id", uuidToString(task.ID), "runtime_id", runtimeID, "error", err)
+			if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); requeueErr != nil && !errors.Is(requeueErr, pgx.ErrNoRows) {
+				slog.Error("daemon claim: requeue after runtime access check failed",
+					"task_id", uuidToString(task.ID), "error", requeueErr)
+			}
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+				outcome: "error_runtime_access_check", status: http.StatusInternalServerError,
+				message: "failed to check runtime access",
+			}
 		}
-		slog.Warn("daemon claim: private runtime no longer permits task agent; refusing dispatch",
-			"task_id", uuidToString(task.ID),
-			"agent_id", uuidToString(task.AgentID),
-			"runtime_id", runtimeID,
-			"agent_owner_valid", agent.OwnerID.Valid,
-		)
-		return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
-			r.Context(), task,
-			userMessage,
-			taskfailure.ReasonRuntimeAccessDenied,
-			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
-		)
+		if !allowed {
+			userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
+			if !agent.OwnerID.Valid {
+				userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+			}
+			slog.Warn("daemon claim: private runtime no longer permits task agent; refusing dispatch",
+				"task_id", uuidToString(task.ID),
+				"agent_id", uuidToString(task.AgentID),
+				"runtime_id", runtimeID,
+				"agent_owner_valid", agent.OwnerID.Valid,
+			)
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				userMessage,
+				taskfailure.ReasonRuntimeAccessDenied,
+				"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
+			)
+		}
 	}
 	if !admissionMatches {
 		// Reuse the dispatched-at CAS so a slow builder cannot requeue a

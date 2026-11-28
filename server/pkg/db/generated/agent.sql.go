@@ -8459,6 +8459,8 @@ WHERE id = (
                         OR a.owner_id IS NULL
                         OR r.owner_id = a.owner_id
                         OR a.owner_id = ANY(r.shared_with)
+                        OR (r.workspace_id = a.workspace_id
+                            AND ARRAY[r.owner_id, a.owner_id] <@ private_runtime_policy_members(r.workspace_id))
                     )
                 )
             )
@@ -8597,6 +8599,8 @@ WITH candidates AS MATERIALIZED (
                         OR a.owner_id IS NULL
                         OR r.owner_id = a.owner_id
                         OR a.owner_id = ANY(r.shared_with)
+                        OR (r.workspace_id = a.workspace_id
+                            AND ARRAY[r.owner_id, a.owner_id] <@ private_runtime_policy_members(r.workspace_id))
                     )
                 )
             )

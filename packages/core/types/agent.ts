@@ -48,7 +48,7 @@ export interface AgentInvocationTargetInput {
 
 // Runtime visibility is a separate axis from agent visibility — different
 // vocabulary because it gates a different action. "private" (default) means
-// the runtime owner and shared_with members can bind agents to it;
+// the runtime owner and users granted access can bind agents to it;
 // only the owner may edit access (MUL-6126); "public" opens binding to
 // any workspace member. Older backends that haven't shipped MUL-2062 omit the
 // field; the consumer must default to "private" so the strictest behavior is
@@ -78,6 +78,8 @@ export interface RuntimeDevice {
   visibility: RuntimeVisibility;
   /** Workspace user IDs granted access while visibility is private. */
   shared_with?: string[];
+  /** Additional use grant from the server operator, separate from explicit sharing. */
+  policy_peer_id?: string | null;
   /**
    * The custom runtime profile this registered runtime was launched from,
    * or `null` for a built-in protocol family. The UI uses this to stamp a

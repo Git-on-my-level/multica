@@ -769,6 +769,17 @@ func (q *Queries) GetAgentRuntimes(ctx context.Context, ids []pgtype.UUID) ([]Ag
 	return items, nil
 }
 
+const getPrivateRuntimePolicyMembers = `-- name: GetPrivateRuntimePolicyMembers :one
+SELECT private_runtime_policy_members($1::uuid)::uuid[] AS user_ids
+`
+
+func (q *Queries) GetPrivateRuntimePolicyMembers(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getPrivateRuntimePolicyMembers, workspaceID)
+	var user_ids []pgtype.UUID
+	err := row.Scan(&user_ids)
+	return user_ids, err
+}
+
 const isAgentRuntimeEligibleForGC = `-- name: IsAgentRuntimeEligibleForGC :one
 SELECT EXISTS (
   SELECT 1 FROM agent_runtime
@@ -1211,7 +1222,11 @@ func (q *Queries) ListRuntimeOwnersByDaemon(ctx context.Context, arg ListRuntime
 
 const listSharedAgentRuntimesForUpdate = `-- name: ListSharedAgentRuntimesForUpdate :many
 SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, shared_with, max_concurrent_tasks FROM agent_runtime
-WHERE workspace_id = $1 AND $2::uuid = ANY(shared_with)
+WHERE workspace_id = $1 AND (
+    $2::uuid = ANY(shared_with)
+    OR (visibility = 'private' AND owner_id <> $2
+        AND ARRAY[owner_id, $2::uuid] <@ (SELECT private_runtime_policy_members($1)))
+)
 ORDER BY id
 FOR NO KEY UPDATE
 `
@@ -1321,7 +1336,9 @@ func (q *Queries) ListStaleOfflineRuntimeGCCandidates(ctx context.Context, arg L
 const listVisibleAgentRuntimes = `-- name: ListVisibleAgentRuntimes :many
 SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, shared_with, max_concurrent_tasks FROM agent_runtime
 WHERE workspace_id = $1
-  AND (owner_id = $2 OR visibility = 'public' OR (visibility = 'private' AND $2 = ANY(shared_with)))
+  AND (owner_id = $2 OR visibility = 'public'
+       OR (visibility = 'private' AND ($2 = ANY(shared_with)
+           OR ARRAY[owner_id, $2::uuid] <@ (SELECT private_runtime_policy_members($1)))))
 ORDER BY created_at ASC
 `
 
