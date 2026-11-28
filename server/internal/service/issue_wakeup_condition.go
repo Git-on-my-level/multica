@@ -32,7 +32,7 @@ const (
 // stored facts (a field value, sub-issue status, a linked pull request's
 // state); it does not interpret business meaning.
 type WakeupCondition struct {
-	// issue_field | children_done | pull_request | other_issue
+	// issue_field | children_done | pull_request | other_issue | merge_return
 	Type string `json:"type"`
 	// issue_field: status | assignee | label | property
 	Field        string          `json:"field,omitempty"`
@@ -68,7 +68,7 @@ var (
 )
 
 func conditionDiagnostic(err error) bool {
-	return errors.Is(err, errPRSnapshotsUnavailable) || errors.Is(err, errPRNotLinked) || errors.Is(err, errPRSnapshotPending) || errors.Is(err, errPRConflictsUnsupported)
+	return errors.Is(err, errMergeReturnCustody) || errors.Is(err, errPRSnapshotsUnavailable) || errors.Is(err, errPRNotLinked) || errors.Is(err, errPRSnapshotPending) || errors.Is(err, errPRConflictsUnsupported)
 }
 
 func badCondition(msg string) error {
@@ -100,6 +100,12 @@ func validateCondition(ctx context.Context, tx pgx.Tx, issue db.Issue, raw json.
 	var events []string
 	var out WakeupCondition
 	switch c.Type {
+	case "merge_return":
+		if _, err := readMergeReturnCustody(c.Value); err != nil {
+			return nil, nil, badCondition(err.Error())
+		}
+		out = WakeupCondition{Type: c.Type, Value: c.Value}
+		events = []string{"issue.status_changed", "issue.assignee_changed", "comment.created"}
 	case "issue_field":
 		out = WakeupCondition{Type: c.Type, Field: c.Field}
 		switch c.Field {
@@ -212,7 +218,7 @@ func validateCondition(ctx context.Context, tx pgx.Tx, issue db.Issue, raw json.
 		}
 		out = WakeupCondition{Type: c.Type, IssueID: util.UUIDToString(id), State: c.State, Identifier: identifier}
 	default:
-		return nil, nil, badCondition("type must be issue_field, children_done, pull_request or other_issue")
+		return nil, nil, badCondition("type must be issue_field, children_done, pull_request, other_issue or merge_return")
 	}
 	normalized, _ := json.Marshal(out)
 	return normalized, events, nil
@@ -227,6 +233,11 @@ func (s *IssueWakeupService) evaluateCondition(ctx context.Context, tx pgx.Tx, q
 		return false, "", nil, err
 	}
 	switch c.Type {
+	case "merge_return":
+		if err := checkMergeReturnCustody(ctx, tx, q, w, c.Value); err != nil {
+			return false, "", nil, err
+		}
+		return true, "merge-return:" + string(c.Value), map[string]any{"merge_return_custody": json.RawMessage(c.Value)}, nil
 	case "issue_field":
 		var status, assigneeType string
 		var assigneeID pgtype.UUID
