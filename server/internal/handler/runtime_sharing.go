@@ -96,13 +96,14 @@ func resolveRuntimeAccess(ctx context.Context, q *db.Queries, rt db.AgentRuntime
 
 // Runtime owners can edit explicit grants independently. Dependency checks
 // must keep agents whose owners are still authorized by the operator policy.
-func runtimeSharesAfterPolicy(ctx context.Context, q *db.Queries, rt db.AgentRuntime) ([]pgtype.UUID, error) {
+// During membership removal, a departing peer disables the whole pair.
+func runtimeSharesAfterPolicy(ctx context.Context, q *db.Queries, rt db.AgentRuntime, departingUser pgtype.UUID) ([]pgtype.UUID, error) {
 	members, err := q.GetPrivateRuntimePolicyMembers(ctx, rt.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
 	peer := service.PrivateRuntimePolicyPeer(rt, members)
-	if !peer.Valid || slices.Contains(rt.SharedWith, peer) {
+	if !peer.Valid || slices.Contains(members, departingUser) || slices.Contains(rt.SharedWith, peer) {
 		return rt.SharedWith, nil
 	}
 	locked, err := q.LockRuntimeShareMembers(ctx, db.LockRuntimeShareMembersParams{

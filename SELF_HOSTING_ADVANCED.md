@@ -213,7 +213,12 @@ A self-host operator can set `MULTICA_PRIVATE_RUNTIME_PEERS` on the backend as `
 
 While both users belong to that workspace, each can place and run their agents on the other's private runtimes. New runtimes owned by either user are covered automatically. Runtime visibility remains private and the owner still controls explicit shares. The runtime list API reports the runtime owner's policy peer as `policy_peer_id` to both members of the pair. The explicit recipients stay in `shared_with`. Other workspaces and other workspace members keep their existing access.
 
-To disable the policy, first move policy-dependent agents to runtimes they can otherwise use and drain their work. Then clear the setting and recreate or restart every API server. Existing explicit shares remain in effect.
+To disable the policy, first move policy-dependent agents to runtimes they can otherwise use and drain their work. Clear the setting and apply the updated environment to every API server.
+
+- With Docker Compose, recreate the backend container. Use the same environment and Compose files you deployed with, for example `docker compose -f docker-compose.selfhost.yml up -d --no-deps --force-recreate backend`. Restarting an existing container keeps its original environment.
+- For a directly supervised API server, restart the server process with the updated environment.
+
+Existing explicit shares remain in effect.
 
 ### Private CA Certificates (Optional)
 

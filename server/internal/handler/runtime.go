@@ -799,7 +799,7 @@ func (h *Handler) updateRuntimeAccessIfNoDependencies(ctx context.Context, rt db
 	}
 
 	if runtimeAccessNarrows(lockedRuntime, next) {
-		effective, err := runtimeSharesAfterPolicy(ctx, qtx, next)
+		effective, err := runtimeSharesAfterPolicy(ctx, qtx, next, pgtype.UUID{})
 		if err != nil {
 			return lockedRuntime, runtimeWorkspaceAccessRevocationPlan{}, false, err
 		}
@@ -1235,7 +1235,7 @@ func (h *Handler) RevokeRuntimeWorkspaceAccess(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	effective, err := runtimeSharesAfterPolicy(r.Context(), qtx, next)
+	effective, err := runtimeSharesAfterPolicy(r.Context(), qtx, next, pgtype.UUID{})
 	if err != nil {
 		if !writeRuntimeRevocationBusy(w, err) {
 			writeError(w, http.StatusInternalServerError, "failed to check runtime access")

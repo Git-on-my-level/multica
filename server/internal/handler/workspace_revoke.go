@@ -259,10 +259,14 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 			}
 			continue
 		}
-		if _, err := lockRuntimeRevocationPlan(ctx, qtx, rt, rt.SharedWith); err != nil {
+		effective, err := runtimeSharesAfterPolicy(ctx, qtx, rt, userID)
+		if err != nil {
 			return empty, err
 		}
-		_, teardown, readyChats, err := applyRuntimeAccessRevocation(ctx, qtx, rt, rt.SharedWith)
+		if _, err := lockRuntimeRevocationPlan(ctx, qtx, rt, effective); err != nil {
+			return empty, err
+		}
+		_, teardown, readyChats, err := applyRuntimeAccessRevocation(ctx, qtx, rt, effective)
 		if err != nil {
 			return empty, err
 		}

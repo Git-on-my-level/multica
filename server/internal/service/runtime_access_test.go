@@ -46,6 +46,8 @@ func TestAgentReadinessRuntimeAccess(t *testing.T) {
 	fixture.Member(t, workspace, other, "member")
 	fx := testutil.New(pool, workspace, owner)
 	privateRuntime := util.MustParseUUID(fx.Runtime(t, "Private runtime"))
+	shared := fx.Runtime(t, "Explicitly shared runtime")
+	fx.Exec(t, "UPDATE agent_runtime SET shared_with = ARRAY[$2::uuid] WHERE id = $1", shared, other)
 	publicRuntime := util.MustParseUUID(fx.Runtime(t, "Public runtime", testutil.Cols{"visibility": "public"}))
 	ownerless := util.MustParseUUID(fx.Runtime(t, "Ownerless runtime", testutil.Cols{"owner_id": nil}))
 	lookup := RuntimeLookup{Queries: db.New(pool)}
@@ -58,6 +60,7 @@ func TestAgentReadinessRuntimeAccess(t *testing.T) {
 	}{
 		{"runtime owner", privateRuntime, util.MustParseUUID(owner), ""},
 		{"private mismatch", privateRuntime, util.MustParseUUID(other), dispatch.ReasonRuntimeAccessDenied},
+		{"explicit share", util.MustParseUUID(shared), util.MustParseUUID(other), ""},
 		{"public mismatch", publicRuntime, util.MustParseUUID(other), ""},
 		{"ownerless agent", privateRuntime, pgtype.UUID{}, dispatch.ReasonRuntimeAccessDenied},
 		{"legacy ownerless runtime", ownerless, util.MustParseUUID(other), ""},

@@ -36,7 +36,7 @@ You also need to pick an email service, otherwise verification codes and invitat
 | `DATABASE_MIN_CONNS` | `5` | Minimum connections each API process keeps |
 | `DATABASE_SEARCH_WORK_MEM_MB` | `64` | PostgreSQL `work_mem` ceiling in MB for each search plan node; set `1`-`64` to lower it or `0` to keep the database/session default |
 | `DATABASE_REPLICA_URL` | empty | Optional PostgreSQL read-only replica connection string; new connections are validated as read-only, while businesses must explicitly opt into eventual-consistency reads in code |
-| `MULTICA_PRIVATE_RUNTIME_PEERS` | empty | Optional reciprocal placement on private runtimes for two current members of one workspace. Enter the workspace UUID and two distinct user UUIDs, separated by commas. Invalid values prevent API startup. Clear the value and restart the API servers to disable the grant. |
+| `MULTICA_PRIVATE_RUNTIME_PEERS` | empty | Optional reciprocal placement on private runtimes for two current members of one workspace. Enter the workspace UUID and two distinct user UUIDs, separated by commas. Invalid values prevent API startup. To disable the grant, clear the setting. Recreate the backend containers in Docker Compose or restart directly supervised API servers with the updated environment. |
 | `DATABASE_REPLICA_MAX_CONNS` | `10` | Maximum replica connections per API process |
 | `DATABASE_REPLICA_MIN_CONNS` | `0` | Minimum replica connections each API process keeps |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | Container-level retry budget shared by migration and API startup; set to `0` for one fail-fast attempt per phase |

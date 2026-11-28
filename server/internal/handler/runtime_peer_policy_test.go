@@ -225,3 +225,37 @@ func TestPrivateRuntimePeerPolicyPlacementDuringRemoval(t *testing.T) {
 		t.Fatalf("placement raced member removal and wrote %d agents", count)
 	}
 }
+
+func TestPrivateRuntimePeerPolicyPreservesPeerOnOtherMemberDeparture(t *testing.T) {
+	runtime, owner, peer := runtimeVisibilityFixture(t)
+	other := dbfx.User(t, "Unrelated runtime recipient", "other-"+uuid.NewString()+"@example.test")
+	member := dbfx.Member(t, testWorkspaceID, other, "member")
+	h := runtimePeerPolicyHandler(t, testWorkspaceID, owner, peer)
+
+	patch := newRequestAs(owner, http.MethodPatch, "/api/runtimes/"+runtime, map[string]any{"shared_with": []string{other}})
+	testutil.Call(t, h.UpdateAgentRuntime, withURLParam(patch, "runtimeId", runtime)).Want(http.StatusOK)
+	peerAgent := dbfx.Agent(t, "Policy peer's agent", runtime, testutil.Cols{"owner_id": peer})
+	otherAgent := dbfx.Agent(t, "Explicit recipient's agent", runtime, testutil.Cols{"owner_id": other})
+	peerTask := dbfx.Task(t, peerAgent, testutil.Cols{"runtime_id": runtime, "status": "running"})
+	otherTask := dbfx.Task(t, otherAgent, testutil.Cols{"runtime_id": runtime, "status": "running"})
+
+	req := newRequest(http.MethodDelete, "/api/workspaces/"+testWorkspaceID+"/members/"+member, nil)
+	testutil.Call(t, h.DeleteMember, testutil.WithURLParams(req, "id", testWorkspaceID, "memberId", member)).Want(http.StatusNoContent)
+
+	for _, tc := range []struct {
+		agent, task, status string
+		bound               bool
+	}{
+		{peerAgent, peerTask, "running", true},
+		{otherAgent, otherTask, "cancelled", false},
+	} {
+		agent, err := h.Queries.GetAgent(t.Context(), parseUUID(tc.agent))
+		if err != nil || agent.RuntimeID.Valid != tc.bound || (tc.bound && uuidToString(agent.RuntimeID) != runtime) {
+			t.Fatalf("agent %s got binding %s, want bound=%v: %v", tc.agent, uuidToString(agent.RuntimeID), tc.bound, err)
+		}
+		task, err := h.Queries.GetAgentTask(t.Context(), parseUUID(tc.task))
+		if err != nil || task.Status != tc.status {
+			t.Fatalf("task %s got status %q, want %q: %v", tc.task, task.Status, tc.status, err)
+		}
+	}
+}

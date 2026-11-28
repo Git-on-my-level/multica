@@ -418,9 +418,11 @@ func main() {
 	// replica connections are validated as read-only by the pool configuration,
 	// while request-driven fallback and a passive circuit breaker handle runtime
 	// failures without background SQL.
+	// The peer grant depends on current membership and is only configured on
+	// the primary pool.
 	var replicaPool *pgxpool.Pool
 	if replicaURL := strings.TrimSpace(os.Getenv("DATABASE_REPLICA_URL")); replicaURL != "" {
-		replicaPool, err = newSizedDBPool(context.Background(), replicaURL, startupSettings.ConnectTimeout, replicaPoolSizing, privateRuntimePeers)
+		replicaPool, err = newSizedDBPool(context.Background(), replicaURL, startupSettings.ConnectTimeout, replicaPoolSizing, "")
 		if err != nil {
 			slog.Warn("database replica configuration is invalid; using primary for reads", "error", err)
 			replicaPool = nil
