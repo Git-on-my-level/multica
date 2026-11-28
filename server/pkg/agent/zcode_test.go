@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +19,11 @@ import (
 //
 //   - ZC_ARGC_FILE   — receives the script's argument count, so a test can
 //     assert the daemon launched the bridge with no protocol subcommand.
-//   - ZC_SET_MODEL_ERROR — when "1", session/setModel answers with the
-//     upstream error string "model not available".
+//   - ZC_SET_MODEL_ERROR — when "1", session/setModel returns the bridge's
+//     "model switch rejected" error. "session_not_found" simulates a stale
+//     session discovered during a switch.
+//   - ZC_MODEL_OPTION — overrides the new-session model option and adds it
+//     to the resume response. Defaults to no model option on resume.
 //   - ZC_PROMPT_ERROR — when "session_not_found", session/prompt answers
 //     with a -32002 session-not-found error (the bridge surfaces a dead
 //     zcode session this way).
@@ -29,6 +34,7 @@ func fakeZcodeACPScript() string {
 	return `#!/bin/sh
 printf '%s\n' "$#" >> "${ZC_ARGC_FILE:-/dev/null}"
 ZC_VERSION="${ZC_VERSION:-0.2.0}"
+default_model_option='{"id":"model","currentValue":"glm-5.3","options":[{"value":"glm-5.3","name":"GLM-5.3"},{"value":"glm-5-turbo","name":"GLM-5-Turbo"}]}'
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "${ZC_REQUESTS_FILE:-/dev/null}"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -50,7 +56,7 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"zcode create failed: timeout"}}}\n' "$id"
         exit 0
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"glm-5.3","options":[{"value":"glm-5.3","name":"GLM-5.3"},{"value":"glm-5-turbo","name":"GLM-5-Turbo"}]},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[%s,{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id" "${ZC_MODEL_OPTION:-$default_model_option}"
       ;;
     *'"method":"session/set_config_option"'*)
       requested=$(printf '%s' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
@@ -64,11 +70,13 @@ while IFS= read -r line; do
       if [ "$ZC_REPLAY" = "1" ]; then
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_zc_resumed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"stale replay from the previous turn"}}}}\n'
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_resumed","configOptions":[{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_resumed","configOptions":[%s{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id" "${ZC_MODEL_OPTION:+$ZC_MODEL_OPTION,}"
       ;;
     *'"method":"session/setModel"'*)
       if [ "$ZC_SET_MODEL_ERROR" = "1" ]; then
-        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"model not available"}}\n' "$id"
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"setModel failed (model switch rejected)"}}}\n' "$id"
+      elif [ "$ZC_SET_MODEL_ERROR" = "session_not_found" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"Session not found: ses_zc_resumed"}}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       fi
@@ -236,24 +244,109 @@ func TestZcodeBackendStreamsPromptAndResult(t *testing.T) {
 
 // TestZcodeBackendSetModelFailureFailsTask pins the contract that a rejected
 // model switch fails the task instead of silently running on the default
-// model, and that the session id survives so the failure is diagnosable.
+// model, and withholds the new session ID before the first prompt.
 func TestZcodeBackendSetModelFailureFailsTask(t *testing.T) {
 	t.Parallel()
 
-	result, _ := runZcodeTest(t, map[string]string{"ZC_SET_MODEL_ERROR": "1"}, ExecOptions{
-		Model: "bogus-model",
+	requestsFile := filepath.Join(t.TempDir(), "requests")
+	result, msgs := runZcodeTest(t, map[string]string{"ZC_SET_MODEL_ERROR": "1", "ZC_REQUESTS_FILE": requestsFile}, ExecOptions{
+		Model: "glm-5.3",
 	})
 	if result.Status != "failed" {
 		t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
 	}
-	if !strings.Contains(result.Error, `could not switch to model "bogus-model"`) {
+	if !strings.Contains(result.Error, `could not switch to model "glm-5.3"`) {
 		t.Errorf("expected error to name the requested model, got %q", result.Error)
 	}
-	if !strings.Contains(result.Error, "model not available") {
+	if !strings.Contains(result.Error, "model switch rejected") {
 		t.Errorf("expected error to surface upstream message, got %q", result.Error)
 	}
-	if result.SessionID != "ses_zc_new" {
-		t.Errorf("expected session id to be preserved on failure, got %q", result.SessionID)
+	if result.SessionID != "" {
+		t.Errorf("expected fresh session id to be withheld on failure, got %q", result.SessionID)
+	}
+	if result.ResumeRejected || len(msgs) != 0 {
+		t.Fatalf("rejected switch started execution or requested retry: result=%+v messages=%+v", result, msgs)
+	}
+	raw, err := os.ReadFile(requestsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(raw), `"method":"session/setModel"`) != 1 || strings.Contains(string(raw), `"method":"session/prompt"`) {
+		t.Fatalf("expected one switch attempt and no prompt, got %s", raw)
+	}
+}
+
+func TestZcodeBackendValidatesExactSessionModel(t *testing.T) {
+	t.Parallel()
+
+	const accepted = `builtin:zai-coding-plan\GLM-5.3`
+	const modelOption = `{"id":"model","currentValue":"builtin:zai-coding-plan\\GLM-5.3","options":[{"value":"builtin:zai-coding-plan\\GLM-5.3","name":"GLM-5.3"}]}`
+	for _, tc := range []struct {
+		name, model, option, resume, wantError string
+	}{
+		{name: "fresh exact", model: accepted, option: modelOption},
+		{name: "resume exact", model: accepted, option: modelOption, resume: "ses_zc_resumed"},
+		{name: "unavailable model", model: "zai/glm-5.4", option: modelOption, wantError: "advertised IDs:"},
+		{name: "unadvertised alias on resume", model: "zai/glm-5.3", option: modelOption, resume: "ses_zc_resumed", wantError: "advertised IDs:"},
+		{name: "qualified ID when resume omits catalog", model: accepted, resume: "ses_zc_resumed"},
+		{name: "current ID when resume omits choices", model: "glm-5.3", option: `{"id":"model","currentValue":"glm-5.3"}`, resume: "ses_zc_resumed"},
+		{name: "unobserved alias when resume omits catalog", model: "zai/glm-5.3", resume: "ses_zc_resumed", wantError: "advertised no model IDs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requestsFile := filepath.Join(t.TempDir(), "requests")
+			result, msgs := runZcodeTest(t, map[string]string{
+				"ZC_REQUESTS_FILE": requestsFile,
+				"ZC_MODEL_OPTION":  tc.option,
+			}, ExecOptions{Model: tc.model, ResumeSessionID: tc.resume})
+			raw, err := os.ReadFile(requestsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantError != "" {
+				if result.Status != "failed" || !strings.Contains(result.Error, tc.wantError) ||
+					!strings.Contains(result.Error, `could not switch to model `+fmt.Sprintf("%q", tc.model)) {
+					t.Fatalf("expected explicit configuration failure, got %+v", result)
+				}
+				if tc.option != "" && !strings.Contains(result.Error, fmt.Sprintf("%q", accepted)) {
+					t.Fatalf("diagnostic omitted accepted ID: %q", result.Error)
+				}
+				if result.SessionID != tc.resume || result.ResumeRejected || len(msgs) != 0 ||
+					strings.Contains(string(raw), `"method":"session/setModel"`) || strings.Contains(string(raw), `"method":"session/prompt"`) {
+					t.Fatalf("configuration failure must preserve the prior session and stop before switch or prompt: %+v, %s", result, raw)
+				}
+				return
+			}
+
+			wantSession := tc.resume
+			if wantSession == "" {
+				wantSession = "ses_zc_new"
+			}
+			if result.Status != "completed" || result.Output != "pong" || result.SessionID != wantSession {
+				t.Fatalf("expected successful turn on session %q, got %+v", wantSession, result)
+			}
+			var methods []string
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				var req struct {
+					Method string
+					Params struct{ ModelID, SessionID string }
+				}
+				if err := json.Unmarshal([]byte(line), &req); err != nil {
+					t.Fatal(err)
+				}
+				switch req.Method {
+				case "session/setModel":
+					if req.Params.ModelID != tc.model || req.Params.SessionID != wantSession {
+						t.Fatalf("unexpected model switch request: %s", line)
+					}
+					methods = append(methods, req.Method)
+				case "session/prompt":
+					methods = append(methods, req.Method)
+				}
+			}
+			if strings.Join(methods, ",") != "session/setModel,session/prompt" {
+				t.Fatalf("expected one exact selection before one prompt, got %v", methods)
+			}
+		})
 	}
 }
 
@@ -264,20 +357,19 @@ func TestZcodeBackendSetModelFailureFailsTask(t *testing.T) {
 func TestZcodeBackendSetModelSessionNotFoundClearsSessionID(t *testing.T) {
 	t.Parallel()
 
-	// The fixture fails every setModel with -32603 wrapped as session
-	// not found via ZC_PROMPT_ERROR is not used here; use the prompt path
-	// instead: set a model but make the prompt fail with session not found.
-	result, _ := runZcodeTest(t, map[string]string{"ZC_PROMPT_ERROR": "session_not_found"}, ExecOptions{
-		ResumeSessionID: "ses_zc_resumed",
-	})
-	if result.Status != "failed" {
-		t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
-	}
-	if !result.ResumeRejected {
-		t.Error("expected ResumeRejected when the resumed session is gone at prompt time")
-	}
-	if result.SessionID != "" {
-		t.Errorf("expected cleared session id, got %q", result.SessionID)
+	for _, tc := range []struct{ name, failureEnv, model string }{
+		{"switch", "ZC_SET_MODEL_ERROR", "glm-5.3"},
+		{"prompt", "ZC_PROMPT_ERROR", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, _ := runZcodeTest(t, map[string]string{
+				tc.failureEnv:     "session_not_found",
+				"ZC_MODEL_OPTION": `{"id":"model","currentValue":"glm-5.3","options":[{"value":"glm-5.3"}]}`,
+			}, ExecOptions{Model: tc.model, ResumeSessionID: "ses_zc_resumed"})
+			if result.Status != "failed" || !result.ResumeRejected || result.SessionID != "" {
+				t.Fatalf("expected failed result with ResumeRejected and no session ID, got %+v", result)
+			}
+		})
 	}
 }
 
