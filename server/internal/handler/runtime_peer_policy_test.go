@@ -259,3 +259,29 @@ func TestPrivateRuntimePeerPolicyPreservesPeerOnOtherMemberDeparture(t *testing.
 		}
 	}
 }
+
+func TestPrivateRuntimePeerPolicyModelDiscovery(t *testing.T) {
+	runtime, owner, peer := runtimeVisibilityFixture(t)
+	h := runtimePeerPolicyHandler(t, testWorkspaceID, owner, peer)
+	h.ModelListStore = NewInMemoryModelListStore()
+	initiate := func(actor string) *testutil.Response {
+		req := newRequestAs(actor, http.MethodPost, "/api/runtimes/"+runtime+"/models", nil)
+		return testutil.Call(t, h.InitiateListModels, withURLParam(req, "runtimeId", runtime))
+	}
+	initiate(testUserID).Want(http.StatusNotFound)
+	var requested ModelListRequest
+	initiate(peer).Want(http.StatusOK).JSON(&requested)
+	if requested.RuntimeID != runtime || requested.ID == "" {
+		t.Fatalf("incorrect model request: %+v", requested)
+	}
+	for _, tc := range []struct {
+		actor  string
+		status int
+	}{
+		{peer, http.StatusOK},
+		{testUserID, http.StatusNotFound},
+	} {
+		req := newRequestAs(tc.actor, http.MethodGet, "/api/runtimes/"+runtime+"/models/"+requested.ID, nil)
+		testutil.Call(t, h.GetModelListRequest, testutil.WithURLParams(req, "runtimeId", runtime, "requestId", requested.ID)).Want(tc.status)
+	}
+}
