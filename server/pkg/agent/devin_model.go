@@ -100,6 +100,21 @@ func devinModelAvailable(choices []devinModelChoice, value string) bool {
 	return false
 }
 
+// DevinModelIDMatches permits only the CLI's dot-to-hyphen ID spelling change.
+// It never equates different variants, efforts, or model families.
+func DevinModelIDMatches(requested, advertised string) bool {
+	return requested != "" && strings.ReplaceAll(requested, ".", "-") == strings.ReplaceAll(advertised, ".", "-")
+}
+
+func devinEquivalentModelValues(choices []devinModelChoice, requested string, values map[string]bool) {
+	for _, choice := range choices {
+		if DevinModelIDMatches(requested, choice.Value) {
+			values[choice.Value] = true
+		}
+		devinEquivalentModelValues(choice.Options, requested, values)
+	}
+}
+
 func normalizeDevinModelName(value string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
@@ -179,7 +194,8 @@ func confirmDevinModel(ctx context.Context, request acpRequestFn, sessionID, req
 	values := map[string]bool{requested: true}
 	if !devinModelAvailable(option.Options, requested) {
 		values = make(map[string]bool)
-		if name := normalizeDevinModelName(requested); name != "" {
+		devinEquivalentModelValues(option.Options, requested, values)
+		if name := normalizeDevinModelName(requested); len(values) == 0 && name != "" {
 			devinNamedModelValues(option.Options, name, values)
 		}
 		if len(values) > 1 {

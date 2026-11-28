@@ -1563,6 +1563,10 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := h.validateDevinModelSelection(r.Context(), runtime.Provider, uuidToString(runtime.ID), req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if runtime.Provider == "qoder_cloud" {
 		raw, _ := json.Marshal(req.RuntimeConfig)
 		if err := validateQoderAgentConfig(raw); err != nil {
@@ -2155,6 +2159,16 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			provider, ok = h.resolveAgentProvider(r, existing.WorkspaceID, targetRuntimeID)
 			if !ok {
 				writeError(w, 400, "cannot resolve agent runtime")
+				return
+			}
+		}
+		if req.Model != nil || req.RuntimeID != nil {
+			model := existing.Model.String
+			if req.Model != nil {
+				model = *req.Model
+			}
+			if err := h.validateDevinModelSelection(r.Context(), provider, uuidToString(targetRuntimeID), model); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		}
