@@ -1394,6 +1394,19 @@ type EnvRootGCClaim struct {
 // LockEnvRootForGC takes the run lock through the directory handle that will
 // also be used to remove the contents.
 func LockEnvRootForGC(wsRoot *os.Root, rel, envRoot string) (*EnvRootGCClaim, error) {
+	gc, err := openEnvRootForGC(wsRoot, rel, envRoot)
+	if err != nil {
+		return nil, err
+	}
+	gc.claim, err = lockOpenEnvRoot(gc.root, envRoot)
+	if err != nil {
+		gc.Release()
+		return nil, err
+	}
+	return gc, nil
+}
+
+func openEnvRootForGC(wsRoot *os.Root, rel, envRoot string) (*EnvRootGCClaim, error) {
 	if wsRoot == nil || !filepath.IsLocal(rel) || rel == "." {
 		return nil, fmt.Errorf("execenv: env root %s is not inside the workspaces root", envRoot)
 	}
@@ -1421,11 +1434,6 @@ func LockEnvRootForGC(wsRoot *os.Root, rel, envRoot string) (*EnvRootGCClaim, er
 	if err != nil || !os.SameFile(info, lockedInfo) {
 		gc.Release()
 		return nil, fmt.Errorf("execenv: gc root %s changed before lock acquisition", envRoot)
-	}
-	gc.claim, err = lockOpenEnvRoot(root, envRoot)
-	if err != nil {
-		gc.Release()
-		return nil, err
 	}
 	return gc, nil
 }

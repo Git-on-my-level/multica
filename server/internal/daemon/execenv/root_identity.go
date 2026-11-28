@@ -238,11 +238,17 @@ func ValidateEnvRootOwnerPath(workspacesRoot, envRoot string, owner EnvRootOwner
 	return nil
 }
 
+// ErrEnvRootNotIndexed means there is no published record for the root.
+var ErrEnvRootNotIndexed = errors.New("task root is not indexed")
+
 // IndexedEnvRootOwner recovers provenance from a published stable-root record.
 // Readable suffixes alone are never ownership proof. This lookup creates nothing.
 func IndexedEnvRootOwner(workspacesRoot, envRoot string) (*EnvRootOwner, error) {
 	indexDir := filepath.Join(workspacesRoot, taskRootIndexDir)
 	info, err := os.Lstat(indexDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrEnvRootNotIndexed
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +289,7 @@ func IndexedEnvRootOwner(workspacesRoot, envRoot string) (*EnvRootOwner, error) 
 		found = &owner
 	}
 	if found == nil {
-		return nil, fmt.Errorf("execenv: no task root record for %s", envRoot)
+		return nil, fmt.Errorf("execenv: %s: %w", envRoot, ErrEnvRootNotIndexed)
 	}
 	return found, nil
 }
