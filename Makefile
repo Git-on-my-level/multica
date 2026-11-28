@@ -144,7 +144,12 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 # Internal: see selfhost-start.
 selfhost-build-start:
 	@echo "==> Building Multica from the current checkout..."
-	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
+	@if worktree_status=$$(git status --porcelain 2>/dev/null) && [ -z "$$worktree_status" ]; then \
+		revision="$(BUILD_COMMIT)"; \
+	else \
+		revision=unknown; \
+	fi; \
+		COMMIT="$$revision" VERSION="$(VERSION)" $(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
@@ -191,10 +196,8 @@ env-exec: ## Run a command with this environment's variables (ARGS="-- pnpm dev:
 # Single-component entry points. No database preflight: `up` has already proven
 # the database is reachable before it launches anything, and repeating the
 # check here would make each component slower to restart on its own.
-# The commit ldflag is what makes /health's identity useful: without it every
-# environment reports "unknown" and cannot prove which revision it is serving.
 api-dev: ## Run only the Go backend for the current env file
-	cd server && go run -ldflags "-X main.commit=$(COMMIT)" ./cmd/server
+	cd server && go run -ldflags "-X main.commit=$(COMMIT) -X main.buildCommit=$(BUILD_COMMIT) -X main.date=$(DATE)" ./cmd/server
 
 web-dev: ## Run only the Next.js dev server for the current env file
 	pnpm dev:web
@@ -351,7 +354,7 @@ DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 # checkouts with no Go toolchain installed.
 build: EXE = $(if $(filter windows,$(or $(GOOS),$(shell go env GOOS))),.exe,)
 build: ## Build the server, CLI, and migrate binaries into server/bin
-	cd server && go build -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT)" -o bin/server$(EXE) ./cmd/server
+	cd server && go build -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildCommit=$(BUILD_COMMIT) -X main.date=$(DATE)" -o bin/server$(EXE) ./cmd/server
 	cd server && go build -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildCommit=$(BUILD_COMMIT) -X main.date=$(DATE)" -o bin/multica$(EXE) ./cmd/multica
 	cd server && go build -o bin/migrate$(EXE) ./cmd/migrate
 
