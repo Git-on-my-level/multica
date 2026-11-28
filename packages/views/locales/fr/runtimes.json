@@ -184,6 +184,11 @@
       "public": "Tout membre de l'espace de travail peut créer des agents sur ce runtime.",
       "members": "Seuls vous et les membres sélectionnés pouvez créer des agents sur cet environnement."
     },
+    "visibility_policy_peer_notice": "La politique de l’opérateur autorise {{name}} à déployer et à exécuter des agents sur ce runtime.",
+    "visibility_hint_policy": {
+      "private": "Retirez les partages explicites. Les accès accordés par la politique de l’opérateur restent valides.",
+      "members": "Partagez avec des membres précis en complément des accès accordés par la politique de l’opérateur."
+    },
     "visibility_hint_readonly": {
       "private": "Seul le propriétaire du runtime peut y créer des agents, et lui seul peut le passer en Public.",
       "public": "Tout membre de l'espace de travail peut créer des agents sur ce runtime. Seul son propriétaire peut le repasser en Privé.",

@@ -72,6 +72,10 @@ export function RuntimeAccessEditor({ runtime }: { runtime: AgentRuntime }) {
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const updateRuntime = useUpdateRuntime(wsId);
   const current = runtimeAccessScope(runtime);
+  const policyPeerId = runtime.policy_peer_id;
+  const policyPeerName = policyPeerId
+    ? members.find((member) => member.user_id === policyPeerId)?.name || policyPeerId
+    : null;
   const persisted = useMemo(() => runtime.shared_with ?? [], [runtime.shared_with]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [revokePlan, setRevokePlan] = useState<RuntimeAccessRevocationPlan | null>(null);
@@ -124,6 +128,7 @@ export function RuntimeAccessEditor({ runtime }: { runtime: AgentRuntime }) {
             key={scope}
             scope={scope}
             active={current === scope}
+            hasPolicyPeer={Boolean(policyPeerId)}
             disabled={disabled}
             onClick={() => {
               if (current !== scope) apply(scope, []);
@@ -132,7 +137,14 @@ export function RuntimeAccessEditor({ runtime }: { runtime: AgentRuntime }) {
         ))}
         <Popover open={pickerOpen} onOpenChange={(open) => setPickerOpen(open && !disabled)}>
           <PopoverTrigger
-            render={<ScopeButton scope="members" active={current === "members"} disabled={disabled} />}
+            render={
+              <ScopeButton
+                scope="members"
+                active={current === "members"}
+                hasPolicyPeer={Boolean(policyPeerId)}
+                disabled={disabled}
+              />
+            }
           />
           <PopoverContent align="end" className="w-72 p-0">
             {pickerOpen ? (
@@ -169,6 +181,11 @@ export function RuntimeAccessEditor({ runtime }: { runtime: AgentRuntime }) {
           </span>
         </button>
       ) : null}
+      {policyPeerName ? (
+        <p className="wrap-anywhere px-1 text-caption text-muted-foreground">
+          {t(($) => $.detail.visibility_policy_peer_notice, { name: policyPeerName })}
+        </p>
+      ) : null}
       <RevokeRuntimeAccessDialog open={revokeOpen} onOpenChange={setRevokeOpen}
         runtime={runtime} wsId={wsId} initialPlan={revokePlan} sharedWith={revokeMembers} />
     </div>
@@ -178,11 +195,13 @@ export function RuntimeAccessEditor({ runtime }: { runtime: AgentRuntime }) {
 function ScopeButton({
   scope,
   active,
+  hasPolicyPeer,
   disabled,
   ...props
 }: {
   scope: RuntimeAccessScope;
   active: boolean;
+  hasPolicyPeer: boolean;
   disabled: boolean;
 } & ComponentProps<"button">) {
   const { t } = useT("runtimes");
@@ -207,7 +226,11 @@ function ScopeButton({
           </button>
         }
       />
-      <TooltipContent>{t(($) => $.detail.visibility_hint[scope])}</TooltipContent>
+      <TooltipContent>
+        {hasPolicyPeer && scope !== "public"
+          ? t(($) => $.detail.visibility_hint_policy[scope])
+          : t(($) => $.detail.visibility_hint[scope])}
+      </TooltipContent>
     </Tooltip>
   );
 }
